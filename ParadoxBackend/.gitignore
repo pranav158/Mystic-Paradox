@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+tmp/
+temp/
+.cache/
+*.db
+file
+migration-fixtures/snapshot_mysticparadox_pre_migration.json
