@@ -1,0 +1,12 @@
+{
+  "Example_Node_Unlock": {
+    "childNodes": ["Example_Node_Upgrade_0"],
+    "currencyCosts": [{ "amount": 1, "currency": "CURRENCY_EXAMPLE" }],
+    "rewards": []
+  },
+  "Example_Node_Upgrade_0": {
+    "childNodes": [],
+    "currencyCosts": [],
+    "rewards": ["EXAMPLE_PART_00"]
+  }
+}

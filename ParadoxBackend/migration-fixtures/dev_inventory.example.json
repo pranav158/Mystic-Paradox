@@ -1,0 +1,10 @@
+{
+  "_note": "Synthetic placeholder only. Real starter inventory is generated locally from your own installation (see docs/GENERATING_GAME_DATA.md). No captured game data is distributed. characterId is filled from the request at serve time.",
+  "characterId": "00000000-0000-0000-0000-000000000000",
+  "instancedItems": [
+    { "catalogId": "EXAMPLE_WEAPON_00", "instanceId": "EXAMPLEINSTANCE00000000000", "itemData": null, "updateVersion": 0 }
+  ],
+  "stackedItems": [
+    { "catalogId": "EXAMPLE_CURRENCY_00", "quantity": 1 }
+  ]
+}
