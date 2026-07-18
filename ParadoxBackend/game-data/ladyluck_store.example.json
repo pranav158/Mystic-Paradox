@@ -1,0 +1,13 @@
+[
+  {
+    "id": "example_store_item",
+    "displayName": "Example Store Item",
+    "displayDescription": "Synthetic placeholder store entry for smoke tests only.",
+    "displayPriority": 0,
+    "prices": [ { "currencyId": "id_currency_example", "price": 1 } ],
+    "maxAllowed": 1,
+    "tags": ["ladyluckstore"],
+    "items": [ { "catalogId": "EXAMPLE_ITEM_00", "quantity": 1, "instanced": true } ],
+    "duplicateInstancedItems": []
+  }
+]

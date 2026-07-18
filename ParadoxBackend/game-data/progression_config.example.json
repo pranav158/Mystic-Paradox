@@ -1,0 +1,22 @@
+{
+  "code": null,
+  "message": "OK",
+  "payload": {
+    "paths": [
+      {
+        "end_date": "2020-01-01T00:00:00+00:00",
+        "free_rewards": [
+          { "entitlements": [], "instanced_items": [], "rank_id": 0, "stacked_items": [] },
+          {
+            "entitlements": [],
+            "instanced_items": [],
+            "rank_id": 1,
+            "stacked_items": [
+              { "catalog_id": "EXAMPLE_REWARD_00", "hidden": false, "priority": 0, "quantity": 1 }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

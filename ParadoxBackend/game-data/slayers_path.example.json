@@ -1,0 +1,10 @@
+{
+  "code": null,
+  "message": "OK",
+  "payload": {
+    "nodes": {
+      "Example_Node_Unlock": { "node_id": "Example_Node_Unlock", "node_status": 0, "objectives": [] },
+      "Example_Node_Upgrade_0": { "node_id": "Example_Node_Upgrade_0", "node_status": 0, "objectives": [] }
+    }
+  }
+}
