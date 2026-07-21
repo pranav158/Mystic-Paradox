@@ -1,0 +1,16 @@
+[
+  {
+    "Type": "DataTable",
+    "Name": "player_hunts_table",
+    "Properties": {
+      "RowStruct": { "ObjectName": "ScriptStruct'PlayerHuntTableData'", "ObjectPath": "/Script/Example" }
+    },
+    "Rows": {
+      "Example_Hunt_Easy": {
+        "HuntName": { "SourceString": "Example Hunt", "LocalizedString": "Example Hunt" },
+        "HuntDescription": { "SourceString": "Synthetic placeholder hunt for smoke tests only.", "LocalizedString": "Synthetic placeholder hunt for smoke tests only." },
+        "MatchmakerHuntIDs": [ { "RowName": "Example_MatchmakerHunt" } ]
+      }
+    }
+  }
+]
