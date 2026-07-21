@@ -1,0 +1,21 @@
+[
+  {
+    "Type": "DataTable",
+    "Name": "arena_easy_matchmaker_hunts",
+    "Properties": {
+      "RowStruct": { "ObjectName": "ScriptStruct'MatchmakerHuntTableData'", "ObjectPath": "/Script/Example" }
+    },
+    "Rows": {
+      "Example_MatchmakerHunt": {
+        "HuntTags": [],
+        "HuntThreatLevel": 1,
+        "GameModeOverride": "",
+        "SpecificBehemoth": {
+          "BehemothName": "None",
+          "BehemothAsset": { "AssetPathName": "None", "SubPathString": "" }
+        },
+        "MapList": [ { "MapAssetName": "/Game/Maps/Example/example_map" } ]
+      }
+    }
+  }
+]
