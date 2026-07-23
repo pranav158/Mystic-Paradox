@@ -1,0 +1,69 @@
+# --- Secrets & config (NEVER commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.pfx
+ParadoxCertificates/
+ParadoxRuntime/deployment_config.generated.h
+
+# --- Generated SDK (dump it yourself with Dumper-7) ---
+# The complete Dumper-7 CppSDK output is game-derived and is NOT distributed.
+# See docs/GENERATING_SDK.md.
+ParadoxRuntime/SDK/
+ParadoxRuntime/SDK.hpp
+ParadoxRuntime/Assertions.inl
+ParadoxRuntime/NameCollisions.inl
+ParadoxRuntime/PropertyFixup.hpp
+ParadoxRuntime/UnrealContainers.hpp
+ParadoxRuntime/UtfN.hpp
+
+# --- Locally generated game data (extract from your OWN installation) ---
+# Progression, hunt tables, store, Slayer's Path, etc. are Phoenix Labs game data and are
+# NOT distributed. Generate them with CatalogExporter + the generate:* scripts.
+# See docs/GENERATING_GAME_DATA.md. Example fixtures (*.example.json) ARE committed.
+ParadoxBackend/game-data/*.json
+ParadoxDirector/game-data/*.json
+!ParadoxBackend/game-data/*.example.json
+!ParadoxDirector/game-data/*.example.json
+
+# --- Node ---
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# --- Databases & logs ---
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# --- Native / MSVC build artifacts ---
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.pch
+*.tlog
+*.lastbuildstate
+.vs/
+*.user
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Stale backups
+*.bak
