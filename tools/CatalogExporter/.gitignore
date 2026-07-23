@@ -1,0 +1,10 @@
+# Build output
+x64/
+obj/
+.vs/
+*.user
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
