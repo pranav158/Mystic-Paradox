@@ -6,6 +6,7 @@
 *.key
 *.crt
 *.pfx
+.secrets/
 ParadoxCertificates/
 ParadoxRuntime/deployment_config.generated.h
 
@@ -67,3 +68,6 @@ desktop.ini
 
 # Stale backups
 *.bak
+# --- Local/internal documentation ---
+# Existing tracked documentation remains tracked; new files under docs/ stay local.
+docs/

@@ -10,8 +10,8 @@ contributions only (see `ADDITIONAL_TERMS.md`).
 Mystic Paradox is a modified version of Undaunted (AGPLv3 §5).
 
 Development of the Mystic Paradox modifications began on 5 July 2026. This public
-repository is a sanitized and reorganized source release of work developed between
-5 July and 23 July 2026.
+repository is a sanitized and reorganized source release of work developed since
+5 July 2026.
 
 - Original project: Undaunted by gwog :3 / Gregory Morford (SyST3MDeV)
 - Modified work: Mystic Paradox by Pranav Karande

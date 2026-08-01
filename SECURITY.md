@@ -6,7 +6,7 @@
   Migration/test fixtures must contain only the minimal synthetic fields needed to exercise a
   script — never a dump of real user data.
 - Secrets of any kind: `.env` files, private keys, TLS certificates/passphrases, API keys,
-  OAuth client secrets, TOTP secrets.
+  OAuth client secrets, TOTP secrets, and launcher/runtime signing keys or passwords.
 - Phoenix Labs game data or assets (see `docs/GENERATING_GAME_DATA.md`).
 
 These paths are enforced by `.gitignore`, but the rule is the source of truth — do not override it.
