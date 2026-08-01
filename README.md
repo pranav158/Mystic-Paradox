@@ -23,6 +23,8 @@ Features may be incomplete, unstable, or changed without notice.
 - **ParadoxRuntime** — runtime compatibility layer; injected C++ DLL (server / client mode)
   that adapts the game client and gameserver processes to the private backend and the
   updated engine. Built with MSVC + MinHook.
+- **ParadoxLauncher** — Windows desktop launcher; authenticates players, verifies the
+  supported client, installs signed runtime updates, and issues one-time game sessions.
 - **tools/CatalogExporter** — local exporter used to generate compatibility data from your
   own installation.
 
@@ -78,6 +80,8 @@ See `docs/GENERATING_GAME_DATA.md`.
 ## Prerequisites
 
 - Node.js 20+ and npm
+- Current stable Rust, the MSVC target, Windows SDK, and Microsoft Edge WebView2 Runtime for
+  `ParadoxLauncher`
 - MongoDB (local or Atlas)
 - Visual Studio Build Tools 2026 (Desktop C++ workload) with the `v145` platform toolset, for the
   C++ projects (`ParadoxRuntime`, `tools/CatalogExporter`). To build with Visual Studio 2022
@@ -118,6 +122,16 @@ npm run build
 npm start
 ```
 
+### Launcher (ParadoxLauncher)
+
+```bash
+cd ParadoxLauncher
+npm ci
+npm run tauri dev
+```
+
+See `ParadoxLauncher/README.md` for native API configuration, tests, and release signing.
+
 ### Runtime DLL (ParadoxRuntime)
 
 Generate the SDK (`docs/GENERATING_SDK.md`) and create `deployment_config.generated.h`, then open
@@ -135,7 +149,8 @@ Output: `ParadoxRuntime/x64/Release/MysticParadox.dll`.
 - Admin routes (`/admin/v1`) fail closed without `ADMIN_TOTP_SECRET` and an origin
   allow-list. Publisher/update-push routes fail closed without an explicit IP
   allow-list.
-- Never commit a populated `.env`, private keys, or certificates.
+- Never commit a populated `.env`, private keys, certificates, updater signing keys, or signing
+  passwords. Launcher release material belongs only in ignored `.secrets/` directories.
 
 ## Self-hosting
 
