@@ -30,19 +30,26 @@ The example IP is documentation-only. An empty publisher allow-list must deny up
 From `ParadoxLauncher`:
 
 ```powershell
-node scripts/generate-runtime-key.mjs .secrets\mystic-runtime-update
 node scripts/publish-runtime-update.mjs `
   --dll ..\ParadoxRuntime\x64\Release\MystPaxInternalServer.dll `
+  --extra ..\tools\RuntimeLoader\target\release\winmm.dll `
   --target client `
   --version 0.4.13 `
   --changelist 392819 `
   --channel stable `
   --output D:\MysticUpdates `
   --base-url https://your-backend.example `
-  --key .secrets\mystic-runtime-update.private.pem
+  --key .secrets\selfhost-runtime-update.private.pem
 ```
 
-The publisher writes a versioned artifact, `manifest.json`, and `latest.json`. Use `--target server` for the director's dedicated-server runtime. Consumers verify target, changelist, HTTPS origin, size, SHA-256, and Ed25519 signature before replacing a DLL.
+The self-host configuration helper creates `.secrets\selfhost-runtime-update.private.pem`. If you
+are not using it, generate an equivalent key with `generate-runtime-key.mjs` and compile its public
+key into your launcher. The `--extra` argument publishes the required loader beside the runtime;
+multiple `--extra` arguments are supported.
+
+The publisher writes a versioned artifact, `manifest.json`, and `latest.json`. Use `--target server`
+for the director's dedicated-server runtime. Consumers verify target, changelist, HTTPS origin,
+size, SHA-256, and Ed25519 signature before replacing a DLL.
 
 ## Publish a launcher update
 

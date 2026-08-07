@@ -14,6 +14,8 @@ import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { logger } from "../logger";
 import { CheckAndUpdateQueueStatus, GetCandidateStatusPeriodMillis, HandlePlayerMatchmaking } from "../controllers/matchmaking";
 import { GetPartyForPlayer } from "../controllers/party";
+import { sessionRegistry } from "../realtime/SessionRegistry";
+import { ResolveMatchmakingParty } from "../matchmakingParty";
 
 export const matchmakingRouter = Router();
 
@@ -150,8 +152,36 @@ matchmakingRouter.post("/candidate/join", HasParadoxBackendAuth, async (req: any
     
     
     const PartyForPlayer = GetPartyForPlayer(UserId);
-    const PartyId = PartyForPlayer?.partyId;
-    const PartyMembers = PartyForPlayer?.members;
+    const RequestedPartyId =
+        typeof req.body.partyId === "string" && req.body.partyId.trim().length > 0
+            ? req.body.partyId
+            : undefined;
+    const PartyResolution = ResolveMatchmakingParty(
+        GameMode,
+        UserId,
+        RequestedPartyId,
+        PartyForPlayer,
+        (AccountId) => sessionRegistry.isOnline(AccountId)
+    );
+
+    if(PartyResolution.partyIdMismatch){
+        logger.warn(
+            "UserId " + UserId + " requested ISLAND travel without its active party id; " +
+            "client partyId=" + (RequestedPartyId ?? "<missing>") +
+            " authoritative partyId=" + (PartyForPlayer?.partyId ?? "<none>") +
+            ". Launching solo."
+        );
+    }
+    else if(PartyResolution.excludedMembers.length > 0){
+        logger.warn(
+            "UserId " + UserId + " party contains disconnected member(s); " +
+            "launching with " + (PartyResolution.partyMembers?.length ?? 1) +
+            " active player(s). excluded=" + PartyResolution.excludedMembers.join(",")
+        );
+    }
+
+    const PartyId = PartyResolution.partyId;
+    const PartyMembers = PartyResolution.partyMembers;
 
     const MatchmakingResult = await HandlePlayerMatchmaking(GameMode, GameArgs, HuntId, UserId, PartyId, PartyMembers);
 
