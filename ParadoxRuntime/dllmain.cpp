@@ -3638,34 +3638,144 @@ static int SafeCallGraphServerReplicate(void* graph, float dt) {
 
 
 
+void* OrigRepGraphReplicateSingleActor = nullptr;
+uint64_t __fastcall RepGraphReplicateSingleActorGuardHook(
+    void* Graph, void* Actor, void* ConnActorInfo, void* GlobalInfo,
+    void* ConnManager, void* ActorInfoMap, uint32_t Frame) {
+    if (Actor && ConnManager
+        && IsReadablePointer(Actor, 0x420)
+        && IsReadablePointer(ConnManager, 0x30)
+        && IsRegisteredLiveObject(Actor)
+        && reinterpret_cast<UObject*>(Actor)->IsA(SDK::APlayerController::StaticClass())) {
+        void* Connection = *reinterpret_cast<void**>(
+            reinterpret_cast<uintptr_t>(ConnManager) + 0x28);
+        void* ConnectionPC = (Connection && IsReadablePointer(Connection, 0xA0))
+            ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Connection) + 0x30)
+            : nullptr;
+        void* OwningActor = (Connection && IsReadablePointer(Connection, 0xA0))
+            ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Connection) + 0x98)
+            : nullptr;
+        void* ActorConnection = *reinterpret_cast<void**>(
+            reinterpret_cast<uintptr_t>(Actor) + 0x418);
+        const bool ConnectionHasIdentity = ConnectionPC || OwningActor;
+        const bool IsRemoteByConnection =
+            ActorConnection && Connection && ActorConnection != Connection;
+        const bool IsRemoteByIdentity =
+            !ActorConnection && ConnectionHasIdentity
+            && Actor != ConnectionPC && Actor != OwningActor;
+
+        if (IsRemoteByConnection || IsRemoteByIdentity) {
+            static std::atomic<uint32_t> BlockedCount{ 0 };
+            const uint32_t Count = BlockedCount.fetch_add(1, std::memory_order_relaxed);
+            if (Count < 64) {
+                MpLog("[PlayerControllerPreChannelGuard] BLOCK actor=" + MpPtr(Actor)
+                    + " actorNetConnection=" + MpPtr(ActorConnection)
+                    + " targetConnection=" + MpPtr(Connection)
+                    + " targetPC=" + MpPtr(ConnectionPC)
+                    + " targetOwningActor=" + MpPtr(OwningActor)
+                    + " connManager=" + MpPtr(ConnManager)
+                    + " connActorInfo=" + MpPtr(ConnActorInfo)
+                    + " globalInfo=" + MpPtr(GlobalInfo)
+                    + " frame=" + std::to_string(Frame)
+                    + " reason=" + (IsRemoteByConnection
+                        ? "actor-netconnection-mismatch"
+                        : "target-identity-mismatch")
+                    + " result=SKIP_BEFORE_CREATE_CHANNEL");
+            }
+            return 0;
+        }
+    }
+
+    return reinterpret_cast<uint64_t(__fastcall*)(
+        void*, void*, void*, void*, void*, void*, uint32_t)>(
+            OrigRepGraphReplicateSingleActor)(
+                Graph, Actor, ConnActorInfo, GlobalInfo,
+                ConnManager, ActorInfoMap, Frame);
+}
+
+// Final fail-closed ownership invariant. The native function returns a 64-bit replication count,
+// not bool; preserving the ABI matters because its caller adds this result to its running total.
 void* OrigReplicateActorFreq = nullptr;
-bool __fastcall ReplicateActorFreqHook(UActorChannel* channel) {
+uint64_t __fastcall ReplicateActorFreqHook(UActorChannel* channel) {
     if (channel && IsReadablePointer(reinterpret_cast<void*>(channel), 0x78)) {
-        void* actor = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(channel) + 0x70);
-        if (actor && IsReadablePointer(actor, 0x20)) {
-            void* cls = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(actor) + 0x10);
-            if (cls && IsReadablePointer(cls, 0x20)) {
-                static std::vector<std::pair<std::string, int>> s_counts;
-                static uint64_t s_ms = 0;
-                std::string cn = reinterpret_cast<UObject*>(cls)->GetName();
-                bool found = false;
-                for (auto& kv : s_counts) { if (kv.first == cn) { kv.second++; found = true; break; } }
-                if (!found && s_counts.size() < 64) s_counts.push_back(std::make_pair(cn, 1));
-                uint64_t now = static_cast<uint64_t>(GetTickCount64());
-                if (s_ms == 0) s_ms = now;
-                if (now - s_ms > 1000) {
-                    std::string line;
-                    for (auto& kv : s_counts) { line += " " + kv.first + "=" + std::to_string(kv.second); }
-                    MpLog("[RepFreq] window=" + std::to_string(now - s_ms) + "ms reps/class:" + line);
-                    s_counts.clear();
-                    s_ms = now;
+        void* Actor = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(channel) + 0x70);
+        if (Actor && IsReadablePointer(Actor, 0x20)) {
+            if (IsRegisteredLiveObject(Actor)
+                && reinterpret_cast<UObject*>(Actor)->IsA(SDK::APlayerController::StaticClass())) {
+                void* Connection = *reinterpret_cast<void**>(
+                    reinterpret_cast<uintptr_t>(channel) + 0x28);
+                void* ConnectionPC = (Connection && IsReadablePointer(Connection, 0xA0))
+                    ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Connection) + 0x30)
+                    : nullptr;
+                void* OwningActor = (Connection && IsReadablePointer(Connection, 0xA0))
+                    ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Connection) + 0x98)
+                    : nullptr;
+                void* ActorConnection = IsReadablePointer(Actor, 0x420)
+                    ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Actor) + 0x418)
+                    : nullptr;
+                const bool ConnectionHasIdentity = ConnectionPC || OwningActor;
+                const bool IsRemoteByConnection =
+                    ActorConnection && Connection && ActorConnection != Connection;
+                const bool IsRemoteByIdentity =
+                    !ActorConnection && ConnectionHasIdentity
+                    && Actor != ConnectionPC && Actor != OwningActor;
+
+                if (IsRemoteByConnection || IsRemoteByIdentity) {
+                    static std::atomic<uint32_t> BlockedCount{ 0 };
+                    const uint32_t Count = BlockedCount.fetch_add(1, std::memory_order_relaxed);
+                    if (Count < 64) {
+                        MpLog("[PlayerControllerChannelGuard] BLOCK actor=" + MpPtr(Actor)
+                            + " actorNetConnection=" + MpPtr(ActorConnection)
+                            + " targetConnection=" + MpPtr(Connection)
+                            + " targetPC=" + MpPtr(ConnectionPC)
+                            + " targetOwningActor=" + MpPtr(OwningActor)
+                            + " reason=" + (IsRemoteByConnection
+                                ? "actor-netconnection-mismatch"
+                                : "target-identity-mismatch"));
+                    }
+                    return 0;
+                }
+            }
+
+            if (!RepGraphDiag()) {
+                return reinterpret_cast<uint64_t(__fastcall*)(UActorChannel*)>(
+                    OrigReplicateActorFreq)(channel);
+            }
+
+            void* Class = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Actor) + 0x10);
+            if (Class && IsReadablePointer(Class, 0x20)) {
+                static std::vector<std::pair<std::string, int>> Counts;
+                static uint64_t WindowStartMs = 0;
+                std::string ClassName = reinterpret_cast<UObject*>(Class)->GetName();
+                bool Found = false;
+                for (auto& Entry : Counts) {
+                    if (Entry.first == ClassName) {
+                        Entry.second++;
+                        Found = true;
+                        break;
+                    }
+                }
+                if (!Found && Counts.size() < 64) {
+                    Counts.push_back(std::make_pair(ClassName, 1));
+                }
+                uint64_t Now = static_cast<uint64_t>(GetTickCount64());
+                if (WindowStartMs == 0) WindowStartMs = Now;
+                if (Now - WindowStartMs > 1000) {
+                    std::string Line;
+                    for (auto& Entry : Counts) {
+                        Line += " " + Entry.first + "=" + std::to_string(Entry.second);
+                    }
+                    MpLog("[RepFreq] window=" + std::to_string(Now - WindowStartMs)
+                        + "ms reps/class:" + Line);
+                    Counts.clear();
+                    WindowStartMs = Now;
                 }
             }
         }
     }
-    return reinterpret_cast<bool(__fastcall*)(UActorChannel*)>(OrigReplicateActorFreq)(channel);
+    return reinterpret_cast<uint64_t(__fastcall*)(UActorChannel*)>(
+        OrigReplicateActorFreq)(channel);
 }
-
 
 
 
@@ -9114,11 +9224,28 @@ void InitServerHooks() {
 
     
     
-    if (RepGraphDiag()) {
-        MH_CreateHook((void*)(Globals::BaseAddress + 0x03B7B470), ReplicateActorFreqHook, &OrigReplicateActorFreq);
-        MH_EnableHook((void*)(Globals::BaseAddress + 0x03B7B470));
-        MpLog("[InitServerHooks] RepFreq diag hook installed (REPGRAPH_DIAG.flag present)");
-    }
+    MH_STATUS PcPreChannelCreate = MH_CreateHook(
+        (void*)(Globals::BaseAddress + 0x00ECEC50),
+        RepGraphReplicateSingleActorGuardHook,
+        &OrigRepGraphReplicateSingleActor);
+    MH_STATUS PcPreChannelEnable = MH_EnableHook(
+        (void*)(Globals::BaseAddress + 0x00ECEC50));
+    MpLog(std::string("[InitServerHooks] PlayerController pre-channel guard create=")
+        + MH_StatusToString(PcPreChannelCreate)
+        + " enable=" + MH_StatusToString(PcPreChannelEnable)
+        + " target=+" + MpHex(0x00ECEC50));
+
+    MH_STATUS PcChannelCreate = MH_CreateHook(
+        (void*)(Globals::BaseAddress + 0x03B7B470),
+        ReplicateActorFreqHook,
+        &OrigReplicateActorFreq);
+    MH_STATUS PcChannelEnable = MH_EnableHook(
+        (void*)(Globals::BaseAddress + 0x03B7B470));
+    MpLog(std::string("[InitServerHooks] PlayerController channel guard create=")
+        + MH_StatusToString(PcChannelCreate)
+        + " enable=" + MH_StatusToString(PcChannelEnable)
+        + " target=+" + MpHex(0x03B7B470)
+        + (RepGraphDiag() ? " (RepFreq diag also enabled)" : ""));
 
     
     

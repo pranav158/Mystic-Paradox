@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -29,11 +29,31 @@ async fn bearer_token_for_channel(
     Ok(Some(session.access_token))
 }
 
-const RUNTIME_ENDPOINT: &str = "https://paradox.mysticfox.dev/launcher/v1/runtime";
+const DEFAULT_RUNTIME_ENDPOINT: &str = "https://paradox.mysticfox.dev/launcher/v1/runtime";
+const DEFAULT_RUNTIME_UPDATE_PUBLIC_KEY_B64: &str = "3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc=";
 const TARGET_CHANGELIST: u32 = 392819;
-// Public key only. The matching private key is kept outside the repository and
-// is used exclusively by scripts/publish-runtime-update.mjs.
-const RUNTIME_UPDATE_PUBLIC_KEY_B64: &str = "3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc=";
+
+fn runtime_endpoint() -> &'static str {
+    option_env!("MYSTPAX_RUNTIME_ENDPOINT").unwrap_or(DEFAULT_RUNTIME_ENDPOINT)
+}
+
+fn runtime_update_public_key_b64() -> &'static str {
+    option_env!("MYSTPAX_RUNTIME_PUBLIC_KEY_B64").unwrap_or(DEFAULT_RUNTIME_UPDATE_PUBLIC_KEY_B64)
+}
+
+fn is_approved_runtime_url_for(endpoint: &str, candidate: &str) -> bool {
+    let (Ok(endpoint), Ok(candidate)) = (Url::parse(endpoint), Url::parse(candidate)) else {
+        return false;
+    };
+    candidate.scheme() == "https"
+        && endpoint.scheme() == "https"
+        && candidate.host_str() == endpoint.host_str()
+        && candidate.port_or_known_default() == endpoint.port_or_known_default()
+}
+
+fn is_approved_runtime_url(candidate: &str) -> bool {
+    is_approved_runtime_url_for(runtime_endpoint(), candidate)
+}
 const MAX_RUNTIME_BYTES: usize = 200 * 1024 * 1024;
 pub(crate) const RUNTIME_DLL_NAME: &str = "MystPaxInternalServer.dll";
 
@@ -74,7 +94,10 @@ fn manifest_url(channel: &str) -> Result<String, String> {
     if !matches!(channel, "stable" | "beta" | "dev") {
         return Err("Invalid runtime update channel.".to_string());
     }
-    Ok(format!("{RUNTIME_ENDPOINT}/{channel}/windows-x86_64"))
+    Ok(format!(
+        "{}/{channel}/windows-x86_64",
+        runtime_endpoint().trim_end_matches('/')
+    ))
 }
 
 async fn fetch_manifest(
@@ -136,7 +159,7 @@ fn verify_manifest(manifest: &RuntimeManifest, bytes: &[u8]) -> Result<(), Strin
         return Err("Runtime update hash verification failed.".to_string());
     }
     let public_bytes = BASE64
-        .decode(RUNTIME_UPDATE_PUBLIC_KEY_B64)
+        .decode(runtime_update_public_key_b64())
         .map_err(|_| "Runtime update public key is invalid.".to_string())?;
     let public_array: [u8; 32] = public_bytes
         .try_into()
@@ -234,7 +257,7 @@ pub async fn install_runtime_update(
         });
     }
 
-    if !manifest.url.starts_with("https://paradox.mysticfox.dev/") {
+    if !is_approved_runtime_url(&manifest.url) {
         return Err("Runtime update URL is not an approved HTTPS endpoint.".to_string());
     }
     let mut download_request = Client::builder()
@@ -309,7 +332,7 @@ async fn install_extra_file(
     if !is_safe_extra_name(&extra.name) {
         return Err(format!("Rejected unsafe extra file name: {}", extra.name));
     }
-    if !extra.url.starts_with("https://paradox.mysticfox.dev/") {
+    if !is_approved_runtime_url(&extra.url) {
         return Err("Extra file URL is not an approved HTTPS endpoint.".to_string());
     }
     let target = directory.join(&extra.name);
@@ -367,7 +390,7 @@ async fn install_extra_file(
         ));
     }
     let public_bytes = BASE64
-        .decode(RUNTIME_UPDATE_PUBLIC_KEY_B64)
+        .decode(runtime_update_public_key_b64())
         .map_err(|_| "Runtime update public key is invalid.".to_string())?;
     let public_array: [u8; 32] = public_bytes
         .try_into()
@@ -398,4 +421,39 @@ async fn install_extra_file(
         return Err(format!("Couldn't install {}: {error}", extra.name));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_approved_runtime_url_for, is_safe_extra_name};
+
+    #[test]
+    fn runtime_downloads_must_use_the_configured_https_origin() {
+        let endpoint = "https://community.example/launcher/v1/runtime";
+
+        assert!(is_approved_runtime_url_for(
+            endpoint,
+            "https://community.example/launcher/v1/runtime/stable/runtime.dll"
+        ));
+        assert!(!is_approved_runtime_url_for(
+            endpoint,
+            "https://attacker.example/runtime.dll"
+        ));
+        assert!(!is_approved_runtime_url_for(
+            endpoint,
+            "http://community.example/runtime.dll"
+        ));
+        assert!(!is_approved_runtime_url_for(
+            endpoint,
+            "https://community.example.evil.test/runtime.dll"
+        ));
+    }
+
+    #[test]
+    fn runtime_extra_files_remain_flat_dll_names() {
+        assert!(is_safe_extra_name("winmm.dll"));
+        assert!(!is_safe_extra_name("../winmm.dll"));
+        assert!(!is_safe_extra_name("nested/winmm.dll"));
+        assert!(!is_safe_extra_name("notes.txt"));
+    }
 }

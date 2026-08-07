@@ -17,16 +17,46 @@ function HashGameserverAPIKey(GameserverAPIKeyToHash: string){
     return crypto.createHash("sha256").update(GameserverAPIKeyToHash, "utf8").digest("hex");
 }
 
+export function ParseConfiguredGameserverAPIKeys(Value: string | undefined): string[] {
+    return [...new Set(
+        (Value ?? "")
+            .split(",")
+            .map((Key) => Key.trim())
+            .filter((Key) => Key.length > 0)
+    )];
+}
+
 export async function DrainAndRegisterAPIKeys(){
-    const APIKeysToRegister = await GetRepositories().apiKeys.findAllGameServerKeysToRegister();
+    const PendingKeys = await GetRepositories().apiKeys.findAllGameServerKeysToRegister();
+    const ConfiguredKeys = ParseConfiguredGameserverAPIKeys(process.env.GAMESERVER_API_KEYS);
+    const CandidateKeys = [...new Set([
+        ...PendingKeys.map((Record) => Record.key),
+        ...ConfiguredKeys
+    ])];
 
     await GetRepositories().apiKeys.clearGameServerKeysToRegister();
 
-    for(const APIKey of APIKeysToRegister){
-        await GetRepositories().apiKeys.insertGameServerKeyHash(HashGameserverAPIKey(APIKey.key));
+    const ExistingHashes = new Set(
+        (await GetRepositories().apiKeys.findAllGameServerKeyHashes())
+            .map((Record) => Record.keyHash)
+            .filter((Hash): Hash is string => typeof Hash === "string")
+    );
+
+    let Registered = 0;
+    for(const APIKey of CandidateKeys){
+        const Hash = HashGameserverAPIKey(APIKey);
+        if(ExistingHashes.has(Hash)){
+            continue;
+        }
+        await GetRepositories().apiKeys.insertGameServerKeyHash(Hash);
+        ExistingHashes.add(Hash);
+        Registered++;
     }
 
-    logger.info(`Registered ${APIKeysToRegister.length} new Gameserver API Key(s) on boot!`);
+    logger.info(
+        "Registered " + Registered + " new Gameserver API key(s); " +
+        ConfiguredKeys.length + " configured through GAMESERVER_API_KEYS"
+    );
 }
 
 export async function IsValidGameserverAPIKey(GameserverAPIKey: string){

@@ -9,9 +9,13 @@ The project is based on the open-source Undaunted server and is being adapted fr
 
 ## Project status
 
-Mystic Paradox is under active development and is not yet production-ready. Work is currently focused on porting the server from 1.4.4 to 1.12.0, updating the runtime and networking layers for Unreal Engine 4.26.2, and reconciling the backend with the 1.12.0 client.
+Mystic Paradox is an alpha preservation server for Dauntless 1.12.0. The source tree now includes
+a reproducible Windows self-host configuration path, the runtime loader, backend/director
+authentication wiring, and regression tests for party travel. Gameplay coverage is still incomplete
+and operators should expect active development rather than production-grade uptime.
 
-Features may be incomplete, unstable, or changed without notice.
+Recent stability work prevents disconnected party members from holding solo travel open and blocks
+remote PlayerController replication before it can disconnect another party member during travel.
 
 ## Components
 
@@ -25,6 +29,8 @@ Features may be incomplete, unstable, or changed without notice.
   updated engine. Built with MSVC + MinHook.
 - **ParadoxLauncher** — Windows desktop launcher; authenticates players, verifies the
   supported client, installs signed runtime updates, and issues one-time game sessions.
+- **tools/RuntimeLoader** — Apache-licensed winmm proxy source; loads the runtime at process
+  startup while forwarding multimedia calls to the real Windows system library.
 - **tools/CatalogExporter** — local exporter used to generate compatibility data from your
   own installation.
 
@@ -88,55 +94,21 @@ See `docs/GENERATING_GAME_DATA.md`.
   instead, retarget both `.vcxproj` files to `v143` and rebuild.
 - Your own game client for the target build + a Dumper-7 SDK (see above)
 
-## Setup
+## Quick start
 
-Each service is configured entirely through environment variables. Copy the
-example file in each service and fill in your own values:
+The supported source-deployment path is documented in
+[docs/SELF_HOSTING.md](docs/SELF_HOSTING.md). On Windows, the configuration helper generates fresh
+JWT and runtime-signing keys, wires the backend and director gameserver key, hashes the approved
+game executable, creates the runtime host header, and prepares a self-host launcher build:
 
-```bash
-cp ParadoxBackend/.env.example      ParadoxBackend/.env
-cp ParadoxDirector/.env.example  ParadoxDirector/.env
-```
+    powershell -ExecutionPolicy Bypass -File scripts\configure-selfhost.ps1 -PublicHost paradox.example.net -GameServerBinaryPath D:\Dauntless\Archon\Binaries\Win64\Dauntless-Win64-Shipping.exe -TlsCertificatePath D:\certs\fullchain.pem -TlsPrivateKeyPath D:\certs\privkey.pem
 
-Generate your own RS256 keypair for JWT signing and place the base64-encoded PEMs
-into `AUTH_SIGNING_PRIVKEY_B64` / `AUTH_SIGNING_PUBKEY_B64`. Point `MONGODB_URI` at
-your own database. Provide your own TLS certificate/key and passphrase.
+It does not download or generate proprietary game content. Follow
+[docs/GENERATING_SDK.md](docs/GENERATING_SDK.md) and
+[docs/GENERATING_GAME_DATA.md](docs/GENERATING_GAME_DATA.md) using your own installation.
 
-### Backend (ParadoxBackend)
-
-```bash
-cd ParadoxBackend
-npm install
-npm run build
-# generate game data (see docs/GENERATING_GAME_DATA.md), or copy game-data/*.example.json for a smoke test
-npm start
-```
-
-### Director (ParadoxDirector)
-
-```bash
-cd ParadoxDirector
-npm install
-npm run build
-# generate hunt tables (see docs/GENERATING_GAME_DATA.md), or copy game-data/*.example.json for a smoke test
-npm start
-```
-
-### Launcher (ParadoxLauncher)
-
-```bash
-cd ParadoxLauncher
-npm ci
-npm run tauri dev
-```
-
-See `ParadoxLauncher/README.md` for native API configuration, tests, and release signing.
-
-### Runtime DLL (ParadoxRuntime)
-
-Generate the SDK (`docs/GENERATING_SDK.md`) and create `deployment_config.generated.h`, then open
-`ParadoxRuntime/MysticParadox.sln` in Visual Studio and build `Release|x64` (or run `_build.bat`).
-Output: `ParadoxRuntime/x64/Release/MysticParadox.dll`.
+For a build-only smoke test, pass `-UseSyntheticData`. The synthetic fixtures are intentionally not
+playable.
 
 ## Security notes
 
@@ -154,7 +126,13 @@ Output: `ParadoxRuntime/x64/Release/MysticParadox.dll`.
 
 ## Self-hosting
 
-No support is provided for self-hosting at this time. You may deploy the project yourself, but the maintainers do not provide installation, configuration, or troubleshooting assistance, and the deployment process is still evolving. This does not restrict any rights granted under the AGPLv3.
+Self-hosting from source is supported on Windows x64 for the documented 1.12.0 target. The project
+does not provide the game, generated SDK, extracted data, certificates, or hosted infrastructure.
+Start with [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md), which covers the full service order,
+runtime loader, TLS/DNS requirements, launcher configuration, ports, validation, and troubleshooting.
+
+Issue reports are welcome when they include the component, commit, configuration with secrets
+removed, reproduction steps, and relevant logs.
 
 ## Contributions
 
