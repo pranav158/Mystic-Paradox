@@ -1,0 +1,21 @@
+[package]
+name = "paradox-runtime-loader"
+version = "0.1.0"
+edition = "2024"
+description = "winmm proxy that loads the Mystic Paradox runtime"
+license = "Apache-2.0"
+repository = "https://github.com/pranav158/Mystic-Paradox"
+
+[lib]
+name = "winmm"
+crate-type = ["cdylib"]
+
+[dependencies]
+winapi = { version = "0.3.9", features = ["libloaderapi", "sysinfoapi", "winnt"] }
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"

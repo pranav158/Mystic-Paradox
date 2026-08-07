@@ -50,7 +50,12 @@ $env:MYSTPAX_API_BASE_URL = "https://your-backend.example"
 npm run tauri dev
 ```
 
-A custom backend origin must also be allowed by `app.security.csp` in `src-tauri/tauri.conf.json`. Fork operators must replace the official update endpoints and both embedded verification public keys before publishing their own channel.
+A custom backend origin must also be allowed by `app.security.csp`. Self-host builds can set
+`MYSTPAX_RUNTIME_ENDPOINT` and `MYSTPAX_RUNTIME_PUBLIC_KEY_B64` at compile time to bind runtime
+downloads to their own HTTPS origin and Ed25519 verification key. The root
+[self-hosting guide](../docs/SELF_HOSTING.md) generates these settings and a private Tauri CSP
+overlay without requiring source edits. Launcher updater signing uses a separate key and endpoint;
+configure both before publishing a custom channel.
 
 ## Build and test
 

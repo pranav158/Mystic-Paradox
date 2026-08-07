@@ -42,6 +42,9 @@ build/
 *.sqlite3
 *.log
 
+# --- Rust build artifacts ---
+target/
+
 # --- Native / MSVC build artifacts ---
 [Dd]ebug/
 [Rr]elease/
@@ -68,6 +71,7 @@ desktop.ini
 
 # Stale backups
 *.bak
-# --- Local/internal documentation ---
-# Existing tracked documentation remains tracked; new files under docs/ stay local.
-docs/
+
+# --- Generated self-host configuration ---
+.selfhost/
+docs/LOCAL_RELEASE_READINESS.md
