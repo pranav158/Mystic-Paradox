@@ -12,7 +12,8 @@ Output: target\release\winmm.dll.
 
 Place winmm.dll and the runtime renamed to MystPaxInternalServer.dll beside
 Dauntless-Win64-Shipping.exe. The loader can optionally read mystic_loader.ini; when present,
-list one additional project-owned DLL path per line. Relative paths resolve from the game directory.
+list one additional project-owned DLL path per line. These entries never replace the required
+MystPaxInternalServer.dll. Relative paths resolve from the game directory.
 
 Do not list untrusted DLLs. Every configured library executes inside the game process.
 

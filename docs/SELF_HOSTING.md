@@ -193,7 +193,8 @@ match the exact 1.12.0 executable and the configured changelist must remain 3928
 ### Gameservers receive 401 responses
 
 GAMESERVER_API_KEYS in ParadoxBackend and METAGAME_API_KEY in ParadoxDirector must share one raw key.
-Restart the backend after changing the list.
+The configured backend list is authoritative: restart the backend after changing it, and removed keys
+will be revoked from MongoDB.
 
 ### Solo hunts wait for another player
 

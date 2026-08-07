@@ -19,23 +19,6 @@ import {
     UserApiKeyToRegisterRecord
 } from "../../mapping/domainTypes";
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 export class MongoApiKeyRepository implements ApiKeyRepository {
     async findAllGameServerKeyHashes(): Promise<GameServerApiKeyRecord[]> {
         const Db = await GetMongoDb();
@@ -48,13 +31,30 @@ export class MongoApiKeyRepository implements ApiKeyRepository {
         await Db.collection(Collections.GameServerApiKeys).insertOne({ keyHash });
     }
 
+    async replaceGameServerKeyHashes(keyHashes: string[]): Promise<void> {
+        const Db = await GetMongoDb();
+        const Collection = Db.collection(Collections.GameServerApiKeys);
+        if(keyHashes.length === 0){
+            await Collection.deleteMany({});
+            return;
+        }
+
+        await Collection.bulkWrite(keyHashes.map((keyHash) => ({
+            updateOne: {
+                filter: { keyHash },
+                update: { $set: { keyHash } },
+                upsert: true
+            }
+        })));
+        await Collection.deleteMany({ keyHash: { $nin: keyHashes } });
+    }
+
     async findAllGameServerKeysToRegister(): Promise<GameServerApiKeyToRegisterRecord[]> {
-        
         return [];
     }
 
     async clearGameServerKeysToRegister(): Promise<void> {
-        // No-op: nothing to clear on this provider — see class note.
+        // No-op: nothing to clear on this provider.
     }
 
     async findAllUserKeyHashes(): Promise<UserApiKeyRecord[]> {
@@ -69,11 +69,10 @@ export class MongoApiKeyRepository implements ApiKeyRepository {
     }
 
     async findAllUserKeysToRegister(): Promise<UserApiKeyToRegisterRecord[]> {
-        
         return [];
     }
 
     async clearUserKeysToRegister(): Promise<void> {
-        // No-op: nothing to clear on this provider — see class note.
+        // No-op: nothing to clear on this provider.
     }
 }

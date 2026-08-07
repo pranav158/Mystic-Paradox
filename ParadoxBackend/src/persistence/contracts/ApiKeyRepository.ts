@@ -32,6 +32,7 @@ import {
 export interface ApiKeyRepository {
     findAllGameServerKeyHashes(): Promise<GameServerApiKeyRecord[]>;
     insertGameServerKeyHash(keyHash: string): Promise<void>;
+    replaceGameServerKeyHashes(keyHashes: string[]): Promise<void>;
     findAllGameServerKeysToRegister(): Promise<GameServerApiKeyToRegisterRecord[]>;
     clearGameServerKeysToRegister(): Promise<void>;
 
