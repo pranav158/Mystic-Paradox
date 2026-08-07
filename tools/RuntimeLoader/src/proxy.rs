@@ -1,55 +1,45 @@
-use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{OnceLock, atomic::AtomicPtr};
-use winapi::shared::minwindef::HMODULE;
-use winapi::um::libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryA};
-use winapi::um::sysinfoapi::GetSystemDirectoryA;
+use std::collections::HashMap;
+use std::ffi::{CString, OsString};
+use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
-static SYSTEM_DLL: OnceLock<AtomicPtr<HMODULE>> = OnceLock::new();
-static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+use winapi::shared::minwindef::HMODULE;
+use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryW};
+use winapi::um::sysinfoapi::GetSystemDirectoryW;
+
+static SYSTEM_DLLS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 
 fn load_proxied_dll(dll_name: &str) -> Option<HMODULE> {
-    if let Some(dll) = SYSTEM_DLL.get() {
-        return Some(unsafe { *dll.load(Ordering::Relaxed) });
+    let modules = SYSTEM_DLLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut modules = modules.lock().ok()?;
+    let cache_key = dll_name.to_ascii_lowercase();
+
+    if let Some(handle) = modules.get(&cache_key) {
+        return Some(*handle as HMODULE);
     }
 
-    let mut system_path = [0u8; 260];
-    let len = unsafe { GetSystemDirectoryA(system_path.as_mut_ptr() as *mut i8, 260) };
-
-    if len == 0 {
+    let mut system_path = vec![0u16; 32_768];
+    let len = unsafe { GetSystemDirectoryW(system_path.as_mut_ptr(), system_path.len() as u32) };
+    if len == 0 || len as usize >= system_path.len() {
         return None;
     }
 
-    let dll_path = format!(
-        "{}\\{}\0",
-        unsafe { std::str::from_utf8_unchecked(&system_path[..len as usize]) },
-        dll_name
-    );
+    let mut dll_path = PathBuf::from(OsString::from_wide(&system_path[..len as usize]));
+    dll_path.push(dll_name);
+    let dll_path: Vec<u16> = dll_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
-    let dll = unsafe { LoadLibraryA(dll_path.as_ptr() as *const i8) };
-    if !dll.is_null() {
-        SYSTEM_DLL
-            .set(AtomicPtr::new(Box::into_raw(Box::new(dll))))
-            .ok();
-        Some(dll)
-    } else {
-        None
-    }
-}
-
-pub fn cleanup_proxied_dll() {
-    if SHUTTING_DOWN.swap(true, Ordering::Relaxed) {
-        return;
+    let dll = unsafe { LoadLibraryW(dll_path.as_ptr()) };
+    if dll.is_null() {
+        return None;
     }
 
-    if let Some(dll) = SYSTEM_DLL.get() {
-        unsafe { FreeLibrary(*dll.load(Ordering::Relaxed)) };
-        SYSTEM_DLL
-            .set(AtomicPtr::new(Box::into_raw(
-                Box::new(std::ptr::null_mut()),
-            )))
-            .ok();
-    }
+    modules.insert(cache_key, dll as usize);
+    Some(dll)
 }
 
 pub fn get_proxied_func(dll_name: &str, func_name: &str) -> Option<unsafe extern "system" fn()> {

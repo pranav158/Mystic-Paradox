@@ -55,18 +55,26 @@ function New-RandomHex([int]$Bytes) {
     return ([BitConverter]::ToString($Buffer)).Replace("-", "").ToLowerInvariant()
 }
 
+function ConvertTo-DotEnvValue([string]$Name, [string]$Value) {
+    if ($Value.Contains("`r") -or $Value.Contains("`n") -or $Value.Contains('"')) {
+        throw "$Name contains a newline or double quote, which cannot be written safely to .env."
+    }
+    return '"' + $Value + '"'
+}
+
 function Set-EnvValue([string]$Path, [string]$Name, [string]$Value) {
     $Content = [IO.File]::ReadAllText($Path)
     $Pattern = "(?m)^" + [Text.RegularExpressions.Regex]::Escape($Name) + "=.*$"
+    $SerializedValue = ConvertTo-DotEnvValue $Name $Value
     if ([Text.RegularExpressions.Regex]::IsMatch($Content, $Pattern)) {
         $Evaluator = [Text.RegularExpressions.MatchEvaluator]{
             param($Match)
-            return $Name + "=" + $Value
+            return $Name + "=" + $SerializedValue
         }
         $Content = [Text.RegularExpressions.Regex]::Replace($Content, $Pattern, $Evaluator, 1)
     }
     else {
-        $Content = $Content.TrimEnd() + [Environment]::NewLine + $Name + "=" + $Value + [Environment]::NewLine
+        $Content = $Content.TrimEnd() + [Environment]::NewLine + $Name + "=" + $SerializedValue + [Environment]::NewLine
     }
     [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
@@ -82,6 +90,9 @@ $GameServerBinaryPath = Assert-File $GameServerBinaryPath "Dauntless executable"
 $TlsCertificatePath = Assert-File $TlsCertificatePath "TLS certificate"
 $TlsPrivateKeyPath = Assert-File $TlsPrivateKeyPath "TLS private key"
 
+if ($BackendHttpsPort -ne 443) {
+    throw "The 1.12.0 runtime currently requires -BackendHttpsPort 443."
+}
 if ($GamePortEnd - $GamePortBegin -lt 2) {
     throw "The game port range needs at least three ports (hunts, Training Dojo, Ramsgate)."
 }

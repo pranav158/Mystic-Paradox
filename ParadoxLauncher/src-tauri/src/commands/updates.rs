@@ -321,7 +321,7 @@ fn is_safe_extra_name(name: &str) -> bool {
         && !name.contains("..")
         && name != "."
         && name.to_ascii_lowercase().ends_with(".dll")
-        && name != RUNTIME_DLL_NAME
+        && !name.eq_ignore_ascii_case(RUNTIME_DLL_NAME)
 }
 
 async fn install_extra_file(
@@ -425,7 +425,7 @@ async fn install_extra_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_approved_runtime_url_for, is_safe_extra_name};
+    use super::{is_approved_runtime_url_for, is_safe_extra_name, RUNTIME_DLL_NAME};
 
     #[test]
     fn runtime_downloads_must_use_the_configured_https_origin() {
@@ -455,5 +455,8 @@ mod tests {
         assert!(!is_safe_extra_name("../winmm.dll"));
         assert!(!is_safe_extra_name("nested/winmm.dll"));
         assert!(!is_safe_extra_name("notes.txt"));
+        assert!(!is_safe_extra_name(RUNTIME_DLL_NAME));
+        assert!(!is_safe_extra_name("mystpaxinternalserver.dll"));
+        assert!(!is_safe_extra_name("MYSTPAXINTERNALSERVER.DLL"));
     }
 }
