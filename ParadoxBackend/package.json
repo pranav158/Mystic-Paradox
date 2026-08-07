@@ -17,10 +17,12 @@
     "generate:ladyluck-store": "node scripts/generate_ladyluck_store.cjs",
     "test:bootstrap": "npm run build && node --env-file=.env scripts/test_bootstrap_regression.cjs",
     "test:loadout": "node --import tsx --test src/loadoutSlots.test.ts",
-    "test:realtime": "node --import tsx --test src/realtime/jid.test.ts src/realtime/stateMachine.test.ts src/realtime/xml.test.ts src/realtime/XMPPAuth.test.ts src/realtime/DirectChatService.test.ts src/realtime/RoomService.test.ts src/realtime/PresenceService.test.ts src/realtime/SessionRegistry.test.ts"
-    ,"test:auth-security": "node --import tsx --test src/security/accountEligibility.test.ts src/security/totp.test.ts"
-    ,"admin:bootstrap": "tsx --env-file=.env scripts/bootstrap_admin.ts"
-    ,"approval:migrate": "tsx --env-file=.env scripts/migrate_launcher_approval.ts"
+    "test:realtime": "node --import tsx --test src/realtime/jid.test.ts src/realtime/stateMachine.test.ts src/realtime/xml.test.ts src/realtime/XMPPAuth.test.ts src/realtime/DirectChatService.test.ts src/realtime/RoomService.test.ts src/realtime/PresenceService.test.ts src/realtime/SessionRegistry.test.ts",
+    "test:auth-security": "node --import tsx --test src/security/accountEligibility.test.ts src/security/totp.test.ts",
+    "admin:bootstrap": "tsx --env-file=.env scripts/bootstrap_admin.ts",
+    "approval:migrate": "tsx --env-file=.env scripts/migrate_launcher_approval.ts",
+    "test:matchmaking": "node --import tsx --test src/matchmakingParty.test.ts src/apiKeysConfig.test.ts",
+    "test": "npm run test:loadout && npm run test:realtime && npm run test:auth-security && npm run test:matchmaking"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.0.2",

@@ -43,6 +43,12 @@ Pranav Karande includes, among other things:
 - Realtime XMPP presence/chat services.
 - Progression, inventory, store, matchmaking, party, and guild systems for 1.12.0.
 
+### Runtime loader
+
+`tools/RuntimeLoader` is derived from
+[coldloader-proxy](https://github.com/denuvosanctuary/coldloader-proxy) and is distributed under
+the Apache License 2.0. Its license is retained at `tools/RuntimeLoader/LICENSE`.
+
 ## Notes
 
 - This repository does not distribute the game client, packaged game assets, generated SDK

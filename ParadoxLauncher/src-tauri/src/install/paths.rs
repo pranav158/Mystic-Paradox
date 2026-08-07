@@ -110,7 +110,8 @@ mod tests {
             resolved.file_name().and_then(|name| name.to_str()),
             Some(GAME_EXE_NAME)
         );
-        assert_eq!(resolved.parent(), Some(exe_dir.as_path()));
+        let expected_dir = dunce::canonicalize(&exe_dir).unwrap();
+        assert_eq!(resolved.parent(), Some(expected_dir.as_path()));
 
         fs::remove_dir_all(root).unwrap();
     }
