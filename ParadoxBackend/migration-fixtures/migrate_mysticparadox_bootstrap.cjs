@@ -112,9 +112,9 @@ function validateBaseline(inventory, loadout, wallet) {
                 db.collection("wallets").updateOne({ _id: DEV_USER_ID }, { $set: { bootstrapVersion: BOOTSTRAP_VERSION } }, { session }),
             ]);
         });
-        console.log(`Validated and migrated ${DEV_USER_ID} (${characterId}) to ${BOOTSTRAP_VERSION}.`);
+        console.log(`Validated and migrated baseline data to ${BOOTSTRAP_VERSION}.`);
     } finally {
         await session.endSession();
         await client.close();
     }
-})().catch((error) => { console.error("MIGRATION FAILED:", error.message); process.exit(1); });
+})().catch(() => { console.error("MIGRATION FAILED."); process.exit(1); });
