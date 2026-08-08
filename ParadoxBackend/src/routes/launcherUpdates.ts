@@ -1,4 +1,5 @@
 import express, { Router, Request, Response } from "express";
+import rateLimit from "express-rate-limit";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -48,6 +49,22 @@ function hasValidPublisherKey(req: Request): boolean {
     if (!expectedKey || !providedKey || expectedKey.length !== providedKey.length) return false;
     try { return crypto.timingSafeEqual(Buffer.from(expectedKey), Buffer.from(providedKey)); } catch { return false; }
 }
+
+const runtimePublishRateLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many requests. Please retry later." },
+});
+
+const runtimeDownloadRateLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 180,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many requests. Please retry later." },
+});
 
 
 
@@ -156,6 +173,7 @@ launcherUpdatesRouter.get("/launcher/v1/runtime/:channel/:platform/download", (r
 
 launcherUpdatesRouter.post(
     "/launcher/v1/admin/updates/runtime/:target/:channel/:platform",
+    runtimePublishRateLimiter,
     express.raw({ type: "application/octet-stream", limit: "200mb" }),
     (req: Request, res: Response) => {
         if (!isPublisherIpAllowed(req)) {
@@ -222,6 +240,7 @@ launcherUpdatesRouter.post(
 
 launcherUpdatesRouter.post(
     "/launcher/v1/admin/updates/runtime/:target/:channel/:platform/extra",
+    runtimePublishRateLimiter,
     express.raw({ type: "application/octet-stream", limit: "200mb" }),
     (req: Request, res: Response) => {
         if (!isPublisherIpAllowed(req)) {
@@ -278,7 +297,7 @@ launcherUpdatesRouter.post(
 );
 
 
-launcherUpdatesRouter.get("/launcher/v1/runtime/:target/:channel/:platform/extra/:filename", (req, res) => {
+launcherUpdatesRouter.get("/launcher/v1/runtime/:target/:channel/:platform/extra/:filename", runtimeDownloadRateLimiter, (req, res) => {
     if (!RUNTIME_TARGETS.has(req.params.target)) { res.sendStatus(400); return; }
     try {
         const target = segment(req.params.target, "target");
@@ -333,7 +352,7 @@ launcherUpdatesRouter.post("/launcher/v1/admin/updates/serving", express.json({ 
 
 
 
-launcherUpdatesRouter.get("/launcher/v1/updates/:target/:arch/download", (req, res) => {
+launcherUpdatesRouter.get("/launcher/v1/updates/:target/:arch/download", runtimeDownloadRateLimiter, (req, res) => {
     try {
         const target = segment(req.params.target, "target");
         const arch = segment(req.params.arch, "architecture");
