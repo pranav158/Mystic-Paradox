@@ -28,6 +28,7 @@
     "@node-rs/argon2": "^2.0.2",
     "dotenv": "^17.4.2",
     "express": "5.2.1",
+    "express-rate-limit": "8.6.2",
     "jsonwebtoken": "^9.0.3",
     "ltx": "3.1.2",
     "mongodb": "7.5.0",
