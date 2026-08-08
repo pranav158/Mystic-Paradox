@@ -45,7 +45,7 @@ function ToRecord(Doc: any): LauncherAccountRecord {
 export class MongoLauncherAccountRepository implements LauncherAccountRepository {
     async findByUserId(userId: string): Promise<LauncherAccountRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.Accounts).findOne({ _id: userId as any, displayNameNormalized: { $exists: true } });
+        const Doc = await Db.collection(Collections.Accounts).findOne({ _id: { $eq: userId as any }, displayNameNormalized: { $exists: true } });
 
         return Doc == undefined ? undefined : ToRecord(Doc);
     }

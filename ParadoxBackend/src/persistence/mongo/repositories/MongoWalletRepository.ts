@@ -69,7 +69,7 @@ export class MongoWalletRepository implements WalletRepository {
         }
 
         const Result = await Db.collection(Collections.Wallets).findOneAndUpdate(
-            { _id: wallet.userId as any },
+            { _id: { $eq: wallet.userId as any } },
             Update,
             { upsert: true, returnDocument: "after", session }
         );
@@ -103,7 +103,7 @@ export class MongoWalletRepository implements WalletRepository {
         
         
         
-        const Filter: Record<string, any> = { _id: userId as any };
+        const Filter: Record<string, any> = { _id: { $eq: userId as any } };
         if (delta < 0) {
             Filter[BalanceField] = { $gte: -delta };
         }
