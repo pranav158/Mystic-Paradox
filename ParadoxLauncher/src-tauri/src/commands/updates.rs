@@ -55,7 +55,7 @@ fn is_approved_runtime_url(candidate: &str) -> bool {
     is_approved_runtime_url_for(runtime_endpoint(), candidate)
 }
 const MAX_RUNTIME_BYTES: usize = 200 * 1024 * 1024;
-pub(crate) const RUNTIME_DLL_NAME: &str = "MystPaxInternalServer.dll";
+pub(crate) const RUNTIME_DLL_NAME: &str = "MysticParadox.dll";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -456,7 +456,7 @@ mod tests {
         assert!(!is_safe_extra_name("nested/winmm.dll"));
         assert!(!is_safe_extra_name("notes.txt"));
         assert!(!is_safe_extra_name(RUNTIME_DLL_NAME));
-        assert!(!is_safe_extra_name("mystpaxinternalserver.dll"));
-        assert!(!is_safe_extra_name("MYSTPAXINTERNALSERVER.DLL"));
+        assert!(!is_safe_extra_name("mysticparadox.dll"));
+        assert!(!is_safe_extra_name("MYSTICPARADOX.DLL"));
     }
 }

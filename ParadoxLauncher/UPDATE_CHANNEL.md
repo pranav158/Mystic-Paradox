@@ -31,7 +31,7 @@ From `ParadoxLauncher`:
 
 ```powershell
 node scripts/publish-runtime-update.mjs `
-  --dll ..\ParadoxRuntime\x64\Release\MystPaxInternalServer.dll `
+  --dll ..\ParadoxRuntime\x64\Release\MysticParadox.dll `
   --extra ..\tools\RuntimeLoader\target\release\winmm.dll `
   --target client `
   --version 0.4.13 `
