@@ -10,7 +10,7 @@ use winapi::um::winnt::DLL_PROCESS_ATTACH;
 mod exports;
 pub mod proxy;
 
-const DLLS: [&str; 1] = ["MystPaxInternalServer.dll"];
+const DLLS: [&str; 1] = ["MysticParadox.dll"];
 
 /// Optional additional-DLL list placed next to the proxy DLL.
 const INI_FILE: &str = "mystic_loader.ini";

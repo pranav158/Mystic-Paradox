@@ -91,7 +91,7 @@ Build the runtime:
     cd ParadoxRuntime
     .\_build.bat
 
-The x64 Release output is MystPaxInternalServer.dll.
+The x64 Release output is MysticParadox.dll.
 
 Build the loader:
 
@@ -100,11 +100,11 @@ Build the loader:
 
 Copy these two files beside Dauntless-Win64-Shipping.exe:
 
-- ParadoxRuntime\x64\Release\MystPaxInternalServer.dll
+- ParadoxRuntime\x64\Release\MysticParadox.dll
 - tools\RuntimeLoader\target\release\winmm.dll
 
 The loader forwards calls to the real Windows winmm library and loads only
-MystPaxInternalServer.dll by default. Do not add untrusted DLLs to mystic_loader.ini.
+MysticParadox.dll by default. Do not add untrusted DLLs to mystic_loader.ini.
 
 ## 5. Start the services
 
@@ -143,7 +143,7 @@ The compile-time settings bind native account requests and runtime downloads to 
 Runtime manifests must be signed by the generated Ed25519 private key. Publish both the runtime
 and loader from `ParadoxLauncher` before the first client install:
 
-    node scripts/publish-runtime-update.mjs --dll ..\ParadoxRuntime\x64\Release\MystPaxInternalServer.dll --extra ..\tools\RuntimeLoader\target\release\winmm.dll --target client --version 0.1.0 --changelist 392819 --channel stable --output ..\ParadoxBackend\updates --base-url https://your-hostname --key .secrets\selfhost-runtime-update.private.pem
+    node scripts/publish-runtime-update.mjs --dll ..\ParadoxRuntime\x64\Release\MysticParadox.dll --extra ..\tools\RuntimeLoader\target\release\winmm.dll --target client --version 0.1.0 --changelist 392819 --channel stable --output ..\ParadoxBackend\updates --base-url https://your-hostname --key .secrets\selfhost-runtime-update.private.pem
 
 Use a new semantic version for each published artifact. See
 [ParadoxLauncher\UPDATE_CHANNEL.md](../ParadoxLauncher/UPDATE_CHANNEL.md) for channel and rollout
@@ -182,7 +182,7 @@ Set ADMIN_TOTP_SECRET and ADMIN_ALLOWED_ORIGINS before enabling the admin routes
 
 ### The launcher says the runtime is missing
 
-Confirm both winmm.dll and MystPaxInternalServer.dll are non-empty and beside the exact executable
+Confirm both winmm.dll and MysticParadox.dll are non-empty and beside the exact executable
 selected in the launcher.
 
 ### Game sessions are rejected
