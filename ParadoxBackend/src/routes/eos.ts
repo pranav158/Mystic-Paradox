@@ -96,7 +96,7 @@ eosRouter.post("/account/api/oauth/token", async (req, res) => {
 
         await EnsureDevUser(UserId);
 
-        logger.info(`Logging in ${UserId}!`);
+        logger.info("Logging in user via EOS dev auth mode.");
 
         const AuthToken = SignMetagameJWTForUid(UserId);
 
