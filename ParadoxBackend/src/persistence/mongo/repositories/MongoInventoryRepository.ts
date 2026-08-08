@@ -26,7 +26,7 @@ import { InventoryRecord } from "../../mapping/domainTypes";
 export class MongoInventoryRepository implements InventoryRepository {
     async findByCharacterId(characterId: string, session?: ClientSession): Promise<InventoryRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.Inventories).findOne({ _id: characterId as any }, { session });
+        const Doc = await Db.collection(Collections.Inventories).findOne({ _id: { $eq: characterId as any } }, { session });
 
         if (Doc == undefined) {
             return undefined;
@@ -63,10 +63,10 @@ export class MongoInventoryRepository implements InventoryRepository {
         
         const RevisionFilter = expectedRevision === 0
             ? { $or: [{ revision: 0 }, { revision: { $exists: false } }] }
-            : { revision: expectedRevision };
+            : { revision: { $eq: expectedRevision } };
 
         const Result = await Db.collection(Collections.Inventories).findOneAndUpdate(
-            { _id: characterId as any, ...RevisionFilter },
+            { _id: { $eq: characterId as any }, ...RevisionFilter },
             { $set: { instancedItems: instancedItemsJson, stackedItems: stackedItemsJson, revision: expectedRevision + 1 } },
             { returnDocument: "after", session }
         );
