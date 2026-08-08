@@ -74,7 +74,7 @@ export class MongoCharacterRepository implements CharacterRepository {
         
         
         await Db.collection(Collections.Characters).updateOne(
-            { _id: characterId as any, userId, updateVersion: { $lt: effectiveVersion } },
+            { _id: { $eq: characterId as any }, userId: { $eq: userId }, updateVersion: { $lt: effectiveVersion } },
             { $set: { data, updateVersion: effectiveVersion } }
         );
     }
