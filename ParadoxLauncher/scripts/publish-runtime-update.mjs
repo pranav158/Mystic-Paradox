@@ -38,7 +38,7 @@ const bytes = readFileSync(dllPath);
 if (bytes.length === 0 || bytes.length > 200 * 1024 * 1024) throw new Error("DLL size is outside the safe range");
 
 const sha256 = createHash("sha256").update(bytes).digest("hex");
-const artifactName = `MystPaxInternalServer-${version}-${target}-${targetChangelist}.dll`;
+const artifactName = `MysticParadox-${version}-${target}-${targetChangelist}.dll`;
 const artifactDir = resolve(outputRoot, "runtime", target, channel, "windows-x86_64", version);
 mkdirSync(artifactDir, { recursive: true });
 
@@ -112,7 +112,7 @@ for (const extraPath of extraPaths) {
 
 const manifest = {
   schema: 1,
-  component: "MystPaxInternalServer",
+  component: "ParadoxRuntime",
   target,
   version,
   channel,

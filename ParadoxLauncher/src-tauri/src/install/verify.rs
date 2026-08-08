@@ -2,7 +2,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 const WINMM_DLL_NAME: &str = "winmm.dll";
-const INTERNAL_SERVER_DLL_NAME: &str = "MystPaxInternalServer.dll";
+const RUNTIME_DLL_NAME: &str = "MysticParadox.dll";
 
 pub fn hash_file_sha256(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("Couldn't read file: {e}"))?;
@@ -18,8 +18,8 @@ pub fn hash_file_sha256(path: &Path) -> Result<String, String> {
         .collect())
 }
 
-/// `winmm.dll` (the proxy that loads `MystPaxInternalServer.dll` — see
-/// MystPaxInternalServer's build) and the DLL itself must both be present
+/// `winmm.dll` (the proxy that loads `MysticParadox.dll`) and the runtime DLL
+/// itself must both be present
 /// alongside the game exe. This is a presence/non-empty check, not a hash
 /// match — unlike the game exe (checked against the backend's approved-hash
 /// allow-list), these are project-owned files that get rebuilt far more often,
@@ -28,7 +28,7 @@ pub fn verify_runtime_dlls_present(game_dir: &Path) -> Result<(), String> {
     const GENERIC_ERR: &str =
         "Runtime binaries are missing or corrupted. Repair your installation.";
 
-    for name in [WINMM_DLL_NAME, INTERNAL_SERVER_DLL_NAME] {
+    for name in [WINMM_DLL_NAME, RUNTIME_DLL_NAME] {
         let path = game_dir.join(name);
         let metadata = std::fs::metadata(&path).map_err(|_| GENERIC_ERR.to_string())?;
 
@@ -75,7 +75,7 @@ mod tests {
             std::env::temp_dir().join(format!("mystpax-dll-empty-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(WINMM_DLL_NAME), b"").unwrap();
-        fs::write(dir.join(INTERNAL_SERVER_DLL_NAME), b"content").unwrap();
+        fs::write(dir.join(RUNTIME_DLL_NAME), b"content").unwrap();
 
         assert!(verify_runtime_dlls_present(&dir).is_err());
 
@@ -87,7 +87,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mystpax-dll-ok-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(WINMM_DLL_NAME), b"content").unwrap();
-        fs::write(dir.join(INTERNAL_SERVER_DLL_NAME), b"content").unwrap();
+        fs::write(dir.join(RUNTIME_DLL_NAME), b"content").unwrap();
 
         assert!(verify_runtime_dlls_present(&dir).is_ok());
 
