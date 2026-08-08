@@ -101,7 +101,7 @@ async function main() {
     console.log("new userId    :", NewUser);
     console.log("displayName   :", DisplayName);
     console.log("email         :", Email);
-    console.log("password      :", Password, "  (store this — it is the launcher login)");
+    console.log("password      : [REDACTED] (not logged)");
     console.log("cloned counts :", JSON.stringify(Counts));
 
     await GetPersistenceLifecycle().stop();
