@@ -120,6 +120,7 @@ if ([string]::IsNullOrWhiteSpace($PrivateKeyB64) -or [string]::IsNullOrWhiteSpac
     throw "JWT signing-key generation returned an incomplete key pair."
 }
 $GameServerApiKey = New-RandomHex 32
+$ApiKeyHashSecret = New-RandomHex 32
 $ExecutableHash = (Get-FileHash -LiteralPath $GameServerBinaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $BaseUrl = "https://$PublicHost"
 
@@ -141,6 +142,7 @@ $BackendValues = [ordered]@{
     MATCHMAKING_MODE = "DEPLOYSERVER"
     DEPLOYSERVER_URL = "127.0.0.1:$DirectorPort"
     GAMESERVER_API_KEYS = $GameServerApiKey
+    API_KEY_HASH_SECRET = $ApiKeyHashSecret
     HTTPS_PORT = [string]$BackendHttpsPort
     PARADOX_CERT_PEM_PATH = $TlsCertificatePath
     PARADOX_KEY_PEM_PATH = $TlsPrivateKeyPath

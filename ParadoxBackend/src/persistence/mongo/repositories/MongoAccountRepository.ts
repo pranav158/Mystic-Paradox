@@ -21,7 +21,7 @@ import { AccountRecord } from "../../mapping/domainTypes";
 export class MongoAccountRepository implements AccountRepository {
     async findByUserId(userId: string): Promise<AccountRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.Accounts).findOne({ _id: userId as any });
+        const Doc = await Db.collection(Collections.Accounts).findOne({ _id: { $eq: userId as any } });
 
         if (Doc == undefined) {
             return undefined;

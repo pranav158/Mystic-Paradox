@@ -80,8 +80,9 @@ files are absent or structurally invalid.
     npm ci
     npm run build
 
-The backend reads GAMESERVER_API_KEYS from its environment, hashes each key before persistence, and
-accepts the matching raw METAGAME_API_KEY used by the director. No manual MongoDB key insertion is
+The backend reads GAMESERVER_API_KEYS from its environment, applies a domain-separated HMAC using
+API_KEY_HASH_SECRET before persistence, and accepts the matching raw METAGAME_API_KEY used by the
+director. No manual MongoDB key insertion is
 required.
 
 ## 4. Build the runtime and loader
@@ -105,6 +106,8 @@ Copy these two files beside Dauntless-Win64-Shipping.exe:
 
 The loader forwards calls to the real Windows winmm library and loads only
 MysticParadox.dll by default. Do not add untrusted DLLs to mystic_loader.ini.
+During the public-name migration, the launcher also maintains MystPaxInternalServer.dll with the
+same verified bytes so older launchers/loaders cannot select a stale runtime.
 
 ## 5. Start the services
 
@@ -193,6 +196,7 @@ match the exact 1.12.0 executable and the configured changelist must remain 3928
 ### Gameservers receive 401 responses
 
 GAMESERVER_API_KEYS in ParadoxBackend and METAGAME_API_KEY in ParadoxDirector must share one raw key.
+API_KEY_HASH_SECRET stays backend-only and must remain stable across restarts.
 The configured backend list is authoritative: restart the backend after changing it, and removed keys
 will be revoked from MongoDB.
 

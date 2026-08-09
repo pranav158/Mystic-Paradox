@@ -13,12 +13,13 @@ import jwt, {JwtPayload} from "jsonwebtoken";
 import crypto from "crypto";
 import { GetRepositories } from "../persistence";
 import { logger } from "../logger";
+import { HashApiKey } from "../security/apiKeyHash";
 
 const PRIVKEY = Buffer.from(process.env.AUTH_SIGNING_PRIVKEY_B64!, "base64").toString("utf-8");
 const PUBKEY = Buffer.from(process.env.AUTH_SIGNING_PUBKEY_B64!, "base64").toString("utf-8");
 
 function HashUserAPIKey(UserAPIKeyToHash: string){
-    return crypto.createHash("sha256").update(UserAPIKeyToHash, "utf8").digest("hex");
+    return HashApiKey(UserAPIKeyToHash, "user");
 }
 
 export async function DrainAndRegisterUserAPIKeys(){
@@ -30,7 +31,7 @@ export async function DrainAndRegisterUserAPIKeys(){
         await GetRepositories().apiKeys.insertUserKeyHash(APIKey.userId, HashUserAPIKey(APIKey.key));
     }
 
-    logger.info(`Registered ${APIKeysToRegister.length} new User API Key(s) on boot!`);
+    logger.info("Registered pending User API keys on boot.");
 }
 
 export async function GetUserIDForAPIKey(UserAPIKey: string){

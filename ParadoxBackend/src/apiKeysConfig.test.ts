@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { ParseConfiguredGameserverAPIKeys, SynchronizeConfiguredGameserverAPIKeys } from "./controllers/apikeys";
+process.env.API_KEY_HASH_SECRET = "test-only-api-key-hash-secret-0123456789abcdef";
+
 
 test("gameserver keys are trimmed, deduplicated, and empty values are ignored", () => {
     assert.deepEqual(
