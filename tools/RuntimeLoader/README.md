@@ -1,7 +1,8 @@
 # Paradox Runtime Loader
 
 A small winmm.dll proxy that forwards multimedia calls to the real Windows system library and
-loads MysticParadox.dll from the game directory during process startup.
+loads the newest available runtime copy from the game directory during process startup. The
+canonical name is MysticParadox.dll; MystPaxInternalServer.dll remains a temporary migration alias.
 
 ## Build
 
@@ -10,10 +11,11 @@ loads MysticParadox.dll from the game directory during process startup.
 
 Output: target\release\winmm.dll.
 
-Place winmm.dll and MysticParadox.dll beside
-Dauntless-Win64-Shipping.exe. The loader can optionally read mystic_loader.ini; when present,
-list one additional project-owned DLL path per line. These entries never replace the required
-MysticParadox.dll. Relative paths resolve from the game directory.
+Place winmm.dll and MysticParadox.dll beside Dauntless-Win64-Shipping.exe. During the rename
+transition the launcher keeps MysticParadox.dll and MystPaxInternalServer.dll synchronized, and
+the loader selects the most recently updated copy. The loader can optionally read
+mystic_loader.ini; when present, list one additional project-owned DLL path per line. These entries
+never replace either runtime alias. Relative paths resolve from the game directory.
 
 Do not list untrusted DLLs. Every configured library executes inside the game process.
 

@@ -56,6 +56,8 @@ fn is_approved_runtime_url(candidate: &str) -> bool {
 }
 const MAX_RUNTIME_BYTES: usize = 200 * 1024 * 1024;
 pub(crate) const RUNTIME_DLL_NAME: &str = "MysticParadox.dll";
+pub(crate) const LEGACY_RUNTIME_DLL_NAME: &str = "MystPaxInternalServer.dll";
+const RUNTIME_DLL_NAMES: [&str; 2] = [RUNTIME_DLL_NAME, LEGACY_RUNTIME_DLL_NAME];
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -175,6 +177,83 @@ fn verify_manifest(manifest: &RuntimeManifest, bytes: &[u8]) -> Result<(), Strin
         .map_err(|_| "Runtime update signature verification failed.".to_string())
 }
 
+#[derive(Debug)]
+struct RuntimeAliasState {
+    reported_hash: Option<String>,
+    current_source: Option<PathBuf>,
+    all_current: bool,
+}
+
+fn inspect_runtime_aliases(
+    directory: &std::path::Path,
+    expected_hash: &str,
+) -> Result<RuntimeAliasState, String> {
+    let mut fallback_hash = None;
+    let mut current_source = None;
+    let mut current_count = 0;
+
+    for name in RUNTIME_DLL_NAMES {
+        let path = directory.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let hash = verify::hash_file_sha256(&path)?;
+        if fallback_hash.is_none() {
+            fallback_hash = Some(hash.clone());
+        }
+        if hash.eq_ignore_ascii_case(expected_hash) {
+            current_count += 1;
+            if current_source.is_none() {
+                current_source = Some(path);
+            }
+        }
+    }
+
+    let reported_hash = if current_source.is_some() {
+        Some(expected_hash.to_string())
+    } else {
+        fallback_hash
+    };
+
+    Ok(RuntimeAliasState {
+        reported_hash,
+        current_source,
+        all_current: current_count == RUNTIME_DLL_NAMES.len(),
+    })
+}
+
+fn replace_runtime_alias(
+    directory: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let target = directory.join(name);
+    let staged = directory.join(format!("{name}.new"));
+    let backup = directory.join(format!("{name}.bak"));
+    std::fs::write(&staged, bytes).map_err(|e| format!("Couldn't stage {name}: {e}"))?;
+    if target.exists() {
+        let _ = std::fs::remove_file(&backup);
+        std::fs::rename(&target, &backup)
+            .map_err(|e| format!("Couldn't prepare {name} replacement: {e}"))?;
+    }
+    if let Err(error) = std::fs::rename(&staged, &target) {
+        if backup.exists() {
+            let _ = std::fs::rename(&backup, &target);
+        }
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("Couldn't install {name}: {error}"));
+    }
+
+    Ok(())
+}
+
+fn install_runtime_aliases(directory: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    for name in RUNTIME_DLL_NAMES {
+        replace_runtime_alias(directory, name, bytes)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn check_runtime_update(
     app: AppHandle,
@@ -191,12 +270,9 @@ pub async fn check_runtime_update(
         });
     };
     let directory = install_dir(&app)?;
-    let current_path = directory.join(RUNTIME_DLL_NAME);
-    let current_hash = current_path
-        .is_file()
-        .then(|| verify::hash_file_sha256(&current_path))
-        .transpose()?;
-    let mut available = current_hash.as_deref() != Some(manifest.sha256.as_str());
+    let runtime_state = inspect_runtime_aliases(&directory, &manifest.sha256)?;
+    let current_hash = runtime_state.reported_hash;
+    let mut available = !runtime_state.all_current;
     if !available {
         for extra in &manifest.extra_files {
             let extra_path = directory.join(&extra.name);
@@ -234,11 +310,7 @@ pub async fn install_runtime_update(
         return Err("No runtime update is published for this channel.".to_string());
     };
     let directory = install_dir(&app)?;
-    let current_path = directory.join(RUNTIME_DLL_NAME);
-    let current_hash = current_path
-        .is_file()
-        .then(|| verify::hash_file_sha256(&current_path))
-        .transpose()?;
+    let runtime_state = inspect_runtime_aliases(&directory, &manifest.sha256)?;
 
     // Install extra files first — they must be fetched even when the main DLL is current.
     // Each install_extra_file already skips when the target file matches the published hash.
@@ -246,12 +318,27 @@ pub async fn install_runtime_update(
         install_extra_file(&directory, extra, token.as_deref()).await?;
     }
 
-    // If the main DLL is already current and all extras are installed, we are done.
-    if current_hash.as_deref() == Some(manifest.sha256.as_str()) {
+    // During the migration both names carry identical bytes: the old loader
+    // can keep using the legacy name while the new loader accepts either.
+    if runtime_state.all_current {
         return Ok(RuntimeUpdateStatus {
             available: false,
             version: Some(manifest.version),
-            current_sha256: current_hash,
+            current_sha256: runtime_state.reported_hash,
+            latest_sha256: Some(manifest.sha256),
+            size: Some(manifest.size),
+        });
+    }
+
+    if let Some(source) = runtime_state.current_source {
+        let bytes = std::fs::read(&source)
+            .map_err(|e| format!("Couldn't read the installed runtime: {e}"))?;
+        verify_manifest(&manifest, &bytes)?;
+        install_runtime_aliases(&directory, &bytes)?;
+        return Ok(RuntimeUpdateStatus {
+            available: false,
+            version: Some(manifest.version),
+            current_sha256: Some(manifest.sha256.clone()),
             latest_sha256: Some(manifest.sha256),
             size: Some(manifest.size),
         });
@@ -290,21 +377,7 @@ pub async fn install_runtime_update(
         .to_vec();
     verify_manifest(&manifest, &bytes)?;
 
-    let staged = directory.join(format!("{RUNTIME_DLL_NAME}.new"));
-    let backup = directory.join(format!("{RUNTIME_DLL_NAME}.bak"));
-    std::fs::write(&staged, &bytes).map_err(|e| format!("Couldn't stage runtime update: {e}"))?;
-    if current_path.exists() {
-        let _ = std::fs::remove_file(&backup);
-        std::fs::rename(&current_path, &backup)
-            .map_err(|e| format!("Couldn't prepare runtime replacement: {e}"))?;
-    }
-    if let Err(error) = std::fs::rename(&staged, &current_path) {
-        if backup.exists() {
-            let _ = std::fs::rename(&backup, &current_path);
-        }
-        let _ = std::fs::remove_file(&staged);
-        return Err(format!("Couldn't install runtime update: {error}"));
-    }
+    install_runtime_aliases(&directory, &bytes)?;
     Ok(RuntimeUpdateStatus {
         available: false,
         version: Some(manifest.version),
@@ -322,6 +395,7 @@ fn is_safe_extra_name(name: &str) -> bool {
         && name != "."
         && name.to_ascii_lowercase().ends_with(".dll")
         && !name.eq_ignore_ascii_case(RUNTIME_DLL_NAME)
+        && !name.eq_ignore_ascii_case(LEGACY_RUNTIME_DLL_NAME)
 }
 
 async fn install_extra_file(
@@ -425,7 +499,10 @@ async fn install_extra_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_approved_runtime_url_for, is_safe_extra_name, RUNTIME_DLL_NAME};
+    use super::{
+        inspect_runtime_aliases, install_runtime_aliases, is_approved_runtime_url_for,
+        is_safe_extra_name, LEGACY_RUNTIME_DLL_NAME, RUNTIME_DLL_NAME,
+    };
 
     #[test]
     fn runtime_downloads_must_use_the_configured_https_origin() {
@@ -456,7 +533,35 @@ mod tests {
         assert!(!is_safe_extra_name("nested/winmm.dll"));
         assert!(!is_safe_extra_name("notes.txt"));
         assert!(!is_safe_extra_name(RUNTIME_DLL_NAME));
+        assert!(!is_safe_extra_name(LEGACY_RUNTIME_DLL_NAME));
         assert!(!is_safe_extra_name("mysticparadox.dll"));
         assert!(!is_safe_extra_name("MYSTICPARADOX.DLL"));
+    }
+
+    #[test]
+    fn synchronizes_both_runtime_aliases_from_one_current_copy() {
+        let dir =
+            std::env::temp_dir().join(format!("mystpax-runtime-alias-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = dir.join(RUNTIME_DLL_NAME);
+        std::fs::write(&canonical, b"runtime").unwrap();
+        let expected_hash = crate::install::verify::hash_file_sha256(&canonical).unwrap();
+        let before = inspect_runtime_aliases(&dir, &expected_hash).unwrap();
+        assert!(!before.all_current);
+        assert!(before.current_source.is_some());
+
+        install_runtime_aliases(&dir, b"runtime").unwrap();
+        let after = inspect_runtime_aliases(&dir, &expected_hash).unwrap();
+        assert!(after.all_current);
+        assert_eq!(
+            std::fs::read(dir.join(RUNTIME_DLL_NAME)).unwrap(),
+            b"runtime"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(LEGACY_RUNTIME_DLL_NAME)).unwrap(),
+            b"runtime"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
     }
 }

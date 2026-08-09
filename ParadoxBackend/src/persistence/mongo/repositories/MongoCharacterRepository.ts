@@ -35,13 +35,16 @@ function ToRecord(Doc: any): CharacterRecord {
 export class MongoCharacterRepository implements CharacterRepository {
     async findManyByUserId(userId: string): Promise<CharacterRecord[]> {
         const Db = await GetMongoDb();
-        const Docs = await Db.collection(Collections.Characters).find({ userId }).toArray();
+        const Docs = await Db.collection(Collections.Characters).find({ userId: { $eq: userId } }).toArray();
         return Docs.map(ToRecord);
     }
 
     async findByCharacterIdAndUserId(characterId: string, userId: string, session?: ClientSession): Promise<CharacterRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.Characters).findOne({ _id: characterId as any, userId }, { session });
+        const Doc = await Db.collection(Collections.Characters).findOne(
+            { _id: { $eq: characterId as any }, userId: { $eq: userId } },
+            { session }
+        );
 
         if (Doc == undefined) {
             return undefined;

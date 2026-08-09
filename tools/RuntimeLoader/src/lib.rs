@@ -10,7 +10,8 @@ use winapi::um::winnt::DLL_PROCESS_ATTACH;
 mod exports;
 pub mod proxy;
 
-const DLLS: [&str; 1] = ["MysticParadox.dll"];
+const RUNTIME_DLL_NAMES: [&str; 2] = ["MysticParadox.dll", "MystPaxInternalServer.dll"];
+const CANONICAL_RUNTIME_DLL_NAME: &str = RUNTIME_DLL_NAMES[0];
 
 /// Optional additional-DLL list placed next to the proxy DLL.
 const INI_FILE: &str = "mystic_loader.ini";
@@ -40,19 +41,33 @@ fn module_directory(module: HMODULE) -> Option<PathBuf> {
     module_path.parent().map(Path::to_path_buf)
 }
 
+fn select_runtime_dll(directory: &Path) -> Option<PathBuf> {
+    RUNTIME_DLL_NAMES
+        .iter()
+        .filter_map(|name| {
+            let path = directory.join(name);
+            let metadata = std::fs::metadata(&path).ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+            let canonical = usize::from(name.eq_ignore_ascii_case(CANONICAL_RUNTIME_DLL_NAME));
+            Some((modified, canonical, path))
+        })
+        .max_by_key(|(modified, canonical, _)| (*modified, *canonical))
+        .map(|(_, _, path)| path)
+}
+
 fn initialize(dll_path: &Path) {
-    for dll in DLLS {
-        let dll = dll_path.join(dll);
-        if dll.exists() {
-            let _ = load_dll(&dll);
-        }
+    if let Some(runtime) = select_runtime_dll(dll_path) {
+        let _ = load_dll(&runtime);
     }
 
     // INI entries are additional libraries; they never replace the required
     // runtime above.
     if let Some(dlls) = read_dll_list_from_ini(&dll_path.join(INI_FILE)) {
         for dll in dlls {
-            if DLLS
+            if RUNTIME_DLL_NAMES
                 .iter()
                 .any(|required| required.eq_ignore_ascii_case(&dll))
             {
@@ -114,4 +129,41 @@ fn load_dll(dll_path: &Path) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CANONICAL_RUNTIME_DLL_NAME, select_runtime_dll};
+    use std::fs;
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "mystic-runtime-loader-{name}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn selects_the_canonical_runtime_when_it_is_the_only_copy() {
+        let dir = test_dir("canonical");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(CANONICAL_RUNTIME_DLL_NAME), b"runtime").unwrap();
+
+        let selected = select_runtime_dll(&dir).unwrap();
+        assert_eq!(selected.file_name().unwrap(), CANONICAL_RUNTIME_DLL_NAME);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn falls_back_to_the_legacy_runtime_name() {
+        let dir = test_dir("legacy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("MystPaxInternalServer.dll"), b"runtime").unwrap();
+
+        let selected = select_runtime_dll(&dir).unwrap();
+        assert_eq!(selected.file_name().unwrap(), "MystPaxInternalServer.dll");
+
+        fs::remove_dir_all(dir).ok();
+    }
 }

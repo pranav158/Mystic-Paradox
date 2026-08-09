@@ -4,11 +4,20 @@
  */
 
 import { Router } from "express";
+import rateLimit from "express-rate-limit";
 import { logger } from "../logger";
 import { HasAdminAuth } from "../middleware/HasAdminAuth";
 import { AdminLogin, AdminLogout, AdminMe, DeletePlayer, ListAudit, ListOnlinePlayers, ListPlayers, UpdatePlayerAccess } from "../controllers/admin";
 
 export const adminRouter = Router();
+const adminLoginRateLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 6,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: { code: "ADMIN_RATE_LIMITED", message: "Too many sign-in attempts." } },
+});
+
 
 function AllowedOrigins(): string[] {
     return (process.env.ADMIN_ALLOWED_ORIGINS ?? "https://admin.paradox.example.com,http://localhost:4173,http://localhost:5174")
@@ -38,7 +47,7 @@ adminRouter.use("/admin/v1", (req, res, next) => {
     next();
 });
 
-adminRouter.post("/admin/v1/auth/login", AdminLogin);
+adminRouter.post("/admin/v1/auth/login", adminLoginRateLimiter, AdminLogin);
 adminRouter.post("/admin/v1/auth/logout", HasAdminAuth, AdminLogout);
 adminRouter.get("/admin/v1/me", HasAdminAuth, AdminMe);
 adminRouter.get("/admin/v1/online-players", HasAdminAuth, ListOnlinePlayers);
