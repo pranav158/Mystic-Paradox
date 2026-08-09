@@ -1,63 +1,144 @@
 # Generating game data
 
-This project does **not** distribute Phoenix Labs game data (progression, hunt tables, store,
-Slayer's Path, etc.). You extract it from your **own lawful game installation** and generate the
-runtime files locally. The server loads them from a `game-data/` directory at startup.
+Mystic Paradox does not distribute Phoenix Labs game data. Extract the required material from your
+own lawful Dauntless 1.12.0 installation and generate the service payloads locally.
 
-- Backend needs: `progression_config.json`, `slayers_path.json`, `slayers_path_definitions.json`,
-  `ladyluck_store.json` (in `ParadoxBackend/game-data/`).
-- Director needs: `player_hunts_table.json`, `matchmaker_hunts_table.json`,
-  `arena_{easy,hard,elite}_matchmaker_hunts.json` (in `ParadoxDirector/game-data/`).
+Synthetic *.example.json files only allow build and startup smoke tests. They are not playable.
 
-Override the location with `PARADOX_GAME_DATA_DIR`. Raw exporter output goes in `game-data/raw/`
-(override with `PARADOX_GAME_DATA_RAW_DIR`).
+## Final required files
 
-## 1. Extract raw data with CatalogExporter
+Backend reads these files from ParadoxBackend/game-data by default:
 
-Build `tools/CatalogExporter` (see `GENERATING_SDK.md` for the SDK it needs), set the flags you
-need in `export_flags.txt` (copy from `export_flags.example.txt`), and inject it into your own
-game process. Relevant flags:
+- progression_config.json
+- slayers_path.json
+- slayers_path_definitions.json
+- ladyluck_store.json
 
-| Flag | Produces (raw) | Feeds |
-|---|---|---|
-| `EXPORT_HUNTS=1` | `player_hunts.jsonl`, `matchmaker_hunts.jsonl` | hunt/matchmaker/arena tables |
-| `EXPORT_SLAYERS_PATH=1` | `player_journey_nodes.jsonl` | Slayer's Path graph + definitions |
-| `EXPORT_PROGRESSION=1` | progression export | progression config |
-| `EXPORT_DROP_TABLES=1` | drop-table export | Lady Luck's store |
+Director reads these files from ParadoxDirector/game-data by default:
 
-> Some flags are client-only and require the relevant menu to be open so the tables have streamed
-> in — see `tools/CatalogExporter/ExportFlags.md`.
+- player_hunts_table.json
+- matchmaker_hunts_table.json
+- arena_easy_matchmaker_hunts.json
+- arena_hard_matchmaker_hunts.json
+- arena_elite_matchmaker_hunts.json
 
-Copy the produced files into the matching service's `game-data/raw/` directory.
+Override either final directory with PARADOX_GAME_DATA_DIR. Raw inputs use game-data/raw by default
+and can be overridden with PARADOX_GAME_DATA_RAW_DIR.
 
-## 2. Generate the runtime files
+## 1. Build and run CatalogExporter
 
-**Director (hunt tables):**
-```
-cd ParadoxDirector
-npm run generate:hunt-tables            # dry run
-node scripts/import_hunt_tables.cjs --apply
-```
+Build tools/CatalogExporter against the complete SDK described in
+[GENERATING_SDK.md](GENERATING_SDK.md).
 
-**Backend:**
-```
-cd ParadoxBackend
-node scripts/generate_slayers_path.cjs --apply           # needs game-data/raw/player_journey_nodes.jsonl
-node scripts/generate_progression_config.cjs --apply     # needs game-data/raw/progression_config.source.json
-node scripts/generate_ladyluck_store.cjs --apply         # needs game-data/raw/ladyluck_store.source.json
-```
+Copy export_flags.example.txt to export_flags.txt and enable only the required modes:
 
-All generators are **dry-run by default** and print a plan; pass `--apply` to write. They write
-into `game-data/` (git-ignored).
+| Flag | Relevant raw output |
+|---|---|
+| EXPORT_SLAYERS_PATH=1 | Items_Analysis/slayers_path_1_12/player_journey_nodes.jsonl |
+| EXPORT_HUNTS=1 | Items_Analysis/hunts_1_12/player_hunts.jsonl and matchmaker_hunts.jsonl |
+| EXPORT_PROGRESSION=1 | Progression extraction material |
+| EXPORT_DROP_TABLES=1 | Drop-table/store extraction material |
 
-## 3. Smoke test without real data
+Inject the exporter into your own supported game process. Flags are read once at startup, so
+re-inject after changing them. Review
+[tools/CatalogExporter/ExportFlags.md](../tools/CatalogExporter/ExportFlags.md) for all modes and
+streaming requirements.
 
-Every required file ships a synthetic `*.example.json` placeholder. Copy them to the real name to
-let the services boot with fictional data (see each `game-data/README.md`). This is for
-compilation/plumbing checks only — it is **not** playable content.
+Some client-only tables exist only after reaching Ramsgate or opening the relevant UI. A successful
+DLL injection does not guarantee that every required table was loaded.
 
-## Provenance note
+## 2. Copy raw inputs to the services
 
-The published schemas, loaders, and generator scripts match what the hosted server consumes. Only
-the raw *values* are user-supplied from your own installation. Do not host a build using different
-private data while pointing users at a materially different generation path.
+Use these exact destinations:
+
+| Export/capture | Destination |
+|---|---|
+| Items_Analysis/slayers_path_1_12/player_journey_nodes.jsonl | ParadoxBackend/game-data/raw/player_journey_nodes.jsonl |
+| Compatible progression response | ParadoxBackend/game-data/raw/progression_config.source.json |
+| Compatible Lady Luck store response | ParadoxBackend/game-data/raw/ladyluck_store.source.json |
+| Items_Analysis/hunts_1_12/player_hunts.jsonl | ParadoxDirector/game-data/raw/player_hunts.jsonl |
+| Items_Analysis/hunts_1_12/matchmaker_hunts.jsonl | ParadoxDirector/game-data/raw/matchmaker_hunts.jsonl |
+
+Source-shape requirements:
+
+- progression_config.source.json must be an exact compatible response object containing
+  payload.paths as an array.
+- ladyluck_store.source.json must be a JSON array.
+- progression and drop-table exports are extraction material; the exporter does not necessarily
+  assemble those two final source response shapes automatically.
+- slayers_path_definitions.json currently has no checked-in one-command generator. Supply the
+  matching definitions payload from your own compatible environment.
+
+This last limitation is a real bootstrap constraint. The repository supports the schemas, loaders,
+and validation path, but a fresh clone does not contain a downloadable complete playable data pack.
+
+## 3. Validate, then generate
+
+Generators are dry-run by default. Run them once without --apply and read their plan/errors.
+
+Backend:
+
+    Set-Location ParadoxBackend
+    npm run generate:slayers-path
+    npm run generate:progression-config
+    npm run generate:ladyluck-store
+
+Apply only after validation succeeds:
+
+    node scripts/generate_slayers_path.cjs --apply
+    node scripts/generate_progression_config.cjs --apply
+    node scripts/generate_ladyluck_store.cjs --apply
+
+Director:
+
+    Set-Location ..\ParadoxDirector
+    npm run generate:hunt-tables
+    node scripts/import_hunt_tables.cjs --apply
+
+The Director importer writes both normal hunt tables and the three arena tables.
+
+## 4. Verify final outputs
+
+From the repository root:
+
+    $backendRequired = @(
+      'progression_config.json',
+      'slayers_path.json',
+      'slayers_path_definitions.json',
+      'ladyluck_store.json'
+    )
+    $directorRequired = @(
+      'player_hunts_table.json',
+      'matchmaker_hunts_table.json',
+      'arena_easy_matchmaker_hunts.json',
+      'arena_hard_matchmaker_hunts.json',
+      'arena_elite_matchmaker_hunts.json'
+    )
+    $backendRequired | ForEach-Object { Test-Path (Join-Path 'ParadoxBackend\game-data' $_) }
+    $directorRequired | ForEach-Object { Test-Path (Join-Path 'ParadoxDirector\game-data' $_) }
+
+Every result must be True. Then build the services so their loaders validate the structures:
+
+    Set-Location ParadoxBackend
+    npm run build
+    Set-Location ..\ParadoxDirector
+    npm run build
+
+Service startup also fails on missing or structurally invalid required data.
+
+## Synthetic smoke-test data
+
+To test compilation and wiring only, copy each *.example.json to its corresponding *.json name, or
+run configure-selfhost.ps1 with -UseSyntheticData.
+
+Do not describe a synthetic deployment as playable. Replace all fixtures with data generated from
+the same compatible installation before testing account progression, matchmaking, or Ramsgate.
+
+## Provenance and privacy
+
+Keep raw captures and final extracted tables out of the public repository. They are ignored for this
+reason. Before sharing logs, remove account identifiers, tokens, private paths, and captured payloads
+that contain user or proprietary data.
+
+Continue with [SELF_HOSTING.md](SELF_HOSTING.md) for runtime compilation, signed update publication,
+service startup, launcher setup, and the Ramsgate acceptance test.

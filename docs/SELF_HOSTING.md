@@ -1,224 +1,614 @@
-# Self-hosting Mystic Paradox
+# Self-hosting Mystic Paradox: source to Ramsgate
 
-This guide describes the supported source deployment for Dauntless 1.12.0
-(rel-1.12.0-Archon, changelist 392819) on Windows x64.
+This handbook covers a complete Windows x64 deployment of Mystic Paradox for Dauntless 1.12.0,
+from a clean source checkout through the first successful Ramsgate session.
 
-Mystic Paradox does not distribute the game, generated SDK headers, or extracted game data.
-You must supply those from a lawful installation. The synthetic example data is only a build and
-startup fixture; it does not produce a playable server.
+Mystic Paradox is an unofficial preservation project. It does not distribute the game, generated
+Unreal SDK files, or extracted game data. Use only a lawful installation that you control.
 
-## Deployment shape
+> [!IMPORTANT]
+> A fresh clone can compile the Node services and exercise startup plumbing with synthetic fixtures.
+> It cannot reach a playable Ramsgate without a complete SDK and complete compatible game data
+> extracted from your own installation.
 
-A complete host has five project components:
+## Supported target
 
-| Component | Purpose | Typical location |
+| Property | Required value |
+|---|---|
+| Game | Dauntless 1.12.0 |
+| Build label | rel-1.12.0-Archon |
+| Changelist | 392819 |
+| Unreal Engine | 4.26.2 |
+| Platform | Windows x64 |
+| Public backend | HTTPS on TCP 443 |
+
+Other builds are not expected to work. The launcher verifies the executable hash as well as the
+changelist.
+
+## What you are deploying
+
+| Component | Responsibility | Runs on |
 |---|---|---|
-| ParadoxBackend | HTTPS game API, accounts, persistence, and realtime presence | Windows host or VM |
-| ParadoxDirector | Starts Ramsgate, Training Dojo, and hunt servers | Same Windows machine as the game binary |
-| ParadoxRuntime | Injected compatibility and authoritative-server DLL | Beside the game executable |
-| tools/RuntimeLoader | winmm proxy that loads the runtime at process startup | Beside the game executable |
-| ParadoxLauncher | Account login, executable verification, runtime updates, and launch | Each player PC |
+| ParadoxBackend | Accounts, persistence, game APIs, matchmaking coordination, XMPP presence, runtime manifests | Backend host |
+| ParadoxDirector | Starts and supervises Ramsgate, Training Dojo, and hunt processes | Windows game-server host |
+| ParadoxRuntime | MysticParadox.dll compatibility/runtime layer | Beside every game executable |
+| RuntimeLoader | winmm.dll proxy that loads the runtime at process startup | Beside every game executable |
+| ParadoxLauncher | Account UI, executable verification, signed runtime repair, session exchange, game launch | Every player PC |
+| MongoDB | Persistent service data | Private database host |
 
-MongoDB is the only external database.
+A simple deployment can run MongoDB, Backend, Director, and dedicated game processes on one Windows
+host. Players run the launcher and their own compatible client.
 
-## Before you begin
+    Player launcher/game
+        | HTTPS 443 and XMPP WebSocket
+        v
+    ParadoxBackend ---- private TCP 3001 ----> ParadoxDirector
+        |                                      |
+        v                                      v
+    MongoDB TCP 27017                 Ramsgate / Dojo / hunts
+                                      UDP 8780-8790 by default
 
-Install:
+Keep TCP 3000, TCP 3001, and MongoDB private. Expose TCP 443 and the configured game UDP range.
 
-- Windows 10 or 11 x64
-- Node.js 20 or newer and npm
-- MongoDB 7 or a compatible MongoDB Atlas deployment
-- Rust stable with the x86_64-pc-windows-msvc target
-- Visual Studio C++ Build Tools and a Windows SDK
-- Microsoft Edge WebView2 Runtime
-- A valid TLS certificate and private key in PEM format
-- Your own Dauntless 1.12.0 Windows installation
-- A Dumper-7 SDK generated from that installation
+## Prerequisites
 
-The backend hostname must resolve to the server and its certificate must be trusted by every player
-machine. The runtime redirects game service requests to this hostname. Production and remote
-deployments therefore use HTTPS on port 443.
+Install or prepare:
 
-## 1. Clone and configure
+- Windows 10 or 11 x64.
+- Node.js 20 or newer and npm.
+- MongoDB 7 or a compatible MongoDB Atlas deployment.
+- Current stable Rust with the x86_64-pc-windows-msvc target.
+- Visual Studio C++ Build Tools, a Windows SDK, and the Desktop development with C++ workload.
+- Microsoft Edge WebView2 Runtime for the Tauri launcher.
+- A DNS name you control, such as paradox.example.net.
+- A publicly trusted TLS certificate for that exact hostname.
+- Your own Dauntless 1.12.0 Windows installation.
+- A complete Dumper-7 CppSDK generated from that installation.
+- Complete backend and director game-data payloads generated from the same build.
 
-From an ordinary PowerShell prompt at the repository root:
+Official prerequisite references:
 
-    powershell -ExecutionPolicy Bypass -File scripts\configure-selfhost.ps1 -PublicHost paradox.example.net -GameServerBinaryPath D:\Dauntless\Archon\Binaries\Win64\Dauntless-Win64-Shipping.exe -TlsCertificatePath D:\MysticParadox\certs\fullchain.pem -TlsPrivateKeyPath D:\MysticParadox\certs\privkey.pem -GameServerPublicAddress 203.0.113.20
+- Tauri Windows prerequisites: https://v2.tauri.app/start/prerequisites/
+- Rust installation: https://www.rust-lang.org/tools/install/
+- MongoDB on Windows: https://www.mongodb.com/docs/manual/tutorial/install-mongodb-on-windows/
+- Let's Encrypt challenge types: https://letsencrypt.org/docs/challenge-types/
 
-The script:
+The C++ projects currently select the Visual Studio v145 toolset. If you use Visual Studio 2022,
+retarget both ParadoxRuntime and tools/CatalogExporter to v143 locally before building.
 
-- creates ignored ParadoxBackend and ParadoxDirector environment files;
-- generates a new 4096-bit RSA JWT key pair;
-- generates a gameserver API key and configures both services with the same value;
-- hashes the supplied executable into the launch allow-list;
-- writes the ignored runtime deployment header;
-- creates an Ed25519 runtime-update signing key under ParadoxLauncher\.secrets;
-- creates ignored launcher build settings under .selfhost.
+## 1. Prepare DNS, TLS, and firewall rules
 
-It refuses to replace existing environment files unless Force is supplied. Never commit the
-generated environment files, .selfhost directory, certificate private key, or .secrets directory.
+### DNS
 
-For a compilation-only smoke test, add UseSyntheticData. Replace the synthetic files with real
-generated data before attempting gameplay.
+Create an A or AAAA record for the public hostname and point it at the backend. Use the exact same
+hostname for:
 
-## 2. Generate the SDK and game data
+- the certificate Subject Alternative Name;
+- PublicHost passed to configure-selfhost.ps1;
+- MP_PUBLIC_HOST compiled into the runtime;
+- launcher API and runtime origins;
+- REALTIME_XMPP_ALLOWED_HOSTS.
 
-Follow GENERATING_SDK.md, then GENERATING_GAME_DATA.md.
+Changing the hostname later requires rebuilding both the runtime and launcher.
 
-The runtime needs the complete Dumper-7 CppSDK output in ParadoxRuntime. The backend and director
-need their generated JSON files under their game-data directories. Startup fails when required
-files are absent or structurally invalid.
+### TLS certificate
 
-## 3. Install and validate the Node services
+ParadoxBackend terminates TLS directly on TCP 443. Supply a PEM full chain containing the leaf and
+intermediate certificates, a PEM private key, and the passphrase if the key is encrypted.
 
-    cd ParadoxBackend
+For a launcher distributed to other players, use a publicly trusted certificate. The native launcher
+uses reqwest with WebPKI roots. Installing only a private CA in the Windows certificate store is not
+sufficient for the current launcher unless you modify and rebuild its trust configuration.
+
+DNS-01 issuance is convenient because the application does not require public port 80. The backend
+reads certificate files at startup, so restart it after renewal. Never keep the private key inside
+the repository.
+
+### Firewall and NAT
+
+| Port | Protocol | Purpose | Exposure |
+|---|---|---|---|
+| 443 | TCP | Backend HTTPS and realtime WebSocket | Public |
+| 3000 | TCP | Backend local HTTP | Private |
+| 3001 | TCP | Backend-to-Director API | Private |
+| 8780-8788 | UDP | Dynamically allocated hunts | Public |
+| 8789 | UDP | Training Dojo | Public |
+| 8790 | UDP | Ramsgate | Public |
+| 27017 | TCP | MongoDB | Private |
+
+Forward the UDP game range to the Director/game-server machine if it is behind NAT. Set
+GameServerPublicAddress to the address players can reach. Do not expose MongoDB to the Internet.
+
+## 2. Verify the game installation
+
+The expected executable is normally:
+
+    D:\Dauntless\Archon\Binaries\Win64\Dauntless-Win64-Shipping.exe
+
+Keep a clean copy. The configurator records its SHA-256 in APPROVED_EXECUTABLE_SHA256; session
+issuance fails closed if a player executable does not match.
+
+    Get-FileHash -Algorithm SHA256 -LiteralPath 'D:\Dauntless\Archon\Binaries\Win64\Dauntless-Win64-Shipping.exe'
+
+Do not commit or redistribute the executable, PAKs, generated SDK, or extracted content.
+
+## 3. Generate the Unreal SDK
+
+Follow [GENERATING_SDK.md](GENERATING_SDK.md). In summary:
+
+1. Build Dumper-7.
+2. Run your own 1.12.0 client and inject Dumper-7 into that process.
+3. Copy the complete CppSDK output into ParadoxRuntime.
+4. Confirm generated headers and all *_functions.cpp files are present.
+
+Expected layout:
+
+    ParadoxRuntime\
+      SDK\
+        ...generated headers...
+        ...generated *_functions.cpp files...
+      SDK.hpp
+      Assertions.inl
+      NameCollisions.inl
+      PropertyFixup.hpp
+      UnrealContainers.hpp
+      UtfN.hpp
+
+A header-only or partial copy is not enough. tools/CatalogExporter uses the same SDK.
+
+## 4. Generate the required game data
+
+Follow [GENERATING_GAME_DATA.md](GENERATING_GAME_DATA.md). Final required files are:
+
+Backend, under ParadoxBackend/game-data:
+
+- progression_config.json
+- slayers_path.json
+- slayers_path_definitions.json
+- ladyluck_store.json
+
+Director, under ParadoxDirector/game-data:
+
+- player_hunts_table.json
+- matchmaker_hunts_table.json
+- arena_easy_matchmaker_hunts.json
+- arena_hard_matchmaker_hunts.json
+- arena_elite_matchmaker_hunts.json
+
+Raw-to-final mapping:
+
+| Raw source | Raw destination | Generator |
+|---|---|---|
+| player_journey_nodes.jsonl | ParadoxBackend/game-data/raw | generate_slayers_path.cjs |
+| progression_config.source.json | ParadoxBackend/game-data/raw | generate_progression_config.cjs |
+| ladyluck_store.source.json | ParadoxBackend/game-data/raw | generate_ladyluck_store.cjs |
+| player_hunts.jsonl | ParadoxDirector/game-data/raw | import_hunt_tables.cjs |
+| matchmaker_hunts.jsonl | ParadoxDirector/game-data/raw | import_hunt_tables.cjs |
+
+Validate first without --apply, then write the results:
+
+    Set-Location ParadoxBackend
+    npm run generate:slayers-path
+    npm run generate:progression-config
+    npm run generate:ladyluck-store
+    node scripts/generate_slayers_path.cjs --apply
+    node scripts/generate_progression_config.cjs --apply
+    node scripts/generate_ladyluck_store.cjs --apply
+
+    Set-Location ..\ParadoxDirector
+    npm run generate:hunt-tables
+    node scripts/import_hunt_tables.cjs --apply
+
+Important limitations:
+
+- progression_config.source.json must contain the expected payload.paths response shape.
+- ladyluck_store.source.json must be a JSON array.
+- EXPORT_PROGRESSION and EXPORT_DROP_TABLES provide extraction material; they do not necessarily
+  manufacture the final source payload automatically.
+- slayers_path_definitions.json has no checked-in one-command generator. Preserve or assemble the
+  matching definitions payload from your own compatible environment.
+- Some tables stream only after reaching the relevant UI or Ramsgate. A fresh environment may need
+  captures from an already working compatible local setup.
+- Synthetic *.example.json files are only compilation/startup fixtures and are not playable.
+
+Do not continue to gameplay testing until every final file exists and validates.
+
+## 5. Install MongoDB
+
+For a local service, use:
+
+    mongodb://127.0.0.1:27017
+
+For Atlas, use its TLS connection string and restrict access to the backend host. On startup the
+backend creates collections, indexes, TTL indexes, and gameserver-key records. A new installation
+does not require a separate manual migration command.
+
+Back up MongoDB before inviting players. It stores accounts, characters, inventory, loadouts,
+parties, and progression.
+
+## 6. Generate the self-host configuration
+
+From the repository root:
+
+    powershell -ExecutionPolicy Bypass -File scripts\configure-selfhost.ps1 -PublicHost paradox.example.net -GameServerBinaryPath 'D:\Dauntless\Archon\Binaries\Win64\Dauntless-Win64-Shipping.exe' -TlsCertificatePath 'D:\MysticParadoxData\certs\fullchain.pem' -TlsPrivateKeyPath 'D:\MysticParadoxData\certs\privkey.pem' -GameServerPublicAddress 203.0.113.20 -InstallDependencies
+
+The helper requires HTTPS port 443 and at least three game ports. It creates:
+
+- ParadoxBackend/.env
+- ParadoxDirector/.env
+- ParadoxLauncher/.env
+- ParadoxRuntime/deployment_config.generated.h
+- a fresh RSA JWT signing pair;
+- a shared gameserver API key;
+- a backend-only API-key hashing secret;
+- the approved executable SHA-256;
+- a runtime-update Ed25519 key under ParadoxLauncher/.secrets;
+- .selfhost/build-env.ps1;
+- .selfhost/tauri.selfhost.conf.json.
+
+These are ignored. Confirm they remain untracked:
+
+    git status --short --ignored
+
+Use -UseSyntheticData only for a non-playable build/start smoke test.
+
+> [!WARNING]
+> Do not use -Force for routine updates or certificate renewal. It replaces environment files and
+> may rotate credentials. Use it only when you intentionally want a new deployment identity and
+> understand its effect on existing sessions and keys.
+
+## 7. Review the generated settings
+
+Inspect both generated .env files locally without sharing their contents.
+
+Backend essentials:
+
+| Setting | Expected |
+|---|---|
+| AUTH_MODE | LAUNCHER |
+| ALLOW_NO_AUTH_DEV_MODE | false |
+| TARGET_CHANGELIST | 392819 |
+| MATCHMAKING_MODE | DEPLOYSERVER |
+| DEPLOYSERVER_URL | 127.0.0.1:3001 unless separated |
+| HTTPS_PORT | 443 |
+| PARADOX_CERT_PEM_PATH | Absolute full-chain path |
+| PARADOX_KEY_PEM_PATH | Absolute private-key path |
+| APPROVED_EXECUTABLE_SHA256 | Exact target executable hash |
+| REALTIME_XMPP_ENABLED | true |
+| REALTIME_XMPP_ALLOWED_HOSTS | Exact public hostname |
+
+Director essentials:
+
+| Setting | Expected |
+|---|---|
+| MY_IP | Player-reachable public or LAN address |
+| PORT_RANGE_BEGIN / END | 8780 / 8790 by default |
+| GAMESERVER_BINARY_PATH | Exact game-server executable |
+| METAGAME_API_KEY | Same raw key generated for Backend |
+| GAMESERVER_READY_TIMEOUT_MS | 30000 or a deliberate override |
+
+Set stable absolute locations as well:
+
+    # ParadoxBackend\.env
+    PARADOX_GAME_DATA_DIR=D:\MysticParadoxData\backend-game-data
+    LAUNCHER_UPDATE_ROOT=D:\MysticParadoxData\updates
+
+    # ParadoxDirector\.env
+    PARADOX_GAME_DATA_DIR=D:\MysticParadoxData\director-game-data
+    GAMESERVER_LOG_DIR=D:\MysticParadoxData\gameserver-logs
+
+Copy the final data files into those directories if you override the defaults.
+
+UPDATE_PUBLISHER_API_KEY may remain blank when artifacts are published locally with the provided
+script. Blank remote-publisher settings fail closed.
+
+## 8. Build and test the services
+
+Backend:
+
+    Set-Location ParadoxBackend
     npm ci
+    npm run build
     npm test
-    npm run build
 
-    cd ..\ParadoxDirector
+Director:
+
+    Set-Location ..\ParadoxDirector
     npm ci
     npm run build
 
-The backend reads GAMESERVER_API_KEYS from its environment, applies a domain-separated HMAC using
-API_KEY_HASH_SECRET before persistence, and accepts the matching raw METAGAME_API_KEY used by the
-director. No manual MongoDB key insertion is
-required.
+Do not run npm run test:bootstrap against the real database. That integration suite is destructive
+and requires a separate MONGODB_TEST_DB plus an explicit opt-in.
 
-## 4. Build the runtime and loader
+## 9. Build MysticParadox.dll and winmm.dll
 
 Build the runtime:
 
-    cd ParadoxRuntime
+    Set-Location ..\ParadoxRuntime
     .\_build.bat
 
-The x64 Release output is MysticParadox.dll.
+Expected output:
+
+    ParadoxRuntime\x64\Release\MysticParadox.dll
 
 Build the loader:
 
-    cd ..\tools\RuntimeLoader
+    Set-Location ..\tools\RuntimeLoader
     cargo build --release
 
-Copy these two files beside Dauntless-Win64-Shipping.exe:
+Expected output:
 
-- ParadoxRuntime\x64\Release\MysticParadox.dll
-- tools\RuntimeLoader\target\release\winmm.dll
+    tools\RuntimeLoader\target\release\winmm.dll
 
-The loader forwards calls to the real Windows winmm library and loads only
-MysticParadox.dll by default. Do not add untrusted DLLs to mystic_loader.ini.
-During the public-name migration, the launcher also maintains MystPaxInternalServer.dll with the
-same verified bytes so older launchers/loaders cannot select a stale runtime.
+Place both beside the exact game executable used by Director:
 
-## 5. Start the services
+    D:\Dauntless\Archon\Binaries\Win64\
+      Dauntless-Win64-Shipping.exe
+      MysticParadox.dll
+      winmm.dll
 
-Start MongoDB first. Then use separate PowerShell windows:
+MysticParadox.dll is the canonical public runtime name. The launcher temporarily keeps the legacy
+MystPaxInternalServer.dll alias synchronized for compatibility with older installations. Never ship
+different bytes under the two names.
 
-    cd ParadoxBackend
+The loader forwards legitimate winmm exports to the Windows system library and loads the runtime.
+Do not add untrusted DLLs to mystic_loader.ini.
+
+## 10. Publish the signed client runtime
+
+The launcher repairs the runtime from a signed manifest. Publish MysticParadox.dll and winmm.dll
+into the Backend update root before installing a client:
+
+    Set-Location ParadoxLauncher
+    node scripts/publish-runtime-update.mjs --dll ..\ParadoxRuntime\x64\Release\MysticParadox.dll --extra ..\tools\RuntimeLoader\target\release\winmm.dll --target client --version 0.1.0 --changelist 392819 --channel stable --output D:\MysticParadoxData\updates --base-url https://paradox.example.net --key .secrets\selfhost-runtime-update.private.pem
+
+Use a new semantic version whenever bytes change. Protect and back up the private signing key.
+Losing it means existing launchers cannot trust a replacement without being rebuilt.
+
+Runtime signing and Tauri launcher-update signing are separate systems.
+
+## 11. Start Backend and verify HTTPS
+
+Start MongoDB, then:
+
+    Set-Location ParadoxBackend
     npm start
 
-    cd ParadoxDirector
+Check locally and publicly:
+
+    Invoke-RestMethod http://127.0.0.1:3000/
+    Invoke-RestMethod https://paradox.example.net/
+    Invoke-RestMethod https://paradox.example.net/QoS
+    Invoke-RestMethod https://paradox.example.net/launcher/v1/status
+    Invoke-RestMethod https://paradox.example.net/launcher/v1/runtime/client/stable/windows-x86_64
+
+Expected results:
+
+- the root endpoint reports ok;
+- QoS reports pong;
+- launcher status reports online and supportedBuildChangelist 392819;
+- the runtime endpoint returns the signed manifest;
+- there is no TLS warning or hostname mismatch.
+
+Do not move on while HTTPS or the runtime manifest fails.
+
+## 12. Start Director and verify persistent worlds
+
+Confirm MysticParadox.dll and winmm.dll are beside GAMESERVER_BINARY_PATH, then:
+
+    Set-Location ParadoxDirector
     npm start
 
-The director starts Ramsgate and Training Dojo immediately. Do not start the director until the
-runtime DLL and winmm loader are beside the configured game executable.
+Director immediately starts Training Dojo and Ramsgate. Hunts use the lower portion of the range;
+with defaults, Training Dojo uses 8789 and Ramsgate uses 8790.
 
-Useful checks:
+A process existing is not enough. Wait for the exact runtime readiness marker:
 
-- GET http://127.0.0.1:3000/ returns ok.
-- GET https://your-hostname/ returns ok with no certificate warning.
-- Backend logs show one configured gameserver API key.
-- Director logs show both persistent hubs reporting ready.
-- Gameserver logs contain MYSTICPARADOX_GAMESERVER_READY.
+    MYSTICPARADOX_GAMESERVER_READY launchId=<uuid> port=<port>
 
-## 6. Build or run the launcher
+Director should then log messages equivalent to:
 
-The configuration script creates .selfhost\build-env.ps1 and a Tauri CSP overlay. Dot-source the
-environment before invoking Tauri:
+    training_dojo ready on <MY_IP>:8789
+    ramsgate ready on <MY_IP>:8790
 
+If Director logs a startup failure but remains listening on port 3001, the deployment is not ready.
+Fix the child failure before launching a player.
+
+Runtime logs appear beside the game executable as mysticparadox_dll_port*.log. Director-managed
+process logs use GAMESERVER_LOG_DIR when configured.
+
+## 13. Build and run the self-host launcher
+
+The configurator generated compile-time native settings. Dot-source them in the same PowerShell
+process used to invoke Tauri:
+
+    Set-Location <repository-root>
     . .\.selfhost\build-env.ps1
-    cd ParadoxLauncher
+    Set-Location ParadoxLauncher
     npm ci
+    npm run build
+    npm test
     npm run tauri -- dev --config ..\.selfhost\tauri.selfhost.conf.json
 
-For a packaged build, replace dev with build.
+This compiles the React/Vite assets and the native Tauri application. It binds native authentication
+and runtime downloads to your HTTPS origin and verification key.
 
-The compile-time settings bind native account requests and runtime downloads to your HTTPS origin.
-Runtime manifests must be signed by the generated Ed25519 private key. Publish both the runtime
-and loader from `ParadoxLauncher` before the first client install:
+For a packaged build, replace dev with build:
 
-    node scripts/publish-runtime-update.mjs --dll ..\ParadoxRuntime\x64\Release\MysticParadox.dll --extra ..\tools\RuntimeLoader\target\release\winmm.dll --target client --version 0.1.0 --changelist 392819 --channel stable --output ..\ParadoxBackend\updates --base-url https://your-hostname --key .secrets\selfhost-runtime-update.private.pem
+    npm run tauri -- build --config ..\.selfhost\tauri.selfhost.conf.json
 
-Use a new semantic version for each published artifact. See
-[ParadoxLauncher\UPDATE_CHANNEL.md](../ParadoxLauncher/UPDATE_CHANNEL.md) for channel and rollout
-details.
+### Configure launcher self-updates before distribution
 
-Tauri launcher updates use a separate signing system. Before distributing a packaged launcher,
-replace the updater endpoint and public key in a private Tauri configuration overlay and keep the
-matching private key outside the repository.
+The checked-in Tauri configuration contains the project-maintainer updater endpoint and public key.
+Do not distribute a custom self-host launcher that inherits those defaults.
 
-## Network and firewall
+Generate your own Tauri updater key:
 
-Default ports created by the configuration script:
+    npm run tauri signer generate -- -w .secrets\mystic-launcher.key
 
-| Port | Protocol | Purpose |
-|---|---|---|
-| 443 | TCP | Backend HTTPS and realtime WebSocket |
-| 3000 | TCP | Local backend HTTP; keep private |
-| 3001 | TCP | Backend-to-director API; keep private |
-| 8780-8790 | UDP/TCP as used by the game | Hunts, Training Dojo, and Ramsgate |
-| 27017 | TCP | MongoDB; keep private |
+Add your updater public key and HTTPS updater endpoint to an ignored Tauri overlay, then build with
+that overlay and the required signing environment. See
+[ParadoxLauncher/UPDATE_CHANNEL.md](../ParadoxLauncher/UPDATE_CHANNEL.md).
 
-Expose only HTTPS and the required game ports. Bind MongoDB, backend HTTP, and the director API to a
-trusted network or protect them with host firewall rules.
+The release:launcher and publish:launcher scripts target the repository's normal release
+configuration. Do not use them unchanged for a custom overlay. Tauri updater signatures are not
+Windows Authenticode signatures and do not by themselves establish SmartScreen reputation.
 
-## First account and administration
+## 14. First player setup
 
-The launcher registration flow creates ordinary accounts. To bootstrap an administrator after the
-account exists:
+On a player PC:
 
-    cd ParadoxBackend
-    npm run admin:bootstrap -- --email=operator@example.net --username=operator
+1. Install or run the self-host launcher.
+2. Select Create account.
+3. Use a 3-16 character alphanumeric username and a password of at least 8 characters.
+4. Sign in.
+5. Select Locate game and choose the Archon/game folder containing
+   Binaries\Win64\Dauntless-Win64-Shipping.exe.
+6. Select Repair if the launcher reports a missing or stale runtime.
+7. Confirm the supported executable and runtime are ready.
+8. Select Play.
 
-Set ADMIN_TOTP_SECRET and ADMIN_ALLOWED_ORIGINS before enabling the admin routes on a public host.
+Play refreshes policy, validates the executable and runtime, downloads any required signed runtime,
+obtains a short-lived one-time exchange code, and launches the game. Starting the executable
+directly does not obtain that code and is not the supported login path.
+
+Launcher session logs are collected under:
+
+    %LOCALAPPDATA%\MysticParadox\Logs\Sessions\<session-id>\
+
+Each session includes launcher.log, metadata.json, and copies of available runtime logs.
+
+## 15. Ramsgate acceptance test
+
+The first supported milestone is complete only when all of these are true:
+
+- MongoDB is connected and Backend has no missing-data error.
+- Public HTTPS is trusted and launcher status reports changelist 392819.
+- The signed client runtime manifest downloads successfully.
+- Director reports Training Dojo and Ramsgate ready.
+- UDP 8790 is reachable from the player network.
+- The launcher creates or signs into an account and accepts the executable hash.
+- Repair installs matching winmm.dll and MysticParadox.dll.
+- Play launches with a one-time exchange code.
+- Character login completes.
+- The player enters Ramsgate without an immediate disconnect.
+- Backend, Director, game-server, and runtime logs show no auth or readiness failure.
+
+After that, test in this order:
+
+1. Reconnect to Ramsgate.
+2. Invite, remove, and disconnect a party member.
+3. Start solo island travel.
+4. Start party island travel.
+5. Return to Ramsgate.
+6. Enter Training Dojo.
+7. Test public hunt reuse only if explicitly enabled.
+
+Use matching current Backend, Director, Runtime, and Launcher builds. The replication and
+disconnected-party fixes span multiple components.
+
+## Operations and updates
+
+### Certificate renewal
+
+Renew the full chain and key at the same paths, then restart Backend. Do not rerun the configurator
+with -Force merely to renew a certificate.
+
+### Runtime update
+
+Build MysticParadox.dll and winmm.dll, publish a new semantic version with the same protected
+runtime-signing key, verify the manifest endpoint, then test Repair and Play on one client.
+
+### Backend or Director update
+
+Back up MongoDB and ignored configuration, review source changes, run builds/tests, and restart
+Backend before Director unless release notes say otherwise.
+
+### Backups
+
+Back up:
+
+- MongoDB;
+- generated .env files;
+- TLS key and certificate history;
+- runtime and launcher signing keys;
+- the approved client checksum record;
+- generated game data from your own installation.
+
+Never publish backups or attach them unredacted to issues.
 
 ## Troubleshooting
 
-### The launcher says the runtime is missing
+### Launcher stays offline or account creation fails
 
-Confirm both winmm.dll and MysticParadox.dll are non-empty and beside the exact executable
-selected in the launcher.
+Check public DNS, certificate chain, TCP 443, /launcher/v1/status, and whether the launcher was built
+after dot-sourcing .selfhost/build-env.ps1. A browser accepting a private CA does not prove the
+native WebPKI launcher trusts it.
 
-### Game sessions are rejected
+### Runtime is missing or Repair fails
 
-Re-run the configuration script after changing the game executable. APPROVED_EXECUTABLE_SHA256 must
-match the exact 1.12.0 executable and the configured changelist must remain 392819.
+Check the manifest endpoint, artifact URLs, compiled Ed25519 public key, size, SHA-256, and
+signature. Confirm both files are beside the exact selected executable. Publish a new version
+instead of mutating an existing artifact.
 
-### Gameservers receive 401 responses
+### Session request is rejected
 
-GAMESERVER_API_KEYS in ParadoxBackend and METAGAME_API_KEY in ParadoxDirector must share one raw key.
-API_KEY_HASH_SECRET stays backend-only and must remain stable across restarts.
-The configured backend list is authoritative: restart the backend after changing it, and removed keys
-will be revoked from MongoDB.
+APPROVED_EXECUTABLE_SHA256 must match the exact player executable. Recompute it deliberately after
+a known-good binary change and restart Backend.
 
-### Solo hunts wait for another player
+### Director runs but Ramsgate is unavailable
 
-The current backend filters disconnected XMPP members and requires an ISLAND request party id to
-match the authoritative party. Confirm realtime is enabled and inspect the excluded-member warning
-in backend logs.
+Look for MYSTICPARADOX_GAMESERVER_READY and the ramsgate ready log, not merely an open Director port.
+Check GAMESERVER_BINARY_PATH, both DLLs, UDP forwarding, data files, GAMESERVER_LOG_DIR, and
+mysticparadox_dll_port*.log.
 
-### Party travel disconnects a client
+### Gameservers receive HTTP 401
 
-Use the current runtime. It blocks remote PlayerController replication before channel creation and
-preserves the native 64-bit replication-count ABI at the final channel boundary.
+GAMESERVER_API_KEYS in Backend must contain the raw METAGAME_API_KEY used by Director.
+API_KEY_HASH_SECRET is backend-only and must remain stable. Restart Backend after changing the
+authoritative key list.
 
-## Security checklist
+### TLS works locally but remote players fail
 
-Before inviting remote users:
+Confirm the hostname matches the certificate SAN, the full intermediate chain is served, public DNS
+does not resolve to a private address, and TCP 443 is forwarded. Restart Backend after certificate
+changes.
 
-- Use AUTH_MODE=LAUNCHER and keep ALLOW_NO_AUTH_DEV_MODE false.
-- Use a publicly trusted certificate or explicitly manage trust on every client.
-- Restrict MongoDB, backend HTTP, and director ports at the firewall.
-- Replace all keys generated for test deployments before production.
-- Keep runtime and launcher signing private keys offline or in a dedicated secret store.
-- Publish source for network-visible modifications as required by the AGPL.
-- Back up MongoDB and the generated environment files securely.
+### Solo hunts wait for a disconnected member
+
+Use matching current Backend and Runtime versions. Inspect XMPP/session state and warnings about
+excluded disconnected members. The requested ISLAND party id must match the authoritative party.
+
+### Party travel disconnects another client
+
+Use matching runtime bytes on clients and game servers. Repair through the launcher and confirm
+runtime hashes. The current runtime blocks remote PlayerController replication before channel
+creation and preserves the native 64-bit replication-count ABI at the final channel boundary.
+
+### Useful logs
+
+| Log | Location |
+|---|---|
+| Launcher session | %LOCALAPPDATA%\MysticParadox\Logs\Sessions\<session-id> |
+| Runtime | Beside game executable, mysticparadox_dll_port*.log |
+| Director child processes | GAMESERVER_LOG_DIR |
+| Backend and Director | Console output or service-wrapper logs |
+
+When reporting an issue, include the commit, component versions, redacted configuration, changelist,
+reproduction steps, and relevant logs. Remove tokens, account data, private infrastructure paths,
+certificate material, and every private key.
+
+## Public-host security checklist
+
+Before inviting users:
+
+- Keep AUTH_MODE=LAUNCHER and ALLOW_NO_AUTH_DEV_MODE=false.
+- Use a publicly trusted certificate for the exact public hostname.
+- Restrict MongoDB, backend HTTP, and Director ports at the firewall.
+- Keep gameserver keys, API_KEY_HASH_SECRET, JWT keys, TLS keys, and signing keys private.
+- Leave publisher upload routes fail-closed unless intentionally configured.
+- Set ADMIN_TOTP_SECRET and ADMIN_ALLOWED_ORIGINS before enabling admin access.
+- Disable diagnostic body capture unless actively debugging.
+- Load trusted DLLs only and verify the runtime manifest.
+- Back up MongoDB and signing material securely.
+- Publish corresponding source for network-visible modifications as required by AGPLv3.

@@ -89,6 +89,8 @@ See `docs/GENERATING_GAME_DATA.md`.
 - Current stable Rust, the MSVC target, Windows SDK, and Microsoft Edge WebView2 Runtime for
   `ParadoxLauncher`
 - MongoDB (local or Atlas)
+- A publicly trusted TLS certificate for the public backend hostname; the native launcher uses
+  WebPKI roots and does not inherit a private CA installed only in the Windows certificate store
 - Visual Studio Build Tools 2026 (Desktop C++ workload) with the `v145` platform toolset, for the
   C++ projects (`ParadoxRuntime`, `tools/CatalogExporter`). To build with Visual Studio 2022
   instead, retarget both `.vcxproj` files to `v143` and rebuild.
@@ -96,8 +98,10 @@ See `docs/GENERATING_GAME_DATA.md`.
 
 ## Quick start
 
-The supported source-deployment path is documented in
-[docs/SELF_HOSTING.md](docs/SELF_HOSTING.md). On Windows, the configuration helper generates fresh
+The complete source-to-Ramsgate deployment path is documented in
+[docs/SELF_HOSTING.md](docs/SELF_HOSTING.md). It covers DNS/TLS, SDK and game-data extraction,
+runtime/loader compilation, signed runtime publication, service readiness, launcher packaging, and
+the first Ramsgate acceptance test. On Windows, the configuration helper generates fresh
 JWT and runtime-signing keys, wires the backend and director gameserver key, hashes the approved
 game executable, creates the runtime host header, and prepares a self-host launcher build:
 
@@ -116,8 +120,9 @@ playable.
   together with `ALLOW_NO_AUTH_DEV_MODE=true` auto-creates/logs in arbitrary
   accounts with no verification. These are development-only switches; leave them
   unset in any real deployment.
-- The backend server terminates TLS directly. Supply a real certificate and keep
-  its passphrase out of version control (only `.env`, which is git-ignored).
+- The backend server terminates TLS directly. Use a publicly trusted certificate for a launcher
+  distributed to other PCs, and keep its private key/passphrase out of version control. A browser
+  trusting a private Windows CA does not mean the current native WebPKI launcher trusts it.
 - Admin routes (`/admin/v1`) fail closed without `ADMIN_TOTP_SECRET` and an origin
   allow-list. Publisher/update-push routes fail closed without an explicit IP
   allow-list.

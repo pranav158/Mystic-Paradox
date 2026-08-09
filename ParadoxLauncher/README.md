@@ -1,19 +1,23 @@
 # Mystic Paradox Launcher
 
-The Windows desktop launcher for Mystic Paradox. It signs players in, verifies a supported Dauntless 1.12.0 installation, installs signed project runtime updates, and launches the game with a short-lived, single-use exchange code.
+The Windows desktop launcher for Mystic Paradox. It signs players in, verifies a supported Dauntless
+1.12.0 installation, installs signed runtime updates, obtains a one-time game exchange code, and
+launches the game.
 
 > [!IMPORTANT]
-> Mystic Paradox is an unofficial community preservation project. It is not affiliated with or endorsed by Phoenix Labs, Epic Games, Forte Labs, or any Dauntless rights holder.
+> Mystic Paradox is an unofficial community preservation project. It is not affiliated with or
+> endorsed by Phoenix Labs, Epic Games, Forte Labs, or any Dauntless rights holder.
 
 ## What is included
 
-- Tauri 2 native shell with a React, TypeScript, Vite, and Tailwind frontend.
+- Tauri 2 shell with React, TypeScript, Vite, and Tailwind assets.
 - Native account authentication and Discord deep-link completion.
-- Windows Credential Manager storage with a current-user DPAPI-encrypted fallback.
+- Credential Manager storage with a current-user DPAPI-encrypted fallback.
 - Executable/runtime hashing, signed runtime downloads, and signed launcher updates.
-- Per-session game log collection with user-visible upload controls.
+- Per-session game log collection with user-controlled upload actions.
 
-This directory contains source and project-owned branding only. It does not contain the game client, game binaries, extracted game assets, runtime DLLs, private signing keys, or credentials.
+This directory contains source and project-owned branding only. It does not contain the game client,
+game binaries, extracted assets, runtime DLLs, private signing keys, or credentials.
 
 ## Supported target
 
@@ -21,65 +25,119 @@ This directory contains source and project-owned branding only. It does not cont
 |---|---|
 | Operating system | Windows x64 |
 | Game version | Dauntless 1.12.0 |
-| Changelist | `392819` |
+| Changelist | 392819 |
 | Desktop stack | Tauri 2 / Rust / WebView2 |
 
 ## Prerequisites
 
-- Node.js 20+ and npm
-- Current stable Rust with the MSVC target
-- Visual Studio C++ Build Tools and Windows SDK
-- Microsoft Edge WebView2 Runtime
-- A running compatible `ParadoxBackend` for sign-in and session issuance
+- Node.js 20+ and npm.
+- Current stable Rust with the MSVC target.
+- Visual Studio C++ Build Tools and a Windows SDK.
+- Microsoft Edge WebView2 Runtime.
+- A running compatible ParadoxBackend.
+- A publicly trusted HTTPS certificate for a launcher distributed to other PCs.
 
-## Development
+The native client uses reqwest with WebPKI roots. A private CA installed only in the Windows
+certificate store is not trusted by the current build unless native trust handling is changed.
+
+## Local development
 
 From the repository root:
 
-```powershell
-cd ParadoxLauncher
-Copy-Item .env.example .env
-npm ci
-npm run tauri dev
-```
+    Set-Location ParadoxLauncher
+    Copy-Item .env.example .env
+    npm ci
+    npm run tauri dev
 
-Debug native requests default to `http://127.0.0.1:3000`. The frontend status/username requests use `VITE_API_BASE_URL` from `.env`. Set `MYSTPAX_API_BASE_URL` in the build environment to override the native Rust API origin:
+Debug native requests default to http://127.0.0.1:3000. Frontend status requests use
+VITE_API_BASE_URL. MYSTPAX_API_BASE_URL overrides the native Rust API origin at compile time.
 
-```powershell
-$env:MYSTPAX_API_BASE_URL = "https://your-backend.example"
-npm run tauri dev
-```
+## Self-host build
 
-A custom backend origin must also be allowed by `app.security.csp`. Self-host builds can set
-`MYSTPAX_RUNTIME_ENDPOINT` and `MYSTPAX_RUNTIME_PUBLIC_KEY_B64` at compile time to bind runtime
-downloads to their own HTTPS origin and Ed25519 verification key. The root
-[self-hosting guide](../docs/SELF_HOSTING.md) generates these settings and a private Tauri CSP
-overlay without requiring source edits. Launcher updater signing uses a separate key and endpoint;
-configure both before publishing a custom channel.
+Use [docs/SELF_HOSTING.md](../docs/SELF_HOSTING.md) for the full source-to-Ramsgate flow. The root
+configurator generates:
+
+- ParadoxLauncher/.env with the frontend API origin;
+- .selfhost/build-env.ps1 with MYSTPAX_API_BASE_URL, MYSTPAX_RUNTIME_ENDPOINT, and
+  MYSTPAX_RUNTIME_PUBLIC_KEY_B64;
+- .selfhost/tauri.selfhost.conf.json with a CSP for the custom origin;
+- an Ed25519 runtime-update signing pair under the ignored .secrets directory.
+
+Dot-source the environment in the same PowerShell used for Tauri:
+
+    Set-Location <repository-root>
+    . .\.selfhost\build-env.ps1
+    Set-Location ParadoxLauncher
+    npm ci
+    npm run build
+    npm test
+    npm run tauri -- dev --config ..\.selfhost\tauri.selfhost.conf.json
+
+For a packaged build:
+
+    npm run tauri -- build --config ..\.selfhost\tauri.selfhost.conf.json
+
+This compiles both the React/Vite assets and the native Tauri application.
+
+## Runtime updates versus launcher updates
+
+Runtime updates distribute MysticParadox.dll and winmm.dll. They are signed with the Ed25519 key
+generated by configure-selfhost.ps1 and served by ParadoxBackend.
+
+Launcher self-updates use Tauri's separate updater key and endpoint. The checked-in Tauri
+configuration contains the project-maintainer channel. A self-host operator must put their own
+updater public key and HTTPS endpoint in an ignored overlay before distributing a custom launcher.
+
+Generate a Tauri updater key with:
+
+    npm run tauri signer generate -- -w .secrets\mystic-launcher.key
+
+See [UPDATE_CHANNEL.md](UPDATE_CHANNEL.md) for artifact details. The release:launcher and
+publish:launcher scripts use the repository's normal release configuration; do not run them
+unchanged for a custom self-host overlay.
+
+Tauri signing authenticates updater artifacts. It is separate from Windows Authenticode signing and
+does not by itself establish SmartScreen reputation.
+
+## First player flow
+
+1. Create an account using a 3-16 character alphanumeric username and password of at least 8
+   characters.
+2. Sign in.
+3. Locate the Archon/game folder containing Binaries\Win64\Dauntless-Win64-Shipping.exe.
+4. Select Repair if runtime files are missing or stale.
+5. Select Play.
+
+Play performs a final policy refresh, verifies the executable and runtime, obtains a short-lived
+single-use exchange code, and launches the client. Directly running the game executable bypasses
+that exchange and is not the supported authentication flow.
+
+Session logs are stored under:
+
+    %LOCALAPPDATA%\MysticParadox\Logs\Sessions\<session-id>\
 
 ## Build and test
 
-```powershell
-npm ci
-npm run build
-npm test
-npm run tauri build
-```
+    npm ci
+    npm run build
+    npm test
+    npm run tauri build
 
-The unsigned development build does not require release keys. Official updater artifacts are signed separately; see [UPDATE_CHANNEL.md](UPDATE_CHANNEL.md).
-
+The unsigned development build does not require release signing keys.
 
 ## Security model
 
-- Passwords and refresh tokens remain in the native layer; the webview receives account metadata only.
-- The desktop launcher stores refresh tokens in Credential Manager and a DPAPI-encrypted fallback.
-- Runtime downloads are restricted to the configured HTTPS origin and verified by size, SHA-256, and Ed25519 signature before replacement.
+- Passwords and refresh tokens remain in the native layer; the webview receives account metadata.
+- Refresh tokens use Credential Manager and a DPAPI-encrypted fallback.
+- Runtime downloads are restricted to the compiled HTTPS origin and verified by size, SHA-256, and
+  Ed25519 signature before replacement.
 - Launcher updates are verified by Tauri's updater signature.
 - One-time game exchange codes are short-lived and are not printed to logs.
-- Local signing material belongs only in `.secrets/`, which is ignored by both this directory and the repository root.
+- Signing material belongs only in ignored .secrets directories.
 
 Report vulnerabilities according to [SECURITY.md](../SECURITY.md).
 
 ## License
 
-Licensed under the GNU Affero General Public License v3.0 only. See [LICENSE](../LICENSE), [NOTICE.md](../NOTICE.md), and [ADDITIONAL_TERMS.md](../ADDITIONAL_TERMS.md).
+Licensed under GNU Affero General Public License v3.0 only. See [LICENSE](../LICENSE),
+[NOTICE.md](../NOTICE.md), and [ADDITIONAL_TERMS.md](../ADDITIONAL_TERMS.md).
