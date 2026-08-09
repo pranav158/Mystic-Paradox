@@ -34,10 +34,9 @@ const INSTANCE_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const INSTANCE_ID_LENGTH = 26;
 
 export function GenerateStarterInstanceId(): string {
-    const Bytes = crypto.randomBytes(INSTANCE_ID_LENGTH);
     let Id = "";
     for (let i = 0; i < INSTANCE_ID_LENGTH; i++) {
-        Id += INSTANCE_ID_ALPHABET[Bytes[i] % INSTANCE_ID_ALPHABET.length];
+        Id += INSTANCE_ID_ALPHABET[crypto.randomInt(INSTANCE_ID_ALPHABET.length)];
     }
     return Id;
 }

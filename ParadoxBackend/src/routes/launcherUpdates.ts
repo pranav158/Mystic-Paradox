@@ -70,7 +70,7 @@ const runtimeDownloadRateLimiter = rateLimit({
 
 
 
-const SERVING_FLAG_PATH = path.join(UPDATE_ROOT, "serving.json");
+const SERVING_FLAG_PATH = updatePath("serving.json");
 function isRuntimeServingEnabled(): boolean {
     try {
         const parsed = JSON.parse(fs.readFileSync(SERVING_FLAG_PATH, "utf8")) as { runtimeEnabled?: boolean };
@@ -86,11 +86,35 @@ function setRuntimeServingEnabled(enabled: boolean): void {
 
 export const launcherUpdatesRouter = Router();
 
-function segment(value: string, label: string): string {
-    if (!/^[A-Za-z0-9._-]+$/.test(value) || value === "." || value === "..") {
+export function segment(value: unknown, label: string): string {
+    if (typeof value !== "string") {
         throw new Error(`Invalid ${label}`);
     }
-    return value;
+
+    const safe = path.basename(value);
+    if (
+        safe !== value
+        || !/^[A-Za-z0-9._-]+$/.test(safe)
+        || safe === "."
+        || safe === ".."
+    ) {
+        throw new Error(`Invalid ${label}`);
+    }
+    return safe;
+}
+
+function updatePath(...segments: unknown[]): string {
+    const safeSegments = segments.map((value, index) => segment(value, `path segment ${index + 1}`));
+    const resolved = path.resolve(UPDATE_ROOT, ...safeSegments);
+    const relative = path.relative(UPDATE_ROOT, resolved);
+    if (
+        relative === ".."
+        || relative.startsWith(`..${path.sep}`)
+        || path.isAbsolute(relative)
+    ) {
+        throw new Error("Update path escapes LAUNCHER_UPDATE_ROOT");
+    }
+    return resolved;
 }
 
 function readJson(file: string): Record<string, unknown> | undefined {
@@ -102,7 +126,7 @@ function readJson(file: string): Record<string, unknown> | undefined {
 }
 
 function runtimeManifestPath(target: string, channel: string, platform: string): string {
-    return path.join(UPDATE_ROOT, "runtime", segment(target, "target"), segment(channel, "channel"), segment(platform, "platform"), "latest.json");
+    return updatePath("runtime", target, channel, platform, "latest.json");
 }
 
 function serveRuntimeManifest(target: string, channel: string, platform: string, res: Response): void {
@@ -138,7 +162,7 @@ function serveRuntimeDownload(target: string, channel: string, platform: string,
             res.sendStatus(404);
             return;
         }
-        const artifact = path.join(UPDATE_ROOT, "runtime", safeTarget, safeChannel, safePlatform, version, file);
+        const artifact = updatePath("runtime", safeTarget, safeChannel, safePlatform, version, file);
         if (!fs.existsSync(artifact)) {
             res.sendStatus(404);
             return;
@@ -153,22 +177,40 @@ function serveRuntimeDownload(target: string, channel: string, platform: string,
 }
 
 launcherUpdatesRouter.get("/launcher/v1/runtime/:target/:channel/:platform", (req, res) => {
-    if (!RUNTIME_TARGETS.has(req.params.target)) { res.sendStatus(400); return; }
-    serveRuntimeManifest(req.params.target, req.params.channel, req.params.platform, res);
+    try {
+        const target = segment(req.params.target, "target");
+        if (!RUNTIME_TARGETS.has(target)) { res.sendStatus(400); return; }
+        serveRuntimeManifest(target, segment(req.params.channel, "channel"), segment(req.params.platform, "platform"), res);
+    } catch {
+        res.sendStatus(400);
+    }
 });
 
 
 launcherUpdatesRouter.get("/launcher/v1/runtime/:channel/:platform", (req, res) => {
-    serveRuntimeManifest("client", req.params.channel, req.params.platform, res);
+    try {
+        serveRuntimeManifest("client", segment(req.params.channel, "channel"), segment(req.params.platform, "platform"), res);
+    } catch {
+        res.sendStatus(400);
+    }
 });
 
 launcherUpdatesRouter.get("/launcher/v1/runtime/:target/:channel/:platform/download", (req, res) => {
-    if (!RUNTIME_TARGETS.has(req.params.target)) { res.sendStatus(400); return; }
-    serveRuntimeDownload(req.params.target, req.params.channel, req.params.platform, res);
+    try {
+        const target = segment(req.params.target, "target");
+        if (!RUNTIME_TARGETS.has(target)) { res.sendStatus(400); return; }
+        serveRuntimeDownload(target, segment(req.params.channel, "channel"), segment(req.params.platform, "platform"), res);
+    } catch {
+        res.sendStatus(400);
+    }
 });
 
 launcherUpdatesRouter.get("/launcher/v1/runtime/:channel/:platform/download", (req, res) => {
-    serveRuntimeDownload("client", req.params.channel, req.params.platform, res);
+    try {
+        serveRuntimeDownload("client", segment(req.params.channel, "channel"), segment(req.params.platform, "platform"), res);
+    } catch {
+        res.sendStatus(400);
+    }
 });
 
 launcherUpdatesRouter.post(
@@ -188,13 +230,16 @@ launcherUpdatesRouter.post(
             res.status(401).json({ error: "Invalid update publisher credentials." });
             return;
         }
-        const target = String(req.params.target);
-        const channel = String(req.params.channel);
-        const platform = String(req.params.platform);
+        let target: string, channel: string, platform: string;
+        try {
+            target = segment(req.params.target, "target");
+            channel = segment(req.params.channel, "channel");
+            platform = segment(req.params.platform, "platform");
+        } catch { res.status(400).json({ error: "Invalid runtime update metadata." }); return; }
         const version = req.header("x-update-version") ?? "";
         const changelist = Number(req.header("x-update-changelist"));
         const signatureText = req.header("x-update-signature") ?? "";
-        if (!RUNTIME_TARGETS.has(target) || !/^[A-Za-z0-9._-]+$/.test(channel) || platform !== "windows-x86_64" ||
+        if (!RUNTIME_TARGETS.has(target) || platform !== "windows-x86_64" ||
             !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) || changelist !== 392819 || !Buffer.isBuffer(req.body)) {
             res.status(400).json({ error: "Invalid runtime update metadata." });
             return;
@@ -212,9 +257,9 @@ launcherUpdatesRouter.post(
         }
         const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
         const artifactName = `ParadoxRuntime-${version}-${target}-392819.dll`;
-        const artifactDir = path.join(UPDATE_ROOT, "runtime", target, channel, platform, version);
+        const artifactDir = updatePath("runtime", target, channel, platform, version);
         fs.mkdirSync(artifactDir, { recursive: true });
-        const artifactPath = path.join(artifactDir, artifactName);
+        const artifactPath = updatePath("runtime", target, channel, platform, version, artifactName);
         if (fs.existsSync(artifactPath)) {
             res.status(409).json({ error: "That target/channel/version is already published and immutable." });
             return;
@@ -227,10 +272,10 @@ launcherUpdatesRouter.post(
             url: `${UPDATE_PUBLIC_BASE_URL}/launcher/v1/runtime/${encodeURIComponent(target)}/${encodeURIComponent(channel)}/${platform}/download`,
             extraFiles: [] as { name: string; size: number; sha256: string; signature: string; url: string }[],
         };
-        const latestDir = path.join(UPDATE_ROOT, "runtime", target, channel, platform);
+        const latestDir = updatePath("runtime", target, channel, platform);
         fs.mkdirSync(latestDir, { recursive: true });
-        fs.writeFileSync(path.join(artifactDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-        fs.writeFileSync(path.join(latestDir, "latest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+        fs.writeFileSync(updatePath("runtime", target, channel, platform, version, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+        fs.writeFileSync(updatePath("runtime", target, channel, platform, "latest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
         res.status(201).json({ target, channel, version, sha256 });
     },
 );
@@ -257,11 +302,11 @@ launcherUpdatesRouter.post(
         }
         let target: string, channel: string, platform: string, version: string, filename: string;
         try {
-            target = segment(String(req.params.target), "target");
-            channel = segment(String(req.params.channel), "channel");
-            platform = segment(String(req.params.platform), "platform");
+            target = segment(req.params.target, "target");
+            channel = segment(req.params.channel, "channel");
+            platform = segment(req.params.platform, "platform");
             version = segment(req.header("x-update-version") ?? "", "version");
-            filename = segment(path.basename(req.header("x-update-filename") ?? ""), "filename");
+            filename = segment(req.header("x-update-filename") ?? "", "filename");
         } catch { res.status(400).json({ error: "Invalid extra-file metadata." }); return; }
         if (!RUNTIME_TARGETS.has(target) || platform !== "windows-x86_64" || !filename.toLowerCase().endsWith(".dll")) {
             res.status(400).json({ error: "Invalid extra-file target/platform/name." }); return;
@@ -275,14 +320,14 @@ launcherUpdatesRouter.post(
         if (signature.length !== 64 || !crypto.verify(null, bytes, RUNTIME_PUBLIC_KEY, signature)) {
             res.status(400).json({ error: "Extra file signature verification failed." }); return;
         }
-        const versionDir = path.join(UPDATE_ROOT, "runtime", target, channel, platform, version);
+        const versionDir = updatePath("runtime", target, channel, platform, version);
         const latestPath = runtimeManifestPath(target, channel, platform);
         const manifest = readJson(latestPath) as any;
         if (!fs.existsSync(versionDir) || !manifest || manifest.version !== version) {
             res.status(409).json({ error: "Publish the main runtime DLL for this version first." }); return;
         }
         const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
-        fs.writeFileSync(path.join(versionDir, filename), bytes);
+        fs.writeFileSync(updatePath("runtime", target, channel, platform, version, filename), bytes);
         const extra = {
             name: filename, size: bytes.length, sha256, signature: signature.toString("base64"),
             url: `${UPDATE_PUBLIC_BASE_URL}/launcher/v1/runtime/${encodeURIComponent(target)}/${encodeURIComponent(channel)}/${platform}/extra/${encodeURIComponent(filename)}`,
@@ -290,7 +335,7 @@ launcherUpdatesRouter.post(
         const extras = Array.isArray(manifest.extraFiles) ? manifest.extraFiles.filter((e: any) => e && e.name !== filename) : [];
         extras.push(extra);
         manifest.extraFiles = extras;
-        fs.writeFileSync(path.join(versionDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+        fs.writeFileSync(updatePath("runtime", target, channel, platform, version, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
         fs.writeFileSync(latestPath, `${JSON.stringify(manifest, null, 2)}\n`);
         res.status(201).json({ name: filename, sha256, size: bytes.length });
     },
@@ -298,18 +343,18 @@ launcherUpdatesRouter.post(
 
 
 launcherUpdatesRouter.get("/launcher/v1/runtime/:target/:channel/:platform/extra/:filename", runtimeDownloadRateLimiter, (req, res) => {
-    if (!RUNTIME_TARGETS.has(req.params.target)) { res.sendStatus(400); return; }
     try {
         const target = segment(req.params.target, "target");
+        if (!RUNTIME_TARGETS.has(target)) { res.sendStatus(400); return; }
         const channel = segment(req.params.channel, "channel");
         const platform = segment(req.params.platform, "platform");
-        const filename = segment(path.basename(req.params.filename), "filename");
+        const filename = segment(req.params.filename, "filename");
         const manifest = readJson(runtimeManifestPath(target, channel, platform)) as any;
         const version = typeof manifest?.version === "string" ? segment(manifest.version, "version") : undefined;
         const extras = Array.isArray(manifest?.extraFiles) ? manifest.extraFiles : [];
         const known = extras.find((e: any) => e && e.name === filename);
         if (!version || !known) { res.sendStatus(404); return; }
-        const artifact = path.join(UPDATE_ROOT, "runtime", target, channel, platform, version, filename);
+        const artifact = updatePath("runtime", target, channel, platform, version, filename);
         if (!fs.existsSync(artifact)) { res.sendStatus(404); return; }
         res.setHeader("Content-Type", "application/octet-stream");
         res.setHeader("Content-Length", fs.statSync(artifact).size);
@@ -356,14 +401,14 @@ launcherUpdatesRouter.get("/launcher/v1/updates/:target/:arch/download", runtime
     try {
         const target = segment(req.params.target, "target");
         const arch = segment(req.params.arch, "architecture");
-        const manifest = readJson(path.join(UPDATE_ROOT, "launcher", target, arch, "latest.json"));
+        const manifest = readJson(updatePath("launcher", target, arch, "latest.json"));
         const version = typeof manifest?.version === "string" ? segment(manifest.version, "version") : undefined;
         const file = typeof manifest?.file === "string" ? path.basename(manifest.file) : undefined;
         if (!version || !file || file !== manifest?.file) {
             res.sendStatus(404);
             return;
         }
-        const artifact = path.join(UPDATE_ROOT, "launcher", target, arch, version, file);
+        const artifact = updatePath("launcher", target, arch, version, file);
         if (!fs.existsSync(artifact)) {
             res.sendStatus(404);
             return;
@@ -379,13 +424,7 @@ launcherUpdatesRouter.get("/launcher/v1/updates/:target/:arch/download", runtime
 
 launcherUpdatesRouter.get("/launcher/v1/updates/:target/:arch/:currentVersion", (req, res) => {
     try {
-        const file = path.join(
-            UPDATE_ROOT,
-            "launcher",
-            segment(req.params.target, "target"),
-            segment(req.params.arch, "architecture"),
-            "latest.json",
-        );
+        const file = updatePath("launcher", req.params.target, req.params.arch, "latest.json");
         const manifest = readJson(file);
         if (!manifest) {
             res.sendStatus(204);

@@ -13,9 +13,10 @@ import { GetRepositories } from "../persistence";
 import { ApiKeyRepository } from "../persistence/contracts/ApiKeyRepository";
 import crypto from "crypto";
 import { logger } from "../logger";
+import { HashApiKey } from "../security/apiKeyHash";
 
 function HashGameserverAPIKey(GameserverAPIKeyToHash: string){
-    return crypto.createHash("sha256").update(GameserverAPIKeyToHash, "utf8").digest("hex");
+    return HashApiKey(GameserverAPIKeyToHash, "gameserver");
 }
 
 export function ParseConfiguredGameserverAPIKeys(Value: string | undefined): string[] {

@@ -3,6 +3,7 @@ use std::path::Path;
 
 const WINMM_DLL_NAME: &str = "winmm.dll";
 const RUNTIME_DLL_NAME: &str = "MysticParadox.dll";
+const LEGACY_RUNTIME_DLL_NAME: &str = "MystPaxInternalServer.dll";
 
 pub fn hash_file_sha256(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("Couldn't read file: {e}"))?;
@@ -18,9 +19,9 @@ pub fn hash_file_sha256(path: &Path) -> Result<String, String> {
         .collect())
 }
 
-/// `winmm.dll` (the proxy that loads `MysticParadox.dll`) and the runtime DLL
-/// itself must both be present
-/// alongside the game exe. This is a presence/non-empty check, not a hash
+/// `winmm.dll` and either the canonical or legacy runtime DLL must be present
+/// alongside the game executable during the public-name migration. This is a
+/// presence/non-empty check, not a hash
 /// match — unlike the game exe (checked against the backend's approved-hash
 /// allow-list), these are project-owned files that get rebuilt far more often,
 /// so pinning them to a hash here would break on every rebuild.
@@ -28,13 +29,21 @@ pub fn verify_runtime_dlls_present(game_dir: &Path) -> Result<(), String> {
     const GENERIC_ERR: &str =
         "Runtime binaries are missing or corrupted. Repair your installation.";
 
-    for name in [WINMM_DLL_NAME, RUNTIME_DLL_NAME] {
-        let path = game_dir.join(name);
-        let metadata = std::fs::metadata(&path).map_err(|_| GENERIC_ERR.to_string())?;
+    let proxy =
+        std::fs::metadata(game_dir.join(WINMM_DLL_NAME)).map_err(|_| GENERIC_ERR.to_string())?;
+    if proxy.len() == 0 {
+        return Err(GENERIC_ERR.to_string());
+    }
 
-        if metadata.len() == 0 {
-            return Err(GENERIC_ERR.to_string());
-        }
+    let runtime_present = [RUNTIME_DLL_NAME, LEGACY_RUNTIME_DLL_NAME]
+        .iter()
+        .any(|name| {
+            std::fs::metadata(game_dir.join(name))
+                .map(|metadata| metadata.is_file() && metadata.len() > 0)
+                .unwrap_or(false)
+        });
+    if !runtime_present {
+        return Err(GENERIC_ERR.to_string());
     }
 
     Ok(())
@@ -88,6 +97,19 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(WINMM_DLL_NAME), b"content").unwrap();
         fs::write(dir.join(RUNTIME_DLL_NAME), b"content").unwrap();
+
+        assert!(verify_runtime_dlls_present(&dir).is_ok());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn accepts_the_legacy_runtime_name_during_migration() {
+        let dir =
+            std::env::temp_dir().join(format!("mystpax-dll-legacy-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(WINMM_DLL_NAME), b"content").unwrap();
+        fs::write(dir.join(LEGACY_RUNTIME_DLL_NAME), b"content").unwrap();
 
         assert!(verify_runtime_dlls_present(&dir).is_ok());
 

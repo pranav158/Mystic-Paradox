@@ -21,7 +21,6 @@ import { AssertAccountAdmitted, AssertAccountEligible, EffectiveApprovalStatus }
 
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; 
 const EXCHANGE_CODE_TTL_MS = 60 * 1000; 
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/i;
 
 
@@ -74,6 +73,35 @@ function NormalizeDisplayName(displayName: string): string {
     return displayName.trim().toLowerCase();
 }
 
+export function IsValidEmailAddress(raw: unknown): raw is string {
+    if (typeof raw !== "string" || raw.length === 0 || raw.length > 254) {
+        return false;
+    }
+
+    const at = raw.indexOf("@");
+    if (at <= 0 || at !== raw.lastIndexOf("@") || at > 64) {
+        return false;
+    }
+
+    const local = raw.slice(0, at);
+    const domain = raw.slice(at + 1);
+    if (
+        domain.length < 3
+        || domain.startsWith(".")
+        || domain.endsWith(".")
+        || !domain.includes(".")
+    ) {
+        return false;
+    }
+
+    for (const char of local + domain) {
+        if (char === " " || char === "\t" || char === "\r" || char === "\n") {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 function ValidateUsername(raw: unknown): string {
     const username = typeof raw === "string" ? raw.trim() : "";
@@ -90,7 +118,7 @@ function ValidateUsername(raw: unknown): string {
 }
 
 function ValidateRegistrationInput(email: string, password: string): void {
-    if (typeof email !== "string" || !EMAIL_PATTERN.test(email)) {
+    if (!IsValidEmailAddress(email)) {
         throw new LauncherApiError("AUTH_VALIDATION_FAILED", "Enter a valid email address.");
     }
 
