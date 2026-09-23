@@ -7,6 +7,31 @@ The project is based on the open-source Undaunted server and is being adapted fr
 > [!IMPORTANT]
 > Mystic Paradox is an unofficial, community-developed preservation project. It is not affiliated with, endorsed by, or sponsored by Phoenix Labs, Epic Games, Forte Labs, or any current or former Dauntless rights holder.
 
+> [!CAUTION]
+> ## Frequently Asked Questions
+>
+> Here are some clarifications in response to questions I frequently receive about the project.
+>
+> **1. Can you add the game files and generated SDK files to the repository?**
+>
+> No. The game files and generated SDK files contain intellectual property belonging to Phoenix Labs and/or Forte Labs. I cannot upload, distribute, or provide them. You must obtain the required game files lawfully and generate the SDK from your own compatible installation by following the project documentation.
+>
+> **2. Why is development paused? Have you stopped working on the project?**
+>
+> No, I have not abandoned the project. Development is currently slow because my job and personal schedule leave me with limited time to work on it.
+>
+> **3. How can I test the project, help with development, or discuss it with you? What is your Reddit or other social media?**
+>
+> For bug reports, feature requests, testing feedback, or other project-related topics, you can create an issue on GitHub.
+>
+> I do not provide project support or hold project discussions through Reddit. You can also add me on Discord: `uwumystic`.
+>
+> Please include a short note with your friend request explaining why you are contacting me. This helps me identify project-related requests and separate them from unrelated ones.
+>
+> **4. When will a public server or launcher be available?**
+>
+> There is currently no planned release date. Work is still in progress. In the meantime, you can self-host the project to play with friends or operate your own public server.
+
 ## Project status
 
 Mystic Paradox is an alpha preservation server for Dauntless 1.12.0. The source tree now includes
