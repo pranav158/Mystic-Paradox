@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/banner.webp" alt="Mystic Paradox — open-source Dauntless server project" width="100%">
+</p>
+
 # Mystic Paradox
 
 Mystic Paradox is a community preservation project working to restore local and private-server functionality for the discontinued monster-hunting game Dauntless.
