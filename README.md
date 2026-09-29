@@ -6,7 +6,7 @@
 
 Mystic Paradox is a community preservation project working to restore local and private-server functionality for the discontinued monster-hunting game Dauntless.
 
-The project is based on the open-source Undaunted server and is being adapted from Dauntless 1.4.4 to Dauntless 1.12.0. It provides the backend, deployment, and runtime compatibility pieces needed to connect a supported game client to a privately operated server.
+The project is based on the open-source Undaunted server and was adapted from Dauntless 1.4.4 to Dauntless 1.12.0; a port to the final Dauntless release, 1.14.7, is in progress. It provides the backend, deployment, and runtime compatibility pieces needed to connect a supported game client to a privately operated server.
 
 > [!IMPORTANT]
 > Mystic Paradox is an unofficial, community-developed preservation project. It is not affiliated with, endorsed by, or sponsored by Phoenix Labs, Epic Games, Forte Labs, or any current or former Dauntless rights holder.
@@ -65,15 +65,16 @@ remote PlayerController replication before it can disconnect another party membe
 
 ## Supported game version
 
-| Property | Value |
-|---|---|
-| Game version | Dauntless 1.12.0 |
-| Build label | `rel-1.12.0-Archon` |
-| Changelist | `392819` |
-| Unreal Engine | `4.26.2` |
-| Platform | Windows x64 |
+| Property | Supported | In progress |
+|---|---|---|
+| Game version | Dauntless 1.12.0 | Dauntless 1.14.7 |
+| Build label | `rel-1.12.0-Archon` | `rel-1.14.7-Archon` |
+| Changelist | `392819` | `647472` |
+| Unreal Engine | `4.26.2` | `4.26.2` |
+| Platform | Windows x64 | Windows x64 |
 
-Other versions are not expected to work unless explicitly documented.
+The source in this repository targets 1.12.0. The 1.14.7 port is developed separately and is not
+usable from this tree yet. Other versions are not expected to work unless explicitly documented.
 
 ## What is NOT included (you must supply your own)
 
