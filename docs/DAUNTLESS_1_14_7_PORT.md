@@ -27,6 +27,35 @@ is usable.
 4. **Backend data from the new client.** Catalog, progression, store and hunt tables are regenerated
    from the 1.14.7 installation with `tools/CatalogExporter`; the 1.12.0 tables are not reused.
 
+## Progress
+
+### Social hubs: replication and client arrival (5 October 2026)
+
+Clients could connect to a 1.14.7 hub (Ramsgate, Training Grounds) but never finished joining: they
+timed out with "Loading timeout while joining the server" because they never received the game
+state or their own player state.
+
+- **Cause:** the game's replication graph queues actors that are only relevant to their owner in a
+  pending list, and only its `ServerReplicateActors` entry point drains it. Nothing called that entry
+  point on a 1.14.7 dedicated hub, so those actors never left the graph.
+- **Fix:** the runtime drives the replication graph's `ServerReplicateActors` once per server frame.
+- **Result:** clients receive the game state and player state, the possession chain completes, and
+  players arrive in Ramsgate and can move, interact and travel to the Training Grounds and back.
+
+### The hub's local player
+
+The 1.14.7 hub process runs in listen-server mode at map load and spawns a local player with no
+network connection. The 1.12.0 patches that prevented this stop the 1.14.7 boot, so the local player
+is tolerated and kept away from clients: its controller, player state and pawn are removed from the
+replication graph before their replication flags are cleared (the order matters; clearing the flags
+first routes the removal to the wrong graph node).
+
+### Player data
+
+A daily-bounty component on 1.14.7 drafts automatically and needs a draft token that 1.12.0 never
+required. Without it, that component never finished loading and the 60-second player-data timeout
+disconnected the player. The backend now seeds the token for new accounts and repairs existing ones.
+
 ## Lessons so far
 
 - A stale address rarely fails where it is called. Calling into the middle of an instruction in the
