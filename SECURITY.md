@@ -20,6 +20,9 @@ These paths are enforced by `.gitignore`, but the rule is the source of truth â€
 - Update-push routes fail closed without an explicit IP allow-list.
 - The server terminates TLS directly â€” supply your own certificate and keep its passphrase in
   `.env` only.
+- Use a **publicly trusted** certificate for a launcher you give to other PCs. The native launcher
+  checks WebPKI roots, so a private CA trusted only by the Windows certificate store (and your
+  browser) is not enough.
 
 ## Reporting a vulnerability
 

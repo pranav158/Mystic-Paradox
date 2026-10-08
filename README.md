@@ -2,205 +2,96 @@
   <img src="docs/assets/banner.webp" alt="Mystic Paradox — open-source Dauntless server project" width="100%">
 </p>
 
-# Mystic Paradox
+<h1 align="center">Mystic Paradox</h1>
 
-Mystic Paradox is a community preservation project working to restore local and private-server functionality for the discontinued monster-hunting game Dauntless.
+<p align="center">
+  <b>Open-source private server for Dauntless</b> — backend, game-server orchestration, launcher and runtime
+  compatibility layer, so you can run the game on a server of your own.
+</p>
 
-The project is based on the open-source Undaunted server and was adapted from Dauntless 1.4.4 to Dauntless 1.12.0; a port to the final Dauntless release, 1.14.7, is in progress. It provides the backend, deployment, and runtime compatibility pieces needed to connect a supported game client to a privately operated server.
+<p align="center">
+  <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-blue"></a>
+  <img alt="Dauntless 1.12.0 supported" src="https://img.shields.io/badge/Dauntless-1.12.0%20supported-2ea44f">
+  <a href="docs/DAUNTLESS_1_14_7_PORT.md"><img alt="Dauntless 1.14.7 in progress" src="https://img.shields.io/badge/Dauntless-1.14.7%20in%20progress-orange"></a>
+  <img alt="Platform: Windows x64" src="https://img.shields.io/badge/platform-Windows%20x64-lightgrey">
+  <img alt="Discord: uwumystic" src="https://img.shields.io/badge/Discord-uwumystic-5865F2?logo=discord&logoColor=white">
+</p>
+
+<p align="center">
+  <a href="#-get-started">Get started</a> ·
+  <a href="#-documentation">Docs</a> ·
+  <a href="docs/FAQ.md">FAQ</a> ·
+  <a href="#-community-and-help">Community</a> ·
+  <a href="docs/DAUNTLESS_1_14_7_PORT.md">1.14.7 progress</a>
+</p>
 
 > [!IMPORTANT]
-> Mystic Paradox is an unofficial, community-developed preservation project. It is not affiliated with, endorsed by, or sponsored by Phoenix Labs, Epic Games, Forte Labs, or any current or former Dauntless rights holder.
+> Unofficial and community-developed. Not affiliated with, endorsed by, or sponsored by Phoenix Labs,
+> Epic Games, Forte Labs, or any current or former Dauntless rights holder. This repository ships
+> **source code only** — no game files, SDK or game data.
 
-> [!CAUTION]
-> ## Frequently Asked Questions
->
-> Here are some clarifications in response to questions I frequently receive about the project.
->
-> **1. Can you add the game files and generated SDK files to the repository?**
->
-> No. The game files and generated SDK files contain intellectual property belonging to Phoenix Labs and/or Forte Labs. I cannot upload, distribute, or provide them. You must obtain the required game files lawfully and generate the SDK from your own compatible installation by following the project documentation.
->
-> **2. Why is development paused? Have you stopped working on the project?**
->
-> No, I have not abandoned the project. Development is currently slow because my job and personal schedule leave me with limited time to work on it.
->
-> **3. How can I test the project, help with development, or discuss it with you? What is your Reddit or other social media?**
->
-> For bug reports, feature requests, testing feedback, or other project-related topics, you can create an issue on GitHub.
->
-> I do not provide project support or hold project discussions through Reddit. You can also add me on Discord: `uwumystic`.
->
-> Please include a short note with your friend request explaining why you are contacting me. This helps me identify project-related requests and separate them from unrelated ones.
->
-> **4. When will a public server or launcher be available?**
->
-> There is currently no planned release date. Work is still in progress. In the meantime, you can self-host the project to play with friends or operate your own public server.
+## 📊 Status
 
-## Project status
+| Game version | State |
+|---|---|
+| **Dauntless 1.12.0** (CL `392819`) | ✅ Supported by this source tree — alpha, self-hostable |
+| **Dauntless 1.14.7** (CL `647472`) | 🚧 Port in progress: hubs, arrival and dedicated hunts work — [progress notes](docs/DAUNTLESS_1_14_7_PORT.md) |
 
-Mystic Paradox is an alpha preservation server for Dauntless 1.12.0. The source tree now includes
-a reproducible Windows self-host configuration path, the runtime loader, backend/director
-authentication wiring, and regression tests for party travel. Gameplay coverage is still incomplete
-and operators should expect active development rather than production-grade uptime.
+Expect active development, not production-grade uptime.
 
-Recent stability work prevents disconnected party members from holding solo travel open and blocks
-remote PlayerController replication before it can disconnect another party member during travel.
+## 🚀 Get started
 
-**Dauntless 1.14.7:** the port reaches a playable loop on dedicated servers — players arrive in
-Ramsgate, visit the Training Grounds, and complete a dedicated hunt and return. Reward persistence
-and player-hosted hunts are not verified yet. Progress and known issues:
-[docs/DAUNTLESS_1_14_7_PORT.md](docs/DAUNTLESS_1_14_7_PORT.md).
+1. **Read the [FAQ](docs/FAQ.md)** — what the project is, what it isn't, and where to get help.
+2. **Generate the SDK** from your own 1.12.0 install — [Generating the SDK](docs/GENERATING_SDK.md).
+3. **Generate the game data** from the same install — [Generating game data](docs/GENERATING_GAME_DATA.md).
+4. **Deploy and play** — [Self-hosting](docs/SELF_HOSTING.md) walks from source to Ramsgate:
+   prerequisites, DNS/TLS, services, launcher and the first acceptance test.
 
-## Components
+## 📚 Documentation
 
-- **ParadoxBackend** — account and metagame backend (login, EOS, character, inventory,
-  loadout, progression, store, matchmaking, party, guild), Node/TypeScript, backed by
-  MongoDB.
-- **ParadoxDirector** — game-server deployment service; spawns and supervises dedicated
-  gameserver processes for social spaces and hunts.
-- **ParadoxRuntime** — runtime compatibility layer; injected C++ DLL (server / client mode)
-  that adapts the game client and gameserver processes to the private backend and the
-  updated engine. Built with MSVC + MinHook.
-- **ParadoxLauncher** — Windows desktop launcher; authenticates players, verifies the
-  supported client, installs signed runtime updates, and issues one-time game sessions.
-- **tools/RuntimeLoader** — Apache-licensed winmm proxy source; loads the runtime at process
-  startup while forwarding multimedia calls to the real Windows system library.
-- **tools/CatalogExporter** — local exporter used to generate compatibility data from your
-  own installation.
+| Guide | What's inside |
+|---|---|
+| 🏠 [Self-hosting](docs/SELF_HOSTING.md) | Full deployment: prerequisites, configuration helper, ports, validation, troubleshooting |
+| 🧩 [Generating the SDK](docs/GENERATING_SDK.md) | Dumping the Unreal SDK with Dumper-7 and building the C++ projects |
+| 📦 [Generating game data](docs/GENERATING_GAME_DATA.md) | Exporting the catalogue and tables from your install |
+| 🔭 [1.14.7 port](docs/DAUNTLESS_1_14_7_PORT.md) | Progress, findings and open issues for the final game release |
+| ❓ [FAQ](docs/FAQ.md) | Common questions, support and contact |
+| ⚖️ [Scope and legal](docs/SCOPE_AND_LEGAL.md) | What isn't included, responsible use, license details |
+| 🔒 [Security](SECURITY.md) | Safe configuration and how to report a vulnerability |
+| 🖥️ [Launcher](ParadoxLauncher/README.md) · [Update channel](ParadoxLauncher/UPDATE_CHANNEL.md) | Building, signing and publishing the launcher and runtime |
 
-## Supported game version
+## 🗂️ Repository layout
 
-| Property | Supported | In progress |
-|---|---|---|
-| Game version | Dauntless 1.12.0 | Dauntless 1.14.7 |
-| Build label | `rel-1.12.0-Archon` | `rel-1.14.7-Archon` |
-| Changelist | `392819` | `647472` |
-| Unreal Engine | `4.26.2` | `4.26.2` |
-| Platform | Windows x64 | Windows x64 |
+| Folder | What it is |
+|---|---|
+| [`ParadoxBackend`](ParadoxBackend) | Account and metagame backend (login, characters, inventory, progression, store, party…) — Node/TypeScript + MongoDB |
+| [`ParadoxDirector`](ParadoxDirector) | Starts and supervises the dedicated game servers for hubs and hunts |
+| [`ParadoxRuntime`](ParadoxRuntime) | C++ DLL injected into the client and servers to adapt them to the private backend (MSVC + MinHook) |
+| [`ParadoxLauncher`](ParadoxLauncher) | Windows launcher: sign-in, install checks, signed runtime updates, game sessions (Tauri) |
+| [`tools/RuntimeLoader`](tools/RuntimeLoader) | `winmm.dll` proxy that loads the runtime at startup |
+| [`tools/CatalogExporter`](tools/CatalogExporter) | Exports compatibility data from your own installation |
 
-The source in this repository targets 1.12.0. The 1.14.7 port is developed separately and is not
-usable from this tree yet. Other versions are not expected to work unless explicitly documented.
+## 💬 Community and help
 
-## What is NOT included (you must supply your own)
+- 🐛 **Bugs, feature requests and testing feedback:** open a [GitHub issue](../../issues). Include the
+  component, commit, configuration with secrets removed, reproduction steps and logs.
+- 💬 **Discord:** add **`uwumystic`**. Please include a short note with your friend request explaining
+  why you're reaching out, so project requests don't get lost among unrelated ones.
+- 🔒 **Security problems:** report them privately — see [SECURITY.md](SECURITY.md).
 
-This repository contains **source code only**. For legal reasons it does **not**
-ship, and will never ship:
+Pull requests are welcome. Never submit game files, leaked source or secrets. Project support is not
+provided on Reddit.
 
-- The game client or any game binaries / packaged assets.
-- The generated Unreal Engine SDK (Dumper-7 output).
-- **Bulk extracted game-data tables** — progression, hunt tables, store, Slayer's Path, etc.
-  These are Phoenix Labs content; you generate them from your own installation.
-- Any credentials, TLS certificates, or private keys.
+## 📜 License and credits
 
-The Node.js services (`ParadoxBackend`, `ParadoxDirector`) **compile and test without any of the
-above** — synthetic `*.example.json` placeholders let them build and smoke-test. The C++ projects
-(`ParadoxRuntime`, `tools/CatalogExporter`) **require a locally generated Dumper-7 SDK** from your
-own compatible installation; they do not build from a fresh clone alone. Real game data must be
-generated locally in all cases.
+[AGPL-3.0-only](LICENSE), with additional terms in [ADDITIONAL_TERMS.md](ADDITIONAL_TERMS.md) — details in
+[Scope and legal](docs/SCOPE_AND_LEGAL.md).
 
-> **Scope of this claim.** This repository does not distribute the game client, packaged game
-> assets, generated SDK headers, or bulk extracted game-data tables. It does necessarily contain
-> interoperability information — protocol/endpoint names, catalog identifiers, class names, and
-> engine hook offsets — as any compatibility layer must. Users must generate the required
-> compatibility data from their own lawful installation.
+- Based on **[Undaunted](https://github.com/SyST3MDeV/Undaunted)** by gwog / Gregory Morford (AGPLv3).
+- **Mystic Paradox** is a separate community project with substantial independent changes, maintained
+  by **Mystic / Pranav Karande**.
+- Development assistance: [Claude](https://www.anthropic.com/claude) (Anthropic).
 
-### Generate the SDK yourself
+Full provenance in [NOTICE.md](NOTICE.md).
 
-The injected DLL (`ParadoxRuntime`) needs a C++ SDK generated from your own copy of the game.
-See `docs/GENERATING_SDK.md`. In short: build [Dumper-7](https://github.com/Encryqed/Dumper-7),
-inject it into your running `1.12.0` process, and copy the **complete** generated `CppSDK` output
-(`SDK/`, `SDK.hpp`, `UnrealContainers.hpp`, `UtfN.hpp`, `PropertyFixup.hpp`, `NameCollisions.inl`,
-`Assertions.inl`) into `ParadoxRuntime/`. Then copy `deployment_config.generated.h.example` to
-`deployment_config.generated.h` and set `MP_PUBLIC_HOST`.
-
-### Generate the game data yourself
-
-Extract it from your own installation with `tools/CatalogExporter` and the `generate:*` scripts.
-See `docs/GENERATING_GAME_DATA.md`.
-
-## Prerequisites
-
-- Node.js 20+ and npm
-- Current stable Rust, the MSVC target, Windows SDK, and Microsoft Edge WebView2 Runtime for
-  `ParadoxLauncher`
-- MongoDB (local or Atlas)
-- A publicly trusted TLS certificate for the public backend hostname; the native launcher uses
-  WebPKI roots and does not inherit a private CA installed only in the Windows certificate store
-- Visual Studio Build Tools 2026 (Desktop C++ workload) with the `v145` platform toolset, for the
-  C++ projects (`ParadoxRuntime`, `tools/CatalogExporter`). To build with Visual Studio 2022
-  instead, retarget both `.vcxproj` files to `v143` and rebuild.
-- Your own game client for the target build + a Dumper-7 SDK (see above)
-
-## Quick start
-
-The complete source-to-Ramsgate deployment path is documented in
-[docs/SELF_HOSTING.md](docs/SELF_HOSTING.md). It covers DNS/TLS, SDK and game-data extraction,
-runtime/loader compilation, signed runtime publication, service readiness, launcher packaging, and
-the first Ramsgate acceptance test. On Windows, the configuration helper generates fresh
-JWT and runtime-signing keys, wires the backend and director gameserver key, hashes the approved
-game executable, creates the runtime host header, and prepares a self-host launcher build:
-
-    powershell -ExecutionPolicy Bypass -File scripts\configure-selfhost.ps1 -PublicHost paradox.example.net -GameServerBinaryPath D:\Dauntless\Archon\Binaries\Win64\Dauntless-Win64-Shipping.exe -TlsCertificatePath D:\certs\fullchain.pem -TlsPrivateKeyPath D:\certs\privkey.pem
-
-It does not download or generate proprietary game content. Follow
-[docs/GENERATING_SDK.md](docs/GENERATING_SDK.md) and
-[docs/GENERATING_GAME_DATA.md](docs/GENERATING_GAME_DATA.md) using your own installation.
-
-For a build-only smoke test, pass `-UseSyntheticData`. The synthetic fixtures are intentionally not
-playable.
-
-## Security notes
-
-- **Do not run with authentication disabled on a public host.** `AUTH_MODE=NONE`
-  together with `ALLOW_NO_AUTH_DEV_MODE=true` auto-creates/logs in arbitrary
-  accounts with no verification. These are development-only switches; leave them
-  unset in any real deployment.
-- The backend server terminates TLS directly. Use a publicly trusted certificate for a launcher
-  distributed to other PCs, and keep its private key/passphrase out of version control. A browser
-  trusting a private Windows CA does not mean the current native WebPKI launcher trusts it.
-- Admin routes (`/admin/v1`) fail closed without `ADMIN_TOTP_SECRET` and an origin
-  allow-list. Publisher/update-push routes fail closed without an explicit IP
-  allow-list.
-- Never commit a populated `.env`, private keys, certificates, updater signing keys, or signing
-  passwords. Launcher release material belongs only in ignored `.secrets/` directories.
-
-## Self-hosting
-
-Self-hosting from source is supported on Windows x64 for the documented 1.12.0 target. The project
-does not provide the game, generated SDK, extracted data, certificates, or hosted infrastructure.
-Start with [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md), which covers the full service order,
-runtime loader, TLS/DNS requirements, launcher configuration, ports, validation, and troubleshooting.
-
-Issue reports are welcome when they include the component, commit, configuration with secrets
-removed, reproduction steps, and relevant logs.
-
-## Contributions
-
-Contributions are welcome via GitHub issues and pull requests. Please describe the scope of your change, keep unrelated changes separate, and do not submit proprietary game files, leaked source, or secrets. Contributions to covered components are distributed under the project's AGPLv3 license. Acceptance is not guaranteed.
-
-## Responsible development
-
-This project is intended for preservation, interoperability research, education, and privately operated community play. Do not use it to access systems without authorization, interfere with official or third-party services, impersonate an official Dauntless service, or mislead users about its unofficial status. Operators are responsible for complying with the laws applicable in their jurisdiction.
-
-## License
-
-Licensed under the **GNU Affero General Public License, version 3 only** (`AGPL-3.0-only`).
-See [LICENSE](LICENSE) for the full text. Additional terms under AGPLv3 Section 7 apply to the
-Mystic Paradox contributions — see `ADDITIONAL_TERMS.md`. Original Undaunted copyright notices
-are retained in the source-file headers as required by the AGPL.
-
-If you operate a modified version that users interact with over a network, you are responsible for satisfying the source-availability requirements of the AGPLv3.
-
-## No warranty
-
-This software is provided without any warranty, to the extent permitted by applicable law. Use it at your own risk.
-
-## Credits and upstream
-
-Mystic Paradox is based on **Undaunted**, originally developed by **gwog / Gregory Morford**:
-
-- Upstream: [SyST3MDeV/Undaunted](https://github.com/SyST3MDeV/Undaunted) (AGPLv3)
-- Mystic Paradox: [pranav158/Mystic-Paradox](https://github.com/pranav158/Mystic-Paradox) — maintained by Pranav Karande
-- Development assistance: [Claude](https://www.anthropic.com/claude) (Anthropic), credited as co-author on the commits it helped write
-
-Mystic Paradox contains substantial independent modifications for Dauntless 1.12.0. It is a separate community project and is not an official continuation of Undaunted. See `NOTICE.md` for full provenance and attribution.
+<p align="center"><sub>Made by the community, for the Slayers who aren't ready to say goodbye. 🗡️</sub></p>
