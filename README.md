@@ -46,6 +46,11 @@ and operators should expect active development rather than production-grade upti
 Recent stability work prevents disconnected party members from holding solo travel open and blocks
 remote PlayerController replication before it can disconnect another party member during travel.
 
+**Dauntless 1.14.7:** the port reaches a playable loop on dedicated servers — players arrive in
+Ramsgate, visit the Training Grounds, and complete a dedicated hunt and return. Reward persistence
+and player-hosted hunts are not verified yet. Progress and known issues:
+[docs/DAUNTLESS_1_14_7_PORT.md](docs/DAUNTLESS_1_14_7_PORT.md).
+
 ## Components
 
 - **ParadoxBackend** — account and metagame backend (login, EOS, character, inventory,
@@ -196,5 +201,6 @@ Mystic Paradox is based on **Undaunted**, originally developed by **gwog / Grego
 
 - Upstream: [SyST3MDeV/Undaunted](https://github.com/SyST3MDeV/Undaunted) (AGPLv3)
 - Mystic Paradox: [pranav158/Mystic-Paradox](https://github.com/pranav158/Mystic-Paradox) — maintained by Pranav Karande
+- Development assistance: [Claude](https://www.anthropic.com/claude) (Anthropic), credited as co-author on the commits it helped write
 
 Mystic Paradox contains substantial independent modifications for Dauntless 1.12.0. It is a separate community project and is not an official continuation of Undaunted. See `NOTICE.md` for full provenance and attribution.

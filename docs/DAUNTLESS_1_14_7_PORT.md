@@ -56,6 +56,26 @@ A daily-bounty component on 1.14.7 drafts automatically and needs a draft token 
 required. Without it, that component never finished loading and the 60-second player-data timeout
 disconnected the player. The backend now seeds the token for new accounts and repairs existing ones.
 
+### Dedicated hunts (8 October 2026)
+
+A full loop now works on 1.14.7 with dedicated servers: Ramsgate → a dedicated IslandA hunt →
+Ramsgate. The omnicell charges, fires and deals damage, all six loadout slots show, and the servers
+ran without faults for the test.
+
+Two more stale 1.12.0 call targets were found on the way: a channel-creation call that landed inside
+an unrelated spline function (the hub "spline crash"), and the omnicell charge getters, which are now
+called by name instead of by address. A server-side crash in an interaction-callout widget, which is
+built only because of the hub's local player, is guarded on servers.
+
+### Still open
+
+- The hub's local player spawns its pawn about a minute after the hub starts. A client that is
+  already connected at that moment receives the pawn before it is removed from the replication
+  graph, and removal does not close an open channel, so that client sees an extra character.
+- Hunt reward persistence and a cold re-login are not verified yet.
+- Player-hosted (peer-to-peer) hunts are not tested on 1.14.7.
+- The gameplay HUD shows during the arrival beam and the airship lobby (also present on 1.12.0).
+
 ## Lessons so far
 
 - A stale address rarely fails where it is called. Calling into the middle of an instruction in the
