@@ -2,7 +2,7 @@
 
 Dauntless 1.14.7 (`rel-1.14.7-Archon`, changelist `647472`) is the final release of the game. This page
 tracks the port from the 1.12.0 target. `main` is moving to 1.14.7 one component at a time: since
-9 October 2026 the runtime, tools and backend target 1.14.7; the Director and the launcher follow.
+9 October 2026 the runtime, tools, backend and Director target 1.14.7; the launcher follows.
 A 1.12.0 setup builds from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0)
 tag. These notes move into the main docs once the port is usable.
 

@@ -24,8 +24,8 @@ There is no planned release date; work is still in progress. In the meantime you
 
 Dauntless **1.12.0** (`rel-1.12.0-Archon`, changelist `392819`) is the supported, self-hostable target;
 build it from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0)
-tag. `main` is moving to **1.14.7**, the final release, one component at a time: the runtime, tools and
-backend are done, the Director and launcher follow, and it is not a complete 1.14.7 setup yet
+tag. `main` is moving to **1.14.7**, the final release, one component at a time: the runtime, tools,
+backend and Director are done, the launcher follows, and it is not a complete 1.14.7 setup yet
 ([progress](DAUNTLESS_1_14_7_PORT.md)). Other versions are not expected to work.
 
 ## How can I test the project, help with development, or contact you?
