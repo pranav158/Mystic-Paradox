@@ -1,7 +1,7 @@
 {
   "name": "paradox-director",
   "version": "0.0.3",
-  "description": "The director (deploy server) for Mystic Paradox",
+  "description": "The deploy server for Mystic Paradox",
   "license": "AGPL-3.0-only",
   "author": "Mystic Paradox (pranav158)",
   "contributors": [
@@ -11,7 +11,9 @@
     "dev": "tsx --env-file=.env src/server.ts",
     "build": "tsc",
     "start": "node --env-file=.env dist/server.js",
-    "generate:hunt-tables": "node scripts/import_hunt_tables.cjs"
+    "generate:hunt-tables": "node scripts/import_hunt_tables.cjs",
+    "test": "node scripts/run-tests.cjs",
+    "test:hunt-coverage": "node --import tsx --test src/controllers/gameservers.gamedata.test.ts"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

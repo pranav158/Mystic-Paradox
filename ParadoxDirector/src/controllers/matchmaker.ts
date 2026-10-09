@@ -24,16 +24,16 @@ export async function HandleMatchmakingRequest(GameMode: string, GameArgs: strin
                 return GetTrainingDojoConnectionDetails();
             }
 
-            
-            
-            
-            
-            
+            // [2026-07-13] Normal Hunting Grounds also arrive via GameMode=SHARED (e.g.
+            // ShatteredIsles_IslandA -> Adventure_IslandA -> adventure_moss_triforce). Previously only the
+            // Training Dojo was handled under SHARED, so every real hunt fell through to Ramsgate. Route any
+            // other valid HuntId through the normal player-hunt resolver (which also picks the map + passes
+            // no MonsterClass when the row's Behemoth is "None", and preserves the player HuntId per player).
             if(ExpectedPlayers != undefined && ExpectedPlayers.length > 0){
                 try {
-                    
-                    
-                    
+                    // [2026-07-19] Public Hunt Server Reuse (Part B, flag-gated): if a live public server is
+                    // already running this player hunt id with room, send the player there instead of
+                    // spawning a new one. No-op (undefined) unless ENABLE_PUBLIC_HUNT_REUSE=1.
                     const Reused = TryReuseSharedHuntServer(HuntId, ExpectedPlayers);
                     if(Reused != undefined){
                         return Reused;
@@ -60,8 +60,8 @@ export async function HandleMatchmakingRequest(GameMode: string, GameArgs: strin
                 return await StartupGameserverWithHuntIdAndPlayers(HuntId, ExpectedPlayers!);
             }
         } catch(Err: any) {
-            
-            
+            // A missing 1.12 row, capacity failure or failed readiness check must remain
+            // visible to Metagame. Redirecting to Ramsgate makes the UI claim a hunt was found.
             logger.error(`ISLAND hunt (huntId='${HuntId}') could not start: ${Err?.message ?? Err}`);
             throw Err;
         }

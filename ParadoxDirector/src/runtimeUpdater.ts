@@ -7,17 +7,18 @@ import { promisify } from "node:util";
 import { logger } from "./logger";
 
 const execFileAsync = promisify(execFile);
-const TARGET_CHANGELIST = 392819;
+// [1.14.7] Served runtime manifests and the Launcher now both use CL 647472.
+const TARGET_CHANGELIST = 647472;
 const MAX_RUNTIME_BYTES = 200 * 1024 * 1024;
 const DEFAULT_MANIFEST_URL =
-  "https://paradox.example.com/launcher/v1/runtime/server/stable/windows-x86_64";
+  "https://paradox.mysticfox.dev/launcher/v1/runtime/server/stable/windows-x86_64";
 const RUNTIME_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEA3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc=
 -----END PUBLIC KEY-----`;
 
 type RuntimeManifest = {
   schema: 1;
-  component: "ParadoxRuntime";
+  component: "ParadoxRuntime" | "MystPaxInternalServer";
   target: "server";
   version: string;
   channel: string;
@@ -44,7 +45,9 @@ function parseManifest(value: unknown): RuntimeManifest {
   const data = value as Record<string, unknown>;
   if (
     data.schema !== 1 ||
-    data.component !== "ParadoxRuntime" ||
+    // "MystPaxInternalServer" is the component name of manifests signed before the 8 Oct 2026
+    // public-layout rename; the signature covers the artifact bytes, so both names stay valid.
+    (data.component !== "ParadoxRuntime" && data.component !== "MystPaxInternalServer") ||
     data.target !== "server" ||
     data.targetChangelist !== TARGET_CHANGELIST ||
     data.platform !== "windows-x86_64" ||

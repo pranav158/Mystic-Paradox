@@ -12,6 +12,7 @@
 import { Router } from "express";
 import { logger } from "../logger";
 import { HandleMatchmakingRequest } from "../controllers/matchmaker";
+import { GetP2PExtension } from "../extensions/p2p";
 import express from "express";
 
 export const matchmakingRouter = Router();
@@ -28,10 +29,13 @@ matchmakingRouter.post("/handle-matchmaking-for-player", express.json(), async (
         res.status(200);
         res.json(MatchmakingResult);
     } catch(Err: any) {
-        
-        
+        // Final safety net: never let a spawn/capacity error become an unhandled rejection that could
+        // take down the DeployServer process (the metagame treats a non-200 as a matchmaking failure).
         logger.error(`handle-matchmaking-for-player failed: ${Err?.message ?? Err}`);
         res.status(500);
         res.json({ error: "matchmaking_failed" });
     }
 });
+
+// Routes of the optional player-hosted hunt module (src/extensions; none without it).
+GetP2PExtension().mountMatchmakerRoutes(matchmakingRouter);

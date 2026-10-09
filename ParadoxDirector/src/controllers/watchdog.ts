@@ -13,7 +13,12 @@ import { kill } from "node:process";
 import { logger } from "../logger";
 import { Gameserver, Gameservers, CleanupServer, LogMissingHuntRequests } from "./gameservers";
 
-
+/**
+ * Watchdog: reclaims dead gameservers — frees ports for hunts, restarts the persistent Ramsgate/Dojo.
+ * Abandoned/empty hunts are NOT reaped here by wall-clock (that would kill an active long hunt); the
+ * gameserver DLL self-terminates when it has had no client connections for a grace period, and that
+ * exit is what this watchdog (and the process exit handler) reclaims.
+ */
 
 function IsGameserverStillAlive(GameserverToCheck: Gameserver){
     try{
@@ -28,8 +33,8 @@ function IsGameserverStillAlive(GameserverToCheck: Gameserver){
 export async function RunWatchdog(){
     logger.info(`Running Gameserver Watchdog!`);
 
-    
-    
+    // Iterate a SNAPSHOT: CleanupServer and the process exit handlers reassign the Gameservers array,
+    // so iterating it live would skip entries.
     for(const Server of [...Gameservers]){
         if(!IsGameserverStillAlive(Server)){
             logger.warn(`Cleaning up dead gameserver on port ${Server.port}`);
@@ -38,7 +43,7 @@ export async function RunWatchdog(){
         }
     }
 
-    
-    
+    // Keeps content-coverage gaps visible. A missing hunt row is silent otherwise: the client
+    // retries, each attempt logs one error, and the underlying cause scrolls away.
     LogMissingHuntRequests();
 }
