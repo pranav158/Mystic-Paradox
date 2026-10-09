@@ -34,13 +34,13 @@
 
 | Game version | State |
 |---|---|
-| **Dauntless 1.14.7** (CL `647472`) | 🚧 `main` is moving to 1.14.7 one component at a time: runtime and tools are done; backend, Director and launcher are next. Hubs, dedicated hunts and saved hunt rewards work — [progress notes](docs/DAUNTLESS_1_14_7_PORT.md) |
+| **Dauntless 1.14.7** (CL `647472`) | 🚧 `main` is moving to 1.14.7 one component at a time: runtime, tools and backend are done; Director and launcher are next. Hubs, dedicated hunts and saved hunt rewards work — [progress notes](docs/DAUNTLESS_1_14_7_PORT.md) |
 | **Dauntless 1.12.0** (CL `392819`) | ✅ Alpha, self-hostable — build it from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag |
 
 Expect active development, not production-grade uptime.
 
 > [!NOTE]
-> `main` is between versions: its runtime targets 1.14.7 while the other components and the guides
+> `main` is between versions: its runtime and backend target 1.14.7 while the other components and the guides
 > below still describe 1.12.0. For a working 1.12.0 setup, check out the `dauntless-1.12.0` tag.
 
 ## 🚀 Get started
