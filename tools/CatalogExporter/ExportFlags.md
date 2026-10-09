@@ -1,5 +1,11 @@
 # CatalogExporter — export flags & progression/combat export modes
 
+> [!NOTE]
+> The file names below show the `_1_12` suffix of the first exports. The current exporter targets
+> Dauntless 1.14.7 and writes `_1_14_7` names instead (for example `catalog_1_14_7.jsonl`,
+> `hunts_1_14_7/`, `slayers_path_1_14_7/`); the suffix is fixed in the source, not read from the game.
+> What the services need, and which screen each export waits for, is in `docs/GENERATING_GAME_DATA.md`.
+
 This extends the original catalog-only `CatalogExporter` DLL with three more export modes
 (progression, combat, skins) plus a flag system to pick which modes run on a given injection,
 without recompiling. All modes still run inside the **same DLL** — per project decision this pass

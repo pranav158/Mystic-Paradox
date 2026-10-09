@@ -1,11 +1,11 @@
 # Self-hosting Mystic Paradox: source to Ramsgate
 
 > [!NOTE]
-> This guide describes Dauntless 1.12.0. Follow it on the
-> [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag: `main` now
-> carries the 1.14.7 runtime, and this guide moves to 1.14.7 with the remaining components.
+> This guide is for Dauntless 1.14.7, which `main` targets (alpha). For 1.12.0, follow the guide on the
+> [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag. Upgrading an
+> existing 1.12.0 deployment? See [Upgrading from 1.12.0](#upgrading-from-1120).
 
-This handbook covers a complete Windows x64 deployment of Mystic Paradox for Dauntless 1.12.0,
+This handbook covers a complete Windows x64 deployment of Mystic Paradox for Dauntless 1.14.7,
 from a clean source checkout through the first successful Ramsgate session.
 
 Mystic Paradox is an unofficial preservation project. It does not distribute the game, generated
@@ -20,9 +20,9 @@ Unreal SDK files, or extracted game data. Use only a lawful installation that yo
 
 | Property | Required value |
 |---|---|
-| Game | Dauntless 1.12.0 |
-| Build label | rel-1.12.0-Archon |
-| Changelist | 392819 |
+| Game | Dauntless 1.14.7 |
+| Build label | rel-1.14.7-Archon |
+| Changelist | 647472 |
 | Unreal Engine | 4.26.2 |
 | Platform | Windows x64 |
 | Public backend | HTTPS on TCP 443 |
@@ -67,7 +67,7 @@ Install or prepare:
 - Microsoft Edge WebView2 Runtime for the Tauri launcher.
 - A DNS name you control, such as paradox.example.net.
 - A publicly trusted TLS certificate for that exact hostname.
-- Your own Dauntless 1.12.0 Windows installation.
+- Your own Dauntless 1.14.7 Windows installation.
 - A complete Dumper-7 CppSDK generated from that installation.
 - Complete backend and director game-data payloads generated from the same build.
 
@@ -142,7 +142,7 @@ Do not commit or redistribute the executable, PAKs, generated SDK, or extracted 
 Follow [GENERATING_SDK.md](GENERATING_SDK.md). In summary:
 
 1. Build Dumper-7.
-2. Run your own 1.12.0 client and inject Dumper-7 into that process.
+2. Run your own 1.14.7 client and inject Dumper-7 into that process.
 3. Copy the complete CppSDK output into ParadoxRuntime.
 4. Confirm generated headers and all *_functions.cpp files are present.
 
@@ -163,7 +163,7 @@ A header-only or partial copy is not enough. tools/CatalogExporter uses the same
 
 ## 4. Generate the required game data
 
-Follow [GENERATING_GAME_DATA.md](GENERATING_GAME_DATA.md). Final required files are:
+Follow [GENERATING_GAME_DATA.md](GENERATING_GAME_DATA.md). The final files are:
 
 Backend, under ParadoxBackend/game-data:
 
@@ -171,6 +171,9 @@ Backend, under ParadoxBackend/game-data:
 - slayers_path.json
 - slayers_path_definitions.json
 - ladyluck_store.json
+- platinum_store.json
+- reward_cache_store.json
+- inventory_storage_policy.json
 
 Director, under ParadoxDirector/game-data:
 
@@ -179,44 +182,24 @@ Director, under ParadoxDirector/game-data:
 - arena_easy_matchmaker_hunts.json
 - arena_hard_matchmaker_hunts.json
 - arena_elite_matchmaker_hunts.json
+- arena_hard_matchmaker_hunts_new.json
+- arena_elite_matchmaker_hunts_new.json
 
-Raw-to-final mapping:
+CatalogExporter, injected into your own 1.14.7 client, provides the catalog, the Slayer's Path nodes,
+the hunt tables and the store images. The Director tables, the Slayer's Path files, the Reward Cache
+store and the storage policy are generated from that export. Two files need a source you supply:
 
-| Raw source | Raw destination | Generator |
-|---|---|---|
-| player_journey_nodes.jsonl | ParadoxBackend/game-data/raw | generate_slayers_path.cjs |
-| progression_config.source.json | ParadoxBackend/game-data/raw | generate_progression_config.cjs |
-| ladyluck_store.source.json | ParadoxBackend/game-data/raw | generate_ladyluck_store.cjs |
-| player_hunts.jsonl | ParadoxDirector/game-data/raw | import_hunt_tables.cjs |
-| matchmaker_hunts.jsonl | ParadoxDirector/game-data/raw | import_hunt_tables.cjs |
+- progression_config.json, from a progression-config response (`payload.paths`);
+- ladyluck_store.json, from a Lady Luck store response (an array of store entries).
 
-Validate first without --apply, then write the results:
+The Platinum store is generated from the catalog and store images (step 6 of the game-data guide).
 
-    Set-Location ParadoxBackend
-    npm run generate:slayers-path
-    npm run generate:progression-config
-    npm run generate:ladyluck-store
-    node scripts/generate_slayers_path.cjs --apply
-    node scripts/generate_progression_config.cjs --apply
-    node scripts/generate_ladyluck_store.cjs --apply
+Some tables stream only after reaching Ramsgate or opening the relevant screen; the game-data guide
+says which. Synthetic *.example.json files are only compilation/startup fixtures and are not
+playable.
 
-    Set-Location ..\ParadoxDirector
-    npm run generate:hunt-tables
-    node scripts/import_hunt_tables.cjs --apply
-
-Important limitations:
-
-- progression_config.source.json must contain the expected payload.paths response shape.
-- ladyluck_store.source.json must be a JSON array.
-- EXPORT_PROGRESSION and EXPORT_DROP_TABLES provide extraction material; they do not necessarily
-  manufacture the final source payload automatically.
-- slayers_path_definitions.json has no checked-in one-command generator. Preserve or assemble the
-  matching definitions payload from your own compatible environment.
-- Some tables stream only after reaching the relevant UI or Ramsgate. A fresh environment may need
-  captures from an already working compatible local setup.
-- Synthetic *.example.json files are only compilation/startup fixtures and are not playable.
-
-Do not continue to gameplay testing until every final file exists and validates.
+Do not continue to gameplay testing until every final file exists and the services start without a
+game-data error.
 
 ## 5. Install MongoDB
 
@@ -272,7 +255,7 @@ Backend essentials:
 |---|---|
 | AUTH_MODE | LAUNCHER |
 | ALLOW_NO_AUTH_DEV_MODE | false |
-| TARGET_CHANGELIST | 392819 |
+| TARGET_CHANGELIST | 647472 |
 | MATCHMAKING_MODE | DEPLOYSERVER |
 | DEPLOYSERVER_URL | 127.0.0.1:3001 unless separated |
 | HTTPS_PORT | 443 |
@@ -281,6 +264,12 @@ Backend essentials:
 | APPROVED_EXECUTABLE_SHA256 | Exact target executable hash |
 | REALTIME_XMPP_ENABLED | true |
 | REALTIME_XMPP_ALLOWED_HOSTS | Exact public hostname |
+| API_KEY_HASH_SECRET | Random, 32+ characters; the backend refuses to start without it. Keep it stable |
+| GAMESERVER_API_KEYS | The raw gameserver key(s); when non-empty this is the complete key set |
+
+The configurator does not set NODE_ENV. If you run the backend with NODE_ENV=production, it also
+requires MYSTICPARADOX_SERVICE_ROLE=api and a MYSTICPARADOX_METRICS_TOKEN, and refuses to start
+without them.
 
 Director essentials:
 
@@ -291,6 +280,11 @@ Director essentials:
 | GAMESERVER_BINARY_PATH | Exact game-server executable |
 | METAGAME_API_KEY | Same raw key generated for Backend |
 | GAMESERVER_READY_TIMEOUT_MS | 30000 or a deliberate override |
+| SERVER_RUNTIME_AUTO_UPDATE | false (the configurator default) |
+
+With SERVER_RUNTIME_AUTO_UPDATE=true the Director fetches the server runtime before starting the
+worlds: set SERVER_RUNTIME_MANIFEST_URL to your own backend and publish a `--target server` runtime
+(step 10) first.
 
 Set stable absolute locations as well:
 
@@ -322,6 +316,10 @@ Director:
     npm ci
     npm run build
 
+Add `npm test` in ParadoxDirector as well. `npm test` skips the `*.gamedata.test.ts` files until every
+real game-data file is present; with your generated data in place it also checks that data. The
+Director does not rebuild on start: run `npm run build` there again after every update.
+
 Do not run npm run test:bootstrap against the real database. That integration suite is destructive
 and requires a separate MONGODB_TEST_DB plus an explicit opt-in.
 
@@ -352,12 +350,9 @@ Place both beside the exact game executable used by Director:
       MysticParadox.dll
       winmm.dll
 
-MysticParadox.dll is the canonical public runtime name. The launcher temporarily keeps the legacy
-MystPaxInternalServer.dll alias synchronized for compatibility with older installations. Never ship
-different bytes under the two names.
-
-The loader forwards legitimate winmm exports to the Windows system library and loads the runtime.
-Do not add untrusted DLLs to mystic_loader.ini.
+The loader forwards legitimate winmm exports to the Windows system library and loads
+MysticParadox.dll. It falls back to a legacy MystPaxInternalServer.dll only when that copy is newer,
+so delete any old copy left from a 1.12.0 install. Do not add untrusted DLLs to mystic_loader.ini.
 
 ## 10. Publish the signed client runtime
 
@@ -365,7 +360,7 @@ The launcher repairs the runtime from a signed manifest. Publish MysticParadox.d
 into the Backend update root before installing a client:
 
     Set-Location ParadoxLauncher
-    node scripts/publish-runtime-update.mjs --dll ..\ParadoxRuntime\x64\Release\MysticParadox.dll --extra ..\tools\RuntimeLoader\target\release\winmm.dll --target client --version 0.1.0 --changelist 392819 --channel stable --output D:\MysticParadoxData\updates --base-url https://paradox.example.net --key .secrets\selfhost-runtime-update.private.pem
+    node scripts/publish-runtime-update.mjs --dll ..\ParadoxRuntime\x64\Release\MysticParadox.dll --extra ..\tools\RuntimeLoader\target\release\winmm.dll --target client --version 0.1.0 --changelist 647472 --channel stable --output D:\MysticParadoxData\updates --base-url https://paradox.example.net --key .secrets\selfhost-runtime-update.private.pem
 
 Use a new semantic version whenever bytes change. Protect and back up the private signing key.
 Losing it means existing launchers cannot trust a replacement without being rebuilt.
@@ -391,7 +386,7 @@ Expected results:
 
 - the root endpoint reports ok;
 - QoS reports pong;
-- launcher status reports online and supportedBuildChangelist 392819;
+- launcher status reports online and supportedBuildChangelist 647472;
 - the runtime endpoint returns the signed manifest;
 - there is no TLS warning or hostname mismatch.
 
@@ -432,7 +427,7 @@ process used to invoke Tauri:
     Set-Location ParadoxLauncher
     npm ci
     npm run build
-    npm test
+    npm run test:workflow
     npm run tauri -- dev --config ..\.selfhost\tauri.selfhost.conf.json
 
 This compiles the React/Vite assets and the native Tauri application. It binds native authentication
@@ -488,7 +483,7 @@ Each session includes launcher.log, metadata.json, and copies of available runti
 The first supported milestone is complete only when all of these are true:
 
 - MongoDB is connected and Backend has no missing-data error.
-- Public HTTPS is trusted and launcher status reports changelist 392819.
+- Public HTTPS is trusted and launcher status reports changelist 647472.
 - The signed client runtime manifest downloads successfully.
 - Director reports Training Dojo and Ramsgate ready.
 - UDP 8790 is reachable from the player network.
@@ -502,12 +497,15 @@ The first supported milestone is complete only when all of these are true:
 After that, test in this order:
 
 1. Reconnect to Ramsgate.
-2. Invite, remove, and disconnect a party member.
-3. Start solo island travel.
-4. Start party island travel.
-5. Return to Ramsgate.
+2. Start a solo hunt, kill a behemoth, and return to Ramsgate. The hunt server should exit about
+   50 seconds after the last player leaves.
+3. Sign out and back in: the hunt rewards must still be in the inventory.
+4. Invite, remove, and disconnect a party member.
+5. Start party island travel.
 6. Enter Training Dojo.
 7. Test public hunt reuse only if explicitly enabled.
+
+Known 1.14.7 issues are listed in the [port notes](DAUNTLESS_1_14_7_PORT.md#still-open).
 
 Use matching current Backend, Director, Runtime, and Launcher builds. The replication and
 disconnected-party fixes span multiple components.
@@ -527,7 +525,8 @@ runtime-signing key, verify the manifest endpoint, then test Repair and Play on 
 ### Backend or Director update
 
 Back up MongoDB and ignored configuration, review source changes, run builds/tests, and restart
-Backend before Director unless release notes say otherwise.
+Backend before Director unless release notes say otherwise. The backend rebuilds a stale build on
+`npm start`; the Director does not, so run `npm run build` there first.
 
 ### Backups
 
@@ -587,8 +586,14 @@ excluded disconnected members. The requested ISLAND party id must match the auth
 ### Party travel disconnects another client
 
 Use matching runtime bytes on clients and game servers. Repair through the launcher and confirm
-runtime hashes. The current runtime blocks remote PlayerController replication before channel
-creation and preserves the native 64-bit replication-count ABI at the final channel boundary.
+runtime hashes. The runtime never lets one connection receive another player's PlayerController.
+
+### Backend or Director stops at startup
+
+Read the first error. Common causes: API_KEY_HASH_SECRET missing or shorter than 32 characters; a
+missing or invalid game-data file (the message names it); an environment key still using the old
+MYSTPAX_ prefix (rename it to MYSTICPARADOX_); NODE_ENV=production without
+MYSTICPARADOX_SERVICE_ROLE and MYSTICPARADOX_METRICS_TOKEN.
 
 ### Useful logs
 
@@ -602,6 +607,32 @@ creation and preserves the native 64-bit replication-count ABI at the final chan
 When reporting an issue, include the commit, component versions, redacted configuration, changelist,
 reproduction steps, and relevant logs. Remove tokens, account data, private infrastructure paths,
 certificate material, and every private key.
+
+## Upgrading from 1.12.0
+
+A 1.12.0 deployment from the `dauntless-1.12.0` tag needs, in this order:
+
+1. A 1.14.7 client and server installation, and a fresh SDK from it (step 3); nothing generated from
+   1.12.0 carries over.
+2. New game data from the 1.14.7 install (step 4), including the files 1.12.0 did not have.
+3. TARGET_CHANGELIST=647472 and APPROVED_EXECUTABLE_SHA256 of the 1.14.7 executable in the backend
+   .env; an API_KEY_HASH_SECRET if you have none (existing SHA-256 key records keep working while
+   API_KEY_LEGACY_SHA256 is `accept`, the default); any MYSTPAX_ environment key renamed to
+   MYSTICPARADOX_, including the launcher build variables in .selfhost/build-env.ps1.
+4. A rebuilt runtime, loader and launcher, a new runtime version published with
+   `--changelist 647472`, and the new launcher on every player PC.
+5. A MongoDB backup, then the one-off account-data migrations in ParadoxBackend. Each is a dry run
+   that only reports; add `--apply --confirm=<token>` with the token named in the script header to
+   write:
+
+       npm run inventory:storage-migrate      # stacked vs instanced items (APPLY_INVENTORY_STORAGE_MIGRATION)
+       npm run banner:instance-migrate        # banner ids to instance ids (APPLY_BANNER_INSTANCE_ID_MIGRATION)
+       npm run loadout:slots-migrate          # loadout slots from Slayer's Path (APPLY_LOADOUT_SLOT_ENTITLEMENT_MIGRATION)
+       npx tsx --env-file=.env scripts/migrate_reward_cache_currency.ts
+                                              # 1.12 season coins to 1.14.7 Cache Coins (APPLY_REWARD_CACHE_COIN_MIGRATION)
+
+   Arguments after an npm script go after `--`, for example
+   `npm run inventory:storage-migrate -- --apply --confirm=APPLY_INVENTORY_STORAGE_MIGRATION`.
 
 ## Public-host security checklist
 

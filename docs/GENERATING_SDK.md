@@ -1,12 +1,11 @@
 # Generating the SDK
 
-> [!NOTE]
-> This guide describes Dauntless 1.12.0. Follow it on the
-> [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag: `main` now
-> carries the 1.14.7 runtime, and this guide moves to 1.14.7 with the remaining components.
-
 ParadoxRuntime and tools/CatalogExporter build against a C++ SDK generated from your own compatible
 game installation. No game-derived SDK is distributed in this repository.
+
+> [!NOTE]
+> This guide is for Dauntless 1.14.7, which `main` targets. For 1.12.0, follow the guide on the
+> [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag.
 
 ## Required target
 
@@ -14,18 +13,20 @@ Generate the SDK from exactly:
 
 | Property | Value |
 |---|---|
-| Game | Dauntless 1.12.0 |
-| Build label | rel-1.12.0-Archon |
-| Changelist | 392819 |
+| Game | Dauntless 1.14.7 |
+| Build label | rel-1.14.7-Archon |
+| Changelist | 647472 |
 | Unreal Engine | 4.26.2 |
 | Platform | Windows x64 |
 
 A dump from a different client may compile but has incompatible layouts, functions, or offsets.
+Nothing generated from 1.12.0 is reusable: class layouts moved even though the engine version did not
+change.
 
 ## Generate and copy the SDK
 
 1. Build [Dumper-7](https://github.com/Encryqed/Dumper-7).
-2. Start your own supported game installation.
+2. Start your own 1.14.7 game installation.
 3. Inject Dumper-7 into that process and wait for the complete CppSDK output.
 4. Copy the entire CppSDK output into ParadoxRuntime.
 
@@ -69,15 +70,16 @@ Changing the hostname requires rebuilding the runtime.
 
 ## Build ParadoxRuntime
 
-The project currently selects platform toolset v145. Visual Studio 2022 users can retarget
-ParadoxRuntime/MysticParadox.vcxproj to v143 locally.
+The projects select platform toolset v145 (Visual Studio with the Desktop development with C++
+workload). Visual Studio 2022 users can retarget ParadoxRuntime/MysticParadox.vcxproj to v143 locally.
 
 From a normal PowerShell or Developer Command Prompt:
 
     Set-Location ParadoxRuntime
     .\_build.bat
 
-The helper finds MSBuild with vswhere. The equivalent command is:
+The helper finds MSBuild with vswhere, builds Release x64 and returns the real build exit code. The
+equivalent command is:
 
     msbuild MysticParadox.sln /p:Configuration=Release /p:Platform=x64
 
@@ -85,7 +87,10 @@ Expected output:
 
     ParadoxRuntime\x64\Release\MysticParadox.dll
 
-MysticParadox.dll is the canonical public filename.
+One DLL serves both the player client and the dedicated servers: it detects `-server` at startup. It
+links the C/C++ runtime statically (/MT), because the game folder ships an older msvcp140.dll that the
+loader would otherwise prefer. See [ParadoxRuntime/BUILD.md](../ParadoxRuntime/BUILD.md) for the
+details and the loader build.
 
 ## Build CatalogExporter
 
@@ -97,16 +102,19 @@ ParadoxRuntime SDK, then build:
 
 Visual Studio 2022 users must also retarget CatalogExporter.vcxproj to v143.
 
-Copy export_flags.example.txt to export_flags.txt beside the exporter or in the location described
-by [ExportFlags.md](../tools/CatalogExporter/ExportFlags.md), enable only the required modes, and
-inject the resulting DLL into your own game process.
+By default the exporter writes to `Items_Analysis` in the injected game's working directory and reads
+`export_flags.txt` from there. To send every export to your repository instead, create the ignored
+file tools/CatalogExporter/ExportPaths.local.h before building:
 
-For the playable-data path, the most relevant flags are:
+    #define MYSTICPARADOX_EXPORT_ROOT L"D:\\MysticParadox"
 
-- EXPORT_SLAYERS_PATH
-- EXPORT_HUNTS
-- EXPORT_PROGRESSION
-- EXPORT_DROP_TABLES
+Exports then land in `D:\MysticParadox\Items_Analysis`, which is where the game-data generators look,
+and the flags file is read from `D:\MysticParadox\tools\CatalogExporter\export_flags.txt`.
+
+Copy export_flags.example.txt to export_flags.txt, enable only the required modes, and inject the
+resulting DLL into your own game process. The modes and what each one needs are listed in
+[GENERATING_GAME_DATA.md](GENERATING_GAME_DATA.md) and
+[ExportFlags.md](../tools/CatalogExporter/ExportFlags.md).
 
 Some exports depend on tables that the client streams only after opening a menu or reaching a world.
 Review the exporter status output and manifest instead of assuming a successful injection produced

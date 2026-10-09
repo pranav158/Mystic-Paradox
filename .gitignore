@@ -29,6 +29,10 @@ ParadoxBackend/game-data/*.json
 ParadoxDirector/game-data/*.json
 !ParadoxBackend/game-data/*.example.json
 !ParadoxDirector/game-data/*.example.json
+ParadoxBackend/game-data/raw/
+ParadoxDirector/game-data/raw/
+# CatalogExporter output (game data extracted from your own install)
+Items_Analysis/
 
 # --- Node ---
 node_modules/

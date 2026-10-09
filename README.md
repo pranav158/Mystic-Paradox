@@ -40,13 +40,13 @@
 Expect active development, not production-grade uptime.
 
 > [!NOTE]
-> `main` targets Dauntless 1.14.7. The self-hosting, SDK and game-data guides below still describe 1.12.0 and
-> are being updated; for a 1.12.0 setup, check out the `dauntless-1.12.0` tag.
+> `main` and the guides below target Dauntless 1.14.7. For a 1.12.0 setup, check out the
+> `dauntless-1.12.0` tag; the self-hosting guide also covers upgrading from it.
 
 ## 🚀 Get started
 
 1. **Read the [FAQ](docs/FAQ.md)** — what the project is, what it isn't, and where to get help.
-2. **Generate the SDK** from your own 1.12.0 install — [Generating the SDK](docs/GENERATING_SDK.md).
+2. **Generate the SDK** from your own 1.14.7 install — [Generating the SDK](docs/GENERATING_SDK.md).
 3. **Generate the game data** from the same install — [Generating game data](docs/GENERATING_GAME_DATA.md).
 4. **Deploy and play** — [Self-hosting](docs/SELF_HOSTING.md) walks from source to Ramsgate:
    prerequisites, DNS/TLS, services, launcher and the first acceptance test.

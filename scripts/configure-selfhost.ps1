@@ -91,7 +91,7 @@ $TlsCertificatePath = Assert-File $TlsCertificatePath "TLS certificate"
 $TlsPrivateKeyPath = Assert-File $TlsPrivateKeyPath "TLS private key"
 
 if ($BackendHttpsPort -ne 443) {
-    throw "The 1.12.0 runtime currently requires -BackendHttpsPort 443."
+    throw "The runtime currently requires -BackendHttpsPort 443."
 }
 if ($GamePortEnd - $GamePortBegin -lt 2) {
     throw "The game port range needs at least three ports (hunts, Training Dojo, Ramsgate)."
@@ -137,7 +137,7 @@ $BackendValues = [ordered]@{
     MONGODB_SERVER_SELECTION_TIMEOUT_MS = "5000"
     MONGODB_MAX_POOL_SIZE = "20"
     MONGODB_MAX_IDLE_TIME_MS = "60000"
-    TARGET_CHANGELIST = "392819"
+    TARGET_CHANGELIST = "647472"
     QOS_TARGET_URL = "$BaseUrl/QoS"
     MATCHMAKING_MODE = "DEPLOYSERVER"
     DEPLOYSERVER_URL = "127.0.0.1:$DirectorPort"

@@ -22,11 +22,11 @@ There is no planned release date; work is still in progress. In the meantime you
 
 ## Which game version do I need?
 
-Dauntless **1.12.0** (`rel-1.12.0-Archon`, changelist `392819`) is the supported, self-hostable target;
-build it from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0)
-tag. `main` targets **1.14.7**, the final release, as an alpha: every component is ported, and the
-self-hosting guides are being updated from 1.12.0 ([progress](DAUNTLESS_1_14_7_PORT.md)). Other versions
-are not expected to work.
+`main` targets Dauntless **1.14.7** (`rel-1.14.7-Archon`, changelist `647472`), the final release, as an
+alpha: every component is ported and the self-hosting guides describe it
+([progress](DAUNTLESS_1_14_7_PORT.md)). Dauntless **1.12.0** (changelist `392819`) builds from the
+[`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag. Other
+versions are not expected to work.
 
 ## How can I test the project, help with development, or contact you?
 

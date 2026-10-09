@@ -1,20 +1,29 @@
-# CatalogExporter flags — copy to export_flags.txt (next to the injected process CWD).
-# One KEY=VALUE per line, VALUE is 0 or 1. See ExportFlags.md for full details.
+# CatalogExporter flags - copy to export_flags.txt. One KEY=VALUE per line, VALUE is 0 or 1.
+# See ExportFlags.md for full details and docs/GENERATING_GAME_DATA.md for what the services need.
 #
-# Output is written to .\Items_Analysis relative to the injected process's working directory.
-# Copy the produced files into the relevant service's game-data/raw/ then run the generate:* scripts.
+# The flags file and the output folder are <root>\tools\CatalogExporter\export_flags.txt and
+# <root>\Items_Analysis when ExportPaths.local.h defines MYSTICPARADOX_EXPORT_ROOT, otherwise
+# .\export_flags.txt and .\Items_Analysis relative to the injected game's working directory.
+# The generators read <repository>\Items_Analysis. A 1.14.7 build names its files *_1_14_7.
 #
 # WARNING: EXPORT_SKINS_RESOLVE_STRINGTABLE is CLIENT-ONLY (calls a live engine function). Never
-# enable it in a build injected into a shared dedicated server. All other flags are pure reads.
+# enable it in a build injected into a shared dedicated server.
 
+# For the services: the catalog (main menu or Ramsgate), Slayer's Path (open the Slayer's Path
+# screen), hunt tables (Ramsgate, open the Hunt/Map screen) and store images (Ramsgate, then
+# Journal -> Challenges -> Reward Cache).
 EXPORT_CATALOG=1
+EXPORT_SLAYERS_PATH=0
+EXPORT_HUNTS=0
+EXPORT_STORE_RUNTIME=0
+
+# Research exports, not read by the services.
 EXPORT_PROGRESSION=0
 EXPORT_COMBAT=0
 EXPORT_SKINS=0
 EXPORT_SKINS_RESOLVE_STRINGTABLE=0
-EXPORT_SLAYERS_PATH=0
 EXPORT_WEAPON_SLOTS=0
-EXPORT_HUNTS=0
 EXPORT_TABLE_INVENTORY=0
 EXPORT_CELLS=0
 EXPORT_DROP_TABLES=0
+EXPORT_CURRENCY_NAMES=0
