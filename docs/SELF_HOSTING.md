@@ -1,5 +1,10 @@
 # Self-hosting Mystic Paradox: source to Ramsgate
 
+> [!NOTE]
+> This guide describes Dauntless 1.12.0. Follow it on the
+> [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag: `main` now
+> carries the 1.14.7 runtime, and this guide moves to 1.14.7 with the remaining components.
+
 This handbook covers a complete Windows x64 deployment of Mystic Paradox for Dauntless 1.12.0,
 from a clean source checkout through the first successful Ramsgate session.
 

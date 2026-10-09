@@ -1,5 +1,10 @@
 # Generating game data
 
+> [!NOTE]
+> This guide describes Dauntless 1.12.0. Follow it on the
+> [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag: `main` now
+> carries the 1.14.7 runtime, and this guide moves to 1.14.7 with the remaining components.
+
 Mystic Paradox does not distribute Phoenix Labs game data. Extract the required material from your
 own lawful Dauntless 1.12.0 installation and generate the service payloads locally.
 

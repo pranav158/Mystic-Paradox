@@ -1,9 +1,10 @@
 # Dauntless 1.14.7 port — progress notes
 
 Dauntless 1.14.7 (`rel-1.14.7-Archon`, changelist `647472`) is the final release of the game. This page
-tracks the port from the supported 1.12.0 target. The source in this repository still targets 1.12.0;
-these notes describe the work being done separately and will move into the main docs once the port
-is usable.
+tracks the port from the 1.12.0 target. `main` is moving to 1.14.7 one component at a time: since
+9 October 2026 the runtime and tools target 1.14.7; the backend, the Director and the launcher follow.
+A 1.12.0 setup builds from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0)
+tag. These notes move into the main docs once the port is usable.
 
 ## Target
 
@@ -67,13 +68,27 @@ an unrelated spline function (the hub "spline crash"), and the omnicell charge g
 called by name instead of by address. A server-side crash in an interaction-callout widget, which is
 built only because of the hub's local player, is guarded on servers.
 
+### Rewards, empty hunts and clean exits (9 October 2026)
+
+- **Hunt rewards persist.** After two kills on a dedicated hunt, the saved inventory matched the
+  crafting screen, and a full re-login showed the same counts.
+- **Extra character fixed.** The hub's local player used to get a pawn about a minute after the hub
+  started, and a client already connected at that moment saw an extra character. The runtime had told
+  the game that every controller may restart, the hub's own included; it now refuses that one, and a
+  pawn that still appears is destroyed.
+- **Empty hunt servers shut down again.** The hunt's local player kept the game's player count at 1,
+  so the 50-second empty shutdown never fired and hunt servers piled up until the server limit. The
+  runtime now counts remote client connections instead.
+- **Clean client exit.** Every quit ended in an access violation because the runtime still logged after
+  its DLL was unloaded. Nothing logs after detach now, and the C runtime is linked statically.
+- **Client branding.** A Mystic Paradox login background, credits section and press-start text. Each
+  one reverts with a `DISABLE_LOGIN_BRANDING.flag`, `DISABLE_CREDITS_BRANDING.flag` or
+  `DISABLE_PRESS_START_BRANDING.flag` beside the game executable.
+
 ### Still open
 
-- The hub's local player spawns its pawn about a minute after the hub starts. A client that is
-  already connected at that moment receives the pawn before it is removed from the replication
-  graph, and removal does not close an open channel, so that client sees an extra character.
-- Hunt reward persistence and a cold re-login are not verified yet.
-- Player-hosted (peer-to-peer) hunts are not tested on 1.14.7.
+- An intermittent client crash on the way back from a hunt to Ramsgate (once in four returns), inside
+  the engine's map load.
 - The gameplay HUD shows during the arrival beam and the airship lobby (also present on 1.12.0).
 
 ## Lessons so far

@@ -1,5 +1,10 @@
 # Generating the SDK
 
+> [!NOTE]
+> This guide describes Dauntless 1.12.0. Follow it on the
+> [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag: `main` now
+> carries the 1.14.7 runtime, and this guide moves to 1.14.7 with the remaining components.
+
 ParadoxRuntime and tools/CatalogExporter build against a C++ SDK generated from your own compatible
 game installation. No game-derived SDK is distributed in this repository.
 
