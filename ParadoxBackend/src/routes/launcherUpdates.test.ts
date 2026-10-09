@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateGuardManifestWindow } from "./launcherUpdates";
+import { AllowedRuntimeExtraFiles, validateGuardManifestWindow } from "./launcherUpdates";
 
 const NOW = Date.parse("2026-09-09T00:00:00.000Z");
 
@@ -46,4 +46,17 @@ test("Guard manifest window rejects a lifetime beyond the publisher bound", () =
 
 test("Guard manifest window rejects malformed timestamps", () => {
     assert.throws(() => validateGuardManifestWindow("not-a-time", "2026-09-09T01:00:00.000Z", NOW), /invalid/);
+});
+
+test("runtime extra files are the winmm proxy plus the configured safe names", () => {
+    const previous = process.env.RUNTIME_EXTRA_FILES;
+    try {
+        delete process.env.RUNTIME_EXTRA_FILES;
+        assert.deepEqual([...AllowedRuntimeExtraFiles()], ["winmm.dll"]);
+        process.env.RUNTIME_EXTRA_FILES = " Coop-Transport.dll, coop-admission.key ,../evil.dll,";
+        assert.deepEqual([...AllowedRuntimeExtraFiles()], ["winmm.dll", "coop-transport.dll", "coop-admission.key"]);
+    } finally {
+        if (previous === undefined) delete process.env.RUNTIME_EXTRA_FILES;
+        else process.env.RUNTIME_EXTRA_FILES = previous;
+    }
 });

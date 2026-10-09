@@ -123,12 +123,8 @@ export interface P2PExtension {
     launcher: {
         /** Extra fields of GET /launcher/v1/policy. */
         policyFields(): Record<string, unknown>;
-        /** Runtime files a launcher with this module installs and reports, all or none. */
-        runtimeArtifacts: readonly string[];
         /** Extra Guard manifest artifact roles. */
         guardManifestRoles: readonly string[];
-        /** Extra runtime files the update publisher accepts (lower case). */
-        updateExtraFiles: readonly string[];
     };
     operations: {
         /** False when the module's fields of the operations policy document are malformed. */
@@ -168,9 +164,7 @@ const DEDICATED_ONLY: P2PExtension = {
     },
     launcher: {
         policyFields: () => ({}),
-        runtimeArtifacts: [],
-        guardManifestRoles: [],
-        updateExtraFiles: []
+        guardManifestRoles: []
     },
     operations: {
         policyFieldsValid: () => true,

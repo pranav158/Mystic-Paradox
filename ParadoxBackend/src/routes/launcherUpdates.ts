@@ -28,11 +28,23 @@ const GUARD_MANIFEST_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
 // authorization into a year-plus credential by bypassing the publisher script.
 const GUARD_MANIFEST_MAX_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
 
-const CORE_GUARD_ARTIFACT_ROLES = ["GAME", "LAUNCHER", "CONTENT"];
+// INTERNAL_SERVER is the runtime DLL and UDP_PROXY the winmm proxy that loads it: every manifest has them.
+const CORE_GUARD_ARTIFACT_ROLES = ["GAME", "LAUNCHER", "CONTENT", "INTERNAL_SERVER", "UDP_PROXY"];
+
+/**
+ * Runtime feed files the publisher accepts besides the runtime DLL: the winmm proxy, plus the lower-case names in
+ * RUNTIME_EXTRA_FILES (comma-separated), for example an optional module's runtime files. Every file must still carry
+ * a valid runtime signature.
+ */
+export function AllowedRuntimeExtraFiles(): Set<string> {
+    const configured = (process.env.RUNTIME_EXTRA_FILES ?? "").split(",")
+        .map((name) => name.trim().toLowerCase()).filter((name) => /^[a-z0-9._-]{1,96}$/.test(name));
+    return new Set(["winmm.dll", ...configured]);
+}
 
 interface GuardManifestArtifact {
     name: string;
-    /** GAME, LAUNCHER or CONTENT, or a role of an optional module (src/extensions). */
+    /** A core role (CORE_GUARD_ARTIFACT_ROLES) or a role of an optional module (src/extensions). */
     role: string;
     size: number;
     sha256: string;
@@ -527,8 +539,8 @@ launcherUpdatesRouter.post(
             version = segment(req.header("x-update-version") ?? "", "version");
             filename = segment(path.basename(req.header("x-update-filename") ?? ""), "filename");
         } catch { res.status(400).json({ error: "Invalid extra-file metadata." }); return; }
-        // winmm.dll loads the runtime; an optional module may publish its own runtime files.
-        const allowedExtra = new Set(["winmm.dll", ...GetP2PExtension().launcher.updateExtraFiles]);
+        // winmm.dll loads the runtime; RUNTIME_EXTRA_FILES names an optional module's runtime files.
+        const allowedExtra = AllowedRuntimeExtraFiles();
         if (!RUNTIME_TARGETS.has(target) || platform !== "windows-x86_64" || !allowedExtra.has(filename.toLowerCase())) {
             res.status(400).json({ error: "Invalid extra-file target/platform/name." }); return;
         }

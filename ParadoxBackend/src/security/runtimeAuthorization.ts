@@ -11,7 +11,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { LauncherApiError } from "./launcherErrors";
 import { TESTER_ROLE } from "./testerFeatures";
-import { GetP2PExtension } from "../extensions/p2p";
 
 export const RUNTIME_CHANNELS = ["stable", "beta", "dev"] as const;
 export type RuntimeChannel = typeof RUNTIME_CHANNELS[number];
@@ -43,11 +42,13 @@ export interface ApprovedRuntimeAttestation {
 const CORE_INSTALLED_ARTIFACTS = ["MysticParadox.dll", "winmm.dll"];
 
 /**
- * Files a launcher built with an optional module installs and reports, all or none (src/extensions).
- * The game client never loads them; a launcher without the module reports the core files alone.
+ * The published manifest's other files (an optional module's runtime files, such as the co-op transport) are
+ * reported all or none: a launcher that uses them reports every one, a launcher that does not reports the core
+ * files alone. The game client never loads them. Their names are feed data, not code.
  */
-function ModuleInstalledArtifacts(): readonly string[] {
-    return GetP2PExtension().launcher.runtimeArtifacts;
+function OptionalInstalledArtifacts(approved: ApprovedRuntimeAttestation): string[] {
+    const core = new Set(CORE_INSTALLED_ARTIFACTS.map((name) => name.toLowerCase()));
+    return approved.artifacts.map((entry) => entry.name).filter((name) => !core.has(name.toLowerCase()));
 }
 
 const SAFE_ARTIFACT_NAME = /^[A-Za-z0-9._-]{1,96}$/;
@@ -83,10 +84,12 @@ function HasAll(seen: Set<string>, names: readonly string[]): boolean {
     return names.every((name) => seen.has(name.toLowerCase()));
 }
 
-/** A launcher reports either the core set or the core plus all of the module's files. */
-function NormalizeRuntimeArtifactSet(value: unknown): RuntimeArtifactHash[] {
-    const moduleArtifacts = ModuleInstalledArtifacts();
-    const knownArtifacts = new Set([...CORE_INSTALLED_ARTIFACTS, ...moduleArtifacts].map((name) => name.toLowerCase()));
+/**
+ * A launcher reports either the core set or the core plus all of the optional files. A name the published
+ * manifest does not list makes the set malformed.
+ */
+function NormalizeRuntimeArtifactSet(value: unknown, optionalArtifacts: readonly string[]): RuntimeArtifactHash[] {
+    const knownArtifacts = new Set([...CORE_INSTALLED_ARTIFACTS, ...optionalArtifacts].map((name) => name.toLowerCase()));
     if (!Array.isArray(value) || value.length > knownArtifacts.size) {
         throw new LauncherApiError("AUTH_VALIDATION_FAILED", "The complete runtime artifact set is required.");
     }
@@ -101,8 +104,8 @@ function NormalizeRuntimeArtifactSet(value: unknown): RuntimeArtifactHash[] {
         seen.add(name.toLowerCase());
         return { name, sha256: NormalizeRuntimeSha256(input.sha256) };
     });
-    const reportsModule = moduleArtifacts.some((name) => seen.has(name.toLowerCase()));
-    if (!HasAll(seen, CORE_INSTALLED_ARTIFACTS) || (reportsModule && !HasAll(seen, moduleArtifacts))) {
+    const reportsOptional = optionalArtifacts.some((name) => seen.has(name.toLowerCase()));
+    if (!HasAll(seen, CORE_INSTALLED_ARTIFACTS) || (reportsOptional && !HasAll(seen, optionalArtifacts))) {
         throw new LauncherApiError("AUTH_VALIDATION_FAILED", "The complete runtime artifact set is required.");
     }
     return normalized.sort((left, right) => left.name.localeCompare(right.name));
@@ -204,8 +207,8 @@ export function GetApprovedRuntimeAttestation(channel: RuntimeChannel,
 
 /**
  * Every reported file must match the signed manifest's hash for that name. A launcher reports the
- * core set, or the core plus all of an optional module's files, so module files the manifest also
- * lists are not required of a core client. The returned digest covers the set actually verified.
+ * core set, or the core plus all of the manifest's optional files, so those are not required of a core
+ * client. The returned digest covers the set actually verified.
  */
 export function AssertRuntimeArtifactSetApproved(channel: RuntimeChannel, requestedVersion: unknown,
     requestedArtifacts: unknown, updateRoot = RuntimeUpdateRoot()): ApprovedRuntimeAttestation {
@@ -213,8 +216,8 @@ export function AssertRuntimeArtifactSetApproved(channel: RuntimeChannel, reques
     if (!SAFE_VERSION.test(version)) {
         throw new LauncherApiError("AUTH_VALIDATION_FAILED", "runtimeManifestVersion is invalid.");
     }
-    const actual = NormalizeRuntimeArtifactSet(requestedArtifacts);
     const approved = GetApprovedRuntimeAttestation(channel, updateRoot);
+    const actual = NormalizeRuntimeArtifactSet(requestedArtifacts, OptionalInstalledArtifacts(approved));
     const approvedByName = new Map(approved.artifacts.map((entry) => [entry.name.toLowerCase(), entry.sha256]));
     if (version !== approved.version ||
         actual.some((entry) => approvedByName.get(entry.name.toLowerCase()) !== entry.sha256)) {
