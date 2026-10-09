@@ -176,7 +176,9 @@
     <!-- Optional player-hosted mode (P2PHooks.h): its sources when present, otherwise the dedicated-only stub. -->
     <ClCompile Include="P2PHooksStub.cpp" Condition="!Exists('p2p\PlayerHost.cpp')" />
     <ClCompile Include="p2p\PlayerHost.cpp" Condition="Exists('p2p\PlayerHost.cpp')" />
-    <ClCompile Include="p2p\HuntGuard.cpp" Condition="Exists('p2p\HuntGuard.cpp')" />
+    <!-- Optional anti-cheat module of the player-hosted mode (p2p\AntiCheatHooks.h): its sources when present, otherwise the stub. -->
+    <ClCompile Include="p2p\AntiCheatHooksStub.cpp" Condition="Exists('p2p\PlayerHost.cpp') And !Exists('anticheat\HuntGuard.cpp')" />
+    <ClCompile Include="anticheat\HuntGuard.cpp" Condition="Exists('p2p\PlayerHost.cpp') And Exists('anticheat\HuntGuard.cpp')" />
     <ClCompile Include="SDK\Archon_functions.cpp" />
     <ClCompile Include="SDK\Basic.cpp" />
     <ClCompile Include="SDK\BPGM_Archon_Prototype_functions.cpp" />

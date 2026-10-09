@@ -85,7 +85,10 @@
     <ClCompile Include="p2p\PlayerHost.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="p2p\HuntGuard.cpp">
+    <ClCompile Include="p2p\AntiCheatHooksStub.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="anticheat\HuntGuard.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="SDK\Archon_functions.cpp">

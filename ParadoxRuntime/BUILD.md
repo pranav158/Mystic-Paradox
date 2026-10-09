@@ -10,11 +10,13 @@ argument it selects the client hooks. Do not build, package, or load separate cl
 ## Optional player-hosted module
 
 `P2PHooks.h` declares the few hook points of the optional player-hosted (P2P) server mode. When
-`p2p\PlayerHost.cpp` exists, the project compiles `p2p\*.cpp`; otherwise it compiles `P2PHooksStub.cpp`,
+`p2p\PlayerHost.cpp` exists, the project compiles it; otherwise it compiles `P2PHooksStub.cpp`,
 whose dedicated-only hooks claim no auth mode (a server always runs as a DeployServer gameserver). The
-conditions are in `MysticParadox.vcxproj`. Code in `p2p\` uses the shared helpers in `RuntimeShared.h`;
-`dllmain.cpp` and `Networking.cpp` never include anything from `p2p\`. Check both builds after touching a
-hook: rename `p2p` aside and build into another `OutDir`/`IntDir` for the dedicated-only one.
+player-hosted mode has its own optional anti-cheat module behind `p2p\AntiCheatHooks.h`: `anticheat\*.cpp`
+when present, otherwise `p2p\AntiCheatHooksStub.cpp` (no hunt evidence). The conditions are in
+`MysticParadox.vcxproj`. Code in `p2p\` and `anticheat\` uses the shared helpers in `RuntimeShared.h`;
+`dllmain.cpp` and `Networking.cpp` never include anything from either folder. Check every combination after
+touching a hook: rename the folders aside and build into another `OutDir`/`IntDir`, never `x64\Release`.
 
 ## Requirements and command
 
