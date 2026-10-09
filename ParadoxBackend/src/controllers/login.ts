@@ -12,10 +12,10 @@
 import { GetRepositories } from "../persistence";
 
 export async function GetUsernameForUserId(userId: string){
-    
-    
-    
-    
+    // Launcher accounts are now the authoritative source for player-facing names.
+    // The legacy accounts document is still needed for the game data path, but it
+    // can contain an old/default name (or no name at all) after a launcher account
+    // has been linked to the same user id.
     try {
         const LauncherAccount = await GetRepositories().launcherAccounts.findByUserId(userId);
         if(LauncherAccount?.displayName){

@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "targetVersion": "example",
+  "catalogSha256": "",
+  "generatedAt": "1970-01-01T00:00:00.000Z",
+  "referencedCatalogIds": 2,
+  "entries": {
+    "EXAMPLE_ITEM_00": {
+      "storage": "instanced",
+      "maxQuantity": 1,
+      "tags": [
+        "Owned"
+      ]
+    },
+    "EXAMPLE_DYE_00": {
+      "storage": "stacked",
+      "maxQuantity": 1,
+      "tags": [
+        "Dye"
+      ]
+    }
+  }
+}

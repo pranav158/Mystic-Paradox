@@ -6,14 +6,24 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
+// Party-aware routing for POST /matchmaking (routes/matchmaking.ts) has two contracts:
+// - ISLAND requests carry the partyId of the party the client is actively travelling with. It must match the
+//   authoritative party, and only members with a live XMPP session go along. A stale server-side party (for
+//   example after the other client disconnected) can then never turn "Private Hunt / solo" into a two-player
+//   server whose airship waits forever.
+// - CITY/ReturnToRamsgate requests omit partyId in the captured 1.12 protocol, so the authoritative party is
+//   kept and returning members still fan out to the shared Ramsgate.
+
 export type MatchmakingPartySnapshot = {
     partyId: string,
-    members: string[]
+    members: string[],
+    revision?: number
 };
 
 export type MatchmakingPartyResolution = {
     partyId?: string,
     partyMembers?: string[],
+    partyRevision?: number,
     excludedMembers: string[],
     partyIdMismatch: boolean
 };
@@ -30,10 +40,7 @@ export function ResolveMatchmakingParty(
     }
 
     const IsIslandRequest = GameMode === "ISLAND";
-    const PartyIdMismatch =
-        IsIslandRequest && RequestedPartyId !== Party.partyId;
-
-    if(PartyIdMismatch){
+    if(IsIslandRequest && RequestedPartyId !== Party.partyId){
         return {
             excludedMembers: Party.members.filter((Member) => Member !== UserId),
             partyIdMismatch: true
@@ -47,6 +54,7 @@ export function ResolveMatchmakingParty(
     return {
         partyId: Party.partyId,
         partyMembers: PartyMembers,
+        partyRevision: Party.revision,
         excludedMembers: Party.members.filter((Member) => !PartyMembers.includes(Member)),
         partyIdMismatch: false
     };

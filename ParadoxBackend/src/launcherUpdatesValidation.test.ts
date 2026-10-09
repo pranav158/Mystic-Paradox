@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+
 import { segment } from "./routes/launcherUpdates";
 
 test("accepts flat update path segments", () => {

@@ -1,14 +1,24 @@
-
+/*
+ * Clone the dev/backup account (userId="mystpax") into a brand-new launcher account
+ * with the SAME progress but a fresh userId + fresh characterIds + login credentials.
+ *
+ * NON-DESTRUCTIVE: only INSERTS new documents. The source (mystpax) is never modified,
+ * so it remains playable as a backup via start-client-direct.bat (dev fallback in
+ * routes/eos.ts). The new account is playable via the launcher (email + password).
+ *
+ * Run:  npx tsx --env-file=.env scripts/clone_account.ts "<DisplayName>" "<email>" "<password>"
+ *   The password (12+ characters) is required; it is never printed.
+ */
 import crypto from "crypto";
 import { GetPersistenceLifecycle } from "../src/persistence";
 import { GetMongoDb } from "../src/persistence/mongo/client";
 import { Collections } from "../src/persistence/mongo/collections";
 import { HashPassword } from "../src/security/passwords";
 
-const SOURCE_USER = process.env.CLONE_SOURCE_USER ?? "mysticparadox";
+const SOURCE_USER = process.env.CLONE_SOURCE_USER ?? "mystpax";
 
-
-
+// Per-character and per-user collections to clone. Accounts + Characters are handled
+// specially (launcher fields / characterId map); the rest are generic field+_id remaps.
 const PER_CHARACTER_OR_USER_COLLECTIONS = [
     Collections.Inventories,
     Collections.Loadouts,
@@ -39,23 +49,27 @@ function remapDoc(doc: any, charMap: Record<string, string>, oldUser: string, ne
 }
 
 async function main() {
-    const DisplayName = (process.argv[2] ?? "ExampleSlayer").trim();
+    const DisplayName = (process.argv[2] ?? "MysticFox").trim();
     const Email = (process.argv[3] ?? "admin@example.com").trim().toLowerCase();
-    const Password = process.argv[4] ?? crypto.randomBytes(9).toString("base64url");
+    const Password = process.argv[4] ?? "";
+    if (Password.length < 12) {
+        console.error('usage: clone_account.ts "<DisplayName>" "<email>" "<password, 12+ characters>"');
+        process.exit(2);
+    }
 
     await GetPersistenceLifecycle().start();
     const Db = await GetMongoDb();
 
     const NewUser = crypto.randomUUID();
 
-    
+    // Guard: don't collide with an existing launcher account.
     if (await Db.collection(Collections.Accounts).findOne({ email: Email })) throw new Error(`email already in use: ${Email}`);
     if (await Db.collection(Collections.Accounts).findOne({ displayNameNormalized: DisplayName.toLowerCase() })) throw new Error(`display name taken: ${DisplayName}`);
 
     const SourceAccount: any = await Db.collection(Collections.Accounts).findOne({ _id: SOURCE_USER as any });
     if (!SourceAccount) throw new Error(`source account not found: ${SOURCE_USER}`);
 
-    
+    // 1. New accounts doc = source game fields (name/notes) + launcher credentials.
     await Db.collection(Collections.Accounts).insertOne({
         _id: NewUser as any,
         userId: NewUser,
@@ -70,7 +84,7 @@ async function main() {
         createdAt: new Date().toISOString()
     } as any);
 
-    
+    // 2. Characters -> fresh characterIds (build map).
     const CharMap: Record<string, string> = {};
     const SourceChars = await Db.collection(Collections.Characters).find({ userId: SOURCE_USER }).toArray();
     for (const c of SourceChars as any[]) {
@@ -81,7 +95,7 @@ async function main() {
         });
     }
 
-    
+    // 3. Everything keyed by userId and/or characterId — generic remap.
     const Counts: Record<string, number> = { characters: SourceChars.length };
     for (const Coll of PER_CHARACTER_OR_USER_COLLECTIONS) {
         const OldCharIds = Object.keys(CharMap);
@@ -101,7 +115,7 @@ async function main() {
     console.log("new userId    :", NewUser);
     console.log("displayName   :", DisplayName);
     console.log("email         :", Email);
-    console.log("password      : [REDACTED] (not logged)");
+    console.log("password      : (as given; not logged)");
     console.log("cloned counts :", JSON.stringify(Counts));
 
     await GetPersistenceLifecycle().stop();

@@ -8,3 +8,4 @@ temp/
 *.db
 file
 migration-fixtures/snapshot_mysticparadox_pre_migration.json
+launcher-logs/

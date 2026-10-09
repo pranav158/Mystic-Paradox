@@ -47,7 +47,7 @@ test("canAcceptStanza: handshake stanzas gated by state", () => {
     assert.equal(canAcceptStanza(XmppState.OpenReceived, "auth"), true);
     assert.equal(canAcceptStanza(XmppState.Connected, "auth"), false);
     assert.equal(canAcceptStanza(XmppState.ReopenReceived, "bind"), true);
-    
+    // close is always acceptable.
     assert.equal(canAcceptStanza(XmppState.Connected, "close"), true);
     assert.equal(canAcceptStanza(XmppState.Closed, "close"), true);
 });

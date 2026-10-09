@@ -18,27 +18,33 @@ import { GetUsernameForUserId } from "../controllers/login";
 import { GetRepositories } from "../persistence";
 import { HashOpaqueToken } from "../security/launcherTokens";
 import { IsAccountEligible } from "../security/accountEligibility";
+import { LauncherApiError } from "../security/launcherErrors";
+import {
+    AssertRuntimeChannelMatchesAccount,
+    AssertRuntimeHashApproved,
+    ParseRuntimeChannel
+} from "../security/runtimeAuthorization";
 
 export const eosRouter = Router();
 
 const DEV_USER_ID = process.env.DEV_USER_ID ?? "dev-user";
 const DEV_USER_NAME = process.env.DEV_USER_NAME ?? "Dev Slayer";
-
-
-
+// OAuth client-credentials grants authenticate the game application, not a
+// player. Keep that token distinct from a real launcher account: the player's
+// identity is established only by the preceding one-time exchange code.
 const LAUNCHER_CLIENT_CREDENTIALS_USER_ID = "__launcher_client_credentials__";
 
-
-
-
-
-
-
-
-
-
-
-
+// [hardening 2026-07-14] The AUTH_MODE=NONE branch below auto-creates and logs in as ANY
+// arbitrary account with zero real authentication - it exists for local development only and
+// must never be reachable in a real deployment. It was previously gated only by
+// `NODE_ENV !== "production"`, which is a single easy-to-leave-unset environment variable away
+// from silently activating in a real deployment (NODE_ENV is not guaranteed to be set by every
+// process manager/host). Now ALSO requires this explicit second flag, so a real deployment must
+// affirmatively opt into no-auth mode twice, not rely on a single env var's absence.
+//
+// Full removal of this fallback (replacing local dev's auth with AUTH_MODE=APIKEY end-to-end) is
+// flagged as separate, explicit follow-up work before shipping multiplayer - it is not done here
+// because it would break the current local dev workflow with no documented replacement in place.
 const ALLOW_NO_AUTH_DEV_MODE = process.env.ALLOW_NO_AUTH_DEV_MODE === "true";
 
 async function EnsureDevUser(userId: string){
@@ -96,7 +102,7 @@ eosRouter.post("/account/api/oauth/token", async (req, res) => {
 
         await EnsureDevUser(UserId);
 
-        logger.info("Logging in user via EOS dev auth mode.");
+        logger.info("Logging in a user in no-auth dev mode.");
 
         const AuthToken = SignMetagameJWTForUid(UserId);
 
@@ -121,7 +127,7 @@ eosRouter.post("/account/api/oauth/token", async (req, res) => {
         const UserId = await GetUserIDForAPIKey(ApiKey);
 
         if(UserId != undefined){
-            logger.info(`Logging in ${UserId}!`);
+            logger.info("Logging in a user by API key.");
 
             const AuthToken = SignMetagameJWTForUid(UserId);
 
@@ -156,11 +162,11 @@ eosRouter.post("/account/api/oauth/token", async (req, res) => {
         const RawExchangeCode = req.body.exchange_code;
 
         if(typeof RawExchangeCode !== "string" || RawExchangeCode.length === 0){
-            
-            
-            
-            
-            
+            // The 1.12 client makes a second normal OAuth request after its
+            // player exchange: grant_type=client_credentials. It intentionally
+            // contains no exchange_code because it authenticates the game app,
+            // not the player. Do not consume or replay a player handoff code
+            // here; return a separate service token instead.
             if(req.body?.grant_type === "client_credentials"){
                 logger.info("LAUNCHER auth: issuing client-credentials token");
 
@@ -190,12 +196,12 @@ eosRouter.post("/account/api/oauth/token", async (req, res) => {
         const CodeRecord = await GetRepositories().gameExchangeCodes.consumeByCodeHash(HashOpaqueToken(RawExchangeCode));
 
         if(CodeRecord === undefined){
-            
-            
-            
-            
-            
-            
+            // Retained dev/backup identity: when no one-time game-session code matches AND dev
+            // mode is explicitly enabled (non-production), treat the value as a dev userId so the
+            // kept-for-backup account (e.g. "mystpax", launched via start-client-direct.bat) can
+            // still play alongside real launcher accounts. Gated by ALLOW_NO_AUTH_DEV_MODE so a
+            // real deployment (flag unset) rejects any non-code value instead — launcher codes
+            // remain single-use and this never weakens them.
             if(ALLOW_NO_AUTH_DEV_MODE && process.env.NODE_ENV !== "production"){
                 logger.info(`LAUNCHER auth: no game-session code matched; dev fallback login as "${RawExchangeCode}"`);
 
@@ -229,7 +235,7 @@ eosRouter.post("/account/api/oauth/token", async (req, res) => {
 
         const TargetChangelist = Number(process.env.TARGET_CHANGELIST ?? NaN);
 
-        
+        // Fails closed if TARGET_CHANGELIST is unset/misconfigured, not open.
         if(!Number.isFinite(TargetChangelist) || CodeRecord.buildChangelist !== TargetChangelist){
             logger.warn(`LAUNCHER auth: build mismatch for ${CodeRecord.userId} (code build=${CodeRecord.buildChangelist}, target=${process.env.TARGET_CHANGELIST})`);
 
@@ -248,7 +254,22 @@ eosRouter.post("/account/api/oauth/token", async (req, res) => {
             return;
         }
 
-        logger.info(`Logging in ${CodeRecord.userId} via launcher exchange code!`);
+        // Re-check the channel and exact signed-manifest runtime hash when the game redeems the
+        // one-time code. A Tester revocation or runtime release change during the code's 60-second
+        // lifetime therefore invalidates the code instead of allowing stale beta access.
+        try {
+            const RuntimeChannel = ParseRuntimeChannel(CodeRecord.runtimeChannel);
+            AssertRuntimeChannelMatchesAccount(RuntimeChannel, Account.roles);
+            AssertRuntimeHashApproved(RuntimeChannel, CodeRecord.runtimeSha256);
+        } catch (error) {
+            const Code = error instanceof LauncherApiError ? error.code : "INTERNAL";
+            logger.warn(`LAUNCHER auth: runtime authorization failed for ${CodeRecord.userId} (${Code})`);
+            res.status(403);
+            res.send();
+            return;
+        }
+
+        logger.info("Logging in a user via a launcher exchange code.");
 
         const AuthToken = SignMetagameJWTForUid(CodeRecord.userId);
 
@@ -322,17 +343,17 @@ async function LookupEpicPublicAccount(accountId: string, displayNameOverride?: 
     return {
         id: accountId,
         displayName: displayNameOverride ?? LauncherAccount?.displayName ?? Account?.name ?? accountId,
-        
-        
+        // The Epic account is the core profile above. This map is only for linked
+        // external platforms (PSN/XBL/etc.), so do not fabricate an "epic" entry.
         externalAuths: {}
     };
 }
 
 eosRouter.get("/account/api/public/account/:AccId", async (req, res) => {
-    
-    
-    
-    
+    // Some Phoenix builds make this single-account request with the bearer
+    // token attached, even though the endpoint itself is public. Apply the same
+    // legacy-self alias treatment as the bulk endpoint when that token identifies
+    // a launcher account; otherwise retain normal public lookup semantics.
     const RequesterId = GetUserIdFromBearerToken(req);
     const IsLegacySelfAlias = req.params.AccId === DEV_USER_ID &&
         RequesterId !== undefined && RequesterId !== DEV_USER_ID;
@@ -355,14 +376,14 @@ eosRouter.get("/account/api/public/account/:AccId/externalAuths", async (req, re
         return;
     }
 
-    
-    
+    // Epic's /externalAuths contract is an array. Returning {} made the 1.12
+    // client reject the identity payload and display "No Epic Account".
     res.json([]);
 });
 
-
-
-
+// Resolve a display name to an accountId so the client can invite a friend by name.
+// Matches Epic's account-public-service display-name lookup. Searches launcher accounts
+// (real registered players). Returns 404 if no such display name exists.
 eosRouter.get("/account/api/public/account/displayName/:displayName", async (req, res) => {
     const DisplayName = typeof req.params.displayName === "string" ? req.params.displayName.trim() : "";
     const Account = await GetRepositories().launcherAccounts.findByDisplayNameNormalized(DisplayName.toLowerCase());
@@ -384,7 +405,7 @@ eosRouter.get("/account/api/public/account/displayName/:displayName", async (req
 eosRouter.delete("/account/api/oauth/sessions/kill", (req, res) => {
     logger.info("Session kill (stubbed)");
 
-    
+    // TODO: Is this needed?
 
     res.json({});
 })
@@ -392,31 +413,31 @@ eosRouter.delete("/account/api/oauth/sessions/kill", (req, res) => {
 eosRouter.delete("/account/api/oauth/sessions/kill/:AuthToken", (req, res) => {
     logger.info("Session kill (stubbed)");
 
-    
+    // TODO: Is this needed?
 
     res.json({});
 })
 
 eosRouter.get("/account/api/public/account", HasParadoxBackendAuth, async (req: any, res) => {
-    
-    
-    
-    
-    
+    // This is Epic's bulk public-account lookup. The query key may be repeated:
+    //   ?accountId=a&accountId=b
+    // The response must always be an array, even for a single requested account.
+    // Previously this ignored the query and returned one full profile object for
+    // the authenticated user; 1.12 rejected it ("users is of the wrong type").
     const QueryValue = req.query.accountId;
     const RequestedIds = (Array.isArray(QueryValue) ? QueryValue : [QueryValue])
         .filter((Value): Value is string => typeof Value === "string" && Value.length > 0);
 
-    
-    
+    // Preserve the old self-lookup behavior for callers that omit accountId while
+    // still honoring the array contract.
     if (RequestedIds.length === 0) RequestedIds.push(req.AuthData.userId);
 
-    
-    
-    
-    
-    
-    
+    // The 1.12 client still performs one legacy self-lookup as `mystpax` even
+    // after launcher authentication has established the real UUID.  Keep the
+    // requested id (the client uses it as its subsystem key), but use the
+    // authenticated launcher's display name for that one compatibility alias.
+    // Without this, the stale legacy account name (usually "Dev Slayer") wins
+    // and the Social panel's local header remains blank/mismatched.
     const AuthenticatedLauncherAccount = await GetRepositories().launcherAccounts.findByUserId(req.AuthData.userId);
     const Accounts = (await Promise.all(RequestedIds.map((RequestedId) => {
         const IsLegacySelfAlias = RequestedId === DEV_USER_ID && req.AuthData.userId !== DEV_USER_ID;

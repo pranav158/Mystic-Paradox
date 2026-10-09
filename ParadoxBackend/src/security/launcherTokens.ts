@@ -12,12 +12,12 @@
 import jwt, { JwtPayload } from "jsonwebtoken";
 import crypto from "crypto";
 
-
-
-
-
-
-
+// Deliberately independent of controllers/auth.ts (the game JWT signer) even
+// though both read the same AUTH_SIGNING_PRIVKEY_B64/PUBKEY keypair — a shared
+// RS256 keypair signing two different `audience` values is safe (the audience
+// claim is exactly what stops a launcher token from being replayed as a game
+// token, per spec section "Token policy"), and keeping this file self-contained
+// means the game backend's auth.ts is never touched by launcher work.
 const LAUNCHER_AUDIENCE = "mysticparadox-launcher";
 const ISSUER = "paradox-backend";
 const ACCESS_TOKEN_TTL = "12m";
@@ -32,7 +32,8 @@ function GetPublicKey(): string {
 
 export interface LauncherAccessTokenPayload {
     userId: string;
-    
+    /** The refresh session's familyId — lets logout revoke the right session
+     *  without the client resending its raw refresh token. */
     sid: string;
 }
 
@@ -55,9 +56,9 @@ export function ValidateLauncherAccessToken(token: string): LauncherAccessTokenP
     return { userId: Payload.userId, sid: Payload.sid };
 }
 
-
-
-
+// Refresh tokens and game exchange codes are opaque random secrets (not JWTs) —
+// stored hashed at rest (spec: "rotating refresh sessions stored hashed
+// server-side", "one-time game exchange codes stored hashed server-side").
 export function GenerateOpaqueToken(): string {
     return crypto.randomBytes(32).toString("hex");
 }

@@ -10,10 +10,9 @@
  */
 
 import jwt, {JwtPayload} from "jsonwebtoken";
-import crypto from "crypto";
 import { GetRepositories } from "../persistence";
 import { logger } from "../logger";
-import { HashApiKey } from "../security/apiKeyHash";
+import { AcceptsLegacyApiKeyHashes, FindApiKeyRecord, HashApiKey, LegacySha256ApiKeyHash } from "../security/apiKeyHash";
 
 const PRIVKEY = Buffer.from(process.env.AUTH_SIGNING_PRIVKEY_B64!, "base64").toString("utf-8");
 const PUBKEY = Buffer.from(process.env.AUTH_SIGNING_PUBKEY_B64!, "base64").toString("utf-8");
@@ -31,29 +30,20 @@ export async function DrainAndRegisterUserAPIKeys(){
         await GetRepositories().apiKeys.insertUserKeyHash(APIKey.userId, HashUserAPIKey(APIKey.key));
     }
 
-    logger.info("Registered pending User API keys on boot.");
+    logger.info(`Registered ${APIKeysToRegister.length} new User API Key(s) on boot!`);
 }
 
 export async function GetUserIDForAPIKey(UserAPIKey: string){
     const AllAPIKeyHashes = await GetRepositories().apiKeys.findAllUserKeyHashes();
 
-    const IncomingUserAPIKeyHashBuffer = Buffer.from(HashUserAPIKey(UserAPIKey), "hex");
+    // HMAC records first; a pre-HMAC (plain SHA-256) record still matches during the migration. User key records
+    // are keyed by userId, so they are not rewritten here - re-register the key to move it to HMAC.
+    const Match = FindApiKeyRecord(AllAPIKeyHashes, HashUserAPIKey(UserAPIKey))
+        ?? (AcceptsLegacyApiKeyHashes()
+            ? FindApiKeyRecord(AllAPIKeyHashes, LegacySha256ApiKeyHash(UserAPIKey))
+            : undefined);
 
-    let UserId: string | undefined = undefined;
-
-    for(const CmpAPIKeyHash of AllAPIKeyHashes){
-        const CmpAPIKeyHashBuffer = Buffer.from(CmpAPIKeyHash.keyHash!, "hex");
-
-        if(CmpAPIKeyHashBuffer.length !== IncomingUserAPIKeyHashBuffer.length){
-            continue;
-        }
-
-        if(crypto.timingSafeEqual(IncomingUserAPIKeyHashBuffer, CmpAPIKeyHashBuffer)){
-            UserId = CmpAPIKeyHash.userId;
-        }
-    }
-
-    return UserId;
+    return Match?.userId;
 }
 
 function SignMetagameJWTForUid(userId: string){
@@ -75,13 +65,22 @@ function ValidateMetagameJWTAndGetPayload(token: string){
     });
 }
 
+// [2026-07-24] Store purchase tokens (Token/Platinum/GetPurchaseToken.md + Notification/
+// BuyFromPurchaseToken.md - real endpoint captures, despite the "platinum" naming the GetPurchaseToken
+// doc explicitly says "any catalogId from shop"). Deliberately a distinct issuer/audience from the
+// account bearer token above: this token is single-purchase-scoped (short expiry, carries
+// userId+characterId+storeTag+skuId, minted by GET /token/{currency}/:id and redeemed by
+// POST /notification/platinum) and must never be accepted where an account bearer token is expected.
+export type StorePurchaseTokenPayload = {
+    userId: string;
+    characterId: string;
+    skuId: string;
+    // Optional only so a token minted by the pre-registry Lady Luck build remains redeemable during
+    // a rolling deployment. New tokens always bind the store identity.
+    storeTag?: string;
+};
 
-
-
-
-
-
-function SignLadyLuckPurchaseToken(payload: { userId: string; characterId: string; skuId: string }){
+function SignStorePurchaseToken(payload: StorePurchaseTokenPayload){
     return jwt.sign(payload, PRIVKEY, {
         algorithm: "RS256",
         expiresIn: "10m",
@@ -90,12 +89,29 @@ function SignLadyLuckPurchaseToken(payload: { userId: string; characterId: strin
     });
 }
 
-function ValidateLadyLuckPurchaseToken(token: string){
+function ValidateStorePurchaseToken(token: string){
     return jwt.verify(token, PUBKEY, {
         algorithms: ["RS256"],
         issuer: "mysticparadox-store",
         audience: "mysticparadox-store-purchase"
-    }) as { userId: string; characterId: string; skuId: string };
+    }) as StorePurchaseTokenPayload;
 }
 
-export { SignMetagameJWTForUid, ValidateMetagameJWTAndGetPayload, SignLadyLuckPurchaseToken, ValidateLadyLuckPurchaseToken }
+// Backward-compatible aliases for existing Lady Luck imports. New callers should use the generic
+// names and include storeTag in the payload.
+function SignLadyLuckPurchaseToken(payload: { userId: string; characterId: string; skuId: string }) {
+    return SignStorePurchaseToken(payload);
+}
+
+function ValidateLadyLuckPurchaseToken(token: string) {
+    return ValidateStorePurchaseToken(token);
+}
+
+export {
+    SignMetagameJWTForUid,
+    ValidateMetagameJWTAndGetPayload,
+    SignStorePurchaseToken,
+    ValidateStorePurchaseToken,
+    SignLadyLuckPurchaseToken,
+    ValidateLadyLuckPurchaseToken,
+}

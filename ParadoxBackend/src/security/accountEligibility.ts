@@ -1,12 +1,16 @@
 /*
- * Copyright (C) 2026 Mystic Paradox (pranav158/MysticParadox)
+ * Copyright (C) 2026 MysticFox / Pranav Karande (pranav158/Mystic-Paradox)
  * Licensed under the GNU Affero General Public License v3.0.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
 import { LauncherAccountRecord } from "../persistence";
 import { LauncherApiError } from "./launcherErrors";
 
-
+/** Legacy launcher accounts intentionally default to approved during rollout.
+ * The explicit migration script can later move selected accounts to pending. */
 export function EffectiveApprovalStatus(account: LauncherAccountRecord): "pending" | "approved" | "rejected" {
     return account.approvalStatus ?? "approved";
 }

@@ -14,11 +14,11 @@ import { Collections } from "../collections";
 import { EncounteredContentRepository } from "../../contracts/EncounteredContentRepository";
 import { EncounteredContentRecord } from "../../mapping/domainTypes";
 
-
-
-
-
-
+// Maps to plan section 6.9's `encounteredContent` collection. _id = characterId.
+// Field kept as `encounteredcontent` (lowercase, matching the SQLite column name)
+// rather than the plan's `entries` to preserve the exact current domain-type
+// shape used by controllers/progression.ts — renaming the field is a separate,
+// non-behavior-preserving change.
 export class MongoEncounteredContentRepository implements EncounteredContentRepository {
     async findByCharacterIdAndUserId(characterId: string, userId: string): Promise<EncounteredContentRecord | undefined> {
         const Db = await GetMongoDb();

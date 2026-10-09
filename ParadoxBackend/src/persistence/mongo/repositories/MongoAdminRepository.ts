@@ -1,8 +1,12 @@
 /*
- * Copyright (C) 2026 Mystic Paradox (pranav158/MysticParadox)
+ * Copyright (C) 2026 MysticFox / Pranav Karande (pranav158/Mystic-Paradox)
  * Licensed under the GNU Affero General Public License v3.0.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
+import { ClientSession } from "mongodb";
 import { AdminAuditRecord, AdminRepository, AdminSessionRecord, PlayerDeletionResult } from "../../contracts/AdminRepository";
 import { GetMongoClient, GetMongoDb } from "../client";
 import { Collections } from "../collections";
@@ -64,9 +68,9 @@ export class MongoAdminRepository implements AdminRepository {
         );
     }
 
-    async appendAudit(record: AdminAuditRecord): Promise<void> {
+    async appendAudit(record: AdminAuditRecord, session?: ClientSession): Promise<void> {
         const Db = await GetMongoDb();
-        await Db.collection(Collections.AdminAudit).insertOne({ ...record, _id: record.id as any });
+        await Db.collection(Collections.AdminAudit).insertOne({ ...record, _id: record.id as any }, { session });
     }
 
     async listAudit(targetUserId: string | undefined, skip: number, limit: number): Promise<{ records: AdminAuditRecord[]; total: number }> {
@@ -109,8 +113,8 @@ export class MongoAdminRepository implements AdminRepository {
                     ]
                 };
 
-                
-                
+                // Authentication and live-session state first. The transaction means
+                // none of these removals become visible unless the full cascade commits.
                 await Remove(Collections.RefreshSessions, { userId });
                 await Remove(Collections.GameExchangeCodes, { userId });
                 await Remove(Collections.AdminSessions, { userId });
@@ -138,9 +142,9 @@ export class MongoAdminRepository implements AdminRepository {
                 }
                 DeletedCounts[Collections.Accounts] = AccountResult.deletedCount;
 
-                
-                
-                
+                // Retain one minimal operational tombstone. It contains opaque IDs
+                // and state only—never the deleted email, username, password hash,
+                // identity details, inventory, or progression.
                 await Db.collection(Collections.AdminAudit).insertOne(
                     { ...audit, _id: audit.id as any },
                     { session: Session }

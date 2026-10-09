@@ -9,14 +9,14 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-
-
-
-
-
-
-
-
+// Rotating launcher refresh sessions (spec section "Token policy"). `familyId`
+// is stable across a rotation chain — every reissue of a refresh token for the
+// same login keeps the same familyId, which is also embedded as `sid` in the
+// short-lived launcher access token so logout can revoke by family without the
+// client having to resend the raw refresh token. Reuse of an already-rotated
+// row (found but `revokedAt` already set) means the token was replayed —
+// revoking the whole family is the caller's (controllers/launcherAuth.ts)
+// responsibility, not this repository's.
 export interface RefreshSessionRecord {
     id: string;
     tokenHash: string;

@@ -9,12 +9,12 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-
-
-
-
-
-
+// A deliberately simple in-memory sliding-window limiter — good enough to stop
+// obvious single-process abuse during development, NOT the distributed/Redis-backed
+// limiter spec section 14 calls for in production (documented as follow-up work
+// in Plans/LAUNCHER_BACKEND_AUTH_REQUIREMENTS.md). Resets on process restart and
+// doesn't coordinate across multiple Metagame instances — both acceptable for now,
+// neither acceptable for a public launch.
 const Windows = new Map<string, number[]>();
 
 export function IsRateLimited(key: string, maxAttempts: number, windowMs: number): boolean {

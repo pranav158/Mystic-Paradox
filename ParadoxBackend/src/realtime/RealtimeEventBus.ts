@@ -11,7 +11,15 @@
 
 import { EventEmitter } from "node:events";
 
-
+/**
+ * Typed realtime social event map (plan §16). HTTP controllers (friends.ts,
+ * party.ts) publish AFTER a successful state mutation; realtime consumers
+ * (presence/roster/room services, WP5+) subscribe. This decouples social
+ * mutations from XMPP internals so neither imports the other's classes.
+ *
+ * In the capture foundation the bus exists and is safe to publish to, but no
+ * consumers are wired yet — that happens post-capture per the plan's order (§23).
+ */
 export interface RealtimeEventMap {
     "friend.invited": { ownerId: string; otherId: string };
     "friend.accepted": { ownerId: string; otherId: string };
@@ -31,8 +39,8 @@ export class RealtimeEventBus {
     private readonly emitter = new EventEmitter();
 
     constructor() {
-        
-        
+        // Realtime fan-out can attach several consumers per event; avoid the default
+        // 10-listener warning without hiding genuine leaks.
         this.emitter.setMaxListeners(64);
     }
 
@@ -50,5 +58,8 @@ export class RealtimeEventBus {
     }
 }
 
-
+/**
+ * Process-wide singleton. A single Metagame process owns realtime state in the MVP;
+ * cross-process fan-out (Redis pub/sub) is the scaling boundary noted in plan §17.
+ */
 export const realtimeEventBus = new RealtimeEventBus();

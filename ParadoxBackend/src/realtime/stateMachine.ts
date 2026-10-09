@@ -11,7 +11,16 @@
 
 import { XmppState } from "./types";
 
-
+/**
+ * XMPP connection state machine (plan §9.2). Pure + unit-tested (§20.1). Defines
+ * which follow-on states are reachable from a given state, and which stanza kinds
+ * are acceptable in a given state — presence/message/room-join must never be
+ * accepted before authentication and resource binding (plan §9.2, §18).
+ *
+ * This is a first, conservative model. The exact sequence (e.g. whether the client
+ * uses RFC 7395 <open> reopen after SASL, or requests a legacy session IQ) is
+ * refined once the real client handshake is captured.
+ */
 
 export const ALLOWED_TRANSITIONS: Readonly<Record<XmppState, readonly XmppState[]>> = {
     [XmppState.Connected]: [XmppState.OpenReceived, XmppState.Closing, XmppState.Closed],
@@ -26,7 +35,7 @@ export const ALLOWED_TRANSITIONS: Readonly<Record<XmppState, readonly XmppState[
 };
 
 export function canTransition(from: XmppState, to: XmppState): boolean {
-    if (from === to) return true; 
+    if (from === to) return true; // idempotent re-entry
     return ALLOWED_TRANSITIONS[from].includes(to);
 }
 
@@ -42,7 +51,7 @@ export type StanzaKind =
     | "ping"
     | "close";
 
-
+/** Stanza kinds that require a fully authenticated + bound session. */
 const REQUIRES_SESSION: ReadonlySet<StanzaKind> = new Set<StanzaKind>([
     "presence",
     "message",
@@ -52,7 +61,7 @@ const REQUIRES_SESSION: ReadonlySet<StanzaKind> = new Set<StanzaKind>([
 export function canAcceptStanza(state: XmppState, kind: StanzaKind): boolean {
     if (kind === "close") return true;
     if (kind === "open") {
-        
+        // Initial stream open, or the post-SASL reopen.
         return state === XmppState.Connected || state === XmppState.Authenticated;
     }
     if (kind === "auth") {
@@ -67,6 +76,6 @@ export function canAcceptStanza(state: XmppState, kind: StanzaKind): boolean {
     if (REQUIRES_SESSION.has(kind)) {
         return state === XmppState.SessionReady || state === XmppState.ResourceBound;
     }
-    
+    // Generic IQ / ping: allowed once the stream is open and not closed.
     return state !== XmppState.Connected && state !== XmppState.Closed;
 }

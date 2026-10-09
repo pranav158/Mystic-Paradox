@@ -9,14 +9,18 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-
+/**
+ * Pure SASL PLAIN parsing (RFC 4616). Deliberately DEPENDENCY-FREE (no auth/persistence imports)
+ * so it can be unit-tested in isolation without JWT keys or Mongo. authenticateSasl (XMPPAuth.ts)
+ * layers JWT verification + account checks on top of this.
+ */
 
 export type PlainParse =
     | { ok: true; authcid: string; password: string }
     | { ok: false; reason: string };
 
-const MAX_SASL_B64_LEN = 8 * 1024; 
-const MAX_SASL_DECODED_LEN = 6 * 1024; 
+const MAX_SASL_B64_LEN = 8 * 1024; // base64 text length cap (defense-in-depth over the WS frame cap)
+const MAX_SASL_DECODED_LEN = 6 * 1024; // decoded byte cap
 
 export function parseSaslPlain(mechanism: string, saslB64: string): PlainParse {
     if ((mechanism ?? "").toUpperCase() !== "PLAIN") {
@@ -36,7 +40,7 @@ export function parseSaslPlain(mechanism: string, saslB64: string): PlainParse {
     } catch {
         return { ok: false, reason: "base64" };
     }
-    
+    // RFC 4616 PLAIN: authzid \0 authcid \0 passwd — exactly three NUL-delimited fields.
     const parts = decoded.split("\u0000");
     if (parts.length !== 3) {
         return { ok: false, reason: "malformed PLAIN layout" };

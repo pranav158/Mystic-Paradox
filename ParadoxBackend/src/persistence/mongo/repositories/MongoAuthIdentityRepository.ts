@@ -9,6 +9,7 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
+import { ClientSession } from "mongodb";
 import { GetMongoDb } from "../client";
 import { Collections } from "../collections";
 import { AuthIdentityRepository, AuthIdentityRecord } from "../../contracts/AuthIdentityRepository";
@@ -25,22 +26,22 @@ function ToRecord(Doc: any): AuthIdentityRecord {
 }
 
 export class MongoAuthIdentityRepository implements AuthIdentityRepository {
-    async findByProviderSubject(provider: "discord", providerSubject: string): Promise<AuthIdentityRecord | undefined> {
+    async findByProviderSubject(provider: "discord", providerSubject: string, session?: ClientSession): Promise<AuthIdentityRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.AuthIdentities).findOne({ provider, providerSubject });
+        const Doc = await Db.collection(Collections.AuthIdentities).findOne({ provider, providerSubject }, { session });
 
         return Doc == undefined ? undefined : ToRecord(Doc);
     }
 
-    async findByUserId(provider: "discord", userId: string): Promise<AuthIdentityRecord | undefined> {
+    async findByUserId(provider: "discord", userId: string, session?: ClientSession): Promise<AuthIdentityRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.AuthIdentities).findOne({ provider, userId });
+        const Doc = await Db.collection(Collections.AuthIdentities).findOne({ provider, userId }, { session });
 
         return Doc == undefined ? undefined : ToRecord(Doc);
     }
 
-    async create(identity: AuthIdentityRecord): Promise<void> {
+    async create(identity: AuthIdentityRecord, session?: ClientSession): Promise<void> {
         const Db = await GetMongoDb();
-        await Db.collection(Collections.AuthIdentities).insertOne({ ...identity });
+        await Db.collection(Collections.AuthIdentities).insertOne({ ...identity }, { session });
     }
 }

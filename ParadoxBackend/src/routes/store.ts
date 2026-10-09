@@ -12,10 +12,11 @@
 import { Router } from "express";
 import { logger } from "../logger";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
-import { GetNotesForUser, GetLadyLuckSkus, PurchaseLadyLuckSku, FindLadyLuckSkuByIdOrCatalogId } from "../controllers/store";
+import { GetNotesForUser, GetStoreSkus, PurchaseStoreSku, FindStoreSkuByIdOrCatalogId } from "../controllers/store";
 import { GetWallet, BuildBalanceDict } from "../controllers/wallet";
+import { ProjectBalances } from "../platinumWallet";
 import { GetCharactersForUid } from "../controllers/character";
-import { SignLadyLuckPurchaseToken, ValidateLadyLuckPurchaseToken } from "../controllers/auth";
+import { SignStorePurchaseToken, ValidateStorePurchaseToken, StorePurchaseTokenPayload } from "../controllers/auth";
 
 export const storeRouter = Router();
 
@@ -105,20 +106,19 @@ storeRouter.get("/balance", HasParadoxBackendAuth, async (req: any, res) => {
         id_currency_s17_coin: 0
     };
 
-    
-    for (const [Cid, Amt] of Object.entries(Wallet)) {
-        Balance[Cid] = Amt;
-        Balance["id_currency_" + Cid.replace(/^CURRENCY_/, "").toLowerCase()] = Amt;
-    }
-
-    res.status(200).json(Balance);
+    // Overlay persisted wallet balances (both CURRENCY_X and id_currency_x forms); adds PJM merit keys
+    // too, and collapses the 13 platinum buckets into the single CURRENCY_PLATINUM key the client
+    // actually reads (platinumWallet.ts). Uses the wallet already fetched above rather than
+    // BuildBalanceDict, which would re-read it - this endpoint is polled constantly.
+    res.status(200).json(ProjectBalances(Wallet, Balance));
 });
 
-
-
-
-
-
+// [2026-07-24] Confirmed real endpoint contract (DauntlessEndpointDocumentation/Store/Product/Skus/
+// SearchPublic.md, captured 2.1.1): GET /product/skus/public?requiredTags={tag} - one tag value per
+// store section (ladyluckstore/huntpass_store/gauntlet_store/dyes/loadout_slots/mailbox/webstore/...).
+// `ladyluckstore` is backed by its verified/cross-checked data set. `season_store` serves the
+// deterministic reconstructed Season 19 cosmetic rotation generated from the verified 1.12 catalog;
+// every other tag remains an empty section.
 storeRouter.get("/product/skus/public", HasParadoxBackendAuth, async (req: any, res) => {
     const RequiredTags = req.query.requiredTags;
 
@@ -128,18 +128,20 @@ storeRouter.get("/product/skus/public", HasParadoxBackendAuth, async (req: any, 
         return;
     }
 
-    if (RequiredTags !== "ladyluckstore") {
+    const StoreSkus = GetStoreSkus(RequiredTags);
+
+    if (StoreSkus.length === 0) {
         logger.info(`Store SKUs requested for unimplemented tag '${RequiredTags}' - returning empty`);
         res.status(200);
         res.json([]);
         return;
     }
 
-    
-    
-    
-    
-    const Skus = GetLadyLuckSkus().map((Sku) => ({
+    // [not yet confirmed by a live capture] `remaining` here does not reflect real per-player
+    // ownership of one-time SKUs - the purchase endpoint below is the actual gate (a repeat purchase
+    // of an already-owned one-time SKU is idempotently safe, not double-charged), this listing just
+    // doesn't grey it out yet. See controllers/store.ts's header comment for the full provenance.
+    const Skus = StoreSkus.map((Sku) => ({
         id: Sku.id,
         displayName: Sku.displayName,
         displayDescription: Sku.displayDescription,
@@ -148,12 +150,19 @@ storeRouter.get("/product/skus/public", HasParadoxBackendAuth, async (req: any, 
         maxAllowed: Sku.maxAllowed,
         remaining: Sku.maxAllowed ?? 999,
         duplicateInstancedItems: Sku.duplicateInstancedItems,
-        images: {},
+        images: Sku.images ?? {},
         tags: Sku.tags,
         scheduledTags: null,
         items: Sku.items.map((i) => ({ catalogId: i.catalogId, quantity: i.quantity })),
-        entitlements: [],
-        skuProgression: null,
+        // [2026-07-30] Previously hardcoded empty/null. The client needs the real values: an
+        // entitlement-payload SKU has `items: null` in the captures and is described entirely by
+        // `entitlements`, and the Hunt Pass screens read `skuProgression` to label a rank skip. Both
+        // are served in the captured shape - `entitlements` as {name, duration}, skuProgression as
+        // {progressionId, ranks, xp}.
+        entitlements: (Sku.entitlements ?? []).map((e) => ({ name: e.name, duration: e.duration })),
+        skuProgression: Sku.skuProgression
+            ? { progressionId: Sku.skuProgression.progressionId, ranks: Sku.skuProgression.ranks, xp: Sku.skuProgression.xp }
+            : null,
         loadoutSlots: null,
         availableFrom: null,
         availableTo: null,
@@ -162,67 +171,72 @@ storeRouter.get("/product/skus/public", HasParadoxBackendAuth, async (req: any, 
         missingEntitlementNames: null,
     }));
 
-    logger.info(`Store SKUs: ladyluckstore -> ${Skus.length} SKUs`);
+    logger.info(`Store SKUs: ${RequiredTags} -> ${Skus.length} SKUs`);
     res.status(200);
     res.json(Skus);
 });
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// [2026-07-24, revised same day after a live capture] DauntlessEndpointDocumentation/Store/Token/
+// Platinum/GetPurchaseToken.md only ever captured the real-money case, so its "platinum" path segment
+// was first assumed to be a naming holdover covering every currency - WRONG, disproven by a live
+// capture. The actual client calls GET /token/{currencySlug}/{skuId}, where currencySlug varies per
+// SKU's priced currency (`markssteel` for `ladyluck_bundle_consumables_00`/`trials_dye_hp08b_punk_02`,
+// `marksgilded` for `ladyluck_headbling_normal` - i.e. the SKU's `prices[].currencyId` with the
+// `id_currency_` prefix and underscores stripped). Hardcoding `platinum` 404'd every single Marks
+// purchase attempt (confirmed via metagame.log once file logging was fixed - three attempts, three
+// `Unstubbed route GET /token/.../...` 404s, zero of them reaching the transaction ledger). The
+// currency segment is client-side routing/display only - the actual price and currency charged still
+// come from the SKU's own `prices` server-side in PurchaseStoreSku, so it doesn't need validating
+// against `:currency` here.
+//
+// This also replaced an earlier, wrong guess at the purchase contract entirely (a skuId-in-path/
+// characterId-in-body POST route) that the real client never called at all - a first live purchase
+// attempt against THAT route left no trace anywhere (no matching entry ever appeared in the
+// inventoryTransactions ledger), which is what led to these two real captured endpoints in the first
+// place.
 storeRouter.get("/token/:currency/:catalogId", HasParadoxBackendAuth, async (req: any, res) => {
     const UserId = req.AuthData.userId;
-    const Sku = FindLadyLuckSkuByIdOrCatalogId(req.params.catalogId);
+    const Located = FindStoreSkuByIdOrCatalogId(req.params.catalogId);
 
-    if (!Sku) {
-        logger.warn(`[LadyLuckStore] GetPurchaseToken: unknown sku/catalogId '${req.params.catalogId}' (currency=${req.params.currency}) for ${UserId}`);
+    if (!Located) {
+        logger.warn(`[Store] GetPurchaseToken: unknown or ambiguous sku/catalogId '${req.params.catalogId}' (currency=${req.params.currency}) for ${UserId}`);
         res.status(404);
         res.json({ code: "404", message: "unknown_sku" });
         return;
     }
 
-    
-    
-    
+    // Dauntless (this era) is single-slayer-per-account; there is no characterId in this flow's
+    // request at all (neither the GetPurchaseToken GET nor the BuyFromPurchaseToken POST carries one),
+    // so it's resolved here, once, at mint time and carried inside the token's own claims.
     const Characters = await GetCharactersForUid(UserId);
     const CharacterId = Characters[0]?.id;
     if (!CharacterId) {
-        logger.error(`[LadyLuckStore] GetPurchaseToken: no character found for ${UserId}`);
+        logger.error(`[Store:${Located.storeTag}] GetPurchaseToken: no character found for ${UserId}`);
         res.status(500);
         res.json({ code: "500", message: "no_character" });
         return;
     }
 
-    const PurchaseToken = SignLadyLuckPurchaseToken({ userId: UserId, characterId: CharacterId, skuId: Sku.id });
-    logger.info(`[LadyLuckStore] Minted purchase token for ${UserId} sku=${Sku.id}`);
+    const PurchaseToken = SignStorePurchaseToken({
+        userId: UserId,
+        characterId: CharacterId,
+        storeTag: Located.storeTag,
+        skuId: Located.sku.id,
+    });
+    logger.info(`[Store:${Located.storeTag}] Minted purchase token for ${UserId} sku=${Located.sku.id}`);
     res.status(200);
     res.json({ purchaseToken: PurchaseToken });
 });
 
-
-
-
-
-
-
-
-
-
+// [2026-07-24] DauntlessEndpointDocumentation/Store/Notification/BuyFromPurchaseToken.md only
+// captured the real-money case (POST /notification/platinum?token=...). No live capture yet shows the
+// redeem step for a Marks purchase (every attempt so far 404'd at the GET-token step above, before the
+// client ever reached redeem) - but given the mint step is confirmed currency-segmented
+// (/token/{currency}/{skuId}), the redeem step is very likely symmetric. Accepting any :currency
+// segment here costs nothing (the token itself, not the URL, carries what's actually being bought) and
+// avoids repeating the same hardcoded-"platinum" mistake if the client turns out to call
+// /notification/markssteel or /notification/marksgilded specifically. Success is still 204 No Content,
+// no body (the doc calls this out explicitly as the confirmed real shape).
 storeRouter.post("/notification/:currency", HasParadoxBackendAuth, async (req: any, res) => {
     const UserId = req.AuthData.userId;
     const Token = req.query.token;
@@ -233,24 +247,37 @@ storeRouter.post("/notification/:currency", HasParadoxBackendAuth, async (req: a
         return;
     }
 
-    let Payload: { userId: string; characterId: string; skuId: string };
+    let Payload: StorePurchaseTokenPayload;
     try {
-        Payload = ValidateLadyLuckPurchaseToken(Token);
+        Payload = ValidateStorePurchaseToken(Token);
     } catch {
-        logger.warn(`[LadyLuckStore] BuyFromPurchaseToken: invalid/expired token from ${UserId}`);
+        logger.warn(`[Store] BuyFromPurchaseToken: invalid/expired token from ${UserId}`);
         res.status(401);
         res.json({ code: "401", message: "invalid_token" });
         return;
     }
 
     if (Payload.userId !== UserId) {
-        logger.error(`[LadyLuckStore] BuyFromPurchaseToken: token userId ${Payload.userId} does not match authenticated ${UserId}`);
+        logger.error(`[Store] BuyFromPurchaseToken: token userId ${Payload.userId} does not match authenticated ${UserId}`);
         res.status(403);
         res.json({ code: "403", message: "token_user_mismatch" });
         return;
     }
 
-    const Result = await PurchaseLadyLuckSku(Payload.userId, Payload.characterId, Payload.skuId);
+    // Tokens minted before the store registry did not carry storeTag. Accept those only when the SKU
+    // still resolves unambiguously; every new token is explicitly store-bound.
+    const StoreTag = Payload.storeTag ?? FindStoreSkuByIdOrCatalogId(Payload.skuId)?.storeTag;
+    if (!StoreTag) {
+        logger.warn(`[Store] BuyFromPurchaseToken: unknown or ambiguous sku=${Payload.skuId} for ${UserId}`);
+        res.status(404);
+        res.json({ code: "404", message: "unknown_sku" });
+        return;
+    }
+
+    // ValidateStorePurchaseToken verified the signature and this route already checked userId. The
+    // characterId was resolved server-side when the token was minted, so the purchase transaction
+    // can skip a redundant ownership round trip while retaining the signed binding.
+    const Result = await PurchaseStoreSku(Payload.userId, Payload.characterId, StoreTag, Payload.skuId, true);
 
     if (!Result.ok) {
         const StatusByReason: Record<string, number> = {
@@ -260,13 +287,13 @@ storeRouter.post("/notification/:currency", HasParadoxBackendAuth, async (req: a
             already_purchased_different_request: 409,
             transaction_failed: 500,
         };
-        logger.warn(`[LadyLuckStore] purchase denied for ${UserId} sku=${Payload.skuId}: ${Result.reason}`);
+        logger.warn(`[Store:${StoreTag}] purchase denied for ${UserId} sku=${Payload.skuId}: ${Result.reason}`);
         res.status(StatusByReason[Result.reason] ?? 400);
         res.json({ code: String(StatusByReason[Result.reason] ?? 400), message: Result.reason });
         return;
     }
 
-    logger.info(`[LadyLuckStore] purchase completed for ${UserId} sku=${Payload.skuId}`);
+    logger.info(`[Store:${StoreTag}] purchase completed for ${UserId} sku=${Payload.skuId}`);
     res.status(204);
     res.send();
 });

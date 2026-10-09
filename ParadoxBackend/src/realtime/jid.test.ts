@@ -19,7 +19,7 @@ test("parseJid: full JID with Epic-style resource containing ':' and '/'", () =>
     assert.ok(jid);
     assert.equal(jid.local, "mysticparadox");
     assert.equal(jid.domain, "prod.ol.epicgames.com");
-    
+    // Split on the FIRST '/' only — the resource keeps its own slashes verbatim.
     assert.equal(jid.resource, "V2:Jackal:WIN::abc/def");
 });
 
@@ -40,9 +40,9 @@ test("parseJid: domain-only JID", () => {
 });
 
 test("parseJid: local + domain lowercased, resource case preserved", () => {
-    const jid = parseJid("ExampleSlayer@Prod.OL.EpicGames.com/ReSource");
+    const jid = parseJid("MysticFox@Prod.OL.EpicGames.com/ReSource");
     assert.ok(jid);
-    assert.equal(jid.local, "exampleslayer");
+    assert.equal(jid.local, "mysticfox");
     assert.equal(jid.domain, "prod.ol.epicgames.com");
     assert.equal(jid.resource, "ReSource");
 });
@@ -50,9 +50,9 @@ test("parseJid: local + domain lowercased, resource case preserved", () => {
 test("parseJid: empty / invalid input returns undefined", () => {
     assert.equal(parseJid(""), undefined);
     assert.equal(parseJid("   "), undefined);
-    
+    // No domain (stray localpart with trailing '@').
     assert.equal(parseJid("user@"), undefined);
-    
+    // Resource-only with empty bare part.
     assert.equal(parseJid("/res"), undefined);
 });
 

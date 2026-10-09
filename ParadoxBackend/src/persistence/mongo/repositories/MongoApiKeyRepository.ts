@@ -19,6 +19,23 @@ import {
     UserApiKeyToRegisterRecord
 } from "../../mapping/domainTypes";
 
+// Maps to plan section 6.10's `gameServerApiKeys`/`userApiKeys` collections.
+//
+// The plaintext registration-queue tables (gameserverapikeystoregister,
+// userapikeystoregister) are NOT migrated to Mongo collections — per plan
+// section 6.10 ("Never create long-lived Mongo collections containing
+// plaintext keys") and section 11.3 ("plaintext key queues: drain/hash before
+// import or abort"). Any pending SQLite registration-queue rows must be drained
+// (via the existing DrainAndRegisterAPIKeys/DrainAndRegisterUserAPIKeys flow,
+// still running against SQLite) BEFORE cutover to DB_PROVIDER=mongodb, since
+// this repository's findAll*KeysToRegister methods always return empty — there
+// is no Mongo-side plaintext queue to drain from. This is documented, not
+// silently handled, per the plan's "no secrets in logs or source" rule (queues
+// simply do not exist on this provider).
+//
+// findAll*KeyHashes preserves the exact full-table-scan + timingSafeEqual
+// comparison semantics from the SQLite adapter (plan section 6.10's explicit
+// requirement) — no server-side hash-equality query is used.
 export class MongoApiKeyRepository implements ApiKeyRepository {
     async findAllGameServerKeyHashes(): Promise<GameServerApiKeyRecord[]> {
         const Db = await GetMongoDb();
@@ -34,14 +51,13 @@ export class MongoApiKeyRepository implements ApiKeyRepository {
     async replaceGameServerKeyHashes(keyHashes: string[]): Promise<void> {
         const Db = await GetMongoDb();
         const Collection = Db.collection(Collections.GameServerApiKeys);
-        if(keyHashes.length === 0){
+        if (keyHashes.length === 0) {
             await Collection.deleteMany({});
             return;
         }
-
         await Collection.bulkWrite(keyHashes.map((keyHash) => ({
             updateOne: {
-                filter: { keyHash },
+                filter: { keyHash: { $eq: keyHash } },
                 update: { $set: { keyHash } },
                 upsert: true
             }
@@ -50,11 +66,12 @@ export class MongoApiKeyRepository implements ApiKeyRepository {
     }
 
     async findAllGameServerKeysToRegister(): Promise<GameServerApiKeyToRegisterRecord[]> {
+        // No Mongo-side plaintext queue exists on this provider — see class note.
         return [];
     }
 
     async clearGameServerKeysToRegister(): Promise<void> {
-        // No-op: nothing to clear on this provider.
+        // No-op: nothing to clear on this provider — see class note.
     }
 
     async findAllUserKeyHashes(): Promise<UserApiKeyRecord[]> {
@@ -69,10 +86,11 @@ export class MongoApiKeyRepository implements ApiKeyRepository {
     }
 
     async findAllUserKeysToRegister(): Promise<UserApiKeyToRegisterRecord[]> {
+        // No Mongo-side plaintext queue exists on this provider — see class note.
         return [];
     }
 
     async clearUserKeysToRegister(): Promise<void> {
-        // No-op: nothing to clear on this provider.
+        // No-op: nothing to clear on this provider — see class note.
     }
 }

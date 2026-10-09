@@ -9,6 +9,7 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
+import { ClientSession } from "mongodb";
 import { GetMongoDb } from "../client";
 import { Collections } from "../collections";
 import {
@@ -18,11 +19,11 @@ import {
     LauncherAccountRecord
 } from "../../contracts/LauncherAccountRepository";
 
-
-
-
-
-
+// Reads/writes the SAME `accounts` collection as MongoAccountRepository (see
+// the contract file's header comment) — this class never imports or modifies
+// MongoAccountRepository. create() additionally seeds `name`/`notes`, the two
+// fields MongoAccountRepository's own findByUserId projects — see the contract
+// file's header comment for why.
 function ToRecord(Doc: any): LauncherAccountRecord {
     return {
         userId: Doc.userId,
@@ -36,6 +37,8 @@ function ToRecord(Doc: any): LauncherAccountRecord {
         approvalUpdatedBy: Doc.approvalUpdatedBy ?? undefined,
         approvalReason: Doc.approvalReason ?? undefined,
         roles: Doc.roles ?? ["player"],
+        rolesUpdatedAt: Doc.rolesUpdatedAt ?? undefined,
+        rolesUpdatedBy: Doc.rolesUpdatedBy ?? undefined,
         createdAt: Doc.createdAt,
         lastLoginAt: Doc.lastLoginAt ?? undefined,
         usernameSet: Doc.usernameSet ?? undefined
@@ -43,9 +46,12 @@ function ToRecord(Doc: any): LauncherAccountRecord {
 }
 
 export class MongoLauncherAccountRepository implements LauncherAccountRepository {
-    async findByUserId(userId: string): Promise<LauncherAccountRecord | undefined> {
+    async findByUserId(userId: string, session?: ClientSession): Promise<LauncherAccountRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.Accounts).findOne({ _id: { $eq: userId as any }, displayNameNormalized: { $exists: true } });
+        const Doc = await Db.collection(Collections.Accounts).findOne(
+            { _id: { $eq: userId as any }, displayNameNormalized: { $exists: true } },
+            { session }
+        );
 
         return Doc == undefined ? undefined : ToRecord(Doc);
     }
@@ -64,7 +70,7 @@ export class MongoLauncherAccountRepository implements LauncherAccountRepository
         return Doc == undefined ? undefined : ToRecord(Doc);
     }
 
-    async create(account: LauncherAccountRecord): Promise<void> {
+    async create(account: LauncherAccountRecord, session?: ClientSession): Promise<void> {
         const Db = await GetMongoDb();
         await Db.collection(Collections.Accounts).insertOne({
             _id: account.userId as any,
@@ -79,14 +85,16 @@ export class MongoLauncherAccountRepository implements LauncherAccountRepository
             approvalUpdatedBy: account.approvalUpdatedBy,
             approvalReason: account.approvalReason,
             roles: account.roles,
+            rolesUpdatedAt: account.rolesUpdatedAt,
+            rolesUpdatedBy: account.rolesUpdatedBy,
             createdAt: account.createdAt,
             lastLoginAt: account.lastLoginAt,
             usernameSet: account.usernameSet,
-            
-            
+            // Game-owned fields (AccountRepository/AccountRecord) — see this file's
+            // header comment for why a launcher-created account needs these too.
             name: account.displayName,
             notes: 0
-        });
+        }, { session });
     }
 
     async updateLastLogin(userId: string, whenIso: string): Promise<void> {
@@ -96,7 +104,7 @@ export class MongoLauncherAccountRepository implements LauncherAccountRepository
 
     async setUsername(userId: string, displayName: string, displayNameNormalized: string): Promise<void> {
         const Db = await GetMongoDb();
-        
+        // Also updates `name` (the game-facing display name GetUsernameForUserId reads).
         await Db.collection(Collections.Accounts).updateOne(
             { _id: userId as any },
             { $set: { displayName, displayNameNormalized, name: displayName, usernameSet: true } }
@@ -160,6 +168,21 @@ export class MongoLauncherAccountRepository implements LauncherAccountRepository
             { _id: userId as any, displayNameNormalized: { $exists: true } },
             { $set: Set },
             { returnDocument: "after" }
+        );
+        return Result == null ? undefined : ToRecord(Result);
+    }
+
+    async updateRoles(
+        userId: string,
+        roles: string[],
+        changes: { rolesUpdatedAt: string; rolesUpdatedBy: string },
+        session?: ClientSession
+    ): Promise<LauncherAccountRecord | undefined> {
+        const Db = await GetMongoDb();
+        const Result = await Db.collection(Collections.Accounts).findOneAndUpdate(
+            { _id: userId as any, displayNameNormalized: { $exists: true } },
+            { $set: { roles, rolesUpdatedAt: changes.rolesUpdatedAt, rolesUpdatedBy: changes.rolesUpdatedBy } },
+            { returnDocument: "after", session }
         );
         return Result == null ? undefined : ToRecord(Result);
     }

@@ -1,3 +1,22 @@
+/*
+ * Original work Copyright (C) 2026 gwog :3 (SyST3MDeV/Undaunted)
+ * Modified work Copyright (C) 2026 MysticFox / Pranav Karande (pranav158/Mystic-Paradox)
+ *
+ * Licensed under the GNU Affero General Public License v3.0.
+ * You may obtain a copy of the License at the root of this repository.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
+ */
+
+// [2026-10-09, ported from the public repo's August security follow-ups] API keys (gameserver and user) are stored
+// as HMAC-SHA256 under a server-side secret, domain-separated by scope, instead of a plain SHA-256. A copy of the
+// key collections alone no longer lets anyone test guesses offline, which matters while a key is human-chosen.
+//
+// Migration: records written before this change are plain SHA-256. They keep matching (AcceptsLegacyApiKeyHashes)
+// so services that still present an old key - including a VPS sharing this database on older code - keep working;
+// a successful legacy gameserver match also stores the HMAC form. Set API_KEY_LEGACY_SHA256=reject once every
+// consumer uses HMAC-registered keys, then delete the legacy records.
 import crypto from "node:crypto";
 
 const MIN_SECRET_LENGTH = 32;
@@ -10,14 +29,38 @@ function ApiKeyHashSecret(): Buffer {
     return Buffer.from(secret, "utf8");
 }
 
-export function HashApiKey(
-    value: string,
-    scope: "gameserver" | "user",
-): string {
+/** Fails fast at startup instead of on the first gameserver request. */
+export function AssertApiKeyHashSecret(): void {
+    ApiKeyHashSecret();
+}
+
+export function HashApiKey(value: string, scope: "gameserver" | "user"): string {
     return crypto
         .createHmac("sha256", ApiKeyHashSecret())
         .update(scope, "utf8")
         .update("\0")
         .update(value, "utf8")
         .digest("hex");
+}
+
+/** The pre-HMAC record format: plain SHA-256 of the key. */
+export function LegacySha256ApiKeyHash(value: string): string {
+    return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+export function AcceptsLegacyApiKeyHashes(): boolean {
+    return (process.env.API_KEY_LEGACY_SHA256 ?? "accept").trim().toLowerCase() !== "reject";
+}
+
+/** Constant-time comparison of one hex hash against stored records; returns the first match. */
+export function FindApiKeyRecord<T extends { keyHash?: string | null }>(records: T[], hashHex: string): T | undefined {
+    const Incoming = Buffer.from(hashHex, "hex");
+    let Found: T | undefined;
+    for (const Record of records) {
+        if (!Record.keyHash) continue;
+        const Stored = Buffer.from(Record.keyHash, "hex");
+        if (Stored.length !== Incoming.length) continue;
+        if (crypto.timingSafeEqual(Incoming, Stored) && Found === undefined) Found = Record;
+    }
+    return Found;
 }

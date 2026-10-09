@@ -11,14 +11,16 @@
 
 import { AccountRecord } from "../mapping/domainTypes";
 
-
-
-
-
-
+// Repository contract for the `users` table (plan section 4.2 target: `accounts`).
+//
+// Covers every current call site: routes/login.ts (/login, DEV lookups),
+// controllers/login.ts (GetUsernameForUserId), controllers/store.ts
+// (GetNotesForUser's ensure-row-exists), routes/eos.ts (EnsureDevUser).
 export interface AccountRepository {
     findByUserId(userId: string): Promise<AccountRecord | undefined>;
 
-    
+    /** Insert a new account row. Caller is responsible for checking existence first
+     *  (matches current behavior in login.ts/store.ts/eos.ts, which is not itself
+     *  race-free — Phase M1 does not change this, only names it). */
     create(account: AccountRecord): Promise<void>;
 }

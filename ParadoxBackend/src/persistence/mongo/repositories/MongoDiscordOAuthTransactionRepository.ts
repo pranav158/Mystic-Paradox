@@ -13,10 +13,10 @@ import { GetMongoDb } from "../client";
 import { Collections } from "../collections";
 import { DiscordOAuthTransactionRepository, DiscordOAuthTransactionRecord } from "../../contracts/DiscordOAuthTransactionRepository";
 
-
-
-
-
+// The document lives through two expiries (the initial state/PKCE window, then a
+// separate completion-code window attached later) — see the contract file's header
+// comment. TTL cleanup uses a single storage-only `ttlAt` set generously past
+// whichever expiry is current, so a slow completion never races the row's deletion.
 const TTL_GRACE_MS = 60 * 60 * 1000;
 
 function ToRecord(Doc: any): DiscordOAuthTransactionRecord {
@@ -46,8 +46,8 @@ export class MongoDiscordOAuthTransactionRepository implements DiscordOAuthTrans
     async consumeByState(state: string): Promise<DiscordOAuthTransactionRecord | undefined> {
         const Db = await GetMongoDb();
         const Result = await Db.collection(Collections.DiscordOAuthTransactions).findOneAndUpdate(
-            
-            
+            // See MongoRefreshSessionRepository's create() comment — `null` matches both
+            // an absent field and one stored as an explicit null.
             { _id: state as any, consumedAt: null, expiresAt: { $gt: new Date().toISOString() } },
             { $set: { consumedAt: new Date().toISOString() } },
             { returnDocument: "after" }

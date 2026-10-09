@@ -15,14 +15,14 @@ import { Collections } from "../collections";
 import { InventoryRepository } from "../../contracts/InventoryRepository";
 import { InventoryRecord } from "../../mapping/domainTypes";
 
-
-
-
-
-
-
-
-
+// Maps to plan section 6.4's `inventories` collection. _id = characterId.
+// instancedItems/stackedItems are stored as raw JSON STRINGS (not parsed BSON
+// arrays) for this phase — matching the exact current SQLite wire contract.
+// Converting to BSON arrays is deferred; it changes nothing observable today
+// since every read/write already goes through JSON.stringify/JSON.parse in the
+// controller, but doing that conversion is a separate, testable change (plan
+// section 6.4's inventory hazards apply once we actually store structured
+// arrays: multikey index behavior, BSON size limits, etc.).
 export class MongoInventoryRepository implements InventoryRepository {
     async findByCharacterId(characterId: string, session?: ClientSession): Promise<InventoryRecord | undefined> {
         const Db = await GetMongoDb();
@@ -59,8 +59,8 @@ export class MongoInventoryRepository implements InventoryRepository {
         session?: ClientSession
     ): Promise<InventoryRecord | undefined> {
         const Db = await GetMongoDb();
-        
-        
+        // $exists:false covers rows created before `revision` existed (treated as revision 0,
+        // matching findByCharacterId's `?? 0` default) — so old rows aren't permanently un-writable.
         const RevisionFilter = expectedRevision === 0
             ? { $or: [{ revision: 0 }, { revision: { $exists: false } }] }
             : { revision: { $eq: expectedRevision } };

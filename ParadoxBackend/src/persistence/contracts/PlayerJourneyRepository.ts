@@ -11,14 +11,16 @@
 
 import { PlayerJourneyRecord } from "../mapping/domainTypes";
 
-
-
-
-
+// Repository contract for the `playerjourney` table (Slayer's Path / PJM).
+//
+// The client-facing updateVersion is retained for wire compatibility; revision is a server-owned
+// CAS token and must advance on every successful replacement, including stale-version merges.
 export interface PlayerJourneyRepository {
     findByUserId(userId: string): Promise<PlayerJourneyRecord | undefined>;
 
-    create(record: PlayerJourneyRecord): Promise<void>;
+    /** Inserts only when the account has no journey row; returns false on a concurrent insert. */
+    createIfAbsent(record: PlayerJourneyRecord): Promise<boolean>;
 
-    update(userId: string, nodesJson: string, updateVersion: number): Promise<void>;
+    /** Replaces the blob and advances server revision only when expectedRevision still matches. */
+    updateIfRevision(userId: string, nodesJson: string, updateVersion: number, expectedRevision: number): Promise<boolean>;
 }

@@ -9,8 +9,10 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
+import { ClientSession } from "mongodb";
 
-
+// External identity links (Discord now, Steam/Epic optionally later — spec
+// section "Identity model"). One provider subject links to exactly one userId.
 export interface AuthIdentityRecord {
     provider: "discord";
     providerSubject: string;
@@ -21,8 +23,8 @@ export interface AuthIdentityRecord {
 }
 
 export interface AuthIdentityRepository {
-    findByProviderSubject(provider: "discord", providerSubject: string): Promise<AuthIdentityRecord | undefined>;
-    
-    findByUserId(provider: "discord", userId: string): Promise<AuthIdentityRecord | undefined>;
-    create(identity: AuthIdentityRecord): Promise<void>;
+    findByProviderSubject(provider: "discord", providerSubject: string, session?: ClientSession): Promise<AuthIdentityRecord | undefined>;
+    /** Used for the account view's `discordLinked` flag — one userId links to at most one row per provider. */
+    findByUserId(provider: "discord", userId: string, session?: ClientSession): Promise<AuthIdentityRecord | undefined>;
+    create(identity: AuthIdentityRecord, session?: ClientSession): Promise<void>;
 }

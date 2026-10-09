@@ -20,7 +20,18 @@ import { isAuthThrottled } from "./authThrottle";
 import { XMPPConnection } from "./XMPPConnection";
 import { ConnectionInfo, RealtimeConfig } from "./types";
 
-
+/**
+ * Owns the WebSocket upgrade path on the existing HTTPS listener (plan §8). In the
+ * capture foundation it:
+ *   - accepts upgrades ONLY on the exact configured path, with host + connection-limit
+ *     checks, and rejects everything else without touching Express HTTP routing;
+ *   - tracks live connections and per-IP counts;
+ *   - tears everything down cleanly on graceful shutdown (plan §8.4).
+ *
+ * Auth, presence, roster, and rooms are layered on later (WP4+) once the client
+ * protocol is captured. When disabled (REALTIME_XMPP_ENABLED != "true") every
+ * upgrade is rejected and no XMPP state exists.
+ */
 export class RealtimeGateway {
     private readonly config: RealtimeConfig;
     private readonly wss: WebSocketServer;
@@ -32,13 +43,13 @@ export class RealtimeGateway {
 
     constructor(config: RealtimeConfig) {
         this.config = config;
-        
-        
+        // noServer: we make the upgrade decision ourselves; ws only completes the
+        // handshake. maxPayload enforces the byte cap at the protocol layer too.
         this.wss = new WebSocketServer({
             noServer: true,
             maxPayload: config.limits.maxMessageBytes,
-            
-            
+            // Echo the XMPP subprotocol if the client offers it (RFC 7395); otherwise
+            // complete the handshake without one. Never reject on subprotocol during capture.
             handleProtocols: (protocols: Set<string>) => (protocols.has("xmpp") ? "xmpp" : false),
         });
     }
@@ -63,11 +74,11 @@ export class RealtimeGateway {
             return;
         }
         if (!this.config.wsPaths.includes(pathOnly)) {
-            
+            // Explicit allowlist only — no generic "accept any path" fallback, even in capture mode.
             this.rejectUpgrade(socket, 404, "Not Found", pathOnly);
             return;
         }
-        
+        // Host policy (plan §8.1). Empty allowlist = allow any (dev capture).
         if (this.config.allowedHosts.length > 0) {
             const host = (req.headers.host ?? "").toLowerCase().split(":")[0];
             if (!this.config.allowedHosts.includes(host)) {
@@ -75,7 +86,7 @@ export class RealtimeGateway {
                 return;
             }
         }
-        
+        // Connection limits (plan §8.1, §18).
         if (this.connections.size >= this.config.limits.maxConnectionsGlobal) {
             this.rejectUpgrade(socket, 503, "Too Many Connections", pathOnly);
             return;
@@ -132,7 +143,7 @@ export class RealtimeGateway {
         return [...this.connections.values()].map((c) => c.info());
     }
 
-    
+    /** Graceful shutdown (plan §8.4): stop accepting, close sockets, then close the WS server. */
     async shutdown(): Promise<void> {
         this.accepting = false;
         if (this.boundServer && this.upgradeHandler) {
@@ -143,7 +154,7 @@ export class RealtimeGateway {
         for (const c of conns) {
             c.close(1001, "server shutting down");
         }
-        
+        // Brief grace for close frames to flush, then force-terminate any stragglers.
         await new Promise((resolve) => setTimeout(resolve, 250));
         for (const c of [...this.connections.values()]) {
             c.terminate();

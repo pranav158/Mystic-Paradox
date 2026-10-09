@@ -20,6 +20,7 @@ import { MongoLoadoutRepository } from "./repositories/MongoLoadoutRepository";
 import { MongoPlayerJourneyRepository } from "./repositories/MongoPlayerJourneyRepository";
 import { MongoWalletRepository } from "./repositories/MongoWalletRepository";
 import { MongoProgressionTrackRepository } from "./repositories/MongoProgressionTrackRepository";
+import { MongoProgressionGrantRepository } from "./repositories/MongoProgressionGrantRepository";
 import { MongoLauncherAccountRepository } from "./repositories/MongoLauncherAccountRepository";
 import { MongoAuthIdentityRepository } from "./repositories/MongoAuthIdentityRepository";
 import { MongoRefreshSessionRepository } from "./repositories/MongoRefreshSessionRepository";
@@ -28,9 +29,13 @@ import { MongoDiscordOAuthTransactionRepository } from "./repositories/MongoDisc
 import { MongoInventoryTransactionRepository } from "./repositories/MongoInventoryTransactionRepository";
 import { MongoFriendshipRepository } from "./repositories/MongoFriendshipRepository";
 import { MongoAdminRepository } from "./repositories/MongoAdminRepository";
+import { MongoEscalationProgressRepository } from "./repositories/MongoEscalationProgressRepository";
+import { MongoEntitlementRepository } from "./repositories/MongoEntitlementRepository";
+import { MongoPartyRepository } from "./repositories/MongoPartyRepository";
+import { MongoLauncherGuardRepository } from "./repositories/MongoLauncherGuardRepository";
 
-
-
+// Builds the MongoDB-backed RepositoryProvider. Each repository lazily resolves
+// the shared pooled Db handle (src/persistence/mongo/client.ts) on first use.
 export function CreateMongoRepositoryProvider(): RepositoryProvider {
     return {
         accounts: new MongoAccountRepository(),
@@ -43,6 +48,8 @@ export function CreateMongoRepositoryProvider(): RepositoryProvider {
         encounteredContent: new MongoEncounteredContentRepository(),
         apiKeys: new MongoApiKeyRepository(),
         progressionTracks: new MongoProgressionTrackRepository(),
+        progressionGrants: new MongoProgressionGrantRepository(),
+        escalationProgress: new MongoEscalationProgressRepository(),
         launcherAccounts: new MongoLauncherAccountRepository(),
         authIdentities: new MongoAuthIdentityRepository(),
         refreshSessions: new MongoRefreshSessionRepository(),
@@ -50,6 +57,9 @@ export function CreateMongoRepositoryProvider(): RepositoryProvider {
         discordOAuthTransactions: new MongoDiscordOAuthTransactionRepository(),
         inventoryTransactions: new MongoInventoryTransactionRepository(),
         friendships: new MongoFriendshipRepository(),
-        admin: new MongoAdminRepository()
+        admin: new MongoAdminRepository(),
+        entitlements: new MongoEntitlementRepository(),
+        parties: new MongoPartyRepository(),
+        launcherGuard: new MongoLauncherGuardRepository()
     };
 }

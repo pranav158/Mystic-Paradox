@@ -33,9 +33,9 @@ test("redacted reveals only length, never content", () => {
 
 test("sanitizeName strips control chars and caps length", () => {
     assert.equal(sanitizeName("clean_name"), "clean_name");
-    
+    // control characters become '?'
     assert.equal(sanitizeName("bad\u0000name\u0007"), "bad?name?");
-    
+    // length cap adds an ellipsis
     const long = "x".repeat(200);
     const out = sanitizeName(long, 16);
     assert.ok(out.length <= 16 + 3);

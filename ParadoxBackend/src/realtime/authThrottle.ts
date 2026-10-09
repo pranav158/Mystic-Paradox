@@ -9,7 +9,12 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-
+/**
+ * Per-IP SASL auth-failure throttling (WP4 §10.4). In-memory, single-process (matches the rest of
+ * the realtime state; a shared store is the horizontal-scaling boundary in plan §17). Repeated
+ * failures from an IP trigger an exponential temporary block; a success clears the counter. Client-
+ * facing errors do not distinguish unknown-account from bad-credential — this is purely rate control.
+ */
 
 interface Entry {
     failures: number;
@@ -19,9 +24,9 @@ interface Entry {
 
 const byIp = new Map<string, Entry>();
 
-const MAX_FAILURES = 5; 
-const DECAY_MS = 5 * 60_000; 
-const BASE_BLOCK_MS = 5_000; 
+const MAX_FAILURES = 5; // failures within the window before blocking
+const DECAY_MS = 5 * 60_000; // reset the counter after this much inactivity
+const BASE_BLOCK_MS = 5_000; // first block duration; doubles per extra failure
 const MAX_BLOCK_MS = 10 * 60_000;
 
 export function isAuthThrottled(ip: string): boolean {

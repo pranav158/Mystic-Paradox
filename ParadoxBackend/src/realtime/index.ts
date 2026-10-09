@@ -19,9 +19,9 @@ let gateway: RealtimeGateway | undefined;
 
 function loadConfig(): RealtimeConfig {
     const enabled = process.env.REALTIME_XMPP_ENABLED === "true";
-    
-    
-    
+    // Capture defaults ON whenever the feature is enabled (this is the capture
+    // milestone); set REALTIME_XMPP_CAPTURE=false to silence it once protocol
+    // fixtures are recorded.
     const captureEnabled = enabled && process.env.REALTIME_XMPP_CAPTURE !== "false";
     const allowedHosts = (process.env.REALTIME_XMPP_ALLOWED_HOSTS ?? "")
         .split(",")
@@ -42,7 +42,11 @@ function loadConfig(): RealtimeConfig {
     };
 }
 
-
+/**
+ * Attach the realtime WebSocket upgrade handler to the HTTPS server. Always safe to
+ * call: when REALTIME_XMPP_ENABLED != "true" the gateway rejects every upgrade and
+ * holds no state, so ordinary HTTPS/REST is unaffected (plan §21 server rollback).
+ */
 export function initRealtime(server: HttpsServer): RealtimeGateway {
     if (gateway) {
         logger.warn("[XMPP] initRealtime called more than once; reusing existing gateway");

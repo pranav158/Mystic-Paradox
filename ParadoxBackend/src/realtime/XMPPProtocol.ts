@@ -12,11 +12,14 @@
 import { RealtimeLimits } from "./types";
 import { redacted, sanitizeName } from "./xml";
 
-
-
+// ltx is a lightweight, XMPP-native XML library (parse + Element + escaping) used
+// across the node-xmpp / xmpp.js ecosystem. We use it here for STRUCTURE only.
 import { parse as parseXml } from "ltx";
 
-
+/**
+ * Minimal shape of an ltx element we rely on, declared locally so any drift in
+ * ltx's own typings can't break our build.
+ */
 interface XmlNodeLike {
     name: string;
     attrs: Record<string, string>;
@@ -24,17 +27,31 @@ interface XmlNodeLike {
 }
 
 export interface FrameSummary {
-    
+    /** true if the frame parsed as a complete XML element. */
     parsed: boolean;
-    
+    /** sanitized top-level element name (or the leading tag for a partial frame). */
     rootName: string;
-    
+    /** sanitized, secret-free one-line structural summary for logging. */
     shape: string;
-    
+    /** byte length of the raw frame. */
     bytes: number;
 }
 
-
+/**
+ * Produce a sanitized structural summary of one inbound WebSocket frame (WP3, plan
+ * §9.1). Policy:
+ *   - element and attribute NAMES are logged;
+ *   - attribute VALUES are logged but control-stripped and length-capped — these
+ *     carry protocol negotiation we NEED (namespaces, logical domain, SASL
+ *     mechanism name, to/from/id/type), none of which is a credential;
+ *   - ALL text nodes are redacted to "<redacted:length>" — this is where the SASL
+ *     credential and message bodies live, which must never be logged (plan §7).
+ *
+ * Framing-agnostic: each WS frame is parsed independently, which fits RFC 7395 (one
+ * element per frame) and still reveals the leading tag of a legacy continuous
+ * stream. Never throws — malformed input yields a "partial" summary, so bad traffic
+ * cannot crash Metagame (plan §9 exit criteria).
+ */
 export function summarizeFrame(raw: string, limits: RealtimeLimits): FrameSummary {
     const bytes = Buffer.byteLength(raw, "utf8");
     try {
@@ -89,12 +106,12 @@ function shapeOf(node: XmlNodeLike, limits: RealtimeLimits, depth: number): stri
     return `${name}${attrPart}${childPart}`;
 }
 
-
+/** Bounded, regex-free extraction of the first tag name (for unparseable/partial frames). */
 function leadingTagName(raw: string): string {
     const lt = raw.indexOf("<");
     if (lt < 0) return "?";
     let i = lt + 1;
-    if (raw[i] === "?" || raw[i] === "/") i++; 
+    if (raw[i] === "?" || raw[i] === "/") i++; // skip "<?" or "</"
     let name = "";
     for (; i < raw.length && name.length < 64; i++) {
         const ch = raw[i];

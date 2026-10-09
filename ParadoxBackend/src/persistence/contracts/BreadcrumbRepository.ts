@@ -11,11 +11,11 @@
 
 import { BreadcrumbsRecord } from "../mapping/domainTypes";
 
-
-
-
-
-
+// Repository contract for the `breadcrumbs` table.
+//
+// Covers every current call site in controllers/progression.ts:
+// GetBreadcrumbsForCharacterIdAndUserId (find-or-create with defaults),
+// SetBreadcrumbsForCharacterIdAndUserId (find-then-insert-or-update).
 export interface BreadcrumbRepository {
     findByCharacterIdAndUserId(characterId: string, userId: string): Promise<BreadcrumbsRecord | undefined>;
 

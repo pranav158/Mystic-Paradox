@@ -3,6 +3,9 @@
  * Modified work Copyright (C) 2026 MysticFox / Pranav Karande (pranav158/Mystic-Paradox)
  *
  * Licensed under the GNU Affero General Public License v3.0.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
 import assert from "node:assert/strict";
@@ -97,7 +100,7 @@ test("direct chat: both friendship directions must be accepted", async () => {
 
 test("direct chat: offline friend returns service-unavailable without throwing", async () => {
     const { service, sender, bob1, bob2 } = setup();
-    
+    // Target an accepted friend's specific resource that is not connected.
     const errors = await service.routeDirectMessage(sender, "bob@prod.ol.epicgames.com/missing", "m4", "hello?");
     assert.equal(bob1.sent.length + bob2.sent.length, 0);
     assert.match(errors[0], /<service-unavailable /);

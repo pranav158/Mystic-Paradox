@@ -27,14 +27,14 @@ async function main(): Promise<void> {
             ? await Accounts.findOne({ displayNameNormalized: Username })
             : await Accounts.findOne({ email: FromEmail ?? Email });
 
-        
+        // Make the rename operation safe to rerun after a successful first run.
         if (!Account && FromEmail && FromEmail !== Email) {
             Account = await Accounts.findOne({ email: Email });
         }
         if (!Account) {
             const Selector = Username ? `username=${Username}` : `email=${FromEmail ?? Email}`;
             throw new Error(
-                `Launcher account not found by ${Selector} in database=${process.env.MONGODB_DB ?? "mysticparadox"}.`
+                `Launcher account not found by ${Selector} in database=${process.env.MONGODB_DB ?? "mystpax"}.`
             );
         }
         if (typeof Account.passwordHash !== "string") {

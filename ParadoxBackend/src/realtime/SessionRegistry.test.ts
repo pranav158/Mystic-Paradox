@@ -1,6 +1,9 @@
 /*
- * Copyright (C) 2026 Mystic Paradox (pranav158/MysticParadox)
+ * Copyright (C) 2026 MysticFox / Pranav Karande (pranav158/Mystic-Paradox)
  * Licensed under the GNU Affero General Public License v3.0.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
 import assert from "node:assert/strict";

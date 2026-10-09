@@ -17,7 +17,14 @@ import { authenticateSasl } from "./XMPPAuth";
 import { escapeXml, sanitizeName } from "./xml";
 import { XmppState } from "./types";
 
-
+/**
+ * Production per-connection XMPP session handler (WP4 + the retained bind/session sequence).
+ *
+ * Replaces the capture-only auto-success responder: SASL is now validated by XMPPAuth, the
+ * connection identity is bound from the VERIFIED TOKEN (never the JID/resource/nick), and stanzas
+ * are rejected before authentication. Presence/MUC (WP5/WP8) are observed here for now and handled
+ * in later steps. Sequence: Open -> SASL -> Success -> Reopen -> Bind -> SessionReady.
+ */
 
 const NS_FRAMING = "urn:ietf:params:xml:ns:xmpp-framing";
 const NS_SASL = "urn:ietf:params:xml:ns:xmpp-sasl";
@@ -34,27 +41,27 @@ interface XmlNodeLike {
 }
 
 export interface SessionAction {
-    
+    /** RFC 7395 frames to send back (one element each). */
     send: string[];
     nextState?: XmppState;
-    
+    /** Set once, when SASL succeeds — the authenticated account identity. */
     accountId?: string;
-    
+    /** Set when a resource is bound. */
     resource?: string;
-    
+    /** If set, close the connection after sending. */
     close?: { code: number; reason: string };
-    
+    /** True when a SASL attempt failed (drives per-IP throttling). */
     authFailed?: boolean;
-    
+    /** Set on a self-presence stanza: the account's availability changed (WP5 fan-out). */
     presence?: { available: boolean };
-    
+    /** Set on a MUC directed stanza (WP8 room join/leave/groupchat). */
     room?:
         | { kind: "join"; to: string }
         | { kind: "leave"; to: string }
         | { kind: "groupchat"; to: string; stanzaId: string; body: string };
-    
+    /** Set on a direct one-to-one chat stanza (WP7). Delivery/authz happens above the parser. */
     direct?: { to: string; stanzaId: string; body: string };
-    
+    /** Sanitized, secret-free note for logs. */
     note: string;
 }
 
@@ -74,7 +81,7 @@ export class XMPPSession {
         try {
             el = parseXml(raw) as unknown as XmlNodeLike;
         } catch {
-            return undefined; 
+            return undefined; // unparseable/partial; connection layer already logged the shape
         }
         if (!el || typeof el.name !== "string") return undefined;
 
@@ -82,7 +89,7 @@ export class XMPPSession {
         const xmlns = attrs["xmlns"] ?? "";
         const local = localName(el.name);
 
-        
+        // --- Stream open / reopen (RFC 7395) ---
         if (local === "open" && xmlns === NS_FRAMING) {
             const to = attrs["to"];
             if (typeof to === "string" && to.length > 0) this.domain = to;
@@ -100,7 +107,7 @@ export class XMPPSession {
             return { send: [openFrame, bindFeatures], nextState: XmppState.ReopenReceived, note: "reopen -> features(bind)" };
         }
 
-        
+        // --- SASL auth (validated) ---
         if (local === "auth" && xmlns === NS_SASL) {
             if (this.authenticated) {
                 return { send: [saslFailure("not-authorized")], note: "auth after already-authenticated (ignored)" };
@@ -124,12 +131,12 @@ export class XMPPSession {
             return action;
         }
 
-        
+        // --- Everything past here REQUIRES authentication ---
         if (!this.authenticated) {
             return { send: [], close: { code: 1008, reason: "not authenticated" }, note: `pre-auth stanza <${sanitizeName(local)}> rejected` };
         }
 
-        
+        // --- Resource bind + generic IQ ---
         if (local === "iq") {
             const id = attrs["id"] ?? "";
             const type = (attrs["type"] ?? "").toLowerCase();
@@ -138,10 +145,10 @@ export class XMPPSession {
                 const resEl = childByLocal(bind, "resource");
                 let resource = (resEl ? textOf(resEl) : "").trim();
                 if (resource.length === 0 || resource.length > MAX_RESOURCE_LEN) {
-                    resource = crypto.randomBytes(8).toString("hex"); 
+                    resource = crypto.randomBytes(8).toString("hex"); // untrusted/oversized -> server-assigned
                 }
                 this.boundResource = resource;
-                
+                // JID identity comes from the VERIFIED TOKEN (accountId), never the client.
                 const full = `${this.accountId}@${this.domain}/${resource}`;
                 const result =
                     `<iq type="result" id="${escapeXml(id)}">` +
@@ -150,35 +157,35 @@ export class XMPPSession {
             }
             const ping = childByLocal(el, "ping");
             if (ping) {
-                
+                // urn:xmpp:ping keepalive — an empty result IS the pong; don't change state.
                 return { send: [`<iq type="result" id="${escapeXml(id)}"/>`], note: "ping -> pong" };
             }
             if (type === "set" || type === "get") {
-                
-                
+                // Session establishment / other IQs: empty result keeps the client advancing.
+                // Specific IQs (roster etc.) are handled in later work packages if the client sends them.
                 return { send: [`<iq type="result" id="${escapeXml(id)}"/>`], nextState: XmppState.SessionReady, note: `IQ ${type} -> result` };
             }
             return undefined;
         }
 
-        
+        // --- Presence ---
         if (local === "presence") {
             const to = attrs["to"];
             if (typeof to === "string" && to.length > 0) {
-                
+                // Directed presence = MUC room join / leave (WP8).
                 const type = (attrs["type"] ?? "").toLowerCase();
                 if (type === "unavailable") {
                     return { send: [], room: { kind: "leave", to }, note: `MUC leave ${sanitizeName(to.split("@")[0])}` };
                 }
                 return { send: [], room: { kind: "join", to }, note: `MUC join ${sanitizeName(to.split("@")[0])}` };
             }
-            
-            
+            // Self presence: availability toward accepted friends (WP5). No reply frame; the
+            // connection layer performs the fan-out via PresenceService.
             const available = (attrs["type"] ?? "").toLowerCase() !== "unavailable";
             return { send: [], presence: { available }, note: `presence ${available ? "available" : "unavailable"}` };
         }
 
-        
+        // --- Message (group chat to a room, or friendship-gated direct chat) ---
         if (local === "message") {
             const to = attrs["to"] ?? "";
             const type = (attrs["type"] ?? "").toLowerCase();

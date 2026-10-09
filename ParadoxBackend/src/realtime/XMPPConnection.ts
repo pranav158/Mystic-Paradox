@@ -27,7 +27,18 @@ export interface ConnectionCallbacks {
     onClose(conn: XMPPConnection): void;
 }
 
-
+/**
+ * One live client WebSocket. In the capture foundation it:
+ *   - enforces the per-message byte cap;
+ *   - records a sanitized structural summary of each frame (when capture is on);
+ *   - maintains protocol state;
+ *   - guarantees clean teardown (timers cleared, registry notified) on
+ *     close/error/timeout (plan §8.3).
+ *
+ * It does NOT yet authenticate, advance the full handshake, or route stanzas — that
+ * arrives with WP3/WP4 once the real client protocol is captured. All inbound data
+ * is treated as untrusted and never interpreted as commands.
+ */
 export class XMPPConnection {
     readonly connId: string;
     readonly remoteIp: string;
@@ -43,9 +54,9 @@ export class XMPPConnection {
     private idleTimer?: NodeJS.Timeout;
     private closed = false;
     private frameCount = 0;
-    
-    
-    
+    // Tracks whether THIS resource has already announced itself available, so repeated presence
+    // stanzas for the same login (rich-status refreshes, travel, reconnect-in-place) don't get
+    // treated as fresh online transitions and re-broadcast full presence to every friend again.
     private presenceAvailable = false;
     private readonly session = new XMPPSession();
     private processing: Promise<void> = Promise.resolve();
@@ -93,8 +104,8 @@ export class XMPPConnection {
 
         this.frameCount++;
 
-        
-        
+        // XMPP-over-WebSocket payloads are UTF-8 text. A binary frame is unexpected;
+        // record and ignore rather than interpret it.
         if (isBinary) {
             logger.info(`[XMPP] conn=${this.connId} binary frame ${bytes}B (ignored in capture)`);
             return;
@@ -102,14 +113,14 @@ export class XMPPConnection {
 
         const text = data.toString("utf8");
 
-        
+        // Optional sanitized capture logging (diagnostics only; never logs text/credentials).
         if (this.config.captureEnabled) {
             const summary = summarizeFrame(text, this.config.limits);
             logger.info(`[XMPP-CAP] conn=${this.connId} #${this.frameCount} state=${this.state} parsed=${summary.parsed} ${summary.shape}`);
         }
 
-        
-        
+        // Real protocol handling (auth-gated). Serialized per connection so async auth can't let a
+        // later frame overtake an earlier one during the handshake.
         this.processing = this.processing.then(() => this.handleFrame(text)).catch((e) => {
             logger.error(`[XMPP] conn=${this.connId} frame handling error: ${e}`);
         });
@@ -129,14 +140,14 @@ export class XMPPConnection {
         }
         if (action.nextState) this.state = action.nextState;
         if (action.accountId) {
-            this.accountId = action.accountId; 
+            this.accountId = action.accountId; // identity bound from the verified token
             recordAuthSuccess(this.remoteIp);
         }
         if (action.resource) {
             this.resource = action.resource;
             if (this.accountId) {
-                
-                
+                // Duplicate-resource policy: deterministic replacement (plan §10.3). If the same
+                // (account, resource) was already live on another socket, close the old one.
                 const displaced = sessionRegistry.bind(this.accountId, this.resource, this);
                 if (displaced && displaced !== this) {
                     displaced.close(1001, "replaced by a newer resource");
@@ -159,7 +170,7 @@ export class XMPPConnection {
 
         if (action.room) {
             if (action.room.kind === "join") {
-                for (const frame of roomService.joinRoom(this, action.room.to)) {
+                for (const frame of await roomService.joinRoom(this, action.room.to)) {
                     this.send(frame);
                 }
             } else if (action.room.kind === "leave") {
@@ -190,7 +201,7 @@ export class XMPPConnection {
 
     private armHandshakeTimeout(): void {
         this.handshakeTimer = setTimeout(() => {
-            
+            // Must complete SASL within the handshake deadline; otherwise reap the connection.
             if (!this.session.isAuthenticated()) {
                 logger.warn(`[XMPP] conn=${this.connId} not authenticated within ${this.config.limits.handshakeTimeoutMs}ms - closing`);
                 this.close(1008, "authentication timeout");
@@ -219,7 +230,7 @@ export class XMPPConnection {
         }
     }
 
-    
+    /** Send a raw RFC 7395 frame to this client (session replies + presence/room fan-out). */
     send(frame: string): void {
         if (this.closed) return;
         try {
@@ -229,7 +240,7 @@ export class XMPPConnection {
         }
     }
 
-    
+    /** Request a graceful WebSocket close, then guarantee teardown. */
     close(code: number, reason: string): void {
         if (this.closed) return;
         this.state = XmppState.Closing;
@@ -241,7 +252,7 @@ export class XMPPConnection {
         this.teardown(`close(${code},${reason})`);
     }
 
-    
+    /** Force-terminate (graceful shutdown / abuse). */
     terminate(): void {
         try {
             this.ws.terminate();
@@ -263,7 +274,7 @@ export class XMPPConnection {
         if (this.accountId && this.resource) {
             roomService.onConnectionClosed(this);
             sessionRegistry.unbind(this.accountId, this.resource, this);
-            void onResourceUnavailable(this.accountId); 
+            void onResourceUnavailable(this.accountId); // offline broadcast if this was the last resource (with grace)
         }
         logger.info(`[XMPP] conn=${this.connId} closed (${why}) frames=${this.frameCount}`);
         try {

@@ -24,8 +24,8 @@ const MAX_DIRECT_MESSAGE_BYTES = 4 * 1024;
 const MAX_STANZA_ID_LENGTH = 128;
 const MAX_RESOURCE_LENGTH = 128;
 
-
-
+// Conservative development limits from plan §13. They are deliberately enforced before Mongo
+// lookup so a chat flood cannot turn into a database-query flood.
 const PER_CONNECTION_LIMIT = 12;
 const PER_CONNECTION_WINDOW_MS = 10_000;
 const PER_ACCOUNT_LIMIT = 60;
@@ -60,7 +60,11 @@ function safeStanzaId(stanzaId: string): string {
     return stanzaId.length <= MAX_STANZA_ID_LENGTH ? stanzaId : "";
 }
 
-
+/**
+ * WP7 direct one-to-one friend chat. The authenticated connection identity is the only sender
+ * authority. The target JID is accepted only on the captured logical domain, and BOTH directed
+ * Mongo friendship edges must be ACCEPTED. Messages are in-memory fan-out only; no offline store.
+ */
 export class DirectChatService {
     private readonly connectionRates = new Map<string, RateWindow>();
     private readonly accountRates = new Map<string, RateWindow>();
@@ -71,7 +75,7 @@ export class DirectChatService {
         private readonly now: () => number = Date.now,
     ) {}
 
-    
+    /** Deliver to the target resource(s); returned frames are errors to send back to the sender. */
     async routeDirectMessage(
         sender: RegisteredConnection,
         rawTarget: string,

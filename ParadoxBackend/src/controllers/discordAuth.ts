@@ -17,8 +17,8 @@ import { CreateSessionForUser, ToAccountView, LauncherSessionResult } from "./la
 import { logger } from "../logger";
 import { AssertAccountAdmitted } from "../security/accountEligibility";
 
-const STATE_TTL_MS = 5 * 60 * 1000; 
-const COMPLETION_CODE_TTL_MS = 60 * 1000; 
+const STATE_TTL_MS = 5 * 60 * 1000; // 5 minutes to complete the Discord consent screen
+const COMPLETION_CODE_TTL_MS = 60 * 1000; // matches the game exchange code's spec-driven lifetime
 
 function GetDeepLinkScheme(): string {
     return process.env.LAUNCHER_DEEPLINK_SCHEME ?? "mysticparadox";
@@ -63,9 +63,9 @@ export async function StartDiscordAuth(): Promise<{ authorizeUrl: string }> {
         client_id: clientId,
         redirect_uri: redirectUri,
         response_type: "code",
-        
-        
-        
+        // identify only — spec: "email only if the product genuinely needs Discord's
+        // email address," which this build doesn't (Discord-created accounts simply
+        // have no email until/unless a future email/password link flow adds one).
         scope: "identify",
         state: State,
         code_challenge: CodeChallenge,
@@ -123,16 +123,16 @@ async function ResolveOrCreateAccountForDiscordUser(discordUser: DiscordUser): P
     const ExistingIdentity = await Repos.authIdentities.findByProviderSubject("discord", discordUser.id);
 
     if (ExistingIdentity != undefined) {
-        
+        // Spec: "if a Discord identity is already linked, sign into that account."
         return ExistingIdentity.userId;
     }
 
     const UserId = crypto.randomUUID();
     const Now = new Date().toISOString();
 
-    
-    
-    
+    // Create the account WITHOUT a chosen username. The launcher forces a set-username step after
+    // Discord sign-in (account.needsUsername === true). Use the opaque userId as a unique placeholder
+    // displayName until the player picks their real one; usernameSet:false drives the prompt.
     await Repos.launcherAccounts.create({
         userId: UserId,
         displayNameNormalized: UserId.toLowerCase(),
@@ -162,7 +162,9 @@ async function ResolveOrCreateAccountForDiscordUser(discordUser: DiscordUser): P
     return UserId;
 }
 
-
+/** Route handler calls this after Discord redirects back with ?code&state, then
+ *  302-redirects the BROWSER to whatever URL this returns (a deep link on success,
+ *  the launcher's error deep link on failure — see routes/launcherAuth.ts). */
 export async function HandleDiscordCallback(code: string | undefined, state: string | undefined): Promise<string> {
     const Scheme = GetDeepLinkScheme();
 

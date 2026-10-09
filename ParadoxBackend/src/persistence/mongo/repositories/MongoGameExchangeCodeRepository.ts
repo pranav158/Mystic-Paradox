@@ -20,6 +20,10 @@ function ToRecord(Doc: any): GameExchangeCodeRecord {
         launcherSessionId: Doc.launcherSessionId,
         buildChangelist: Doc.buildChangelist,
         executableSha256: Doc.executableSha256,
+        runtimeChannel: Doc.runtimeChannel,
+        runtimeSha256: Doc.runtimeSha256,
+        runtimeManifestVersion: Doc.runtimeManifestVersion,
+        runtimeArtifactSetSha256: Doc.runtimeArtifactSetSha256,
         createdAt: Doc.createdAt,
         expiresAt: Doc.expiresAt,
         consumedAt: Doc.consumedAt ?? undefined
@@ -32,7 +36,7 @@ export class MongoGameExchangeCodeRepository implements GameExchangeCodeReposito
         await Db.collection(Collections.GameExchangeCodes).insertOne({
             ...code,
             _id: code.codeHash as any,
-            
+            // Storage-only TTL mirror — see the equivalent comment in MongoRefreshSessionRepository.
             ttlAt: new Date(code.expiresAt)
         });
     }
@@ -40,9 +44,9 @@ export class MongoGameExchangeCodeRepository implements GameExchangeCodeReposito
     async consumeByCodeHash(codeHash: string): Promise<GameExchangeCodeRecord | undefined> {
         const Db = await GetMongoDb();
         const Result = await Db.collection(Collections.GameExchangeCodes).findOneAndUpdate(
-            
-            
-            
+            // `consumedAt: null` matches both a genuinely absent field and one stored as
+            // an explicit null — see MongoRefreshSessionRepository's create() comment for
+            // why `{ $exists: false }` alone is fragile against how a value got inserted.
             { _id: codeHash as any, consumedAt: null, expiresAt: { $gt: new Date().toISOString() } },
             { $set: { consumedAt: new Date().toISOString() } },
             { returnDocument: "after" }

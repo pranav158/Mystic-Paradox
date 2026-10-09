@@ -16,11 +16,11 @@ import { SendLauncherError, LauncherApiError } from "../security/launcherErrors"
 import { GetRepositories } from "../persistence";
 import { AssertAccountAdmitted } from "../security/accountEligibility";
 
-
-
-
-
-
+// Mirrors middleware/HasParadoxBackendAuth.ts's shape, but validates the
+// launcher-audience JWT (security/launcherTokens.ts) instead of the game JWT
+// (controllers/auth.ts) — the two are deliberately non-interchangeable (spec
+// section "Token policy": "a launcher token can never be replayed as a game
+// token or vice versa"). Does not touch HasParadoxBackendAuth.ts.
 export async function HasLauncherAuth(req: Request, res: Response, next: NextFunction) {
     const AuthHeader = req.headers.authorization;
 

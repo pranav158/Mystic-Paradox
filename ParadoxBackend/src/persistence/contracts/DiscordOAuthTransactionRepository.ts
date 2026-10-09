@@ -9,13 +9,13 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-
-
-
-
-
-
-
+// One row carries a Discord login through both of its short-lived phases (spec
+// section "Discord OAuth"):
+//   1. start: {state, codeVerifier} — validates the callback and is single-use
+//      via consumeByState.
+//   2. callback (on success): the same row gains {completionCodeHash, userId}
+//      so the one-time deep-link completion code can be consumed separately
+//      via consumeByCompletionCodeHash, without a second collection.
 export interface DiscordOAuthTransactionRecord {
     state: string;
     codeVerifier: string;
@@ -31,11 +31,11 @@ export interface DiscordOAuthTransactionRecord {
 export interface DiscordOAuthTransactionRepository {
     create(transaction: DiscordOAuthTransactionRecord): Promise<void>;
 
-    
+    /** Atomic find-and-consume by state — succeeds at most once, only before expiry. */
     consumeByState(state: string): Promise<DiscordOAuthTransactionRecord | undefined>;
 
     attachCompletionCode(state: string, completionCodeHash: string, completionExpiresAt: string, userId: string): Promise<void>;
 
-    
+    /** Atomic find-and-consume by the deep-link completion code. */
     consumeByCompletionCodeHash(completionCodeHash: string): Promise<DiscordOAuthTransactionRecord | undefined>;
 }

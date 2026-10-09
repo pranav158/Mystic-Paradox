@@ -14,10 +14,10 @@ import { Collections } from "../collections";
 import { AccountRepository } from "../../contracts/AccountRepository";
 import { AccountRecord } from "../../mapping/domainTypes";
 
-
-
-
-
+// Maps to plan section 6.2's `accounts` collection. _id = userId. Only the fields
+// this migration phase actually uses (userId/name/notes) are stored — the fuller
+// document shape in the plan (displayName/bootstrapVersion/accountFlags/etc.) is
+// Phase M9 dev-account-cleanup scope, not this behavior-preserving migration.
 export class MongoAccountRepository implements AccountRepository {
     async findByUserId(userId: string): Promise<AccountRecord | undefined> {
         const Db = await GetMongoDb();

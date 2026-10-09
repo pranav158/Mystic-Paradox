@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+
 import { IsValidEmailAddress } from "./controllers/launcherAuth";
 
 test("accepts a bounded ordinary email address", () => {
@@ -17,4 +18,10 @@ test("rejects malformed, whitespace, and oversized email addresses", () => {
     ]) {
         assert.equal(IsValidEmailAddress(value), false, value);
     }
+});
+
+test("rejects a long backtracking input quickly", () => {
+    const started = Date.now();
+    assert.equal(IsValidEmailAddress("a@" + ".".repeat(100_000) + "\t"), false);
+    assert.ok(Date.now() - started < 50, "validation must stay linear-time");
 });

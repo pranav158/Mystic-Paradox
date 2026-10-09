@@ -14,7 +14,7 @@ import { Collections } from "../collections";
 import { BreadcrumbRepository } from "../../contracts/BreadcrumbRepository";
 import { BreadcrumbsRecord } from "../../mapping/domainTypes";
 
-
+// Maps to plan section 6.8's `breadcrumbs` collection. _id = characterId.
 export class MongoBreadcrumbRepository implements BreadcrumbRepository {
     async findByCharacterIdAndUserId(characterId: string, userId: string): Promise<BreadcrumbsRecord | undefined> {
         const Db = await GetMongoDb();

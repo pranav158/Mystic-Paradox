@@ -27,29 +27,31 @@ import {
     SetUsername
 } from "../controllers/launcherAuth";
 import { StartDiscordAuth, HandleDiscordCallback, CompleteDiscordLogin } from "../controllers/discordAuth";
+import { GetLauncherPolicy } from "../controllers/launcherPolicy";
+import { ParseRuntimeChannel } from "../security/runtimeAuthorization";
 
-
-
-
-
-
-
+// Implements the /launcher/v1 contract from Plans/LAUNCHER_BACKEND_AUTH_REQUIREMENTS.md.
+// Deliberately additive to the running Metagame: nothing here touches routes/eos.ts,
+// routes/party.ts, or any other existing game route/controller. The one documented
+// remaining integration point — a new AUTH_MODE=LAUNCHER branch in eos.ts that
+// consumes the codes /game-sessions issues below — is intentionally NOT implemented
+// here; see that file's header note and the requirements doc's "status" section.
 export const launcherAuthRouter = Router();
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// Scoped to this router only — not a global app.ts middleware — so it can't
+// change behavior for any existing game route. The launcher's frontend runs
+// as a browser-origin WebView (Tauri) or a plain dev browser during testing,
+// either of which needs actual CORS headers to complete requests; the game
+// client and DeployServer/gameserver calls elsewhere in this app aren't
+// browsers and were never subject to CORS to begin with.
+//
+// Allow-list, not a wildcard — LAUNCHER_ALLOWED_ORIGINS (comma-separated) lets
+// the production Tauri webview's real origin be added once it's known; the
+// Vite dev server origin below is always included since it's fixed by
+// Launcher/src-tauri/tauri.conf.json's devUrl. See
+// Plans/LAUNCHER_BACKEND_AUTH_REQUIREMENTS.md's status notes — Tauri's exact
+// production origin (WebView2 on Windows) is https://tauri.localhost for
+// Tauri 2 packaged builds — confirmed now against the real launcher.exe.
 const DEFAULT_ALLOWED_ORIGINS = ["http://localhost:1420", "https://tauri.localhost"];
 
 function GetAllowedOrigins(): string[] {
@@ -62,11 +64,11 @@ function GetAllowedOrigins(): string[] {
 }
 
 launcherAuthRouter.use((req, res, next) => {
-    
-    
-    
-    
-    
+    // This router is mounted at "/", so this middleware also runs for game and
+    // fall-through requests. Only the launcher API (browser/WebView) needs CORS, so
+    // scope it to /launcher/ — otherwise non-browser game requests (which correctly
+    // have no Origin) log a spurious "[CORS] No origin header" warning on their way
+    // to the 404 handler.
     if (!req.path.startsWith("/launcher/")) {
         next();
         return;
@@ -108,7 +110,9 @@ function GetDeviceFields(req: Request): { deviceId: string; deviceName: string }
     };
 }
 
-
+/** Every handler below funnels errors through here so a thrown LauncherApiError
+ *  becomes the documented {error:{code,message,requestId}} body, and anything
+ *  unexpected is logged (never leaked to the client) and reported as INTERNAL. */
 async function Handle(req: Request, res: Response, fn: () => Promise<unknown>, successStatus = 200): Promise<void> {
     try {
         const Result = await fn();
@@ -162,9 +166,9 @@ launcherAuthRouter.get("/launcher/v1/auth/discord/callback", async (req, res) =>
         const RedirectUrl = await HandleDiscordCallback(req.query.code as string | undefined, req.query.state as string | undefined);
         res.redirect(302, RedirectUrl);
     } catch (error) {
-        
-        
-        
+        // This endpoint's client is the player's system browser mid-redirect, not
+        // the launcher's fetch-based API client — errors go back as a deep link
+        // (which the launcher listens for) rather than a JSON body no one reads.
         const Code = error instanceof LauncherApiError ? error.code : "INTERNAL";
 
         if (!(error instanceof LauncherApiError)) {
@@ -186,12 +190,12 @@ launcherAuthRouter.get("/launcher/v1/me", HasLauncherAuth, (req, res) =>
     Handle(req, res, () => GetAccountView((req as any).LauncherAuthData.userId))
 );
 
-
+// Availability check for the registration screen (pre-auth, read-only).
 launcherAuthRouter.get("/launcher/v1/username", (req, res) =>
     Handle(req, res, () => CheckUsernameAvailable(String(req.query.name ?? "")))
 );
 
-
+// Set the authenticated account's unique username (Discord set-username step).
 launcherAuthRouter.post("/launcher/v1/username", HasLauncherAuth, (req, res) =>
     Handle(req, res, () => SetUsername((req as any).LauncherAuthData.userId, req.body?.username))
 );
@@ -201,6 +205,9 @@ launcherAuthRouter.post("/launcher/v1/game-sessions", HasLauncherAuth, (req, res
         const AuthData = (req as any).LauncherAuthData;
         const BuildChangelist = Number(req.body?.buildChangelist);
         const ExecutableSha256 = req.body?.executableSha256;
+        const RuntimeChannel = ParseRuntimeChannel(req.body?.runtimeChannel);
+        const RuntimeManifestVersion = req.body?.runtimeManifestVersion;
+        const RuntimeArtifacts = req.body?.runtimeArtifacts;
 
         if (!Number.isFinite(BuildChangelist)) {
             throw new LauncherApiError("AUTH_VALIDATION_FAILED", "buildChangelist is required.");
@@ -210,8 +217,20 @@ launcherAuthRouter.post("/launcher/v1/game-sessions", HasLauncherAuth, (req, res
             throw new LauncherApiError("AUTH_VALIDATION_FAILED", "executableSha256 is required.");
         }
 
-        return RequestGameExchangeCode(AuthData.userId, AuthData.sid, BuildChangelist, ExecutableSha256);
+        return RequestGameExchangeCode(
+            AuthData.userId,
+            AuthData.sid,
+            BuildChangelist,
+            ExecutableSha256,
+            RuntimeChannel,
+            RuntimeManifestVersion,
+            RuntimeArtifacts
+        );
     })
+);
+
+launcherAuthRouter.get("/launcher/v1/policy", HasLauncherAuth, (req, res) =>
+    Handle(req, res, () => GetLauncherPolicy((req as any).LauncherAuthData.userId))
 );
 
 launcherAuthRouter.get("/launcher/v1/status", (req, res) =>

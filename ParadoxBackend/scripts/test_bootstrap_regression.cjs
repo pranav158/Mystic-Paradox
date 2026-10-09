@@ -1,4 +1,21 @@
-
+/*
+ * Bootstrap/recovery regression tests.
+ *
+ * SAFETY: these are destructive integration tests. They refuse to run unless BOTH
+ *   ALLOW_DB_INTEGRATION_TESTS=true   and   MONGODB_TEST_DB=<a dedicated test database name>
+ * are set, and MONGODB_TEST_DB must differ from MONGODB_DB (the main database). The app's own
+ * Mongo client is redirected onto MONGODB_TEST_DB for the duration of the run, so nothing here
+ * ever reads or writes the production database.
+ *
+ * Run with:
+ *   $env:ALLOW_DB_INTEGRATION_TESTS="true"; $env:MONGODB_TEST_DB="mysticparadox_test"
+ *   node --env-file=.env scripts/test_bootstrap_regression.cjs
+ * (npm run test:bootstrap wires the same thing.)
+ *
+ * Uses disposable, randomly-generated userId/characterId values only (test_ prefix). Every
+ * document created across characters/inventories/loadouts/wallets/inventoryTransactions is
+ * deleted in cleanup, and a final zero-leftover assertion fails the run if anything remains.
+ */
 require("dotenv").config();
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
@@ -34,7 +51,7 @@ async function test(name, fn) {
 }
 
 (async () => {
-    
+    // --- Safety guard: never run destructively against the main database ------------------------
     if (process.env.ALLOW_DB_INTEGRATION_TESTS !== "true") {
         console.error("Refusing to run: set ALLOW_DB_INTEGRATION_TESTS=true to opt in to destructive integration tests.");
         process.exit(1);
@@ -47,23 +64,23 @@ async function test(name, fn) {
         console.error("Refusing to run: MONGODB_TEST_DB (a dedicated test database name) is required.");
         process.exit(1);
     }
-    if (process.env.MONGODB_TEST_DB === (process.env.MONGODB_DB ?? "mysticparadox")) {
+    if (process.env.MONGODB_TEST_DB === (process.env.MONGODB_DB ?? "mystpax")) {
         console.error("Refusing to run: MONGODB_TEST_DB must differ from the main MONGODB_DB.");
         process.exit(1);
     }
-    
-    
+    // Redirect the app's own lazily-connected Mongo client (GetMongoDb reads MONGODB_DB) onto the
+    // dedicated test database BEFORE requiring any build module, so app writes land in the test DB.
     process.env.MONGODB_DB = process.env.MONGODB_TEST_DB;
 
-    
-    const distStarterManifest = require("../dist/controllers/starterManifest");
-    const distCharacter = require("../dist/controllers/character");
-    const distInventory = require("../dist/controllers/inventory");
-    const distLoadout = require("../dist/controllers/loadout");
-    const distWallet = require("../dist/controllers/wallet");
-    const distValidation = require("../dist/validation");
-    const distWalletContract = require("../dist/persistence/contracts/WalletRepository");
-    const distPersistence = require("../dist/persistence");
+    // Import the compiled JS build so the tests exercise the exact code that runs in production.
+    const distStarterManifest = require("../build/controllers/starterManifest");
+    const distCharacter = require("../build/controllers/character");
+    const distInventory = require("../build/controllers/inventory");
+    const distLoadout = require("../build/controllers/loadout");
+    const distWallet = require("../build/controllers/wallet");
+    const distValidation = require("../build/validation");
+    const distWalletContract = require("../build/persistence/contracts/WalletRepository");
+    const distPersistence = require("../build/persistence");
 
     const client = new MongoClient(process.env.MONGODB_URI);
     await client.connect();
@@ -105,16 +122,23 @@ async function test(name, fn) {
             const byId = new Map(instancedItems.map((i) => [i.catalogId, i.instanceId]));
 
             const slot = JSON.parse(loadout.loadouts)[0];
+            const persistent = JSON.parse(loadout.persistent);
             assert.equal(slot.weapon.item_id, "WP_EB_BEGINNER");
             assert.equal(slot.weapon.instance_id, byId.get("WP_EB_BEGINNER"));
             assert.equal(slot.helmet.instance_id, byId.get("AR_UNEQUIPPED_HELM"));
+            assert.equal(
+                persistent.banner,
+                byId.get("BN_BEGINNER_00"),
+                "persistent banner must reference its owned inventory instance"
+            );
+            assert.notEqual(persistent.banner, "BN_BEGINNER_00");
             assert.ok(wallet.balances.CURRENCY_NOTES > 0);
             assert.equal(wallet.bootstrapVersion, distStarterManifest.BOOTSTRAP_VERSION, "seeded wallet must be tagged");
         });
 
         await test("Character creation adopts a pre-existing wallet, preserving balances and adding the bootstrap tag", async () => {
             const userId = freshUserId();
-            
+            // Simulate an earlier balance request creating the wallet with a non-starter balance and no tag.
             await distPersistence.GetRepositories().wallets.createIfMissing({ userId, balances: { CURRENCY_NOTES: 777 } });
             const before = await distPersistence.GetRepositories().wallets.findByUserId(userId);
             assert.equal(before.balances.CURRENCY_NOTES, 777);
@@ -235,7 +259,7 @@ async function test(name, fn) {
             const recovered = await distInventory.GetInventoryForUserIdAndCharacterId(userId, character.id);
             assert.equal(recovered.instancedItems.map((i) => i.catalogId).sort().join(","), [...EXPECTED_INSTANCED].sort().join(","));
             for (const item of recovered.instancedItems) {
-                assert.ok(!item.instanceId.startsWith("MYSTPAX_STARTER_"), `${item.catalogId} recovered with a shared-ID prefix`);
+                assert.ok(!item.instanceId.startsWith("MYSTICPARADOX_STARTER_"), `${item.catalogId} recovered with a shared-ID prefix`);
             }
 
             const loadoutAfter = await distPersistence.GetRepositories().loadouts.findByCharacterIdAndUserId(character.id, userId);
@@ -254,10 +278,17 @@ async function test(name, fn) {
             const byId = new Map(JSON.parse(inventoryBefore.instancedItems).map((i) => [i.catalogId, i.instanceId]));
             assert.equal(recovered[0].weapon.instance_id, byId.get("WP_EB_BEGINNER"));
             assert.equal(recovered[0].helmet.instance_id, byId.get("AR_UNEQUIPPED_HELM"));
-            assert.ok(!recovered[0].weapon.instance_id.startsWith("MYSTPAX_STARTER_"));
+            assert.ok(!recovered[0].weapon.instance_id.startsWith("MYSTICPARADOX_STARTER_"));
 
             const inventoryAfter = await distPersistence.GetRepositories().inventories.findByCharacterId(character.id);
+            const loadoutAfter = await distPersistence.GetRepositories().loadouts.findByCharacterIdAndUserId(character.id, userId);
+            const persistentAfter = JSON.parse(loadoutAfter.persistent);
             assert.equal(inventoryAfter.instancedItems, inventoryBefore.instancedItems, "surviving inventory must be untouched by loadout-only recovery");
+            assert.equal(
+                persistentAfter.banner,
+                byId.get("BN_BEGINNER_00"),
+                "recovered persistent banner must reference the surviving inventory instance"
+            );
         });
 
         await test("Loadout recovery refuses a character the requesting user does not own (cross-user)", async () => {
@@ -280,7 +311,7 @@ async function test(name, fn) {
         await test("Loadout recovery refuses a nonexistent character and creates no documents", async () => {
             const userId = freshUserId();
             const fakeCharacterId = crypto.randomUUID();
-            created.characterIds.add(fakeCharacterId); 
+            created.characterIds.add(fakeCharacterId); // defensive cleanup; nothing should be created
 
             let threw = null;
             try {
@@ -308,7 +339,7 @@ async function test(name, fn) {
 
             const resA = await distInventory.RunInventoryTransaction(userA, charA.id, sharedTxn, [], grant, [], [], []);
             assert.ok(resA, "user A's grant should succeed");
-            
+            // Same transactionId, DIFFERENT user/character - must NOT be treated as a replay of A's.
             const resB = await distInventory.RunInventoryTransaction(userB, charB.id, sharedTxn, [], grant, [], [], []);
             assert.ok(resB, "user B's identical transactionId must succeed independently, not collide with A");
 
@@ -316,7 +347,7 @@ async function test(name, fn) {
             const tokenB = invB.stackedItems.find((i) => i.catalogId === "TOKEN_REGRESSION");
             assert.equal(tokenB && tokenB.quantity, 1, "user B must have received its own grant");
 
-            
+            // Replaying the SAME (user, character, transactionId) must return the stored result and NOT re-apply.
             const replayA = await distInventory.RunInventoryTransaction(userA, charA.id, sharedTxn, [], grant, [], [], []);
             assert.ok(replayA, "replay should return the stored result");
             const invA = await distInventory.GetInventoryForUserIdAndCharacterId(userA, charA.id);
@@ -336,7 +367,7 @@ async function test(name, fn) {
                 await distWallet.AddCurrency(userId, "evil.$inject", 5);
             } catch (error) { threw = error; }
             assert.ok(threw, "AddCurrency must throw on an unsafe balance field path");
-            
+            // Nothing should have been created for this user.
             const wallet = await db.collection("wallets").findOne({ _id: userId });
             assert.equal(wallet, null, "no wallet should be created when the catalogId is rejected");
         });
@@ -349,13 +380,13 @@ async function test(name, fn) {
             assert.ok(distValidation.ValidateInventoryTransactionBody({ characterId: "c", transactionId: "t", addInstancedItems: [{ catalogId: "X" }] }), "instanced item without instanceId must be rejected");
             assert.ok(distValidation.ValidateInventoryTransactionBody({ characterId: "c", transactionId: "t", addStackedItems: "nope" }), "non-array collection must be rejected");
 
-            
+            // Grant/spend detection drives the gameserver-only gate.
             assert.equal(distValidation.InventoryBodyHasGrantOrSpend({ saveInstancedItems: [{ catalogId: "X", instanceId: "Y" }] }), false, "a pure save is not a grant/spend");
             assert.equal(distValidation.InventoryBodyHasGrantOrSpend({ addStackedItems: [{ catalogId: "X", quantity: 1 }] }), true, "an add is a grant");
             assert.equal(distValidation.InventoryBodyHasGrantOrSpend({ removeInstancedItems: [{ catalogId: "X", instanceId: "Y" }] }), true, "a remove is a spend");
 
             assert.equal(distValidation.ValidateLoadoutWriteData("0", JSON.stringify({ weapon: {} })), null, "a valid slot object should pass");
-            assert.ok(distValidation.ValidateLoadoutWriteData("2", JSON.stringify({})), "an unsupported index must be rejected");
+            assert.ok(distValidation.ValidateLoadoutWriteData("6", JSON.stringify({})), "an index above the supported 0..5 range must be rejected");
             assert.ok(distValidation.ValidateLoadoutWriteData("0", "not json"), "non-JSON data must be rejected");
             assert.ok(distValidation.ValidateLoadoutWriteData("0", JSON.stringify([1, 2])), "a JSON array (not object) must be rejected");
         });
@@ -369,7 +400,7 @@ async function test(name, fn) {
             const helm = before.instancedItems.find((i) => i.catalogId === "AR_UNEQUIPPED_HELM");
             assert.ok(helm, "starter helm missing");
 
-            
+            // Reuse the helm's real instanceId but claim a different, "more valuable" catalogId.
             await distInventory.RunInventoryTransaction(userId, character.id, freshTransactionId(), [], [], [], [], [
                 { catalogId: "AR_LEGENDARY_BIS", instanceId: helm.instanceId, itemData: null, updateVersion: 1 }
             ]);
@@ -389,7 +420,7 @@ async function test(name, fn) {
             const first = await distInventory.RunInventoryTransaction(userId, character.id, txn, [], [{ catalogId: "TOKEN_BIND", quantity: 1 }], [], [], []);
             assert.ok(first, "first body should apply");
 
-            
+            // Same (user, character, transactionId) but a DIFFERENT body (quantity 5) - misuse.
             let threw = null;
             try {
                 await distInventory.RunInventoryTransaction(userId, character.id, txn, [], [{ catalogId: "TOKEN_BIND", quantity: 5 }], [], [], []);
@@ -397,12 +428,12 @@ async function test(name, fn) {
             assert.ok(threw, "a different body under the same transactionId must throw");
             assert.equal(threw.name, "InventoryTransactionMismatchError", `expected InventoryTransactionMismatchError, got ${threw && threw.name}`);
 
-            
+            // The rejected body must NOT have applied: quantity stays at the first body's value.
             const inv = await distInventory.GetInventoryForUserIdAndCharacterId(userId, character.id);
             const token = inv.stackedItems.find((i) => i.catalogId === "TOKEN_BIND");
             assert.equal(token && token.quantity, 1, "the mismatched-body mutation must not have applied");
 
-            
+            // Replaying the ORIGINAL body under the same id still returns the stored result (no double-apply).
             const replay = await distInventory.RunInventoryTransaction(userId, character.id, txn, [], [{ catalogId: "TOKEN_BIND", quantity: 1 }], [], [], []);
             assert.ok(replay, "same-body replay should return the stored result");
             const invAfter = await distInventory.GetInventoryForUserIdAndCharacterId(userId, character.id);
@@ -419,16 +450,16 @@ async function test(name, fn) {
             const sword = inv.instancedItems.find((i) => i.catalogId === "WP_EB_BEGINNER");
             assert.ok(sword, "starter sword missing");
 
-            
+            // Happy path: newer updateVersion applies the itemData.
             const updated = await distInventory.UpdateInstancedItem(character.id, userId, sword.instanceId, "WP_EB_BEGINNER", JSON.stringify({ tint: 1 }), 1);
             assert.ok(updated, "update should succeed");
             assert.equal(JSON.parse(updated.itemData).tint, 1);
 
-            
+            // A catalogId change on the same instanceId must be refused (transmutation guard).
             const transmute = await distInventory.UpdateInstancedItem(character.id, userId, sword.instanceId, "WP_LEGENDARY_BIS", JSON.stringify({ tint: 2 }), 2);
             assert.equal(transmute, undefined, "catalogId change via single-item update must be refused");
 
-            
+            // A stale updateVersion (older than the stored value) must be ignored - no overwrite.
             await distInventory.UpdateInstancedItem(character.id, userId, sword.instanceId, "WP_EB_BEGINNER", JSON.stringify({ tint: 99 }), 0);
 
             const after = await distInventory.GetInventoryForUserIdAndCharacterId(userId, character.id);
@@ -449,30 +480,30 @@ async function test(name, fn) {
             const save = (itemData, version) => [{ catalogId: "WP_EB_BEGINNER", instanceId: swordId, itemData, updateVersion: version }];
             const run = (items) => distInventory.RunInventoryTransaction(userId, character.id, freshTransactionId(), [], [], [], [], items);
 
-            
+            // 1) APPLIED (higher version 1 > seeded 0): reported as updated.
             const r1 = await run(save(JSON.stringify({ tint: 1 }), 1));
             assert.equal(r1.updatedInstancedItems.length, 1, "higher-version save must be reported as updated");
             assert.equal(r1.updatedInstancedItems[0].instanceId, swordId);
             assert.equal(r1.updatedInstancedItems[0].updateVersion, 1);
 
-            
+            // 2) EQUAL-IDENTICAL (same version, same data): no-op, NOT reported.
             const r2 = await run(save(JSON.stringify({ tint: 1 }), 1));
             assert.equal(r2.updatedInstancedItems.length, 0, "equal-version identical save is a no-op and must not be reported");
 
-            
+            // 3) EQUAL-DIVERGENT (same version, different data): applies, reported.
             const r3 = await run(save(JSON.stringify({ tint: 2 }), 1));
             assert.equal(r3.updatedInstancedItems.length, 1, "equal-version divergent save must apply and be reported");
             assert.equal(JSON.parse(r3.updatedInstancedItems[0].itemData).tint, 2);
 
-            
+            // 4) STALE (older version 0 < stored 1): ignored, NOT reported.
             const r4 = await run(save(JSON.stringify({ tint: 999 }), 0));
             assert.equal(r4.updatedInstancedItems.length, 0, "stale save must not be reported");
 
-            
+            // 5) UNKNOWN instance: ignored, NOT reported, nothing created.
             const r5 = await run([{ catalogId: "WP_EB_BEGINNER", instanceId: "ZZZZZZZZZZZZZZZZZZZZZZZZZZ", itemData: JSON.stringify({ tint: 5 }), updateVersion: 5 }]);
             assert.equal(r5.updatedInstancedItems.length, 0, "unknown-instance save must not be reported");
 
-            
+            // Final stored state reflects only the applied saves: version 1, last divergent data.
             const after = await distInventory.GetInventoryForUserIdAndCharacterId(userId, character.id);
             const swordAfter = after.instancedItems.find((i) => i.instanceId === swordId);
             assert.equal(swordAfter.updateVersion, 1, "updateVersion stays at the applied value");
@@ -485,7 +516,7 @@ async function test(name, fn) {
         testError = error;
         console.error(`  FAIL  ${error.message}`);
     } finally {
-        
+        // --- Cleanup: every collection any test can touch, scoped to the tracked test entities ---
         try {
             for (const characterId of created.characterIds) {
                 await db.collection("characters").deleteMany({ characterId });
@@ -507,7 +538,7 @@ async function test(name, fn) {
             console.error("cleanup error:", cleanupError.message);
         }
 
-        
+        // --- Zero-leftover assertion across ALL affected collections -----------------------------
         const leftovers = {
             characters: await db.collection("characters").countDocuments({ userId: { $regex: TEST_PREFIX } }),
             inventories: await db.collection("inventories").countDocuments({ userId: { $regex: TEST_PREFIX } }),
@@ -518,8 +549,8 @@ async function test(name, fn) {
         const totalLeftover = Object.values(leftovers).reduce((sum, count) => sum + count, 0);
 
         await client.close();
-        
-        
+        // GetRepositories()/GetUnitOfWork() open and cache a SEPARATE MongoClient internally
+        // (see src/persistence/mongo/client.ts) - stop it so the process exits cleanly.
         await distPersistence.GetPersistenceLifecycle().stop();
 
         if (testError) {

@@ -39,14 +39,14 @@ export class MongoRefreshSessionRepository implements RefreshSessionRepository {
             deviceName: session.deviceName,
             createdAt: session.createdAt,
             expiresAt: session.expiresAt,
-            
-            
-            
-            
+            // Deliberately NOT setting revokedAt here at all when the session is fresh
+            // (rather than `revokedAt: session.revokedAt`) — the driver stores an
+            // explicit `undefined` value as BSON null, which then IS a field that
+            // exists, breaking any `{ revokedAt: { $exists: false } }` query below.
             ...(session.revokedAt != undefined ? { revokedAt: session.revokedAt } : {}),
-            
-            
-            
+            // Storage-only field for the TTL index (indexes.ts) — expiresAt above stays an
+            // ISO string like every other timestamp in this codebase; Mongo's TTL mechanism
+            // needs an actual BSON Date, so this mirrors it purely for auto-cleanup.
             ttlAt: new Date(session.expiresAt)
         });
     }
@@ -66,9 +66,9 @@ export class MongoRefreshSessionRepository implements RefreshSessionRepository {
     async revokeFamily(familyId: string): Promise<void> {
         const Db = await GetMongoDb();
         await Db.collection(Collections.RefreshSessions).updateMany(
-            
-            
-            
+            // `revokedAt: null` matches BOTH a genuinely absent field and one explicitly
+            // stored as null — robust regardless of how create() serialized it, unlike
+            // `{ $exists: false }` alone (see the comment on create() above).
             { familyId, revokedAt: null },
             { $set: { revokedAt: new Date().toISOString() } }
         );

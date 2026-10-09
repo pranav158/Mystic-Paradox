@@ -14,6 +14,38 @@ import { logger } from "../logger";
 
 export const tuningRouter = Router();
 
+// [1.14.7 2026-10-03] UBountyComponent::ServerInitializeBounties() derives the player's bounty
+// SEASON DATES from the grant windows in this payload:
+//   [LogArchonBounty][Error][bounty_bpc] UBountyComponent::ServerInitializeBounties()
+//       - failed to get season dates for player: <account>
+//   -> "Disconnect Error Message: An error occurred. Please try again later."
+//   -> Match State Changed from InProgress to LeavingMap
+// The captured live response (DauntlessEndpointDocumentation/Progression/Game Tuning/Bounty/GetData.md)
+// carries "item_grant_data" entries whose on_claim_grant_item_start_date / _end_date are the windows,
+// and the captured dates are all in the past (2020-2024). With an empty list - or only expired
+// windows - the component finds no active season and fails. These windows deliberately cover the
+// present so the season dates resolve. Shape taken verbatim from the captured response.
+function BountyGrantWindows(){
+    const Start = new Date(Date.UTC(2026, 0, 1)).toISOString();
+    const End = new Date(Date.UTC(2027, 11, 31)).toISOString();
+    return [
+        {
+            on_claim_grant_item_amount: 1,
+            on_claim_grant_item_end_date: End,
+            on_claim_grant_item_event_id: "",
+            on_claim_grant_item_id: "TOKEN_BOUNTY_DRAFT_PREMIUM",
+            on_claim_grant_item_start_date: Start
+        },
+        {
+            on_claim_grant_item_amount: 5,
+            on_claim_grant_item_end_date: End,
+            on_claim_grant_item_event_id: "",
+            on_claim_grant_item_id: "CURRENCY_PRESTIGE",
+            on_claim_grant_item_start_date: Start
+        }
+    ];
+}
+
 tuningRouter.get("/game_tuning/seasonal_event_schedule", (req: any, res) => {
     logger.info("Seasonal Event Schedule (stubbed)");
 
@@ -76,7 +108,7 @@ tuningRouter.get("/game_tuning/bounty_game_data", (req: any, res) => {
             silver_count: 3,
             gold_count: 1,
             history_length: 10,
-            item_grant_data: [],
+            item_grant_data: BountyGrantWindows(),
             max_slots: 4,
             new_season_reset_bounties: false,
             num_draft_options: 3,
@@ -89,6 +121,13 @@ tuningRouter.get("/game_tuning/bounty_game_data", (req: any, res) => {
     });
 });
 
+// [1.14.7 MEASURED NEGATIVE 2026-10-04] Do NOT "fix" the daily loader by adding grant windows here.
+// The daily route sends "item_grant_data": [] while the base route sends BountyGrantWindows(), and this
+// file's note (lines 14-24) says UBountyComponent::ServerInitializeBounties() derives its SEASON DATES from
+// those windows. That made the grant windows the obvious suspect for the daily loader never completing -
+// but serving BountyGrantWindows() here was TESTED and did NOT help: bounty_daily_bpc stayed
+// loaded=0 loading=1 and the client still lost the connection at ~150s. So the daily component's problem is
+// not the grant windows, and the previous empty list is restored.
 tuningRouter.get("/game_tuning/bounty_game_data_daily", (req: any, res) => {
     logger.debug("Bounty game data daily (stubbed)");
     res.status(200).json({

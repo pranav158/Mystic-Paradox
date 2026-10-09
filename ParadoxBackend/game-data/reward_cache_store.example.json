@@ -1,0 +1,27 @@
+[
+  {
+    "id": "example_reward_cache_item",
+    "displayName": "Example Reward Cache Item",
+    "displayDescription": "Synthetic placeholder store entry for smoke tests only.",
+    "displayPriority": 0,
+    "prices": [
+      {
+        "currencyId": "id_currency_seasonal_coin",
+        "price": 100
+      }
+    ],
+    "maxAllowed": 1,
+    "images": {},
+    "tags": [
+      "season_store"
+    ],
+    "items": [
+      {
+        "catalogId": "EXAMPLE_ITEM_00",
+        "quantity": 1,
+        "instanced": true
+      }
+    ],
+    "duplicateInstancedItems": []
+  }
+]

@@ -1,6 +1,9 @@
 /*
- * Copyright (C) 2026 Mystic Paradox (pranav158/MysticParadox)
+ * Copyright (C) 2026 MysticFox / Pranav Karande (pranav158/Mystic-Paradox)
  * Licensed under the GNU Affero General Public License v3.0.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
 import crypto from "crypto";
@@ -13,6 +16,7 @@ import { VerifyTotp } from "../security/totp";
 import { IsRateLimited } from "../security/rateLimit";
 import { ADMIN_COOKIE_NAME } from "../middleware/HasAdminAuth";
 import { sessionRegistry } from "../realtime/SessionRegistry";
+import { ASSIGNABLE_ROLES, TESTER_ROLE } from "../security/testerFeatures";
 
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 
@@ -24,6 +28,8 @@ function PublicAccount(account: LauncherAccountRecord): Record<string, unknown> 
         approvalStatus: EffectiveApprovalStatus(account),
         status: account.status,
         roles: account.roles,
+        rolesUpdatedAt: account.rolesUpdatedAt,
+        rolesUpdatedBy: account.rolesUpdatedBy,
         usernameSet: account.usernameSet !== false,
         createdAt: account.createdAt,
         lastLoginAt: account.lastLoginAt,
@@ -111,8 +117,8 @@ export async function ListPlayers(req: Request, res: Response): Promise<void> {
 }
 
 export async function ListOnlinePlayers(_req: Request, res: Response): Promise<void> {
-    
-    
+    // The XMPP registry represents live game-client sockets, not reusable launcher/login
+    // sessions. Account IDs are deduplicated there when one client has multiple resources.
     const AccountIds = sessionRegistry.onlineAccountIds();
     const Accounts = await Promise.all(
         AccountIds.map((UserId) => GetRepositories().launcherAccounts.findByUserId(UserId))
@@ -147,6 +153,12 @@ export async function UpdatePlayerAccess(req: Request, res: Response): Promise<v
     }
     if (Approval == undefined && Status == undefined) {
         res.status(400).json({ error: { code: "ADMIN_VALIDATION", message: "No access-state change was supplied." } });
+        return;
+    }
+    if (Reason.length < 3) {
+        res.status(400).json({
+            error: { code: "ADMIN_ACCESS_REASON", message: "Provide a reason of at least 3 characters for every server access change." }
+        });
         return;
     }
     const WouldRemoveOwnAccess =
@@ -199,6 +211,67 @@ export async function UpdatePlayerAccess(req: Request, res: Response): Promise<v
         ip: req.ip ?? "unknown",
         requestId: RequestId,
         createdAt: new Date().toISOString()
+    });
+    res.json({ account: PublicAccount(After), requestId: RequestId });
+}
+
+export async function UpdatePlayerRoles(req: Request, res: Response): Promise<void> {
+    const Actor = (req as any).AdminAuth.account as LauncherAccountRecord;
+    const TargetUserId = String(req.params.userId ?? "");
+    const RequestedRoles = req.body?.roles;
+    const Reason = typeof req.body?.reason === "string" ? req.body.reason.trim().slice(0, 500) : "";
+
+    if (!Array.isArray(RequestedRoles) || !RequestedRoles.every((Role) => typeof Role === "string")) {
+        res.status(400).json({ error: { code: "ADMIN_VALIDATION", message: "roles must be an array of strings." } });
+        return;
+    }
+    if (!RequestedRoles.every((Role) => ASSIGNABLE_ROLES.includes(Role))) {
+        res.status(400).json({
+            error: {
+                code: "ADMIN_VALIDATION",
+                message: `Only these roles can be toggled here: ${ASSIGNABLE_ROLES.join(", ")}.`
+            }
+        });
+        return;
+    }
+
+    const Repos = GetRepositories();
+    const Before = await Repos.launcherAccounts.findByUserId(TargetUserId);
+    if (!Before) {
+        res.status(404).json({ error: { code: "NOT_FOUND", message: "Player not found." } });
+        return;
+    }
+
+    const PreservedRoles = Before.roles.filter((Role) => !ASSIGNABLE_ROLES.includes(Role));
+    const NextRoles = [...PreservedRoles, ...RequestedRoles];
+    const Now = new Date().toISOString();
+
+    const After = await Repos.launcherAccounts.updateRoles(TargetUserId, NextRoles, {
+        rolesUpdatedAt: Now,
+        rolesUpdatedBy: Actor.userId
+    });
+    if (!After) {
+        res.status(404).json({ error: { code: "NOT_FOUND", message: "Player not found." } });
+        return;
+    }
+
+    // A beta/dev exchange code must not survive removal of Tester during its 60-second lifetime.
+    if (Before.roles.includes(TESTER_ROLE) && !After.roles.includes(TESTER_ROLE)) {
+        await Repos.gameExchangeCodes.revokeUnusedForUser(TargetUserId);
+    }
+
+    const RequestId = crypto.randomUUID();
+    await Repos.admin.appendAudit({
+        id: crypto.randomUUID(),
+        actorUserId: Actor.userId,
+        targetUserId: TargetUserId,
+        action: "player.roles.update",
+        oldState: { roles: Before.roles },
+        newState: { roles: After.roles },
+        reason: Reason || undefined,
+        ip: req.ip ?? "unknown",
+        requestId: RequestId,
+        createdAt: Now
     });
     res.json({ account: PublicAccount(After), requestId: RequestId });
 }

@@ -14,7 +14,21 @@ import { logger } from "../logger";
 import { RegisteredConnection } from "./SessionRegistry";
 import { escapeXml, sanitizeName } from "./xml";
 
-
+/**
+ * WP8 (task #7) — secure Party MUC. Captured room JID (plan §27):
+ *   Party-<partyId>@muc.prod.ol.epicgames.com/<nick>   (nick = displayName:userId:resource)
+ * where <partyId> already carries the `_<base64(buildId)>` suffix from MakePartyId — so the room
+ * localpart is exactly `Party-` + partyId (do NOT append another suffix).
+ *
+ * AUTHORIZATION IS BY THE AUTHENTICATED ACCOUNT, NEVER THE NICK: a client joins Party-<partyId>
+ * only if the durable GetPartyForPlayer(accountId).partyId === partyId. The nick is presentation data echoed
+ * back. City-<uuid> rooms are dev-gated + explicitly insecure (DEV_CITY_MUC) until an
+ * accountId->instance mapping exists (task #8).
+ *
+ * MUC subset implemented (XEP-0045 over RFC 7395): join -> existing occupants' presence to joiner
+ * + self-presence(110); notify existing occupants of the newcomer; groupchat message fanout;
+ * leave/disconnect -> unavailable presence to remaining occupants; room removed when empty.
+ */
 
 const MUC_DOMAIN = "muc.prod.ol.epicgames.com";
 const XMPP_DOMAIN = "prod.ol.epicgames.com";
@@ -25,16 +39,16 @@ const MAX_ROOM_LOCAL_LENGTH = 256;
 const MAX_NICK_LENGTH = 256;
 const MAX_STANZA_ID_LENGTH = 128;
 
-
-
-
-
+// DEV-ONLY, INSECURE: City (Ramsgate instance) rooms have no authoritative accountId->instance
+// mapping yet (plan §27 / reviewer task #8), so we cannot verify a user really belongs to a given
+// City-<uuid>. When enabled (default during this dev phase), ANY authenticated user may join ANY
+// City-* room. Set REALTIME_XMPP_DEV_CITY_MUC=false to disable until the mapping exists.
 const DEV_CITY_MUC = process.env.REALTIME_XMPP_DEV_CITY_MUC !== "false";
 
-
-
-
-
+// DEV-ONLY, INSECURE: same story as City rooms above, but for Hunt (island) instances. Without this,
+// authorizeJoin() falls through to "unknown room type" and the client is denied every Hunt-<uuid> MUC
+// join, retrying forever - island chat is silently and permanently broken. Set
+// REALTIME_XMPP_DEV_HUNT_MUC=false to disable until an accountId->instance mapping exists.
 const DEV_HUNT_MUC = process.env.REALTIME_XMPP_DEV_HUNT_MUC !== "false";
 
 interface Occupant {
@@ -52,7 +66,7 @@ function fullJid(accountId: string, resource: string): string {
     return `${accountId}@${XMPP_DOMAIN}/${resource}`;
 }
 
-
+/** Parse "Party-<id>@muc.domain/<nick>" -> parts. Returns undefined if not a well-formed room JID. */
 export function parseRoomJid(to: string, requireNick = false): { roomBare: string; roomLocal: string; nick: string } | undefined {
     const slash = to.indexOf("/");
     const roomBare = slash >= 0 ? to.slice(0, slash) : to;
@@ -68,7 +82,7 @@ export function parseRoomJid(to: string, requireNick = false): { roomBare: strin
     ) {
         return undefined;
     }
-    
+    // Emit the canonical owned domain even if the client used different casing.
     return { roomBare: `${roomLocal}@${MUC_DOMAIN}`, roomLocal, nick };
 }
 
@@ -82,14 +96,17 @@ export class RoomService {
         private readonly devHuntMuc = DEV_HUNT_MUC,
     ) {}
 
-    
-    joinRoom(conn: RegisteredConnection, to: string): string[] {
+    /**
+     * Handle a MUC join (directed available presence). Sends occupant/self presence directly to the
+     * relevant connections and returns any frames the JOINER's own connection should send.
+     */
+    async joinRoom(conn: RegisteredConnection, to: string): Promise<string[]> {
         const target = parseRoomJid(to, true);
         const accountId = conn.accountId;
         const resource = conn.resource;
         if (!target || !accountId || !resource) return [];
 
-        const auth = this.authorizeJoin(target.roomLocal, accountId);
+        const auth = await this.authorizeJoin(target.roomLocal, accountId);
         if (!auth.ok) {
             logger.warn(`[XMPP] MUC join denied (${auth.reason}) room=${sanitizeName(target.roomLocal)}`);
             return [
@@ -108,24 +125,24 @@ export class RoomService {
         const joinerFull = fullJid(accountId, resource);
         const frames: string[] = [];
 
-        
+        // 1) Existing occupants' presence -> the joiner.
         for (const occ of room.values()) {
             frames.push(this.occupantPresence(target.roomBare, occ.nick, fullJid(occ.accountId, occ.resource), joinerFull, false));
-            
+            // 2) Newcomer presence -> each existing occupant.
             occ.conn.send(this.occupantPresence(target.roomBare, target.nick, joinerFull, fullJid(occ.accountId, occ.resource), false));
         }
 
-        
+        // Register the occupant (replacing any prior same-resource entry).
         room.set(occupantKey(accountId, resource), joiner);
 
-        
+        // 3) Self-presence (status 110) -> the joiner, last.
         frames.push(this.occupantPresence(target.roomBare, target.nick, joinerFull, joinerFull, true));
 
         logger.info(`[XMPP] MUC join room=${sanitizeName(target.roomLocal)} occupants=${room.size}`);
         return frames;
     }
 
-    
+    /** Fan out a groupchat message to every occupant of the room. Sender must be an occupant. */
     groupMessage(conn: RegisteredConnection, to: string, stanzaId: string, body: string): void {
         const target = parseRoomJid(to);
         const accountId = conn.accountId;
@@ -155,18 +172,21 @@ export class RoomService {
         logger.info(`[XMPP] groupchat room=${sanitizeName(target.roomLocal)} delivered=${delivered} bytes=${Buffer.byteLength(body, "utf8")}`);
     }
 
-    
+    /** Explicit leave (unavailable presence to a room). */
     leaveRoom(conn: RegisteredConnection, to: string): void {
         const target = parseRoomJid(to);
         if (!target || !conn.accountId || !conn.resource) return;
         this.removeOccupant(target.roomLocal, conn.accountId, conn.resource);
     }
 
-    
-    private authorizeJoin(roomLocal: string, accountId: string): { ok: boolean; reason: string } {
+    /**
+     * Room-join authorization. Party-<partyId>: the authenticated account must be a member of that
+     * Phoenix party (never the nick). City-<uuid>: dev-gated + insecure (no instance mapping yet).
+     */
+    private async authorizeJoin(roomLocal: string, accountId: string): Promise<{ ok: boolean; reason: string }> {
         if (roomLocal.startsWith("Party-")) {
             const partyId = roomLocal.slice("Party-".length);
-            const party = GetPartyForPlayer(accountId);
+            const party = await GetPartyForPlayer(accountId);
             if (party && party.partyId === partyId) return { ok: true, reason: "" };
             return { ok: false, reason: "not a party member" };
         }
@@ -195,11 +215,21 @@ export class RoomService {
         return { ok: false, reason: "unknown room type" };
     }
 
-    
+    /** Remove a closed connection from every room it occupied (called on teardown). */
     onConnectionClosed(conn: RegisteredConnection): void {
         if (!conn.accountId || !conn.resource) return;
         for (const roomLocal of [...this.rooms.keys()]) {
             this.removeOccupant(roomLocal, conn.accountId, conn.resource);
+        }
+    }
+
+    /** Evict every live resource for an account after a committed durable membership removal. */
+    evictPartyMember(partyId: string, accountId: string): void {
+        const roomLocal = `Party-${partyId}`;
+        const room = this.rooms.get(roomLocal);
+        if (room == undefined) return;
+        for (const occupant of [...room.values()]) {
+            if (occupant.accountId === accountId) this.removeOccupant(roomLocal, accountId, occupant.resource);
         }
     }
 
@@ -223,7 +253,7 @@ export class RoomService {
         if (room.size === 0) this.rooms.delete(roomLocal);
     }
 
-    
+    /** occupantFull is the JID of the occupant this presence describes; toFull is the recipient. */
     private occupantPresence(roomBare: string, nick: string, occupantFull: string, toFull: string, isSelf: boolean): string {
         const selfStatus = isSelf ? `<status code="110"/>` : "";
         return (

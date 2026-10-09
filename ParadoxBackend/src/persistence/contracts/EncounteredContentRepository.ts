@@ -11,11 +11,11 @@
 
 import { EncounteredContentRecord } from "../mapping/domainTypes";
 
-
-
-
-
-
+// Repository contract for the `encounteredcontent` table.
+//
+// Covers every current call site in controllers/progression.ts:
+// QueryEncounteredContent (find + in-memory filter/group), AddEncounteredContent
+// (find-or-create, then read-append-rewrite).
 export interface EncounteredContentRepository {
     findByCharacterIdAndUserId(characterId: string, userId: string): Promise<EncounteredContentRecord | undefined>;
 

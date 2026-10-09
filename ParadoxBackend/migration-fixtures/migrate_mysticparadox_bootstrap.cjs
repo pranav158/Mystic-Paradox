@@ -1,8 +1,16 @@
-
+/*
+ * One-time, idempotent migration for the pre-existing mystpax account.
+ *
+ * This script never regenerates captured instance IDs or progression. It validates the actual
+ * baseline first, then tags valid documents and clears the legacy starter inventory itemData
+ * payload (loadout.instance_data remains the sole weapon/appearance state).
+ *
+ * Run locally only: node --env-file=.env migration-fixtures/migrate_mysticparadox_bootstrap.cjs
+ */
 require("dotenv").config();
 const { MongoClient } = require("mongodb");
 
-const DEV_USER_ID = process.env.DEV_USER_ID ?? "mysticparadox";
+const DEV_USER_ID = process.env.DEV_USER_ID ?? "mystpax";
 const BOOTSTRAP_VERSION = "starter-1.12-v1";
 const INSTANCE_ID = /^[A-Z0-9]{26}$/;
 const STARTER_INSTANCED_CATALOG_IDS = [
@@ -42,7 +50,7 @@ function validateBaseline(inventory, loadout, wallet) {
     for (const item of instancedItems) {
         if (!item || typeof item.catalogId !== "string" || typeof item.instanceId !== "string") fail("inventory contains an invalid instanced item");
         if (!INSTANCE_ID.test(item.instanceId)) fail(`inventory ${item.catalogId} has invalid instance ID ${JSON.stringify(item.instanceId)}`);
-        if (item.instanceId.startsWith("MYSTPAX_STARTER_")) fail(`inventory ${item.catalogId} has a shared starter ID`);
+        if (item.instanceId.startsWith("MYSTICPARADOX_STARTER_")) fail(`inventory ${item.catalogId} has a shared starter ID`);
         if (instanceIds.has(item.instanceId)) fail(`inventory has duplicate instance ID ${item.instanceId}`);
         instanceIds.add(item.instanceId);
         if (byCatalogId.has(item.catalogId)) fail(`inventory has duplicate catalog ID ${item.catalogId}`);
@@ -59,7 +67,7 @@ function validateBaseline(inventory, loadout, wallet) {
         const equipment = Object.values(slot).find((value) => value && typeof value === "object" && value.item_id === catalogId);
         if (!equipment) fail(`loadout slot zero is missing ${catalogId}`);
         if (!INSTANCE_ID.test(equipment.instance_id ?? "")) fail(`loadout ${catalogId} has an invalid instance ID`);
-        if (equipment.instance_id.startsWith("MYSTPAX_STARTER_")) fail(`loadout ${catalogId} has a shared starter ID`);
+        if (equipment.instance_id.startsWith("MYSTICPARADOX_STARTER_")) fail(`loadout ${catalogId} has a shared starter ID`);
         if (byCatalogId.get(catalogId).instanceId !== equipment.instance_id) fail(`loadout ${catalogId} does not reference its inventory instance`);
     }
 
@@ -75,7 +83,7 @@ function validateBaseline(inventory, loadout, wallet) {
     if (!process.env.MONGODB_URI) throw new Error("MONGODB_URI is required");
     const client = new MongoClient(process.env.MONGODB_URI);
     await client.connect();
-    const db = client.db(process.env.MONGODB_DB || "mysticparadox");
+    const db = client.db(process.env.MONGODB_DB || "mystpax");
     const character = await db.collection("characters").findOne({ userId: DEV_USER_ID });
     if (!character) fail(`no character found for userId ${JSON.stringify(DEV_USER_ID)}`);
     const characterId = character.characterId;
@@ -90,7 +98,7 @@ function validateBaseline(inventory, loadout, wallet) {
             ]);
             const { instancedItems } = validateBaseline(inventory, loadout, wallet);
 
-            
+            // Explicit migration-only cleanup. Do not perform this normalization on live GETs.
             let itemDataCleaned = false;
             for (const item of instancedItems) {
                 if (STARTER_INSTANCED_CATALOG_IDS.includes(item.catalogId) && item.itemData !== null) {

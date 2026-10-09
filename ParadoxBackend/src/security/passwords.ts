@@ -11,11 +11,11 @@
 
 import { hash, verify } from "@node-rs/argon2";
 
-
-
-
-
-
+// Argon2id (the package default — see node_modules/@node-rs/argon2/index.d.ts,
+// Algorithm.Argon2id is "the default algorithm for normative recommendations").
+// A dummy hash so login can always run a real verify() even when no account
+// matched the email, keeping the failure path's timing close to the success
+// path's (spec section "Login": "generic invalid-credential responses").
 const DUMMY_HASH_FOR_TIMING = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
 
 export async function HashPassword(password: string): Promise<string> {

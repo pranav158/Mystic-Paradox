@@ -20,9 +20,9 @@ import {
     ResolveVisibleTotalLoadoutSlots
 } from "../../../loadoutSlots";
 
-
-
-
+// Maps to plan section 6.5's `loadouts` collection. _id = characterId.
+// loadouts/persistent stored as raw JSON STRINGS, matching the SQLite wire
+// contract exactly (same rationale as MongoInventoryRepository).
 export class MongoLoadoutRepository implements LoadoutRepository {
     async findByCharacterIdAndUserId(characterId: string, userId: string, session?: ClientSession): Promise<LoadoutRecord | undefined> {
         const Db = await GetMongoDb();
@@ -37,6 +37,7 @@ export class MongoLoadoutRepository implements LoadoutRepository {
             userId: Doc.userId,
             loadouts: Doc.loadouts,
             persistent: Doc.persistent,
+            activeIndex: Doc.activeIndex ?? 0,
             unlockedTotalSlots: Doc.unlockedTotalSlots,
             revision: Doc.revision ?? 0
         };
@@ -50,6 +51,7 @@ export class MongoLoadoutRepository implements LoadoutRepository {
             userId: loadout.userId,
             loadouts: loadout.loadouts,
             persistent: loadout.persistent,
+            activeIndex: loadout.activeIndex ?? 0,
             unlockedTotalSlots: loadout.unlockedTotalSlots ?? DEFAULT_ACCOUNT_LOADOUT_SLOTS,
             revision: loadout.revision ?? 0,
             bootstrapVersion: loadout.bootstrapVersion
@@ -94,8 +96,8 @@ export class MongoLoadoutRepository implements LoadoutRepository {
 
         LoadoutsArray[slotIndex] = NewSlot;
 
-        
-        
+        // [hardening] Same $exists:false handling as MongoInventoryRepository, for rows created
+        // before `revision` existed.
         const RevisionFilter = expectedRevision === 0
             ? { $or: [{ revision: 0 }, { revision: { $exists: false } }] }
             : { revision: expectedRevision };
@@ -151,6 +153,49 @@ export class MongoLoadoutRepository implements LoadoutRepository {
             { $set: { persistent: persistentJson, revision: expectedRevision + 1 } }
         );
 
+        return Result.matchedCount > 0;
+    }
+
+    async updateActiveIndexIfRevisionMatches(characterId: string, userId: string, activeIndex: number, expectedRevision: number): Promise<boolean> {
+        const Db = await GetMongoDb();
+        const Doc = await Db.collection(Collections.Loadouts).findOne({ _id: characterId as any, userId });
+        if (Doc == undefined || !Number.isSafeInteger(activeIndex) || activeIndex < 0) {
+            return false;
+        }
+
+        let LoadoutsArray: any[];
+        try {
+            LoadoutsArray = JSON.parse(Doc.loadouts);
+        } catch {
+            return false;
+        }
+        if (!Array.isArray(LoadoutsArray)) {
+            return false;
+        }
+
+        let VisibleTotalSlots: number;
+        try {
+            VisibleTotalSlots = ResolveVisibleTotalLoadoutSlots(LoadoutsArray.length, Doc.unlockedTotalSlots);
+        } catch {
+            return false;
+        }
+        if (activeIndex >= VisibleTotalSlots) {
+            return false;
+        }
+
+        // Legacy rows implicitly select zero. Do not create revision churn when the gameserver
+        // idempotently reapplies the slot it already has.
+        if ((Doc.activeIndex ?? 0) === activeIndex) {
+            return true;
+        }
+
+        const RevisionFilter = expectedRevision === 0
+            ? { $or: [{ revision: 0 }, { revision: { $exists: false } }] }
+            : { revision: expectedRevision };
+        const Result = await Db.collection(Collections.Loadouts).updateOne(
+            { _id: characterId as any, userId, ...RevisionFilter },
+            { $set: { activeIndex, revision: expectedRevision + 1 } }
+        );
         return Result.matchedCount > 0;
     }
 }

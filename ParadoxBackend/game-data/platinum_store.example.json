@@ -1,0 +1,29 @@
+[
+  {
+    "id": "example_platinum_item",
+    "displayName": "Example Platinum Item",
+    "displayDescription": "Synthetic placeholder store entry for smoke tests only.",
+    "displayPriority": 0,
+    "prices": [
+      {
+        "currencyId": "id_currency_platinum",
+        "price": 100
+      }
+    ],
+    "maxAllowed": 1,
+    "images": {},
+    "tags": [
+      "webstore"
+    ],
+    "items": [
+      {
+        "catalogId": "EXAMPLE_DYE_00",
+        "quantity": 1,
+        "instanced": false
+      }
+    ],
+    "duplicateInstancedItems": [
+      "EXAMPLE_DYE_00"
+    ]
+  }
+]

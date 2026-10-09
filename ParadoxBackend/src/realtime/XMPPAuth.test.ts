@@ -40,13 +40,13 @@ test("parseSaslPlain: non-PLAIN mechanism rejected", () => {
 });
 
 test("parseSaslPlain: wrong NUL field count rejected", () => {
-    
+    // Only two fields (missing a NUL) — malformed PLAIN layout.
     const twoFields = Buffer.from("mysticparadox\u0000pw", "utf8").toString("base64");
     const r = parseSaslPlain("PLAIN", twoFields);
     assert.equal(r.ok, false);
     if (!r.ok) assert.equal(r.reason, "malformed PLAIN layout");
 
-    
+    // Four fields — also rejected.
     const fourFields = Buffer.from("a\u0000b\u0000c\u0000d", "utf8").toString("base64");
     assert.equal(parseSaslPlain("PLAIN", fourFields).ok, false);
 });
@@ -58,7 +58,7 @@ test("parseSaslPlain: empty authcid or password rejected", () => {
 
 test("parseSaslPlain: empty / oversized input rejected", () => {
     assert.equal(parseSaslPlain("PLAIN", "").ok, false);
-    const huge = "A".repeat(9 * 1024); 
+    const huge = "A".repeat(9 * 1024); // > MAX_SASL_B64_LEN (8 KiB)
     const r = parseSaslPlain("PLAIN", huge);
     assert.equal(r.ok, false);
     if (!r.ok) assert.equal(r.reason, "sasl length");

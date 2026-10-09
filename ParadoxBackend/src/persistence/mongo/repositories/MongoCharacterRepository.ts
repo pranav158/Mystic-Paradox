@@ -15,11 +15,11 @@ import { Collections } from "../collections";
 import { CharacterRepository } from "../../contracts/CharacterRepository";
 import { CharacterRecord } from "../../mapping/domainTypes";
 
-
-
-
-
-
+// Maps to plan section 6.3's `characters` collection. _id = characterId.
+// `data` is stored as the raw JSON STRING exactly as SQLite stores it — plan
+// section 6.3's "parse the top-level... once" full structured-document upgrade
+// is deferred; this phase preserves the exact current wire contract (controllers
+// still JSON.parse/stringify `data` themselves, unchanged from the SQLite adapter).
 function ToRecord(Doc: any): CharacterRecord {
     return {
         characterId: Doc.characterId,
@@ -33,18 +33,15 @@ function ToRecord(Doc: any): CharacterRecord {
 }
 
 export class MongoCharacterRepository implements CharacterRepository {
-    async findManyByUserId(userId: string): Promise<CharacterRecord[]> {
+    async findManyByUserId(userId: string, session?: ClientSession): Promise<CharacterRecord[]> {
         const Db = await GetMongoDb();
-        const Docs = await Db.collection(Collections.Characters).find({ userId: { $eq: userId } }).toArray();
+        const Docs = await Db.collection(Collections.Characters).find({ userId: { $eq: userId } }, { session }).toArray();
         return Docs.map(ToRecord);
     }
 
     async findByCharacterIdAndUserId(characterId: string, userId: string, session?: ClientSession): Promise<CharacterRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.Characters).findOne(
-            { _id: { $eq: characterId as any }, userId: { $eq: userId } },
-            { session }
-        );
+        const Doc = await Db.collection(Collections.Characters).findOne({ _id: { $eq: characterId as any }, userId: { $eq: userId } }, { session });
 
         if (Doc == undefined) {
             return undefined;
@@ -71,11 +68,11 @@ export class MongoCharacterRepository implements CharacterRepository {
 
     async updateDataConditional(characterId: string, userId: string, data: string, effectiveVersion: number): Promise<void> {
         const Db = await GetMongoDb();
-        
-        
-        
-        
-        
+        // Mirrors the SQLite adapter's `lt(characters.updateVersion, effectiveVersion)`
+        // predicate exactly: only write if the stored version is strictly less than
+        // the incoming effective version. Same "no matched-row check" behavior as
+        // the SQLite adapter (see CharacterRepository.ts's contract note) —
+        // preserved deliberately for this phase.
         await Db.collection(Collections.Characters).updateOne(
             { _id: { $eq: characterId as any }, userId: { $eq: userId }, updateVersion: { $lt: effectiveVersion } },
             { $set: { data, updateVersion: effectiveVersion } }
