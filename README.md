@@ -12,7 +12,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-blue"></a>
   <a href="https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0"><img alt="Dauntless 1.12.0: tag dauntless-1.12.0" src="https://img.shields.io/badge/Dauntless%201.12.0-tag%20dauntless--1.12.0-2ea44f"></a>
-  <a href="docs/DAUNTLESS_1_14_7_PORT.md"><img alt="Dauntless 1.14.7 in progress" src="https://img.shields.io/badge/Dauntless-1.14.7%20in%20progress-orange"></a>
+  <a href="docs/DAUNTLESS_1_14_7_PORT.md"><img alt="Dauntless 1.14.7 alpha" src="https://img.shields.io/badge/Dauntless-1.14.7%20alpha-orange"></a>
   <img alt="Platform: Windows x64" src="https://img.shields.io/badge/platform-Windows%20x64-lightgrey">
   <img alt="Discord: uwumystic" src="https://img.shields.io/badge/Discord-uwumystic-5865F2?logo=discord&logoColor=white">
 </p>
@@ -34,14 +34,14 @@
 
 | Game version | State |
 |---|---|
-| **Dauntless 1.14.7** (CL `647472`) | 🚧 `main` is moving to 1.14.7 one component at a time: runtime, tools, backend and Director are done; the launcher is next. Hubs, dedicated hunts and saved hunt rewards work — [progress notes](docs/DAUNTLESS_1_14_7_PORT.md) |
+| **Dauntless 1.14.7** (CL `647472`) | 🚧 Alpha on `main`: every component targets 1.14.7. Hubs, dedicated hunts and saved hunt rewards work — [progress notes](docs/DAUNTLESS_1_14_7_PORT.md) |
 | **Dauntless 1.12.0** (CL `392819`) | ✅ Alpha, self-hostable — build it from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag |
 
 Expect active development, not production-grade uptime.
 
 > [!NOTE]
-> `main` is between versions: its runtime, backend and Director target 1.14.7 while the launcher and the guides
-> below still describe 1.12.0. For a working 1.12.0 setup, check out the `dauntless-1.12.0` tag.
+> `main` targets Dauntless 1.14.7. The self-hosting, SDK and game-data guides below still describe 1.12.0 and
+> are being updated; for a 1.12.0 setup, check out the `dauntless-1.12.0` tag.
 
 ## 🚀 Get started
 

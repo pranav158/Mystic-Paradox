@@ -220,9 +220,9 @@ New-Item -ItemType Directory -Force -Path $SelfHostRoot | Out-Null
 $BuildEnvironment = [string]::Join([Environment]::NewLine, @(
     "# Dot-source this file before building or running the self-host launcher:",
     "#   . .\.selfhost\build-env.ps1",
-    '$env:MYSTPAX_API_BASE_URL = "__BASE_URL__"',
-    '$env:MYSTPAX_RUNTIME_ENDPOINT = "__BASE_URL__/launcher/v1/runtime"',
-    '$env:MYSTPAX_RUNTIME_PUBLIC_KEY_B64 = "__RUNTIME_PUBLIC_KEY__"',
+    '$env:MYSTICPARADOX_API_BASE_URL = "__BASE_URL__"',
+    '$env:MYSTICPARADOX_RUNTIME_ENDPOINT = "__BASE_URL__/launcher/v1/runtime"',
+    '$env:MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64 = "__RUNTIME_PUBLIC_KEY__"',
     'Write-Host "Mystic Paradox self-host launcher environment loaded for __PUBLIC_HOST__"',
     ""
 ))

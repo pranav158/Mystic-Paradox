@@ -1,8 +1,8 @@
 # Dauntless 1.14.7 port — progress notes
 
 Dauntless 1.14.7 (`rel-1.14.7-Archon`, changelist `647472`) is the final release of the game. This page
-tracks the port from the 1.12.0 target. `main` is moving to 1.14.7 one component at a time: since
-9 October 2026 the runtime, tools, backend and Director target 1.14.7; the launcher follows.
+tracks the port from the 1.12.0 target. Since 9 October 2026 every component on `main` targets 1.14.7
+(alpha).
 A 1.12.0 setup builds from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0)
 tag. These notes move into the main docs once the port is usable.
 
@@ -81,6 +81,9 @@ built only because of the hub's local player, is guarded on servers.
   runtime now counts remote client connections instead.
 - **Clean client exit.** Every quit ended in an access violation because the runtime still logged after
   its DLL was unloaded. Nothing logs after detach now, and the C runtime is linked statically.
+- **Launcher.** The launcher verifies the 1.14.7 install and the signed runtime at Play, and its Launcher
+  Guard is an observer only: it reports the signed file list, process identity and loaded-module digest and
+  never ends a game. Self-hosted builds set their runtime feed and signing key at build time.
 - **Client branding.** A Mystic Paradox login background, credits section and press-start text. Each
   one reverts with a `DISABLE_LOGIN_BRANDING.flag`, `DISABLE_CREDITS_BRANDING.flag` or
   `DISABLE_PRESS_START_BRANDING.flag` beside the game executable.
