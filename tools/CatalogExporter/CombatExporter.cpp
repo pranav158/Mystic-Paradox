@@ -1,4 +1,19 @@
-
+/*
+ * CombatExporter — extends CatalogExporter to dump damage-table and weapon-power-table rows
+ * for Dauntless 1.12.0 (CL 392819, UE 4.26.2), per
+ * Plans/PROGRESSION_XP_COMBAT_DATA_IMPLEMENTATION_PLAN.md sections 9.2/9.3.
+ *
+ * Deliberately narrow scope for this pass (see the plan's decision rule 8: "progression
+ * persistence ships before the optional full combat documentation export"):
+ *   - FDamageTableData rows, found by ROW STRUCT match across every loaded DataTable (not by
+ *     table name) — this is what finds weapon/Behemoth/ability-specific damage tables that
+ *     don't have "DamageTable" anywhere in their object name.
+ *   - FWeaponPowerTableData rows, same row-struct-match approach.
+ *
+ * NOT included in this pass (left for the dedicated Phase 11 CombatDataExporter work per the
+ * plan): curve exports, the ability/GameplayEffect dependency graph, omnicell/lantern/mod/cell
+ * manifests. Those require additional struct/asset-reference work this pass didn't scope.
+ */
 
 #define NOMINMAX
 #include <windows.h>
@@ -8,6 +23,7 @@
 #include <algorithm>
 
 #include "SDK.hpp"
+#include "ExportPaths.hpp"
 
 using namespace SDK;
 
@@ -32,17 +48,8 @@ static std::string JsonEsc(const std::string& s) {
 static std::string Q(const std::string& s) { return "\"" + JsonEsc(s) + "\""; }
 static std::string FNm(const FName& n) { try { return n.ToString(); } catch (...) { return std::string(); } }
 
-static std::wstring ResolveOutDir() {
-    static const wchar_t* kCandidates[] = {
-        L".\\Items_Analysis",
-    };
-    for (const wchar_t* c : kCandidates) {
-        DWORD a = GetFileAttributesW(c);
-        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) return c;
-    }
-    CreateDirectoryW(kCandidates[0], nullptr);
-    return kCandidates[0];
-}
+// See ExportPaths.hpp: <root>\Items_Analysis when ExportPaths.local.h names a root, else .\Items_Analysis.
+static std::wstring ResolveOutDir() { return ExportOutDir(); }
 
 static void Status(const std::string& s) {
     OutputDebugStringA(("[CombatExporter] " + s + "\n").c_str());
@@ -128,10 +135,10 @@ static std::string SerializeWeaponPowerRow(const std::string& tableName, const s
     return o;
 }
 
-
-
-
-
+// Exports every row from every DataTable whose RowStruct matches expectedRowStructName, across
+// the whole loaded object set — this is the plan section 9.2 "export by row struct, not table
+// name" requirement. One output JSONL file per exported row-struct family; each line carries
+// its source table name so provenance is never lost.
 template <typename RowStructT, typename SerializeFn>
 static int ExportByRowStruct(const std::string& expectedRowStructName, const std::wstring& outFile, SerializeFn serialize) {
     std::vector<UDataTable*> tables = FindDataTablesByRowStruct(expectedRowStructName);
@@ -181,8 +188,8 @@ static int ExportByRowStruct(const std::string& expectedRowStructName, const std
 
 int RunCombatExport() {
     std::wstring outDir = ResolveOutDir();
-    CreateDirectoryW((outDir + L"\\combat_1_12").c_str(), nullptr);
-    std::wstring cDir = outDir + L"\\combat_1_12";
+    CreateDirectoryW((outDir + L"\\combat_1_14_7").c_str(), nullptr);
+    std::wstring cDir = outDir + L"\\combat_1_14_7";
 
     int total = 0;
     total += std::max(0, ExportByRowStruct<FDamageTableData>(
@@ -195,6 +202,6 @@ int RunCombatExport() {
     return total;
 }
 
-} 
+} // namespace CombatExp
 
 int RunCombatExport() { return CombatExp::RunCombatExport(); }

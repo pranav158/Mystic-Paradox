@@ -5,7 +5,7 @@ This extends the original catalog-only `CatalogExporter` DLL with three more exp
 without recompiling. All modes still run inside the **same DLL** — per project decision this pass
 does not split into separate `ProgressionDataExporter`/`CombatDataExporter` binaries the way
 `Plans/PROGRESSION_XP_COMBAT_DATA_IMPLEMENTATION_PLAN.md` section 8.1 originally sketched;
-everything lives in `CatalogExporter/` and is gated by flags instead.
+everything lives in `tools/CatalogExporter/` and is gated by flags instead.
 
 ## Why flags instead of argv
 
@@ -15,7 +15,7 @@ pattern as the original one-shot catalog dump).
 
 ## The flags file
 
-`CatalogExporter/export_flags.txt`, one `KEY=VALUE` per line, `VALUE` is `0` or `1`:
+`tools/CatalogExporter/export_flags.txt`, one `KEY=VALUE` per line, `VALUE` is `0` or `1`:
 
 ```
 EXPORT_CATALOG=1
@@ -25,8 +25,9 @@ EXPORT_SKINS=0
 ```
 
 Search order (first match wins):
-1. `.\export_flags.txt` (absolute — works no matter what
-   the injected process's CWD is)
+1. `<root>\tools\CatalogExporter\export_flags.txt` when the optional, git-ignored `ExportPaths.local.h`
+   defines `MYSTICPARADOX_EXPORT_ROOT` (normally your repository root; works whatever the injected process's
+   CWD is - see `ExportPaths.hpp`)
 2. `.\export_flags.txt` (relative to the injected process's CWD)
 
 **If the file is missing entirely**, the exporter defaults to `EXPORT_CATALOG=1` and everything
@@ -278,6 +279,71 @@ If the two disagree (client holds it locally but never sends it, or sends it
 but a later write clobbers it), that's the bug; if the client never
 populates any of these three arrays for the Omnicell at all, the bug is
 upstream of both — client-side/native, not our backend.
+
+### `EXPORT_CURRENCY_NAMES` (new, 2026-07-26 — Reward Cache Store investigation)
+
+Writes `Items_Analysis/currency_names_1_12.jsonl` — every `"currency"`-tagged catalog item
+(filtered from the same `UArchonCatalog::GetAllItems()` source `EXPORT_CATALOG` reads, same
+narrowing approach as `EXPORT_SKINS`), with its real display name resolved via string table where
+the plain `displayName` field reads `<MISSING STRING TABLE ENTRY>`.
+
+**Why this mode exists.** 8 of the 9 Reward Cache currencies (`CURRENCY_REWARDCACHE` +
+`CURRENCY_S13_COIN`..`CURRENCY_S20_COIN`) show `<MISSING STRING TABLE ENTRY>` for `displayName` in
+`catalog_1_12.jsonl` despite each carrying a real, well-formed `DisplayNameLocKey`
+(`Namespace: "currency_tokens_catalog"`, `Key: "<ITEMID>|Display Name"`) — the identical shape
+`EXPORT_SKINS_RESOLVE_STRINGTABLE` already solves for weapon skins. This mode reuses that same
+`UKismetStringTableLibrary::GetTableEntrySourceString` call, scoped to `"currency"`-tagged rows
+instead of `"transmog"`-tagged ones. Concretely: this is how you find out whether
+`CURRENCY_S19_COIN` (our confirmed active `season19`'s coin, icon-named `molten_coin`) is really
+called "Elemental Coin" in-game, instead of guessing from the icon asset filename.
+
+*** CLIENT-ONLY, same warning as `EXPORT_SKINS_RESOLVE_STRINGTABLE` — this mode calls
+`ProcessEvent` off the worker thread. Only inject a build with this flag enabled into your own
+local/offline client, **never** the shared dedicated server process. ***
+
+Output shape:
+
+```json
+{"itemId":"CURRENCY_S19_COIN","displayName":"...","displayNameSource":"stringtable",
+ "hadLocKey":true,"locNamespace":"currency_tokens_catalog","locKey":"CURRENCY_S19_COIN|Display Name",
+ "icon":"/Game/UI/Textures/HuntingGrounds/season_icons/ui_event_molten_coin_currency_icon...",
+ "tags":["currency","seasonal_currency"]}
+```
+
+`displayNameSource` is one of `invariant`/`text`/`stringtable`/`none` (see `SkinsExporter.cpp`'s
+`ResolveString`/`ResolveViaStringTable` for what each means). `catalog_export_status.txt` gets a
+per-row `[stringtable]` diagnostic line for every resolution attempt, same as
+`EXPORT_SKINS_RESOLVE_STRINGTABLE` — if every row comes back `viaStringTable=0`, check those lines
+for whether `currency_tokens_catalog` even registered/had keys, same diagnostic already proven
+useful for the skins case.
+
+**No known load requirement** — `currency_tokens_catalog` is a core string table, not gated behind
+opening a specific screen the way `DT_Cell_Cores` needed the Core Breaker opened first. Not yet
+proven; if resolution comes back empty across the board, that is the first thing to check.
+
+### `EXPORT_STORE_RUNTIME` (new, 2026-07-28 — Reward Cache repro capture)
+
+Writes three read-only live captures under `Items_Analysis/`:
+
+- `store_view_models_1_12.jsonl` — every loaded `UStoreViewModel`, including the exact `TagFilter`,
+  category/subcategory names, breadcrumb tags, entitlement requirements, category SKU ids and
+  `SubTagIds` the native 1.12 UI uses to classify offers.
+- `store_item_view_models_1_12.jsonl` — every loaded `UStoreItemViewModel`, including the rendered
+  price/currency/rarity/ownership state and its parsed `FOnlineStorePhoenixOffer` (SKU id, tags,
+  grants, limits, preview ids and currency code).
+- `store_item_images_1_12.jsonl` — every loaded `StoreItemTable` row. The verified 1.12
+  `FStoreItemTable` contains only `FeatureImage` and `StandardImage`; this output does **not** claim
+  the table contains original SKU prices or reward membership.
+
+**Load requirement:** reach Ramsgate, open Journal -> Challenges -> Reward Cache, wait for the store
+request to complete, then inject. The exporter sees loaded objects only. For this repro,
+`export_flags.txt` enables only `EXPORT_STORE_RUNTIME=1` so unrelated exporters and the
+ProcessEvent-based currency-name mode do not run.
+
+This mode performs no hooks, no `ProcessEvent`, and no game-memory writes. The two protected fields it
+captures are read at their generated 1.12 SDK offsets (`UStoreViewModel::TagFilter +0x170`,
+`UStoreItemViewModel::StoreItem +0x650`); the latter is deliberately not accessed through the SDK's
+`GetStoreItem()` wrapper because that wrapper dispatches `ProcessEvent`.
 
 ## `export_manifest.json`
 

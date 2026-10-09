@@ -1,4 +1,29 @@
-
+/*
+ * DropTableExporter - reads every loaded PlayFabDropTableTableData row (weighted loot tables).
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * catalog_1_12.jsonl's containerResultTableContents field (added for the Lady Luck's Store
+ * investigation) showed CONTAINER_CORE_{BRONZE,SILVER,GOLD}_CELLCORE reference named result tables
+ * (DT_CELL_CORE_00, DT_CELL_CORE_REWARDS_00, DT_BONUS_RAMS_00, DT_MERIT_CHANCE_00), repeated per name
+ * to represent pick weight among the pool. None of those names are their own top-level UDataTable —
+ * the EXPORT_TABLE_INVENTORY census (after opening the Core Breaker and previewing a core of each
+ * tier so the relevant tables actually stream in) found `DT_Cell_Cores` instead, RowStruct
+ * `PlayFabDropTableTableData`, 5 rows — the four names above are almost certainly ROW NAMES inside
+ * this one table, each row itself being a further weighted roll (FPlayFabDropTableTableData.Items /
+ * DropTables, each entry an FPlayFabDropTableItem{ResultItem, Weight, Amount}).
+ *
+ * This searches by RowStruct name, not table name, so it also picks up any OTHER loaded table that
+ * shares this row struct — the Core Breaker table is the immediate need, but the schema is
+ * game-generic (PlayFab-style weighted drop tables), so this is worth having as a standing export
+ * rather than a one-off.
+ *
+ * Read-only: no ProcessEvent, no hooks, no writes into game memory. Same SEH discipline as every
+ * other exporter here — a malformed/mid-load row is skipped, never allowed to fault the process.
+ *
+ * COVERAGE CAVEAT: LOADED tables only. If a table using this RowStruct hasn't streamed in, it is
+ * invisible here — open whatever UI references it (Core Breaker, for DT_Cell_Cores) before injecting.
+ */
 
 #define NOMINMAX
 #include <windows.h>
@@ -9,6 +34,7 @@
 #include <cstdint>
 
 #include "SDK.hpp"
+#include "ExportPaths.hpp"
 
 using namespace SDK;
 
@@ -51,17 +77,8 @@ static bool SehRowCount(UDataTable* dt, int* out) {
 static std::string FStr(const FString& s) { std::string o; SehStr(s, &o); return o; }
 static std::string FNm(const FName& n) { std::string o; SehNm(n, &o); return o; }
 
-static std::wstring ResolveOutDir() {
-    static const wchar_t* kCandidates[] = {
-        L".\\Items_Analysis",
-    };
-    for (const wchar_t* c : kCandidates) {
-        DWORD a = GetFileAttributesW(c);
-        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) return c;
-    }
-    CreateDirectoryW(kCandidates[0], nullptr);
-    return kCandidates[0];
-}
+// See ExportPaths.hpp: <root>\Items_Analysis when ExportPaths.local.h names a root, else .\Items_Analysis.
+static std::wstring ResolveOutDir() { return ExportOutDir(); }
 
 static void Status(const std::string& s) {
     OutputDebugStringA(("[DropTables] " + s + "\n").c_str());
@@ -97,7 +114,7 @@ static std::string SerializeDropItems(const TArray<FPlayFabDropTableItem>& items
     return o + "]";
 }
 
-
+// A malformed/mid-load row must not fault the process — every field read goes through this frame.
 __declspec(noinline) static void RawSerializeRow(const std::string& tableName, const std::string& rowName,
                                                   const FPlayFabDropTableTableData& row, std::string* out) {
     std::string line = "{";
@@ -116,7 +133,7 @@ static bool SafeSerializeRow(const std::string& tableName, const std::string& ro
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-} 
+} // namespace DropTable
 
 int RunDropTableExport() {
     using namespace DropTable;
@@ -131,9 +148,9 @@ int RunDropTableExport() {
         return 0;
     }
 
-    std::ofstream f(outDir + L"\\drop_tables_1_12.jsonl", std::ios::trunc);
+    std::ofstream f(outDir + L"\\drop_tables_1_14_7.jsonl", std::ios::trunc);
     if (!f) {
-        Status("cannot open drop_tables_1_12.jsonl");
+        Status("cannot open drop_tables_1_14_7.jsonl");
         return -1;
     }
 

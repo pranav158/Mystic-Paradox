@@ -55,6 +55,8 @@
     <ClCompile Include="HuntExporter.cpp" />
     <ClCompile Include="TableInventoryExporter.cpp" />
     <ClCompile Include="DropTableExporter.cpp" />
+    <ClCompile Include="CurrencyExporter.cpp" />
+    <ClCompile Include="StoreRuntimeExporter.cpp" />
     <ClCompile Include="$(SdkRoot)SDK\Basic.cpp">
       <ObjectFileName>$(IntDir)sdk_Basic.obj</ObjectFileName>
     </ClCompile>

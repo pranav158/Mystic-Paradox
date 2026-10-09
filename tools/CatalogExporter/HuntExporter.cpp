@@ -1,4 +1,14 @@
-
+/*
+ * HuntExporter - read-only 1.12.0 hunt/matchmaking table export.
+ *
+ * Emits the live PlayerHuntTableData and MatchmakerHuntTableData rows rather than
+ * carrying forward the 1.4.4-era JSON snapshot. This is deliberately an evidence
+ * export: it does not overwrite Metagame vendor tables or invent aliases.
+ *
+ * The tag-routing payload is preserved as tag dictionaries plus raw token streams.
+ * A later importer/resolver can implement the same query semantics without needing
+ * another capture. No ProcessEvent, hooks, or gameplay mutation are used.
+ */
 
 #define NOMINMAX
 #include <windows.h>
@@ -9,6 +19,7 @@
 #include <cstdint>
 
 #include "SDK.hpp"
+#include "ExportPaths.hpp"
 
 using namespace SDK;
 
@@ -35,8 +46,8 @@ static std::string JsonEsc(const std::string& s) {
 }
 static std::string Q(const std::string& s) { return "\"" + JsonEsc(s) + "\""; }
 
-
-
+// Every string/name conversion from raw table memory is SEH guarded. A diagnostic
+// exporter must skip a malformed/mid-load row rather than crash the game process.
 __declspec(noinline) static void RawFStr(const FString& s, std::string* out) {
     if (s.Num() > 0 && s.IsValid()) *out = s.ToString();
 }
@@ -52,17 +63,8 @@ static bool SehNm(const FName& n, std::string* out) {
 static std::string FStr(const FString& s) { std::string o; SehStr(s, &o); return o; }
 static std::string FNm(const FName& n) { std::string o; SehNm(n, &o); return o; }
 
-static std::wstring ResolveOutDir() {
-    static const wchar_t* kCandidates[] = {
-        L".\\Items_Analysis",
-    };
-    for (const wchar_t* c : kCandidates) {
-        DWORD a = GetFileAttributesW(c);
-        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) return c;
-    }
-    CreateDirectoryW(kCandidates[0], nullptr);
-    return kCandidates[0];
-}
+// See ExportPaths.hpp: <root>\Items_Analysis when ExportPaths.local.h names a root, else .\Items_Analysis.
+static std::wstring ResolveOutDir() { return ExportOutDir(); }
 
 static void Status(const std::string& s) {
     OutputDebugStringA(("[HuntExporter] " + s + "\n").c_str());
@@ -102,8 +104,8 @@ static std::string SerializeTagArray(const TArray<FGameplayTag>& tags) {
 }
 
 static std::string SerializeTags(const FGameplayTagContainer& tags) {
-    
-    
+    // GameplayTags is the authored set; ParentTags is transient derived state and
+    // intentionally excluded so exports are stable across load order.
     return SerializeTagArray(tags.GameplayTags);
 }
 
@@ -128,26 +130,44 @@ static std::string SerializeHandle(const FDataTableRowHandle& h) {
            ",\"rowName\":" + Q(FNm(h.RowName)) + "}";
 }
 
-
+/*
+ * Reads the /Game/... path out of a soft pointer WITHOUT loading the asset.
+ *
+ * WHY NOT .Get(): a TSoftObjectPtr/TSoftClassPtr resolves to nullptr whenever the target asset is
+ * not currently loaded, and hunt maps/behemoths are exactly that — streamed on demand, absent in
+ * Ramsgate. The first pass used .Get() and produced an EMPTY mapAssetName for 869 of 869 map
+ * entries, which made the export useless for import: MapAssetName is the field DeployServer hands
+ * to the gameserver to launch a map. The path is always present in the pointer's FSoftObjectPath
+ * regardless of load state, so read that instead.
+ *
+ * WHY A HARDCODED OFFSET: Dumper-7 emits TPersistentObjectPtr::ObjectID with size 0x0000 (it
+ * cannot size the template parameter), so the generated member offset of 0x0C is not trustworthy.
+ * The real layout is FWeakObjectPtr(0x08) + int32 TagAtLastTest(0x04) + 4 bytes alignment padding,
+ * putting FSoftObjectPath at 0x10. This is corroborated by the SDK's own field sizes: both
+ * FHunt_MapInfo::MapAsset and FHunt_BehemothInfo::BehemothAsset are 0x28, and
+ * 0x28 - sizeof(FSoftObjectPath){FName 0x08 + FString 0x10 = 0x18} = 0x10.
+ *
+ * SEH-guarded like every other live read here; a bad path yields "" rather than a fault.
+ */
 static constexpr size_t kSoftObjectPathOffset = 0x10;
 
 __declspec(noinline) static void RawSoftPath(const void* softPtr, std::string* out) {
     const uint8_t* base = reinterpret_cast<const uint8_t*>(softPtr);
     const FName* assetPathName = reinterpret_cast<const FName*>(base + kSoftObjectPathOffset);
 
-    
-    
-    
-    
-    
-    
-    
-    
+    // GetRawString(), NOT ToString(). This SDK's FName::ToString() ends with:
+    //     size_t pos = OutputString.rfind('/');
+    //     return OutputString.substr(pos + 1);
+    // i.e. it strips everything before the last slash to yield a short display name. That is
+    // exactly wrong here: the whole point of this read is the full package path. Using ToString()
+    // produced "adventure_moss_cave.adventure_moss_cave" where the vendored table correctly holds
+    // "/Game/Maps/islands/adventure/Moss_Cave/adventure_moss_cave.adventure_moss_cave", and
+    // DeployServer hands this string to the gameserver to launch the map.
     *out = assetPathName->GetRawString();
 }
 
-
-
+// Split exactly like RawFStr/SehStr above: __try cannot live in a function that owns an object
+// requiring unwinding (C2712), so the std::string local stays out of the guarded frame.
 static bool SehSoftPath(const void* softPtr, std::string* out) {
     __try { RawSoftPath(softPtr, out); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
@@ -155,8 +175,8 @@ static bool SehSoftPath(const void* softPtr, std::string* out) {
 static std::string SoftPath(const void* softPtr) {
     std::string o;
     if (!SehSoftPath(softPtr, &o)) o.clear();
-    
-    
+    // An unset soft pointer reads back as the literal FName "None"; normalize to empty so
+    // consumers do not have to special-case it.
     if (o == "None") o.clear();
     return o;
 }
@@ -174,8 +194,8 @@ static std::string SerializeBehemoth(const FHunt_BehemothInfo& b) {
 static std::string SerializeMap(const FHunt_MapInfo& m) {
     std::string o = "{";
     o += "\"mapName\":" + Q(FStr(m.MapName));
-    
-    
+    // MapAssetName is an authored FString that 1.12 leaves empty; the soft-pointer path below is
+    // the authoritative source. Both are emitted so an importer can prefer whichever is populated.
     o += ",\"mapAssetName\":" + Q(FStr(m.MapAssetName));
     o += ",\"mapAssetPath\":" + Q(SoftPath(&m.MapAsset));
     o += ",\"mapAssetResolvedName\":" + Q(m.MapAsset.Get() ? m.MapAsset.Get()->GetName() : std::string());
@@ -338,14 +358,39 @@ static int ExportTablesByStruct(const std::string& rowStructName, const std::wst
     return written;
 }
 
-
+/*
+ * ---------------------------------------------------------------------------------------------
+ * Supporting hunt-graph tables, identified by the EXPORT_TABLE_INVENTORY census.
+ *
+ * player_hunts/matchmaker_hunts reference these by FDataTableRowHandle, so an importer that only
+ * has the two main tables still cannot resolve a hunt end to end. Row struct names below are the
+ * exact strings the census reported, not guesses:
+ *
+ *   hunt_regions        -> Hunt_Region                 (43 rows)   <- Region handle target
+ *   escalation_mode_specs -> EscalationModeSpecification (19 rows) <- EscalationModeSpecification
+ *   hunt_modifiers      -> HuntModifierTableRow        (164 rows)  <- Modifiers[]
+ *   game_activity_table -> GameActivityTableData       (10 rows)   <- activity -> hunt routing
+ *
+ * NOT exported: map_metadata_table. Its row struct is `map_metadata`, a Blueprint-defined
+ * UserDefinedStruct absent from Archon_structs.hpp, so there is no verified layout to read and
+ * casting a row to a guessed struct is how you fault the process. The map path we actually need
+ * comes from FMatchmakerHuntTableData::MapList instead.
+ *
+ * *** FText IS DELIBERATELY OMITTED FROM EVERY SERIALIZER BELOW. ***
+ * FText is a shared-ref to FTextData, NOT an FString. Calling ToString() on one is what produced
+ * the EXCEPTION_ACCESS_VIOLATION that killed an earlier SlayersPathExporter injection. These rows
+ * are full of display text (Hunt_Region::Name/Description, HuntModifierTableRow::ModifierName and
+ * friends) and every one of those fields is skipped on purpose. Only FName, POD, row handles,
+ * tag containers and soft-pointer paths are read. Do not "improve" this by adding display names.
+ * ---------------------------------------------------------------------------------------------
+ */
 
 static std::string SerializeHuntRegionRow(const std::string& sourceTable, const std::string& rowName,
                                           const FHunt_Region& row) {
     std::string o = "{";
     o += "\"sourceTable\":" + Q(sourceTable);
     o += ",\"rowName\":" + Q(rowName);
-    
+    // FText Name / Description / TargetedHuntDescription intentionally skipped — see header above.
     o += ",\"matchmakingId\":" + Q(FNm(row.MatchmakingId));
     o += ",\"tokenId\":" + Q(FNm(row.TokenId));
     o += ",\"numTokensRequired\":" + std::to_string(row.NumTokensRequired);
@@ -365,7 +410,7 @@ static std::string SerializeEscalationModeSpecRow(const std::string& sourceTable
     std::string o = "{";
     o += "\"sourceTable\":" + Q(sourceTable);
     o += ",\"rowName\":" + Q(rowName);
-    
+    // FText EscalationSpecificationName / Description intentionally skipped.
     o += ",\"initialChallengeLevel\":" + std::to_string(row.InitialChallengeLevel);
     o += ",\"maxChallengeLevel\":" + std::to_string(row.MaxChallengeLevel);
     o += ",\"roundStructureCount\":" + std::to_string(row.RoundStructures.Num());
@@ -385,8 +430,8 @@ static std::string SerializeEscalationModeSpecRow(const std::string& sourceTable
         o += std::to_string(row.EscalationAmountPerScoreValue[i]);
     }
     o += "]";
-    
-    
+    // RoundStructures / EncounterCreationParams / StateTimings are deep nested structs; only their
+    // shape is reported here. Add typed serializers for them only if an importer actually needs them.
     return o + "}";
 }
 
@@ -395,7 +440,7 @@ static std::string SerializeHuntModifierRow(const std::string& sourceTable, cons
     std::string o = "{";
     o += "\"sourceTable\":" + Q(sourceTable);
     o += ",\"rowName\":" + Q(rowName);
-    
+    // FText ModifierName / ModifierDescription / ModifierHUDDescription intentionally skipped.
     o += ",\"modifierAssetPath\":" + Q(SoftPath(&row.ModifierAsset));
     o += ",\"huntComplexityModifier\":" + std::to_string(row.HuntComplexityModifier);
     o += ",\"threatLevel\":" + std::to_string(row.ThreatLevel);
@@ -411,7 +456,7 @@ static std::string SerializeGameActivityRow(const std::string& sourceTable, cons
     o += "\"sourceTable\":" + Q(sourceTable);
     o += ",\"rowName\":" + Q(rowName);
     o += ",\"enabled\":" + std::string(row.bEnabled ? "true" : "false");
-    
+    // The routing fields: how an activity (Trials, Escalation, etc.) maps onto concrete hunts.
     o += ",\"playerHunt\":" + Q(FNm(row.PlayerHunt));
     o += ",\"matchmakerHunts\":[";
     for (int i = 0; i < row.MatchmakerHunts.Num(); ++i) {
@@ -429,14 +474,41 @@ static std::string SerializeGameActivityRow(const std::string& sourceTable, cons
     return o + "}";
 }
 
-
+/*
+ * ---------------------------------------------------------------------------------------------
+ * game_activity_unlock_criteria — WHY a hunt-menu entry stays greyed out.
+ *
+ * THE QUESTION THIS ANSWERS: the Slayer's Path node for "Trials Mode Normal difficulty" unlocks and
+ * persists (survives relog, the Slayer's Path UI shows it unlocked), yet the Trial entry in the hunt
+ * menu is still greyed out with "Unlock Normal Trials at Milestone XI in the Slayer's Path". A stale
+ * client was ruled out — a fresh login still shows it locked — so the gate is failing on a signal we
+ * are not satisfying.
+ *
+ * FProgressionUnlockCriteria can require FIVE independent things, each with its own operation enum:
+ *     FeatureFlags           TArray<TSubclassOf<UFeatureFlag>>   <- our backend serves NONE of these
+ *     ItemIds                TArray<FString>
+ *     ProgressionTrackRanks  TArray<FProgressTrackRank>          { FName Track; int32 Rank; }
+ *     QuestRequirements      TArray<FQuestRequirement>           { FName QuestName; EQuestStatus; }
+ *     PlayerJourneyNodes     TArray<FDataTableRowHandle>         <- it CAN check the node directly
+ * The node is unlocked and it still fails, so one of the other four is the blocker. Each implies a
+ * completely different fix, which is why this is exported before anything is changed.
+ *
+ * FeatureFlags is the leading suspect: a grep of ParadoxBackend found no feature-flag support at all,
+ * so any criterion requiring one can never be satisfied — which matches "fails permanently, survives
+ * relog, unaffected by progression".
+ *
+ * SAFETY: FName + FString + POD + row handles only. FeatureFlags are TSubclassOf, read via SoftPath()
+ * (the same unresolved-soft-pointer read that fixed the empty map paths) so an unloaded class still
+ * yields its path. No FText anywhere — see the file header.
+ * ---------------------------------------------------------------------------------------------
+ */
 static std::string SerializeUnlockCriteriaRow(const std::string& sourceTable, const std::string& rowName,
                                               const FProgressionUnlockCriteria& row) {
     std::string o = "{";
     o += "\"sourceTable\":" + Q(sourceTable);
     o += ",\"rowName\":" + Q(rowName);
 
-    
+    // Operation enums decide AND/OR/NONE semantics per group; exported raw so the importer can map them.
     o += ",\"featureFlagsOperation\":" + std::to_string(static_cast<int>(row.FeatureFlagsOperation));
     o += ",\"featureFlags\":[";
     for (int i = 0; i < row.FeatureFlags.Num(); ++i) {
@@ -483,7 +555,15 @@ static std::string SerializeUnlockCriteriaRow(const std::string& sourceTable, co
     return o + "}";
 }
 
-
+/*
+ * ScheduleData — the schedule tables the USchedulerComponent loads (ScheduleTables @ +0xD0). This is
+ * WHY the Trials hunt-menu entry stays greyed: UHuntCatalog::IsHuntUnlocked runs a scheduler gate
+ * (FUN_14197e8c0) BEFORE the Slayer's Path criteria — a scheduled hunt is only "unlocked" if its
+ * scheduled-item ID is currently ACTIVE (server-pushed via ClientReceiveCurrentSchedule ->
+ * AvailableScheduledItems). Our /game_tuning/seasonal_event_schedule is stubbed empty, so no Trials
+ * rotation is ever active. Dumping these rows gives the exact ScheduledItems[].ID (e.g. "Scheduled_Arena")
+ * to serve always-active in that endpoint. FText Name is deliberately omitted (reading FText faults).
+ */
 static std::string SerializeScheduleDataRow(const std::string& sourceTable, const std::string& rowName,
                                             const FScheduleData& row) {
     std::string o = "{";
@@ -511,13 +591,13 @@ static std::string SerializeScheduleDataRow(const std::string& sourceTable, cons
     return o + "}";
 }
 
-} 
+} // namespace HuntExp
 
 int RunHuntExport() {
     using namespace HuntExp;
 
     const std::wstring root = ResolveOutDir();
-    const std::wstring outDir = root + L"\\hunts_1_12";
+    const std::wstring outDir = root + L"\\hunts_1_14_7";
     CreateDirectoryW(outDir.c_str(), nullptr);
 
     Status("starting read-only 1.12 hunt export");
@@ -526,8 +606,8 @@ int RunHuntExport() {
     const int matchmakerRows = ExportTablesByStruct<FMatchmakerHuntTableData>(
         "MatchmakerHuntTableData", outDir + L"\\matchmaker_hunts.jsonl", SerializeMatchmakerHuntRow);
 
-    
-    
+    // Supporting tables the two above reference by row handle. Counted separately so a fault in a
+    // supporting table is obvious in the manifest rather than silently folded into the main totals.
     const int regionRows = ExportTablesByStruct<FHunt_Region>(
         "Hunt_Region", outDir + L"\\hunt_regions.jsonl", SerializeHuntRegionRow);
     const int escalationRows = ExportTablesByStruct<FEscalationModeSpecification>(
@@ -536,20 +616,20 @@ int RunHuntExport() {
         "HuntModifierTableRow", outDir + L"\\hunt_modifiers.jsonl", SerializeHuntModifierRow);
     const int activityRows = ExportTablesByStruct<FGameActivityTableData>(
         "GameActivityTableData", outDir + L"\\game_activities.jsonl", SerializeGameActivityRow);
-    
+    // The gate itself: what each activity actually requires before the hunt menu will enable it.
     const int unlockCriteriaRows = ExportTablesByStruct<FProgressionUnlockCriteria>(
         "ProgressionUnlockCriteria", outDir + L"\\activity_unlock_criteria.jsonl", SerializeUnlockCriteriaRow);
-    
-    
-    
+    // Schedule tables (USchedulerComponent.ScheduleTables). The scheduled-item IDs here are the missing
+    // piece for Trials: seasonal_event_schedule must mark one of these active for the Trials button to
+    // enable + a trial to launch. See SerializeScheduleDataRow header.
     const int scheduleRows = ExportTablesByStruct<FScheduleData>(
         "ScheduleData", outDir + L"\\schedule_data.jsonl", SerializeScheduleDataRow);
 
     std::ofstream manifest(outDir + L"\\hunt_export_manifest.json", std::ios::trunc);
     if (manifest) {
         manifest << "{\n"
-                 << "  \"gameVersion\": \"1.12.0\",\n"
-                 << "  \"changelist\": 392819,\n"
+                 << "  \"gameVersion\": \"1.14.7\",\n"
+                 << "  \"changelist\": 647472,\n"
                  << "  \"format\": \"jsonl\",\n"
                  << "  \"playerHuntRows\": " << playerRows << ",\n"
                  << "  \"matchmakerHuntRows\": " << matchmakerRows << ",\n"
@@ -573,8 +653,8 @@ int RunHuntExport() {
            " schedule=" + std::to_string(scheduleRows));
 
     if (playerRows < 0 || matchmakerRows < 0) return -1;
-    
-    
+    // Supporting tables are additive: a missing one is reported above but must not mask a
+    // successful main export, so negatives are floored rather than propagated.
     return playerRows + matchmakerRows +
            (regionRows > 0 ? regionRows : 0) +
            (escalationRows > 0 ? escalationRows : 0) +

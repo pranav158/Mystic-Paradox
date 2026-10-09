@@ -8,3 +8,9 @@ obj/
 *.ilk
 *.exp
 *.lib
+
+# Local export root (see ExportPaths.hpp)
+ExportPaths.local.h
+
+# Your flags, copied from export_flags.example.txt (see ExportFlags.md)
+export_flags.txt

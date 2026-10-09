@@ -1,4 +1,44 @@
-
+/*
+ * SkinsExporter — extends CatalogExporter with a weapon-skins-only mode (EXPORT_SKINS flag).
+ *
+ * Filters UArchonCatalog::GetAllItems() (the same source DumpGeneralCatalog in dllmain.cpp
+ * already reads) down to weapon transmog/skin items across all 7 weapon types, instead of
+ * emitting the full ~7000-row general catalog. Useful when you only want to audit skins (e.g.
+ * cross-referencing against the wiki) without re-parsing catalog_1_12.jsonl every time.
+ *
+ * Family tag -> weapon mapping, confirmed against real 1.12 displayNames (2026-07-18 session):
+ *   gaxe    -> Axe        (WeaponType_GAXE)     e.g. "Archonite Axe"
+ *   eblade  -> Sword       (WeaponType_EBLADE)   e.g. "Archonite Sword"
+ *   ihammer -> Hammer      (WeaponType_IHAMMER)  e.g. "Archonite Hammer"
+ *   cblades -> ChainBlades (WeaponType_CBLADES)
+ *   dp      -> Repeaters   (WeaponType_DP)       e.g. "Archonite Repeaters"
+ *   mspear  -> Spear       (WeaponType_MSPEAR)   e.g. "Archonite Spear"/"...Pike"
+ *   ac      -> Strikers    (WeaponType_AC)       e.g. "Archonite Strikers"
+ * A catalog item is a weapon skin iff its tags include "transmog" AND at least one of the
+ * seven family tags above (this is exactly how the general catalog's own tags identify them —
+ * no separate skin-specific struct/table exists; skins are FArchonCatalogItem rows like
+ * everything else, just tagged this way).
+ *
+ * ---- EXPORT_SKINS_RESOLVE_STRINGTABLE (opt-in, CLIENT-ONLY — see warning below) -----------
+ *
+ * ~40% of skins (2026-07-18 session count: 178/444) have DisplayNameInvariant/DisplayName both
+ * blank/"<MISSING STRING TABLE ENTRY>" — confirmed via Ghidra that the real strings live in a
+ * separate UStringTable asset (e.g. "weapon_gaxe_cosmetic_catalog"), keyed by a Namespace+Key
+ * pair embedded in the item's own CustomData JSON (DisplayNameLocKey/DescriptionLocKey). The
+ * only way to resolve these is UKismetStringTableLibrary::GetTableEntrySourceString(TableId,
+ * Key) — a real, live engine call, confirmed present in the game binary via Ghidra
+ * (UKismetStringTableLibrary::execGetTableEntrySourceString).
+ *
+ * *** WARNING: this call goes through UObject::ProcessEvent (see the SDK's own
+ * Engine_functions.cpp implementation of GetTableEntrySourceString/Conv_StringToName), which is
+ * NOT thread-safe to call from an arbitrary OS thread — it assumes the game thread. This
+ * exporter's worker thread (CreateThread in dllmain.cpp) is deliberately NOT the game thread, so
+ * every OTHER export mode in this DLL is a pure GObjects/FString read with zero engine-dispatch
+ * risk, safe to run against a live production server. EXPORT_SKINS_RESOLVE_STRINGTABLE breaks
+ * that guarantee. ONLY inject a build with this flag enabled into your own local/offline client,
+ * NEVER the shared dedicated server process. Default OFF; ExportFlags.md documents this same
+ * warning for anyone editing export_flags.txt directly. ***
+ */
 
 #include <windows.h>
 #include <string>
@@ -7,6 +47,7 @@
 #include <unordered_map>
 
 #include "SDK.hpp"
+#include "ExportPaths.hpp"
 
 using namespace SDK;
 
@@ -39,23 +80,23 @@ static bool IsMissingOrEmpty(const std::string& s) {
     return s.empty() || s == "<MISSING STRING TABLE ENTRY>";
 }
 
-
-
+// Forward decl — Status() itself is defined further down (needs ResolveOutDir first), but the
+// stringtable resolver needs to log per-attempt diagnostics from higher up in the file.
 static void Status(const std::string& s);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+// FArchonCatalogItem carries TWO independent string sources per field (see
+// Archon_structs.hpp FArchonCatalogItem, offsets 0x48/0x58 vs 0x68/0x80):
+//   - DisplayNameInvariant/DescriptionInvariant (FString, Transient) — populated on-demand by
+//     game code that resolves through the live FTextLocalizationManager; comes back
+//     "<MISSING STRING TABLE ENTRY>" if that resolution never ran for this item (e.g. it was
+//     never displayed in any UI during the captured session — exactly what happened for the
+//     Saint's Bond/Frostfall/Dark Harvest "_01"/"_02" variants).
+//   - DisplayName/Description (FText) — the SDK's FText::ToString() reads TextData->TextSource
+//     directly, the string baked into the text asset at cook time, independent of whether the
+//     runtime localization manager ever resolved it for display. A different, more direct path
+//     that can succeed where the Invariant field didn't.
+// ResolveString tries Invariant first (cheap, already a plain FString), falls back to the FText
+// source, and reports which path won (or that neither did) via `source` for transparency.
 static std::string ResolveString(const std::string& invariant, FText& text, std::string& sourceOut) {
     if (!IsMissingOrEmpty(invariant)) {
         sourceOut = "invariant";
@@ -69,20 +110,20 @@ static std::string ResolveString(const std::string& invariant, FText& text, std:
                 return fromText;
             }
         } catch (...) {
-            
-            
+            // TextData present but source unreadable (e.g. torn-down asset) — fall through to
+            // "none" rather than propagate/crash the exporter thread over one row.
         }
     }
     sourceOut = "none";
-    return invariant; 
+    return invariant; // whatever we had (empty or the missing-marker), unchanged
 }
 
-
-
-
-
-
-
+// Pulls Namespace/Key out of one LocKey JSON blob embedded (double-encoded) inside CustomData,
+// e.g. customData contains: "DisplayNameLocKey":"{\r\n\t\"HasValue\": true,\r\n\t\"Namespace\":
+// \"weapon_gaxe_cosmetic_catalog\",\r\n\t\"Key\": \"WP_GA_ROMANTIC_01|Display Name\"\r\n}" — the
+// inner JSON got string-escaped into the outer JSON's string value, so a full JSON parser isn't
+// worth it here; targeted substring search on the known escaped-quote pattern is simpler and
+// matches every sample observed this session (Axe/Sword/Hammer/etc. LocKey blocks alike).
 static bool ExtractLocKey(const std::string& customData, const std::string& blockKey,
                            std::string& outNamespace, std::string& outKey) {
     std::string blockMarker = "\"" + blockKey + "\":\"";
@@ -107,21 +148,21 @@ static bool ExtractLocKey(const std::string& customData, const std::string& bloc
     return !outNamespace.empty() && !outKey.empty();
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// *** CLIENT-ONLY — see the file header warning. Calls through ProcessEvent (game-thread-only
+// engine dispatch) via the SDK's standard UKismetStringLibrary/UKismetStringTableLibrary
+// wrappers. Never call this from a build injected into the dedicated server. ***
+//
+// SDK::FString (UnrealContainers.hpp UC::FString) only has a wchar_t* constructor, and that
+// constructor does NOT copy — it just points Data at the caller's buffer (a view, not an owning
+// string). So the backing std::wstring must stay alive for the whole call; wNs/wKey are locals
+// held through both engine calls below, which is exactly long enough since both dispatch
+// synchronously (native BlueprintCallable, not a deferred Blueprint graph).
+//
+// `logTag` (e.g. "WP_GA_ROMANTIC_01/displayName") is logged with every attempt — diagnostic
+// visibility added 2026-07-18 after a first run came back viaStringTable=0 across all 178 rows
+// with no crash, which is consistent with several different failure points (extraction, CDO
+// lookup, function lookup, or the table genuinely not resident) that a silent empty return can't
+// distinguish between.
 static std::string ResolveViaStringTable(const std::string& ns, const std::string& key, const std::string& logTag) {
     try {
         UClass* strLibCls = UKismetStringLibrary::StaticClass();
@@ -137,7 +178,7 @@ static std::string ResolveViaStringTable(const std::string& ns, const std::strin
             return std::string();
         }
 
-        std::wstring wNs(ns.begin(), ns.end());   
+        std::wstring wNs(ns.begin(), ns.end());   // catalog namespaces/keys are plain ASCII identifiers
         std::wstring wKey(key.begin(), key.end());
 
         FName tableId = UKismetStringLibrary::Conv_StringToName(FString(wNs.c_str()));
@@ -171,17 +212,8 @@ static std::string StrArray(const TArray<FString>& arr) {
     return o;
 }
 
-static std::wstring ResolveOutDir() {
-    static const wchar_t* kCandidates[] = {
-        L".\\Items_Analysis",
-    };
-    for (const wchar_t* c : kCandidates) {
-        DWORD a = GetFileAttributesW(c);
-        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) return c;
-    }
-    CreateDirectoryW(kCandidates[0], nullptr);
-    return kCandidates[0];
-}
+// See ExportPaths.hpp: <root>\Items_Analysis when ExportPaths.local.h names a root, else .\Items_Analysis.
+static std::wstring ResolveOutDir() { return ExportOutDir(); }
 
 static void Status(const std::string& s) {
     OutputDebugStringA(("[SkinsExporter] " + s + "\n").c_str());
@@ -189,7 +221,7 @@ static void Status(const std::string& s) {
     if (f) f << std::wstring(s.begin(), s.end()) << L"\n";
 }
 
-
+// Family tag -> canonical weapon name (see file header for the confirmed mapping).
 static const std::unordered_map<std::string, std::string> kFamilyToWeapon = {
     { "gaxe",    "Axe"         },
     { "eblade",  "Sword"       },
@@ -214,11 +246,11 @@ static UArchonCatalog* FindArchonCatalog() {
     return nullptr;
 }
 
-
-
-
-
-
+// Returns the weapon name for the item's tags if it's a weapon skin, else empty string.
+// An item can only belong to one weapon family in practice, but if tags somehow carried more
+// than one family tag, the first match wins (order = kFamilyToWeapon's declaration order,
+// i.e. Axe/Sword/Hammer/ChainBlades/Repeaters/Spear/Strikers) rather than emitting the row once
+// per matching family.
 static std::string WeaponForTags(const TArray<FString>& tags) {
     bool isTransmog = false;
     for (int i = 0; i < tags.Num(); ++i) {
@@ -233,18 +265,18 @@ static std::string WeaponForTags(const TArray<FString>& tags) {
     return std::string();
 }
 
-
-
-
-
-
-
-
-
+// One-shot characterization of the string-table subsystem, so we stop guessing why
+// GetTableEntrySourceString returns empty for the 178 unresolved skins. Ghidra decompilation of
+// the native GetTableEntrySourceString (FUN_143cc1d20) shows the flow is:
+//   FStringTableRegistry::FindStringTable(TableId)  -> the table (registered, we confirmed)
+//   FStringTable::GetSourceString(Key, Out)         -> hash-map lookup of Key in KeysToEntries
+// and the lookup returns empty when Key's index == -1 (key simply not in the table's entry map).
+// This pass answers the only remaining question: does the table actually CONTAIN any keys (data
+// cooked/loaded), and if so, in what exact key format?
 static void RunStringTableDiagnostic() {
     Status("=== STRINGTABLE DIAGNOSTIC START ===");
 
-    
+    // (1) Pure GObjects read (SAFE): which UStringTable ASSETS are actually loaded in memory.
     if (UObject::GObjects) {
         UClass* stCls = UStringTable::StaticClass();
         int stCount = 0, cosmeticCount = 0;
@@ -263,7 +295,7 @@ static void RunStringTableDiagnostic() {
                " (cosmetic/weapon-related=" + std::to_string(cosmeticCount) + ")");
     }
 
-    
+    // (2) ProcessEvent (CLIENT-ONLY): every registered table ID. Log ones mentioning cosmetic.
     try {
         TArray<FName> registered = UKismetStringTableLibrary::GetRegisteredStringTables();
         Status("  [ST-reg] GetRegisteredStringTables count=" + std::to_string(registered.Num()));
@@ -279,12 +311,12 @@ static void RunStringTableDiagnostic() {
         Status("  [ST-reg] GetRegisteredStringTables threw");
     }
 
-    
-    
-    
-    
-    
-    
+    // (3) ProcessEvent (CLIENT-ONLY): for the axe cosmetic table, dump the ACTUAL keys it holds.
+    // This is the decisive test: if this returns keys in "WP_GA_..|Display Name" form, our format
+    // is right and something else is wrong; if it returns keys in a DIFFERENT form, we adapt; if
+    // it returns 0 keys, the table is registered but its data was never loaded/cooked in this
+    // build (the strings genuinely aren't extractable — matching the in-game "<MISSING STRING
+    // TABLE ENTRY>" the client itself shows).
     try {
         FName axeTable = UKismetStringLibrary::Conv_StringToName(FString(L"weapon_gaxe_cosmetic_catalog"));
         TArray<FString> keys = UKismetStringTableLibrary::GetKeysFromStringTable(axeTable);
@@ -301,7 +333,7 @@ static void RunStringTableDiagnostic() {
     Status("=== STRINGTABLE DIAGNOSTIC END ===");
 }
 
-} 
+} // namespace SkinsExp
 
 int RunSkinsExport(bool resolveViaStringTable) {
     using namespace SkinsExp;
@@ -323,10 +355,10 @@ int RunSkinsExport(bool resolveViaStringTable) {
     }
 
     std::wstring outDir = ResolveOutDir();
-    std::ofstream f(outDir + L"\\weapon_skins_1_12.jsonl", std::ios::trunc);
-    if (!f) { Status("cannot open weapon_skins_1_12.jsonl"); return -1; }
+    std::ofstream f(outDir + L"\\weapon_skins_1_14_7.jsonl", std::ios::trunc);
+    if (!f) { Status("cannot open weapon_skins_1_14_7.jsonl"); return -1; }
 
-    
+    // Per-weapon counts, plus how each row's name got resolved, for the status line.
     std::unordered_map<std::string, int> perWeapon;
     int viaInvariant = 0, viaText = 0, viaStringTable = 0, unresolved = 0;
 
@@ -334,7 +366,7 @@ int RunSkinsExport(bool resolveViaStringTable) {
     for (int i = 0; i < n; ++i) {
         FArchonCatalogItem& it = items[i];
         std::string weapon = WeaponForTags(it.Tags);
-        if (weapon.empty()) continue; 
+        if (weapon.empty()) continue; // not a weapon skin (transmog tag missing, or no family tag)
 
         std::string id = FStr(it.ItemId);
         if (id.empty()) continue;
@@ -375,8 +407,8 @@ int RunSkinsExport(bool resolveViaStringTable) {
         line += ",\"descriptionSource\":" + Q(descSource);
         line += ",\"tags\":" + StrArray(it.Tags);
         line += ",\"customData\":" + Q(customData);
-        
-        
+        // Virtual-currency prices, same shape as the general catalog dump — this is how a
+        // skin's Store price (Platinum amount) surfaces, when it has one.
         line += ",\"virtualCurrencyPrices\":[";
         for (int p = 0; p < it.VirtualCurrencyPrices.Num(); ++p) {
             if (p) line += ",";
@@ -401,7 +433,7 @@ int RunSkinsExport(bool resolveViaStringTable) {
         if (!breakdown.empty()) breakdown += ", ";
         breakdown += weapon + "=" + std::to_string(wcount);
     }
-    Status("wrote " + std::to_string(written) + " weapon skins -> weapon_skins_1_12.jsonl (" + breakdown + ") | "
+    Status("wrote " + std::to_string(written) + " weapon skins -> weapon_skins_1_14_7.jsonl (" + breakdown + ") | "
            "names: invariant=" + std::to_string(viaInvariant) + " viaFText=" + std::to_string(viaText) +
            " viaStringTable=" + std::to_string(viaStringTable) + " stillUnresolved=" + std::to_string(unresolved));
     return written;

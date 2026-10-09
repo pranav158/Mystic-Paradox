@@ -1,4 +1,30 @@
-
+/*
+ * CatalogExporter — standalone, manually-injected DLL for Dauntless 1.12.0 (CL 392819, UE 4.26.2).
+ *
+ * Purpose: dump the FULL runtime catalog to JSONL for building a backend catalog DB. Two sources:
+ *   1) General catalog  — UArchonCatalog::Catalog (TMap<FString,FArchonCatalogItem>) via GetAllItems().
+ *                         Covers currencies, consumables, cells, dyes, emotes, banners, materials,
+ *                         quest items, containers, bundles.  -> Items_Analysis/catalog_1_12.jsonl
+ *   2) Equipment        — UEquipmentCatalogItem_* GObjects walk (weapons/armour/lanterns/roles/parts),
+ *                         enriched.                          -> Items_Analysis/equipment_1_12.jsonl
+ *
+ * Design constraints (per project guidance):
+ *   - NO ProcessEvent hooks, NO MinHook. Pure reads + one SDK API call (GetAllItems).
+ *   - Writes JSONL FILES only; never spams the game's diagnostic log. A tiny progress line goes to
+ *     OutputDebugString + a sidecar catalog_export_status.txt.
+ *   - Preserves the catalogId (global definition) concept ONLY. It exports DEFINITIONS, never owned
+ *     instances — no instanceId is invented, nothing is granted.
+ *   - One-shot on a worker thread once GObjects + the catalog are available.
+ *
+ * Build: see CatalogExporter.vcxproj (reuses the ../../ParadoxRuntime SDK).
+ * Inject: any standard DLL injector into the running game/dedicated-server process.
+ *
+ * [1.14.7 2026-10-08] The SDK root is now the 1.14.7 (CL 647472) dump, and every output is written as
+ * *_1_14_7 (manifest gameVersion 1.14.7) beside the 1.12 files, which stay as the diff baseline. Rebuild
+ * before injecting: a DLL built against the 1.12 SDK carries the wrong GObjects/FName offsets and three
+ * moved struct layouts. Correction to the constraint below: the UFunction wrappers (GetAllItems, ...) DO
+ * call ProcessEvent from the worker thread, so inject only into a local client, never a shared server.
+ */
 
 #include <windows.h>
 #include <string>
@@ -8,13 +34,14 @@
 
 #include "SDK.hpp"
 #include "ExportFlags.hpp"
+#include "ExportPaths.hpp"
 
 using namespace SDK;
 
-
-
-
-
+// Implemented in ProgressionExporter.cpp / CombatExporter.cpp respectively. Declared here
+// rather than via a shared header because each .cpp is a self-contained translation unit with
+// its own JSON/status helpers (mirrors the base exporter's "keep it simple, no shared header
+// churn" style) — only the two entry points cross the boundary.
 extern int RunProgressionExport();
 extern int RunCombatExport();
 extern int RunSkinsExport(bool resolveViaStringTable);
@@ -22,23 +49,12 @@ extern int RunSlayersPathExport();
 extern int RunHuntExport();
 extern int RunTableInventoryExport();
 extern int RunDropTableExport();
+extern int RunCurrencyExport();
+extern int RunStoreRuntimeExport();
 
-
-
-
-static const wchar_t* kOutDirCandidates[] = {
-    L".\\Items_Analysis",
-};
-
-static std::wstring ResolveOutDir() {
-    for (const wchar_t* c : kOutDirCandidates) {
-        DWORD a = GetFileAttributesW(c);
-        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) return c;
-    }
-    
-    CreateDirectoryW(kOutDirCandidates[0], nullptr);
-    return kOutDirCandidates[0];
-}
+// ---- output location -------------------------------------------------------
+// See ExportPaths.hpp: <root>\Items_Analysis when ExportPaths.local.h names a root, else .\Items_Analysis.
+static std::wstring ResolveOutDir() { return ExportOutDir(); }
 
 static void Status(const std::string& s) {
     OutputDebugStringA(("[CatalogExporter] " + s + "\n").c_str());
@@ -47,7 +63,7 @@ static void Status(const std::string& s) {
     if (f) f << s << "\n";
 }
 
-
+// ---- JSON helpers ----------------------------------------------------------
 static std::string JsonEsc(const std::string& s) {
     std::string o; o.reserve(s.size() + 8);
     for (char c : s) {
@@ -65,7 +81,7 @@ static std::string JsonEsc(const std::string& s) {
     return o;
 }
 
-
+// Safe FString -> std::string (Dumper-7 FString has ToString()); guards empty/invalid.
 static std::string FStr(const FString& s) {
     if (s.Num() <= 0 || !s.IsValid()) return std::string();
     return s.ToString();
@@ -75,7 +91,7 @@ static std::string FNm(const FName& n) {
     return n.ToString();
 }
 
-
+// TArray<FString> -> JSON array string.
 static std::string StrArray(const TArray<FString>& arr) {
     std::string o = "[";
     for (int i = 0; i < arr.Num(); ++i) {
@@ -86,12 +102,12 @@ static std::string StrArray(const TArray<FString>& arr) {
     return o;
 }
 
-
-
-
-
-
-
+// [Lady Luck's Store investigation] FArchonCatalogItem carries a richer *WithQuantity sibling next
+// to every plain string-array field already exported (ContainerItemContents/BundledItems etc.) -
+// TArray<FPlayFabCatalogItemQuantity>, i.e. {Item, Amount} pairs instead of bare item ids. The plain
+// arrays read empty for our CONTAINER_CORE_* items even though they are real, purchasable containers
+// (Lady Luck's Store "supplies"/"cells" tabs sell them) - this is the field that was never read to
+// check whether the richer sibling is actually populated instead.
 static std::string QuantityArray(const TArray<FPlayFabCatalogItemQuantity>& arr) {
     std::string o = "[";
     for (int i = 0; i < arr.Num(); ++i) {
@@ -133,13 +149,14 @@ static const char* WeaponPartTypeName(EWeaponPartType type) {
         case EWeaponPartType::Weapon_Part_Soul: return "soul";
         case EWeaponPartType::Item_Part_Lantern_Capacitor: return "lantern_capacitor";
         case EWeaponPartType::Item_Part_Lantern_Cell: return "lantern_cell";
+        case EWeaponPartType::Weapon_Part_Tracker: return "tracker";   // new in 1.14.7 (PART_WT_*)
         default: return "unknown";
     }
 }
-
-
-
-
+// ECellType only names values 0-25 (Max=26) in this SDK dump. Print the raw numeric value
+// regardless so an unnamed/out-of-range value (e.g. if Omnicell reuses a value the SDK dump
+// doesn't have a name for, or the live enum is actually larger than what got captured) is still
+// visible rather than silently mapped to "unknown".
 static const char* CellTypeName(ECellType type) {
     switch (type) {
         case ECellType::None: return "none";
@@ -169,23 +186,23 @@ static const char* CellTypeName(ECellType type) {
         case ECellType::CellType_Any: return "any";
         case ECellType::CellType_Legendary_Ability: return "legendary_ability";
         case ECellType::Max: return "max_sentinel";
-        default: return "UNNAMED";  
+        default: return "UNNAMED";  // <-- if this shows up, the raw numeric value is the real signal
     }
 }
 
-
-
-
-
-
-
-
-
+// ---- live cell-slot diagnostics (Omnicell investigation, 2026-07-21) -------
+// UArchonInventoryItem_CellContainer is the shared base for Weapon/Armour/Lantern inventory
+// items and already exposes GetCellSlots()/GetPermanentCells()/GetAllPermanentCellEffects() as
+// direct member functions (NOT ProcessEvent-only BlueprintCallable) — same call shape as the
+// already-proven GetItemPartSlots()/GetEquippedItemParts() in DumpLiveWeaponSlots above, so this
+// carries the same safety profile (pure reads, no engine dispatch). Walks the base class so it
+// covers weapons, armour AND lanterns in one pass rather than guessing which slot type an
+// Omnicell lives on.
 static int DumpLiveCellSlots(const std::wstring& outDir) {
     if (!UObject::GObjects) return -1;
 
-    std::ofstream f(outDir + L"\\live_cell_slots_1_12.jsonl", std::ios::trunc);
-    if (!f) { Status("cells: cannot open live_cell_slots_1_12.jsonl"); return -1; }
+    std::ofstream f(outDir + L"\\live_cell_slots_1_14_7.jsonl", std::ios::trunc);
+    if (!f) { Status("cells: cannot open live_cell_slots_1_14_7.jsonl"); return -1; }
 
     UClass* containerClass = UArchonInventoryItem_CellContainer::StaticClass();
     if (!containerClass) { Status("cells: UArchonInventoryItem_CellContainer class unavailable"); return -1; }
@@ -249,11 +266,11 @@ static int DumpLiveCellSlots(const std::wstring& outDir) {
     }
 
     f.close();
-    Status("cells: wrote " + std::to_string(written) + " live cell containers -> live_cell_slots_1_12.jsonl");
+    Status("cells: wrote " + std::to_string(written) + " live cell containers -> live_cell_slots_1_14_7.jsonl");
     return written;
 }
 
-
+// ---- find the live UArchonCatalog instance ---------------------------------
 static UArchonCatalog* FindArchonCatalog() {
     if (!UObject::GObjects) return nullptr;
     const int count = UObject::GObjects->Num();
@@ -268,7 +285,7 @@ static UArchonCatalog* FindArchonCatalog() {
     return nullptr;
 }
 
-
+// ---- general catalog dump --------------------------------------------------
 static int DumpGeneralCatalog(const std::wstring& outDir) {
     UArchonCatalog* cat = FindArchonCatalog();
     if (!cat) { Status("general: UArchonCatalog instance NOT found yet"); return -1; }
@@ -279,8 +296,8 @@ static int DumpGeneralCatalog(const std::wstring& outDir) {
     Status("general: GetAllItems returned " + std::to_string(n) + " items");
     if (n <= 0) return 0;
 
-    std::ofstream f(outDir + L"\\catalog_1_12.jsonl", std::ios::trunc);
-    if (!f) { Status("general: cannot open catalog_1_12.jsonl"); return -1; }
+    std::ofstream f(outDir + L"\\catalog_1_14_7.jsonl", std::ios::trunc);
+    if (!f) { Status("general: cannot open catalog_1_14_7.jsonl"); return -1; }
 
     int written = 0;
     for (int i = 0; i < n; ++i) {
@@ -302,11 +319,11 @@ static int DumpGeneralCatalog(const std::wstring& outDir) {
         line += ",\"maxQuantity\":" + std::to_string(it.MaxQuantity);
         line += ",\"containerItemContents\":" + StrArray(it.ContainerItemContents);
         line += ",\"bundledItems\":" + StrArray(it.BundledItems);
-        
-        
-        
-        
-        
+        // [Lady Luck's Store investigation] Richer siblings of the two plain arrays above - see
+        // QuantityArray's comment. Also grabbing the two ResultTable variants (a container/bundle can
+        // point at a SEPARATE weighted-roll table instead of, or alongside, a fixed item list) and the
+        // two remaining *WithQuantity fields FArchonCatalogItem exposes, since they're already fetched
+        // in `it` at zero extra cost - no reason to leave them unexamined once the struct is in hand.
         line += ",\"containerItemContentsWithQuantity\":" + QuantityArray(it.ContainerItemContentsWithQuantity);
         line += ",\"containerResultTableContents\":" + StrArray(it.ContainerResultTableContents);
         line += ",\"containerResultTableContentsWithQuantity\":" + QuantityArray(it.ContainerResultTableContentsWithQuantity);
@@ -315,7 +332,7 @@ static int DumpGeneralCatalog(const std::wstring& outDir) {
         line += ",\"bundledResultTablesWithQuantity\":" + QuantityArray(it.BundledResultTablesWithQuantity);
         line += ",\"otherItemQuantities\":" + QuantityArray(it.OtherItemQuantities);
         line += ",\"alternateItemsToGrant\":" + QuantityArray(it.AlternateItemsToGrant);
-        
+        // Virtual-currency prices (this is where costs / currency ids appear).
         line += ",\"virtualCurrencyPrices\":[";
         for (int p = 0; p < it.VirtualCurrencyPrices.Num(); ++p) {
             if (p) line += ",";
@@ -330,17 +347,17 @@ static int DumpGeneralCatalog(const std::wstring& outDir) {
         ++written;
     }
     f.close();
-    Status("general: wrote " + std::to_string(written) + " definitions -> catalog_1_12.jsonl");
+    Status("general: wrote " + std::to_string(written) + " definitions -> catalog_1_14_7.jsonl");
     return written;
 }
 
-
+// ---- equipment dump (GObjects walk, mirrors the proven DumpEquipmentCatalog) ----
 static int DumpEquipmentCatalog(const std::wstring& outDir) {
     if (!UObject::GObjects) return -1;
     const int count = UObject::GObjects->Num();
 
-    std::ofstream f(outDir + L"\\equipment_1_12.jsonl", std::ios::trunc);
-    if (!f) { Status("equipment: cannot open equipment_1_12.jsonl"); return -1; }
+    std::ofstream f(outDir + L"\\equipment_1_14_7.jsonl", std::ios::trunc);
+    if (!f) { Status("equipment: cannot open equipment_1_14_7.jsonl"); return -1; }
 
     int written = 0;
     for (int i = 0; i < count; ++i) {
@@ -360,7 +377,7 @@ static int DumpEquipmentCatalog(const std::wstring& outDir) {
 
         if (obj->GetName().rfind("Default__", 0) == 0) continue;
 
-        
+        // ItemId FName @ +0x28 (proven in the existing DumpEquipmentCatalog).
         uintptr_t addr = reinterpret_cast<uintptr_t>(obj);
         int32_t comp = *reinterpret_cast<int32_t*>(addr + 0x28);
         int32_t num  = *reinterpret_cast<int32_t*>(addr + 0x2C);
@@ -372,19 +389,19 @@ static int DumpEquipmentCatalog(const std::wstring& outDir) {
         ++written;
     }
     f.close();
-    Status("equipment: wrote " + std::to_string(written) + " definitions -> equipment_1_12.jsonl");
+    Status("equipment: wrote " + std::to_string(written) + " definitions -> equipment_1_14_7.jsonl");
     return written;
 }
 
-
-
-
-
+// ---- live weapon-slot diagnostics ------------------------------------------
+// Slot existence/visibility is not encoded in loadout EquippedItemParts. It comes from the
+// client's FWeaponPartSlot catalog data. Query real live inventory objects so we capture both
+// static catalog flags and the client's effective eligibility decision for the current player.
 static int DumpLiveWeaponSlots(const std::wstring& outDir) {
     if (!UObject::GObjects) return -1;
 
-    std::ofstream f(outDir + L"\\weapon_slots_1_12.jsonl", std::ios::trunc);
-    if (!f) { Status("weapon-slots: cannot open weapon_slots_1_12.jsonl"); return -1; }
+    std::ofstream f(outDir + L"\\weapon_slots_1_14_7.jsonl", std::ios::trunc);
+    if (!f) { Status("weapon-slots: cannot open weapon_slots_1_14_7.jsonl"); return -1; }
 
     UClass* weaponClass = UArchonInventoryItem_Weapon::StaticClass();
     if (!weaponClass) { Status("weapon-slots: UArchonInventoryItem_Weapon class unavailable"); return -1; }
@@ -436,17 +453,17 @@ static int DumpLiveWeaponSlots(const std::wstring& outDir) {
     }
 
     f.close();
-    Status("weapon-slots: wrote " + std::to_string(written) + " live weapons -> weapon_slots_1_12.jsonl");
+    Status("weapon-slots: wrote " + std::to_string(written) + " live weapons -> weapon_slots_1_14_7.jsonl");
     return written;
 }
-
-
-
+// Proves whether server-owned weapon parts were actually instantiated by the client. A catalog
+// slot can be visible and unlocked while its choice list remains empty if the inventory object
+// never materialized locally.
 static int DumpLiveWeaponParts(const std::wstring& outDir) {
     if (!UObject::GObjects) return -1;
 
-    std::ofstream f(outDir + L"\\live_weapon_parts_1_12.jsonl", std::ios::trunc);
-    if (!f) { Status("weapon-parts: cannot open live_weapon_parts_1_12.jsonl"); return -1; }
+    std::ofstream f(outDir + L"\\live_weapon_parts_1_14_7.jsonl", std::ios::trunc);
+    if (!f) { Status("weapon-parts: cannot open live_weapon_parts_1_14_7.jsonl"); return -1; }
 
     UClass* partClass = UArchonInventoryItem_WeaponPart::StaticClass();
     if (!partClass) { Status("weapon-parts: UArchonInventoryItem_WeaponPart class unavailable"); return -1; }
@@ -499,19 +516,19 @@ static int DumpLiveWeaponParts(const std::wstring& outDir) {
     }
 
     f.close();
-    Status("weapon-parts: wrote " + std::to_string(written) + " live parts -> live_weapon_parts_1_12.jsonl");
+    Status("weapon-parts: wrote " + std::to_string(written) + " live parts -> live_weapon_parts_1_14_7.jsonl");
     return written;
 }
 
-
-
-
-
+// Dumps the actual weapon-part DataTable rows consumed by
+// UArchonInventoryItem_WeaponPart::GetWeaponPartType/IsAssignable. The native client reads
+// WeaponPartType at 0x550 and returns !bIsUnassignable (0x5D8); this is the decisive filter used
+// by ULoadoutGearScreen::UpdateAssignPartPanel before it creates PartViewModels.
 static int DumpWeaponPartCatalogRows(const std::wstring& outDir) {
     if (!UObject::GObjects) return -1;
 
-    std::ofstream f(outDir + L"\\weapon_part_catalog_rows_1_12.jsonl", std::ios::trunc);
-    if (!f) { Status("weapon-part-catalog: cannot open weapon_part_catalog_rows_1_12.jsonl"); return -1; }
+    std::ofstream f(outDir + L"\\weapon_part_catalog_rows_1_14_7.jsonl", std::ios::trunc);
+    if (!f) { Status("weapon-part-catalog: cannot open weapon_part_catalog_rows_1_14_7.jsonl"); return -1; }
 
     UClass* tableClass = UDataTable::StaticClass();
     int written = 0;
@@ -542,20 +559,20 @@ static int DumpWeaponPartCatalogRows(const std::wstring& outDir) {
 
     f.close();
     Status("weapon-part-catalog: wrote " + std::to_string(written) +
-           " rows -> weapon_part_catalog_rows_1_12.jsonl");
+           " rows -> weapon_part_catalog_rows_1_14_7.jsonl");
     return written;
 }
-
-
-
-
-
-
+// Dumps the ACTUAL equipment screen used by the loadout UI in the repro screenshot.
+// UWeaponCustomizationScreen is a different screen and is not instantiated here; the real path
+// is ULoadoutGearScreen -> ULoadoutGearViewModel. Its two arrays are the final inputs used to
+// create the visible modification rows:
+//   PartSlotViewModels = rows the screen decided to show
+//   PartViewModels     = owned/candidate parts that can populate those rows
 static int DumpLoadoutGearUI(const std::wstring& outDir) {
     if (!UObject::GObjects) return -1;
 
-    std::ofstream f(outDir + L"\\loadout_gear_ui_1_12.jsonl", std::ios::trunc);
-    if (!f) { Status("loadout-gear-ui: cannot open loadout_gear_ui_1_12.jsonl"); return -1; }
+    std::ofstream f(outDir + L"\\loadout_gear_ui_1_14_7.jsonl", std::ios::trunc);
+    if (!f) { Status("loadout-gear-ui: cannot open loadout_gear_ui_1_14_7.jsonl"); return -1; }
 
     UClass* viewModelClass = ULoadoutGearViewModel::StaticClass();
     UClass* screenClass = ULoadoutGearScreen::StaticClass();
@@ -625,20 +642,21 @@ static int DumpLoadoutGearUI(const std::wstring& outDir) {
     }
 
     f.close();
-    Status("loadout-gear-ui: wrote " + std::to_string(written) + " rows -> loadout_gear_ui_1_12.jsonl");
+    Status("loadout-gear-ui: wrote " + std::to_string(written) + " rows -> loadout_gear_ui_1_14_7.jsonl");
     return written;
 }
-
-
-
-
-
-
+// ---- manifest ---------------------------------------------------------------
+// Per plan section 4's metadata block. Written once per run, after all requested exports
+// finish, listing which modes ran and how many rows/definitions each produced. This is NOT a
+// per-file hash manifest (the plan's fuller ContentData/1.12.0/manifest.json shape is future
+// importer-side work) — it is a lightweight run report proving what THIS injection produced,
+// which is what the flags system needs to be auditable.
 static void WriteManifest(const std::wstring& outDir, const ExportFlags& flags,
                            int catalogGeneral, int catalogEquipment, int liveWeaponSlots,
                            int progressionRows, int combatRows, int skinsRows,
-                           int slayersPathNodes, int huntRows, int tableInventoryRows) {
-    std::ofstream f(outDir + L"\\export_manifest.json", std::ios::trunc);
+                           int slayersPathNodes, int huntRows, int tableInventoryRows,
+                           int storeRuntimeRows) {
+    std::ofstream f(outDir + L"\\export_manifest_1_14_7.json", std::ios::trunc);   // the 1.12 run's is export_manifest.json
     if (!f) return;
 
     auto nowIso = []() -> std::string {
@@ -649,8 +667,8 @@ static void WriteManifest(const std::wstring& outDir, const ExportFlags& flags,
     };
 
     f << "{\n";
-    f << "  \"gameVersion\": \"1.12.0\",\n";
-    f << "  \"changelist\": 392819,\n";
+    f << "  \"gameVersion\": \"1.14.7\",\n";
+    f << "  \"changelist\": 647472,\n";
     f << "  \"engineVersion\": \"4.26.2\",\n";
     f << "  \"exportedAt\": \"" << nowIso() << "\",\n";
     f << "  \"flags\": {\n";
@@ -662,7 +680,8 @@ static void WriteManifest(const std::wstring& outDir, const ExportFlags& flags,
     f << "    \"EXPORT_SLAYERS_PATH\": " << (flags.ExportSlayersPath ? "true" : "false") << ",\n";
     f << "    \"EXPORT_WEAPON_SLOTS\": " << (flags.ExportWeaponSlots ? "true" : "false") << ",\n";
     f << "    \"EXPORT_HUNTS\": " << (flags.ExportHunts ? "true" : "false") << ",\n";
-    f << "    \"EXPORT_TABLE_INVENTORY\": " << (flags.ExportTableInventory ? "true" : "false") << "\n";
+    f << "    \"EXPORT_TABLE_INVENTORY\": " << (flags.ExportTableInventory ? "true" : "false") << ",\n";
+    f << "    \"EXPORT_STORE_RUNTIME\": " << (flags.ExportStoreRuntime ? "true" : "false") << "\n";
     f << "  },\n";
     f << "  \"results\": {\n";
     f << "    \"catalogGeneralItems\": " << catalogGeneral << ",\n";
@@ -673,12 +692,13 @@ static void WriteManifest(const std::wstring& outDir, const ExportFlags& flags,
     f << "    \"skinsRows\": " << skinsRows << ",\n";
     f << "    \"slayersPathNodes\": " << slayersPathNodes << ",\n";
     f << "    \"huntRows\": " << huntRows << ",\n";
-    f << "    \"tableInventoryRows\": " << tableInventoryRows << "\n";
+    f << "    \"tableInventoryRows\": " << tableInventoryRows << ",\n";
+    f << "    \"storeRuntimeRows\": " << storeRuntimeRows << "\n";
     f << "  }\n";
     f << "}\n";
 }
 
-
+// ---- worker: wait for the catalog, then dump once --------------------------
 static DWORD WINAPI ExporterThread(LPVOID) {
     ExportFlags flags = LoadExportFlags();
     Status("thread start; flags: catalog=" + std::string(flags.ExportCatalog ? "1" : "0") +
@@ -691,16 +711,22 @@ static DWORD WINAPI ExporterThread(LPVOID) {
            " hunts=" + std::string(flags.ExportHunts ? "1" : "0") +
            " tableInventory=" + std::string(flags.ExportTableInventory ? "1" : "0") +
            " cells=" + std::string(flags.ExportCells ? "1" : "0") +
-           " dropTables=" + std::string(flags.ExportDropTables ? "1" : "0"));
+           " dropTables=" + std::string(flags.ExportDropTables ? "1" : "0") +
+           " currencyNames=" + std::string(flags.ExportCurrencyNames ? "1" : "0") +
+           " storeRuntime=" + std::string(flags.ExportStoreRuntime ? "1" : "0"));
     if (flags.ExportSkinsResolveStringTable) {
         Status("*** WARNING: EXPORT_SKINS_RESOLVE_STRINGTABLE=1 — this build will call "
                "ProcessEvent off the worker thread. CLIENT-ONLY. Do not inject this build into "
                "the dedicated server. ***");
     }
+    if (flags.ExportCurrencyNames) {
+        Status("*** WARNING: EXPORT_CURRENCY_NAMES=1 — this build will call ProcessEvent off the "
+               "worker thread. CLIENT-ONLY. Do not inject this build into the dedicated server. ***");
+    }
     Status("waiting for GObjects + catalog...");
     std::wstring outDir = ResolveOutDir();
 
-    
+    // Wait up to ~120s for the catalog to be loaded (game must reach the menu/world).
     UArchonCatalog* cat = nullptr;
     for (int tries = 0; tries < 240; ++tries) {
         if (UObject::GObjects && UObject::GObjects->Num() > 0) {
@@ -711,7 +737,7 @@ static DWORD WINAPI ExporterThread(LPVOID) {
     }
     if (!cat) { Status("TIMEOUT: catalog never appeared. Reach the main menu/Ramsgate, then re-inject."); return 0; }
 
-    int gen = 0, eq = 0, weaponSlots = 0, progRows = 0, combatRows = 0, skinsRows = 0, slayersRows = 0, huntRows = 0, tableInventoryRows = 0, dropTableRows = 0;
+    int gen = 0, eq = 0, weaponSlots = 0, progRows = 0, combatRows = 0, skinsRows = 0, slayersRows = 0, huntRows = 0, tableInventoryRows = 0, dropTableRows = 0, currencyRows = 0, storeRuntimeRows = 0;
 
     if (flags.ExportCatalog) {
         gen = DumpGeneralCatalog(outDir);
@@ -730,9 +756,9 @@ static DWORD WINAPI ExporterThread(LPVOID) {
         Status("EXPORT_WEAPON_SLOTS=0, skipping live weapon-slot export");
     }
 
-    
-    
-    
+    // Omnicell investigation (2026-07-21): dumps live GetCellSlots()/GetPermanentCells()/
+    // GetAllPermanentCellEffects() for every owned weapon/armour/lantern. Independent flag from
+    // EXPORT_WEAPON_SLOTS since you may want just this without the part-slot dumps.
     if (flags.ExportCells) {
         DumpLiveCellSlots(outDir);
     } else {
@@ -757,10 +783,10 @@ static DWORD WINAPI ExporterThread(LPVOID) {
         Status("EXPORT_SKINS=0, skipping weapon skins export");
     }
 
-    
-    
-    
-    
+    // Slayer's Path (Player Journey Map) node definitions — costs (CurrencyCosts /
+    // ExperienceCosts), grants (Rewards -> ItemId) and graph edges (ChildNodes). This is the
+    // data the metagame needs to implement an atomic unlock transaction; the served
+    // slayers_path.json carries node ids only.
     if (flags.ExportSlayersPath) {
         slayersRows = RunSlayersPathExport();
     } else {
@@ -773,30 +799,47 @@ static DWORD WINAPI ExporterThread(LPVOID) {
         Status("EXPORT_HUNTS=0, skipping live hunt table export");
     }
 
-    
-    
-    
+    // Lady Luck's Store / Core Breaker investigation (2026-07-24): weighted PlayFabDropTableTableData
+    // rows (DT_Cell_Cores etc.) — real item-id/weight/amount triples for the container-contents result
+    // tables containerResultTableContents pointed at but could not resolve on its own.
     if (flags.ExportDropTables) {
         dropTableRows = RunDropTableExport();
     } else {
         Status("EXPORT_DROP_TABLES=0, skipping drop-table export");
     }
 
-    
-    
+    // Reward Cache Store investigation (2026-07-26): resolves real display names for every
+    // "currency"-tagged catalog item via string-table ProcessEvent — see CurrencyExporter.cpp.
+    if (flags.ExportCurrencyNames) {
+        currencyRows = RunCurrencyExport();
+    } else {
+        Status("EXPORT_CURRENCY_NAMES=0, skipping currency name resolution");
+    }
+
+    // Reward Cache repro capture: live client-authored store categories/tags, parsed offers and
+    // StoreItemsTable image rows. Pure read-only GObjects/SDK-layout access; no ProcessEvent.
+    if (flags.ExportStoreRuntime) {
+        storeRuntimeRows = RunStoreRuntimeExport();
+    } else {
+        Status("EXPORT_STORE_RUNTIME=0, skipping store runtime capture");
+    }
+
+    // Runs last: the census is a discovery aid for the NEXT injection, so it should not delay the
+    // targeted exports above if something faults.
     if (flags.ExportTableInventory) {
         tableInventoryRows = RunTableInventoryExport();
     } else {
         Status("EXPORT_TABLE_INVENTORY=0, skipping DataTable census");
     }
 
-    WriteManifest(outDir, flags, gen, eq, weaponSlots, progRows, combatRows, skinsRows, slayersRows, huntRows, tableInventoryRows);
+    WriteManifest(outDir, flags, gen, eq, weaponSlots, progRows, combatRows, skinsRows, slayersRows, huntRows, tableInventoryRows, storeRuntimeRows);
 
     Status("ALL DONE general=" + std::to_string(gen) + " equipment=" + std::to_string(eq) +
            " progression=" + std::to_string(progRows) + " combat=" + std::to_string(combatRows) +
            " skins=" + std::to_string(skinsRows) + " slayers=" + std::to_string(slayersRows) +
            " hunts=" + std::to_string(huntRows) + " tables=" + std::to_string(tableInventoryRows) +
-           " dropTables=" + std::to_string(dropTableRows));
+           " dropTables=" + std::to_string(dropTableRows) + " currencyNames=" + std::to_string(currencyRows) +
+           " storeRuntime=" + std::to_string(storeRuntimeRows));
     MessageBeep(MB_OK);
     return 0;
 }
