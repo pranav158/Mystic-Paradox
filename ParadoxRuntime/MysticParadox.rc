@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDR_MP_LOGIN_BACKGROUND RCDATA "assets\\mp_login_background.png"

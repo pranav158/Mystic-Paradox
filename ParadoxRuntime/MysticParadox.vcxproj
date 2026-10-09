@@ -23,7 +23,6 @@
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{50a2ca7e-947b-4a94-ae68-49b664cdc6fc}</ProjectGuid>
     <RootNamespace>ParadoxRuntime</RootNamespace>
-    <TargetName>MysticParadox</TargetName>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -71,6 +70,9 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <TargetName>MysticParadox</TargetName>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -112,6 +114,8 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpplatest</LanguageStandard>
+      <!-- Static CRT: see the Release|x64 note. -->
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -130,6 +134,13 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpplatest</LanguageStandard>
+      <!-- Static CRT (/MT). With the default /MD this DLL imports MSVCP140.dll, and the game folder
+           ships 14.24, which the loader picks over System32; code built with the v145 toolset (14.40+
+           ABI, e.g. constexpr std::mutex) is not supported against that older runtime. /MT removes the
+           dependency. (The 0xC0000005 on every client exit, 9 Oct 2026, was this DLL logging after its
+           CRT shut down: see g_MpProcessDetaching in dllmain.cpp.) All malloc/free pairs in this DLL
+           stay inside it; engine memory goes through FMemory. -->
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -141,15 +152,31 @@
     <ClInclude Include="constants.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="Networking.h" />
+    <ClInclude Include="P2PHooks.h" />
+    <ClInclude Include="RuntimeShared.h" />
+    <ClInclude Include="resource.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="MysticParadox.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="assets\mp_login_background.png" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="..\tools\CatalogExporter\StoreRuntimeExporter.cpp">
+      <ObjectFileName>$(IntDir)StoreRuntimeExporter.obj</ObjectFileName>
+    </ClCompile>
     <ClCompile Include="MinHook\buffer.c" />
     <ClCompile Include="MinHook\hde\hde32.c" />
     <ClCompile Include="MinHook\hde\hde64.c" />
     <ClCompile Include="MinHook\hook.c" />
     <ClCompile Include="MinHook\trampoline.c" />
     <ClCompile Include="Networking.cpp" />
+    <!-- Optional player-hosted mode (P2PHooks.h): its sources when present, otherwise the dedicated-only stub. -->
+    <ClCompile Include="P2PHooksStub.cpp" Condition="!Exists('p2p\PlayerHost.cpp')" />
+    <ClCompile Include="p2p\PlayerHost.cpp" Condition="Exists('p2p\PlayerHost.cpp')" />
+    <ClCompile Include="p2p\HuntGuard.cpp" Condition="Exists('p2p\HuntGuard.cpp')" />
     <ClCompile Include="SDK\Archon_functions.cpp" />
     <ClCompile Include="SDK\Basic.cpp" />
     <ClCompile Include="SDK\BPGM_Archon_Prototype_functions.cpp" />
