@@ -1,12 +1,10 @@
 [package]
 name = "launcher"
 default-run = "launcher"
-version = "0.1.16"
+version = "0.1.50"
 description = "Mystic Paradox launcher — sign in, verify your install, and play Dauntless"
 authors = ["Mystic Paradox (pranav158)"]
 edition = "2021"
-license = "AGPL-3.0-only"
-repository = "https://github.com/pranav158/Mystic-Paradox"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -17,6 +15,14 @@ repository = "https://github.com/pranav158/Mystic-Paradox"
 name = "launcher_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# P2P player-hosted hunts: the Steam transport, host/join sessions and the P2P
+# control loop. Off by default, so the default build is the dedicated-only launcher (Ramsgate,
+# Training and dedicated hunts) that never loads Steam. Build the P2P launcher with `--features p2p`
+# (`scripts/build-launcher-release.ps1 -P2P`). The public repo gets none of this (scripts/public-export).
+default = []
+p2p = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -25,6 +31,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+time = { version = "0.3.53", features = ["parsing"] }
 tauri-plugin-deep-link = "2.4.9"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-single-instance = "2.4.2"
@@ -34,9 +41,11 @@ url = "2.5.8"
 sha2 = "0.11.0"
 base64 = "0.22"
 ed25519-dalek = "2"
+zeroize = "1.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+tokio = { version = "1", features = ["sync"] }
 dunce = "1.0.5"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_Power", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging", "Wdk_System_Threading"] }
 tauri-plugin-process = "2"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]

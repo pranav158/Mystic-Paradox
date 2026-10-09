@@ -1,25 +1,52 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 use url::Url;
 
 use crate::auth::secure_store;
+use crate::auth::session_epoch;
+
+/// Revoke all launcher-owned P2P state whenever the local account identity changes.
+/// Guard sessions and protected game/host processes are account-bound; retaining either across
+/// logout or account switch could let a later heartbeat or presence tick submit the old session
+/// with a new bearer token. The Job Object is the hard boundary for any process that does not
+/// stop cleanly.
+fn revoke_local_guard_state() {
+    #[cfg(feature = "p2p")]
+    crate::p2p::stop_all_sessions();
+    let _ = crate::launch::supervisor::terminate_all(0xE304);
+    crate::launch::guard_loop::clear();
+}
+
+// Refresh tokens are single-use and rotated by the backend. Several launcher services begin
+// together after startup (session restore, policy, and P2P presence), so two concurrent refreshes
+// could previously submit the same token. The backend correctly treats that as token reuse and
+// revokes the entire session family, which looked like the launcher signed itself out every time.
+// Serialize the complete load -> rotate -> save operation so each caller observes the latest token.
+static REFRESH_SESSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) fn api_base_url() -> &'static str {
     if cfg!(debug_assertions) {
-        option_env!("MYSTPAX_API_BASE_URL").unwrap_or("http://127.0.0.1:3000")
+        option_env!("MYSTICPARADOX_API_BASE_URL").unwrap_or("http://127.0.0.1:3000")
     } else {
-        option_env!("MYSTPAX_API_BASE_URL").unwrap_or("https://paradox.mysticfox.dev")
+        option_env!("MYSTICPARADOX_API_BASE_URL").unwrap_or("https://paradox.mysticfox.dev")
     }
 }
 
 pub(crate) fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(10))
         .build()
-        .map_err(|_| "Couldn't prepare the secure launcher connection.".to_string())
+        .map_err(|_| "Couldn't prepare the secure launcher connection.".to_string())?;
+    let _ = CLIENT.set(client.clone());
+    Ok(CLIENT.get().cloned().unwrap_or(client))
 }
 
 async fn run_auth_task<T, F>(operation: F) -> Result<T, String>
@@ -71,6 +98,27 @@ pub(crate) fn safe_api_error(response: reqwest::blocking::Response, fallback: &s
         }
         Some("GAME_BUILD_UNSUPPORTED") => {
             "This Dauntless installation is not approved. Verify or repair it.".to_string()
+        }
+        Some("GUARD_REPORT_INVALID") => {
+            "Launcher Guard rejected an invalid heartbeat report.".to_string()
+        }
+        Some("GUARD_SESSION_INVALID") => {
+            "Launcher Guard rejected an expired or mismatched session.".to_string()
+        }
+        Some("GUARD_SIGNATURE_INVALID") => {
+            "Launcher Guard rejected the heartbeat signature.".to_string()
+        }
+        Some("GUARD_MANIFEST_UNAVAILABLE") => {
+            "No current signed Launcher Guard manifest is available.".to_string()
+        }
+        Some("GUARD_MANIFEST_MISMATCH") => {
+            "Launcher Guard rejected a manifest or runtime binding mismatch.".to_string()
+        }
+        Some("GUARD_SEQUENCE_CONFLICT") => {
+            "Launcher Guard rejected a superseded heartbeat sequence.".to_string()
+        }
+        Some("GUARD_REQUIRED") | Some("HOST_GUARD_UNVERIFIED") => {
+            "The backend did not verify the required Launcher Guard session.".to_string()
         }
         _ => format!("{fallback} (server status {})", status.as_u16()),
     }
@@ -148,9 +196,125 @@ struct PendingRegistration {
     account: NativeAccount,
 }
 
+// Access tokens are short-lived JWTs (12 minutes on the backend). Routine UI calls reuse the
+// current one instead of rotating the refresh token: every rotation is a window in which a lost
+// response leaves the stored token already revoked, and the backend then revokes the whole family
+// on its next use. The cache is bound to the account epoch, so login/logout/forget drop it.
+struct CachedAccess {
+    epoch: u64,
+    access_token: String,
+    reuse_until: Instant,
+}
+
+static ACCESS_CACHE: Mutex<Option<CachedAccess>> = Mutex::new(None);
+
+// Stop reusing a token this long before it expires, so a request never races its expiry.
+const ACCESS_TOKEN_REUSE_MARGIN: Duration = Duration::from_secs(90);
+// Never trust a lifetime longer than this, whatever the token claims.
+const ACCESS_TOKEN_MAX_REUSE: Duration = Duration::from_secs(15 * 60);
+
+fn access_cache() -> std::sync::MutexGuard<'static, Option<CachedAccess>> {
+    ACCESS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Lifetime from the JWT's own `iat`/`exp`, both server times, so a skewed local clock cannot
+/// stretch reuse. The signature is the backend's to check; this only decides when to refresh.
+fn access_token_lifetime(access_token: &str) -> Option<Duration> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let payload = access_token.split('.').nth(1)?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+    let issued = claims.get("iat")?.as_u64()?;
+    let expires = claims.get("exp")?.as_u64()?;
+    let lifetime = Duration::from_secs(expires.checked_sub(issued)?);
+    Some(lifetime.min(ACCESS_TOKEN_MAX_REUSE))
+}
+
+fn cache_access(epoch: u64, session: &NativeSession) {
+    let Some(lifetime) = access_token_lifetime(&session.access_token) else {
+        *access_cache() = None;
+        return;
+    };
+    let Some(usable) = lifetime.checked_sub(ACCESS_TOKEN_REUSE_MARGIN) else {
+        *access_cache() = None;
+        return;
+    };
+    *access_cache() = Some(CachedAccess {
+        epoch,
+        access_token: session.access_token.clone(),
+        reuse_until: Instant::now() + usable,
+    });
+}
+
+fn cached_access() -> Option<String> {
+    let epoch = session_epoch::current();
+    let cache = access_cache();
+    cache
+        .as_ref()
+        .filter(|entry| entry.epoch == epoch && Instant::now() < entry.reuse_until)
+        .map(|entry| entry.access_token.clone())
+}
+
+pub(crate) fn invalidate_access_token() {
+    *access_cache() = None;
+}
+
+/// A usable access token: the cached one while it has life left, otherwise one refresh.
+/// Play still calls `refresh_native_session` directly so every launch re-checks admission.
+pub(crate) fn current_access_token(app: &AppHandle) -> Result<String, String> {
+    if let Some(token) = cached_access() {
+        return Ok(token);
+    }
+    let _refresh_guard = lock_refresh();
+    // Another caller may have refreshed while this one waited for the lock.
+    if let Some(token) = cached_access() {
+        return Ok(token);
+    }
+    refresh_locked(app).map(|session| session.access_token)
+}
+
+/// Sends an authenticated request with the current access token. On 401/403 the token is
+/// dropped and the session refreshed once: the refresh path owns sign-out for expired,
+/// unapproved, disabled and banned accounts, exactly as when every call refreshed.
+pub(crate) fn send_authorized<F>(
+    app: &AppHandle,
+    send: F,
+) -> Result<reqwest::blocking::Response, String>
+where
+    F: Fn(&str) -> Result<reqwest::blocking::Response, String>,
+{
+    let token = current_access_token(app)?;
+    let response = send(&token)?;
+    if !matches!(response.status().as_u16(), 401 | 403) {
+        return Ok(response);
+    }
+    invalidate_access_token();
+    let session = refresh_native_session(app)?;
+    send(&session.access_token)
+}
+
+fn lock_refresh() -> std::sync::MutexGuard<'static, ()> {
+    REFRESH_SESSION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) fn refresh_native_session(app: &AppHandle) -> Result<NativeSession, String> {
-    let token = secure_store::load(app)?
-        .ok_or_else(|| "Your session expired. Sign in again.".to_string())?;
+    let _refresh_guard = lock_refresh();
+    refresh_locked(app)
+}
+
+/// Rotates the refresh token. The caller holds `REFRESH_SESSION_LOCK`.
+fn refresh_locked(app: &AppHandle) -> Result<NativeSession, String> {
+    let (epoch, token) = {
+        let epoch = session_epoch::lock();
+        let token = secure_store::load(app)?
+            .ok_or_else(|| "Your session expired. Sign in again.".to_string())?;
+        (*epoch, token)
+    };
     let response = http_client()?
         .post(format!("{}/launcher/v1/auth/refresh", api_base_url()))
         .json(&RefreshRequest {
@@ -160,9 +324,29 @@ pub(crate) fn refresh_native_session(app: &AppHandle) -> Result<NativeSession, S
         })
         .send()
         .map_err(|_| "Couldn't reach the Mystic Paradox account server.".to_string())?;
-    let session: NativeSession =
-        parse_success(response, "Couldn't restore your launcher session.")?;
+    let parsed =
+        parse_success::<NativeSession>(response, "Couldn't restore your launcher session.");
+    let mut current_epoch = session_epoch::lock();
+    session_epoch::check(epoch, *current_epoch)?;
+    let session = match parsed {
+        Ok(session) => session,
+        Err(error) => {
+            invalidate_access_token();
+            if error.contains("expired")
+                || error.contains("approval")
+                || error.contains("approved")
+                || error.contains("disabled")
+                || error.contains("banned")
+            {
+                *current_epoch += 1;
+                let _ = secure_store::clear(app);
+                revoke_local_guard_state();
+            }
+            return Err(error);
+        }
+    };
     secure_store::save(app, &session.refresh_token)?;
+    cache_access(*current_epoch, &session);
     Ok(session)
 }
 
@@ -172,20 +356,26 @@ pub async fn native_restore_session(app: AppHandle) -> Result<Option<NativeAccou
         if secure_store::load(&app)?.is_none() {
             return Ok(None);
         }
-        match refresh_native_session(&app) {
-            Ok(session) => Ok(Some(session.account)),
-            Err(error) => {
-                if error.contains("expired")
-                    || error.contains("approval")
-                    || error.contains("approved")
-                    || error.contains("disabled")
-                    || error.contains("banned")
-                {
-                    let _ = secure_store::clear(&app);
-                }
-                Err(error)
-            }
-        }
+        refresh_native_session(&app).map(|session| Some(session.account))
+    })
+    .await
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeServerStatus {
+    pub online: bool,
+    pub supported_build_changelist: u32,
+}
+
+#[tauri::command]
+pub async fn native_get_server_status() -> Result<NativeServerStatus, String> {
+    run_auth_task(|| {
+        let response = http_client()?
+            .get(format!("{}/launcher/v1/status", api_base_url()))
+            .send()
+            .map_err(|_| "Can't reach the Mystic Paradox service right now.".to_string())?;
+        parse_success(response, "Couldn't check Mystic Paradox service health.")
     })
     .await
 }
@@ -196,6 +386,7 @@ pub async fn native_login(
     email: String,
     password: String,
 ) -> Result<NativeAccount, String> {
+    let expected_epoch = session_epoch::current();
     run_auth_task(move || {
         let response = http_client()?
             .post(format!("{}/launcher/v1/auth/login", api_base_url()))
@@ -208,7 +399,12 @@ pub async fn native_login(
             .send()
             .map_err(|_| "Can't reach the Mystic Paradox server right now.".to_string())?;
         let session: NativeSession = parse_success(response, "Sign-in failed.")?;
+        let mut epoch = session_epoch::lock();
+        session_epoch::check(expected_epoch, *epoch)?;
+        *epoch += 1;
+        revoke_local_guard_state();
         secure_store::save(&app, &session.refresh_token)?;
+        cache_access(*epoch, &session);
         Ok(session.account)
     })
     .await
@@ -221,6 +417,7 @@ pub async fn native_register(
     email: String,
     password: String,
 ) -> Result<NativeAccount, String> {
+    let expected_epoch = session_epoch::current();
     run_auth_task(move || {
         let response = http_client()?
             .post(format!("{}/launcher/v1/auth/register", api_base_url()))
@@ -234,7 +431,11 @@ pub async fn native_register(
             .send()
             .map_err(|_| "Can't reach the Mystic Paradox server right now.".to_string())?;
         let pending: PendingRegistration = parse_success(response, "Registration failed.")?;
+        let mut epoch = session_epoch::lock();
+        session_epoch::check(expected_epoch, *epoch)?;
+        *epoch += 1;
         let _ = secure_store::clear(&app);
+        revoke_local_guard_state();
         Ok(pending.account)
     })
     .await
@@ -245,6 +446,7 @@ pub async fn native_discord_complete(
     app: AppHandle,
     code: String,
 ) -> Result<NativeAccount, String> {
+    let expected_epoch = session_epoch::current();
     run_auth_task(move || {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -266,7 +468,12 @@ pub async fn native_discord_complete(
             .send()
             .map_err(|_| "Couldn't complete Discord sign-in.".to_string())?;
         let session: NativeSession = parse_success(response, "Discord sign-in failed.")?;
+        let mut epoch = session_epoch::lock();
+        session_epoch::check(expected_epoch, *epoch)?;
+        *epoch += 1;
+        revoke_local_guard_state();
         secure_store::save(&app, &session.refresh_token)?;
+        cache_access(*epoch, &session);
         Ok(session.account)
     })
     .await
@@ -312,16 +519,20 @@ pub async fn native_set_username(
         struct UsernameRequest<'a> {
             username: &'a str,
         }
-        let session = refresh_native_session(&app)?;
-        let response = http_client()?
-            .post(format!("{}/launcher/v1/username", api_base_url()))
-            .bearer_auth(&session.access_token)
-            .json(&UsernameRequest {
-                username: &username,
-            })
-            .send()
-            .map_err(|_| "Couldn't set your username.".to_string())?;
-        parse_success(response, "Couldn't set your username.")
+        let response = send_authorized(&app, |token| {
+            http_client()?
+                .post(format!("{}/launcher/v1/username", api_base_url()))
+                .bearer_auth(token)
+                .json(&UsernameRequest {
+                    username: &username,
+                })
+                .send()
+                .map_err(|_| "Couldn't set your username.".to_string())
+        })?;
+        let account: NativeAccount = parse_success(response, "Couldn't set your username.")?;
+        // The cached token still carries the pre-username account view.
+        invalidate_access_token();
+        Ok(account)
     })
     .await
 }
@@ -340,6 +551,9 @@ pub struct NativePolicy {
     pub channel: String,
     pub managed_feature_ids: Vec<String>,
     pub log_upload: NativeLogUpload,
+    pub guard_enforcement: String,
+    pub diagnostics_profile: String,
+    pub p2p_emergency_stop: bool,
 }
 
 // Shared by native_get_policy (badge/channel, exposed to JS) and secure_launch's flag
@@ -354,22 +568,61 @@ pub(crate) fn fetch_policy(access_token: &str) -> Result<NativePolicy, String> {
     parse_success(response, "Couldn't refresh your account policy.")
 }
 
+/// `fetch_policy` with the cached access token, for callers that do not already hold one.
+pub(crate) fn fetch_policy_cached(app: &AppHandle) -> Result<NativePolicy, String> {
+    let response = send_authorized(app, |token| {
+        http_client()?
+            .get(format!("{}/launcher/v1/policy", api_base_url()))
+            .bearer_auth(token)
+            .send()
+            .map_err(|_| "Can't reach the Mystic Paradox server right now.".to_string())
+    })?;
+    parse_success(response, "Couldn't refresh your account policy.")
+}
+
 // Called after login, after session restore, and immediately before Play — the runtime
 // caches several flags for the process lifetime, so this must run before spawn_game(),
-// not just periodically in the background.
+// not just periodically in the background. secure_launch re-fetches it with a fresh session.
 #[tauri::command]
 pub async fn native_get_policy(app: AppHandle) -> Result<NativePolicy, String> {
+    run_auth_task(move || fetch_policy_cached(&app)).await
+}
+
+/// The periodic account-status check. It reads `/launcher/v1/me` with the cached access token
+/// instead of rotating the refresh token every two minutes; the backend still re-checks the
+/// session family and account admission on every request.
+#[tauri::command]
+pub async fn native_refresh_account(app: AppHandle) -> Result<NativeAccount, String> {
     run_auth_task(move || {
-        let session = refresh_native_session(&app)?;
-        fetch_policy(&session.access_token)
+        let response = send_authorized(&app, |token| {
+            http_client()?
+                .get(format!("{}/launcher/v1/me", api_base_url()))
+                .bearer_auth(token)
+                .send()
+                .map_err(|_| "Couldn't reach the Mystic Paradox account server.".to_string())
+        })?;
+        parse_success(response, "Couldn't refresh your account status.")
     })
     .await
 }
 
 #[tauri::command]
-pub fn native_logout(app: AppHandle) -> Result<(), String> {
-    let refresh_token = secure_store::load(&app)?;
+pub async fn native_logout(app: AppHandle) -> Result<(), String> {
+    run_auth_task(move || logout_local_session(app)).await
+}
+
+fn logout_local_session(app: AppHandle) -> Result<(), String> {
+    let mut epoch = session_epoch::lock();
+    *epoch += 1;
+    invalidate_access_token();
+    // Revoke local Guard state before propagating any secure-store error. If the
+    // credential store is temporarily unavailable, a protected game/host must
+    // still be stopped and its account-bound sessions invalidated immediately.
+    let refresh_token = secure_store::load(&app);
+    revoke_local_guard_state();
+    let refresh_token = refresh_token?;
     secure_store::clear(&app)?;
+    drop(epoch);
 
     // Local sign-out must never wait for an offline server. If a token existed,
     // rotate it and revoke the resulting session family in the background.
@@ -403,6 +656,16 @@ pub fn native_logout(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn native_forget_session(app: AppHandle) -> Result<(), String> {
-    secure_store::clear(&app)
+pub async fn native_forget_session(app: AppHandle) -> Result<(), String> {
+    run_auth_task(move || {
+        let mut epoch = session_epoch::lock();
+        *epoch += 1;
+        invalidate_access_token();
+        // Wait for process registration on a blocking worker, never on the UI thread.
+        // Revoke protected processes even if the credential store is unavailable.
+        let clear_result = secure_store::clear(&app);
+        revoke_local_guard_state();
+        clear_result
+    })
+    .await
 }

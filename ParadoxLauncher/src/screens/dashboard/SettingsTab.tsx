@@ -1,19 +1,43 @@
-import { useCallback, useEffect, useState } from "react";
-import { SettingsIcon } from "../../components/icons";
-import { Button } from "../../components/Button";
+import { useCallback, useEffect, useState, type ComponentType, type CSSProperties } from "react";
 import { usePolicy } from "../../policy/PolicyContext";
 import { getLogPaths, openLogFolder, uploadLastSession } from "../../api/tauri";
 import { sanitizeError } from "../../lib/sanitize";
+import { setUiPrefs, useUiPrefs, type SidebarMode, type UiScale } from "../../lib/prefs";
 import type { LogPaths } from "../../api/types";
+import { CopyIcon, FolderIcon, SidebarIcon, SparkIcon, UploadIcon, ZoomIcon } from "../../components/icons";
+import { ArtBackdrop } from "../../components/ArtBackdrop";
 
 type UploadState = { status: "idle" } | { status: "uploading" } | { status: "done"; count: number } | { status: "error"; message: string };
+type Feedback = { kind: "ok" | "bad"; message: string };
+
+const UI_SIZES: { id: UiScale; label: string }[] = [
+  { id: 0.85, label: "Small" },
+  { id: 0.92, label: "Medium" },
+  { id: 1, label: "Large" },
+];
+
+const SIDEBAR_MODES: { id: SidebarMode; label: string }[] = [
+  { id: "auto", label: "Auto" },
+  { id: "expanded", label: "Expanded" },
+  { id: "compact", label: "Compact" },
+];
+
+function at(index: number): CSSProperties {
+  return { "--i": index } as CSSProperties;
+}
+
+// Extra cards of an optional launcher module (src/p2p/*Card.tsx, absent from the dedicated-only build).
+const OPTIONAL_CARDS = Object.values(
+  import.meta.glob<{ default: ComponentType<{ style: CSSProperties }> }>("../../p2p/*Card.tsx", { eager: true }),
+).map((module) => module.default);
 
 export function SettingsTab() {
   const { policy } = usePolicy();
+  const prefs = useUiPrefs();
   const isTester = policy?.roles.includes("tester") ?? false;
   const [paths, setPaths] = useState<LogPaths | null>(null);
   const [pathsError, setPathsError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [actionFeedback, setActionFeedback] = useState<Feedback | null>(null);
   const [upload, setUpload] = useState<UploadState>({ status: "idle" });
 
   const refreshPaths = useCallback(async () => {
@@ -29,16 +53,23 @@ export function SettingsTab() {
     void refreshPaths();
   }, [refreshPaths]);
 
-  const handleCopyPath = useCallback(() => {
+  const handleCopyPath = useCallback(async () => {
     if (!paths) return;
-    void navigator.clipboard.writeText(paths.sessionsRoot).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
+    try {
+      await navigator.clipboard.writeText(paths.sessionsRoot);
+      setActionFeedback({ kind: "ok", message: "Log folder path copied to the clipboard." });
+    } catch {
+      setActionFeedback({ kind: "bad", message: "Couldn't copy the log folder path." });
+    }
   }, [paths]);
 
-  const handleOpenFolder = useCallback(() => {
-    void openLogFolder().catch(() => {});
+  const handleOpenFolder = useCallback(async () => {
+    try {
+      await openLogFolder();
+      setActionFeedback({ kind: "ok", message: "Opened the session log folder." });
+    } catch (err) {
+      setActionFeedback({ kind: "bad", message: sanitizeError(err instanceof Error ? err.message : String(err)) });
+    }
   }, []);
 
   const handleUpload = useCallback(async () => {
@@ -52,71 +83,137 @@ export function SettingsTab() {
     }
   }, [refreshPaths]);
 
+  const sidebarIndex = SIDEBAR_MODES.findIndex((mode) => mode.id === prefs.sidebar);
+  const sizeIndex = UI_SIZES.findIndex((size) => size.id === prefs.scale);
+  const logsIndex = 2 + OPTIONAL_CARDS.length;
+
   return (
-    <div className="max-w-lg px-8 py-7">
-      <h1 className="text-xl font-semibold tracking-tight text-text">Settings</h1>
-      <p className="mt-1 text-[13px] text-text-muted">Tune the launcher to your liking.</p>
+    <div className="subpage">
+      <ArtBackdrop motes={false} depth={6} />
+      <div className="subpage-inner">
+        <header className="page-head reveal" style={at(0)}>
+          <p className="eyebrow">Launcher preferences</p>
+          <h1 className="page-title">Settings</h1>
+          <p className="page-desc">Layout, motion and diagnostics.</p>
+        </header>
 
-      <section className="mt-7 overflow-hidden rounded-2xl border border-border bg-surface">
-        <div className="flex items-center gap-3 border-b border-border px-6 py-4">
-          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-surface-raised text-text-faint">
-            <SettingsIcon className="h-4 w-4" />
-          </div>
-          <div className="min-w-0">
-            <p className="text-[13px] font-medium text-text">Diagnostics &amp; logs</p>
-            <p className="mt-0.5 text-xs text-text-muted">Each Play attempt writes its own session folder.</p>
-          </div>
-        </div>
-
-        <div className="px-6 py-4">
-          {pathsError ? (
-            <p className="text-[13px] text-danger">{pathsError}</p>
-          ) : (
-            <>
-              <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-text-faint">Log folder</p>
-              <p className="mt-1 truncate font-mono text-[11px] text-text-muted" title={paths?.sessionsRoot}>
-                {paths?.sessionsRoot ?? "Loading…"}
-              </p>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <Button variant="secondary" className="w-auto px-4" onClick={handleCopyPath} disabled={!paths}>
-                  {copied ? "Copied" : "Copy path"}
-                </Button>
-                <Button variant="secondary" className="w-auto px-4" onClick={handleOpenFolder} disabled={!paths}>
-                  Open folder
-                </Button>
+        <section className="glass card reveal" style={at(1)} aria-label="Interface">
+          <div className="section">
+            <div className="section-row">
+              <div className="section-head">
+                <div className="section-icon"><ZoomIcon /></div>
+                <div>
+                  <h2 className="section-title">Interface size</h2>
+                  <p className="section-desc">Scales text and controls. Small matches the classic launcher density.</p>
+                </div>
               </div>
-            </>
-          )}
-        </div>
+              <div className="segmented" style={{ "--count": UI_SIZES.length, "--index": Math.max(sizeIndex, 0) } as CSSProperties} role="group" aria-label="Interface size">
+                <span className="segmented-thumb" aria-hidden="true" />
+                {UI_SIZES.map((size) => (
+                  <button key={size.id} type="button" aria-pressed={prefs.scale === size.id} onClick={() => setUiPrefs({ scale: size.id })}>
+                    {size.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className="section">
+            <div className="section-row">
+              <div className="section-head">
+                <div className="section-icon"><SidebarIcon /></div>
+                <div>
+                  <h2 className="section-title">Sidebar layout</h2>
+                  <p className="section-desc">Auto switches to icons only when the window is narrow.</p>
+                </div>
+              </div>
+              <div className="segmented" style={{ "--count": SIDEBAR_MODES.length, "--index": Math.max(sidebarIndex, 0) } as CSSProperties} role="group" aria-label="Sidebar layout">
+                <span className="segmented-thumb" aria-hidden="true" />
+                {SIDEBAR_MODES.map((mode) => (
+                  <button key={mode.id} type="button" aria-pressed={prefs.sidebar === mode.id} onClick={() => setUiPrefs({ sidebar: mode.id })}>
+                    {mode.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className="section">
+            <div className="section-row">
+              <div className="section-head">
+                <div className="section-icon"><SparkIcon /></div>
+                <div>
+                  <h2 className="section-title">Reduce motion</h2>
+                  <p className="section-desc">Turns off drifting art, glows and page animations. Windows' own reduce-motion setting is always respected.</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                className="switch"
+                aria-checked={prefs.motion === "reduced"}
+                aria-label="Reduce motion"
+                onClick={() => setUiPrefs({ motion: prefs.motion === "reduced" ? "full" : "reduced" })}
+              />
+            </div>
+          </div>
+        </section>
 
-        <div className="border-t border-border px-6 py-4">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-text-faint">Last session</p>
-          <p className="mt-1 text-[13px] text-text-muted">
-            {paths?.latestSessionDir ? "A recorded Play attempt is available to upload." : "No Play attempts recorded yet."}
-          </p>
+        {OPTIONAL_CARDS.map((Card, index) => <Card key={index} style={at(2 + index)} />)}
 
-          {isTester ? (
-            <>
-              <Button
-                variant="secondary"
-                className="mt-3 w-auto px-4"
-                onClick={() => void handleUpload()}
-                disabled={upload.status === "uploading" || !paths?.latestSessionDir}
-              >
-                {upload.status === "uploading" ? "Uploading…" : "Upload last session"}
-              </Button>
-              {upload.status === "done" && (
-                <p className="mt-2 text-[13px] text-online">
-                  Uploaded {upload.count} file{upload.count === 1 ? "" : "s"}.
-                </p>
+        <section className="glass card reveal" style={at(logsIndex)} aria-label="Diagnostics and logs">
+          <div className="section">
+            <div className="section-row">
+              <div className="section-head">
+                <div className="section-icon"><FolderIcon /></div>
+                <div className="min-w-0">
+                  <h2 className="section-title">Session logs</h2>
+                  {pathsError
+                    ? <p className="section-desc status-bad" role="alert">{pathsError}</p>
+                    : <p className="section-desc mono truncate" title={paths?.sessionsRoot}>{paths?.sessionsRoot ?? "Loading…"}</p>}
+                </div>
+              </div>
+              <div className="section-actions">
+                <button type="button" className="btn btn-secondary" onClick={() => void handleCopyPath()} disabled={!paths}>
+                  <CopyIcon />Copy path
+                </button>
+                <button type="button" className="btn btn-secondary" onClick={() => void handleOpenFolder()} disabled={!paths}>
+                  <FolderIcon />Open folder
+                </button>
+              </div>
+            </div>
+            {actionFeedback && (
+              <p className={`feedback ${actionFeedback.kind}`} role={actionFeedback.kind === "bad" ? "alert" : "status"}>{actionFeedback.message}</p>
+            )}
+          </div>
+          <div className="section">
+            <div className="section-row">
+              <div className="section-head">
+                <div className="section-icon"><UploadIcon /></div>
+                <div>
+                  <h2 className="section-title">Last session</h2>
+                  <p className="section-desc">
+                    {paths?.latestSessionDir ? "A recorded Play attempt is ready to send to the team." : "No Play attempts recorded yet."}
+                  </p>
+                  {upload.status === "done" && <p className="feedback ok">Uploaded {upload.count} file{upload.count === 1 ? "" : "s"}.</p>}
+                  {upload.status === "error" && <p className="feedback bad" role="alert">{upload.message}</p>}
+                  {!isTester && <p className="note">Log upload is available to tester accounts.</p>}
+                </div>
+              </div>
+              {isTester && (
+                <div className="section-actions">
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => void handleUpload()}
+                    disabled={upload.status === "uploading" || !paths?.latestSessionDir}
+                  >
+                    {upload.status === "uploading" ? <><span className="spinner" aria-hidden="true" />Uploading…</> : <><UploadIcon />Upload last session</>}
+                  </button>
+                </div>
               )}
-              {upload.status === "error" && <p className="mt-2 text-[13px] text-danger">{upload.message}</p>}
-            </>
-          ) : (
-            <p className="mt-3 text-[13px] text-text-faint">Log upload is available to tester accounts.</p>
-          )}
-        </div>
-      </section>
+            </div>
+          </div>
+        </section>
+      </div>
     </div>
   );
 }

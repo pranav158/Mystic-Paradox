@@ -12,9 +12,11 @@ export class LauncherApiError extends Error {
   }
 }
 
-// Configurable so pointing the launcher at a real backend later is a config
-// change, not a code change. Falls back to the expected local dev port.
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:3000";
+// Configurable so pointing the launcher at another backend is a config change, not a code
+// change. Without VITE_API_BASE_URL the fallback matches Rust's api_base_url(): the local dev
+// port in development builds and the production service otherwise.
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? "http://127.0.0.1:3000" : "https://paradox.mysticfox.dev");
 
 interface ErrorBody {
   error?: {

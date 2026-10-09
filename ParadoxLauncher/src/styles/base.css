@@ -1,0 +1,217 @@
+/* Reset, typography and shared motion. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  font-synthesis: none;
+  font-feature-settings: "cv11", "ss03";
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+h1, h2, h3, h4, p, figure, dl, dd {
+  margin: 0;
+}
+
+ul, ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+}
+
+button {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+img, svg {
+  display: block;
+}
+
+input, textarea {
+  user-select: text;
+}
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--aether);
+  outline-offset: 3px;
+}
+
+::selection {
+  background: rgba(91, 163, 255, 0.35);
+}
+
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 11px;
+  background: rgba(160, 190, 230, 0.16) padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(160, 190, 230, 0.3);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-feature-settings: normal;
+}
+
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- Motion ------------------------------------------------------------ */
+
+@keyframes rise {
+  from { opacity: 0; transform: translate3d(0, 14px, 0); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes pop {
+  0% { opacity: 0; transform: scale(0.4); }
+  70% { opacity: 1; transform: scale(1.14); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes live-ring {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }
+  100% { box-shadow: 0 0 0 7px transparent; }
+}
+
+@keyframes slide-across {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(260%); }
+}
+
+/* Entry stagger: set --i on each item. */
+.reveal {
+  animation: rise var(--t-slow) var(--ease-out) both;
+  animation-delay: calc(var(--i, 0) * 70ms + 30ms);
+}
+
+/* Keyed text that changes value fades in instead of snapping. */
+.swap {
+  animation: fade-in var(--t-med) var(--ease-out) both;
+}
+
+/* Page changes: a View Transition where available, this entry animation otherwise. */
+.page-host {
+  min-height: 100%;
+  view-transition-name: page;
+}
+
+.page-enter {
+  animation: rise 380ms var(--ease-out) both;
+}
+
+::view-transition-old(page) {
+  animation: vt-out 170ms var(--ease-in-out) both;
+}
+
+::view-transition-new(page) {
+  animation: vt-in 360ms var(--ease-out) both;
+}
+
+::view-transition-group(nav-indicator) {
+  animation-duration: 440ms;
+  animation-timing-function: var(--ease-spring);
+}
+
+@keyframes vt-out {
+  to { opacity: 0; transform: translateY(-6px) scale(0.995); filter: blur(3px); }
+}
+
+@keyframes vt-in {
+  from { opacity: 0; transform: translateY(14px); filter: blur(6px); }
+}
+
+[data-motion="reduced"] *,
+[data-motion="reduced"] *::before,
+[data-motion="reduced"] *::after {
+  animation-duration: 1ms !important;
+  animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 1ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}

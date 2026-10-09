@@ -35,7 +35,7 @@ node scripts/publish-runtime-update.mjs `
   --extra ..\tools\RuntimeLoader\target\release\winmm.dll `
   --target client `
   --version 0.4.13 `
-  --changelist 392819 `
+  --changelist 647472 `
   --channel stable `
   --output D:\MysticUpdates `
   --base-url https://your-backend.example `

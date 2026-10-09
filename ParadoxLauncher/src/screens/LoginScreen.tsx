@@ -1,9 +1,10 @@
 import { useState, type FormEvent } from "react";
 import { useAuth, describeAuthError } from "../auth/AuthContext";
-import { TextField } from "../components/TextField";
+import { RevealToggle, TextField } from "../components/TextField";
 import { Button } from "../components/Button";
 import { Banner } from "../components/Banner";
-import { AetherMark } from "../components/AetherMark";
+import { AuthCard, AuthLayout } from "../components/AuthLayout";
+import { DiscordIcon } from "../components/icons";
 
 interface LoginScreenProps {
   onCreateAccount: () => void;
@@ -27,15 +28,12 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
-
     if (!email || !password) {
       setError("Enter your email and password.");
       return;
     }
-
     setError(null);
     setSubmitting(true);
-
     try {
       await login(email, password);
       // Entered credentials are intentionally left in state — a successful
@@ -50,7 +48,6 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
   async function handleDiscord() {
     setError(null);
     setDiscordSubmitting(true);
-
     try {
       await startDiscordLogin();
     } catch (err) {
@@ -60,20 +57,9 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
   }
 
   return (
-    <div className="relative flex h-full items-center justify-center overflow-hidden px-6">
-      <div className="aether-halo pointer-events-none absolute inset-0" />
-
-      <div className="relative w-full max-w-sm">
-        <div className="mb-8 flex flex-col items-center text-center">
-          <AetherMark size={40} />
-          <h1 className="mt-4 text-[26px] font-semibold tracking-tight text-text">Mystic Paradox</h1>
-          <p className="mt-1.5 text-sm text-text-muted">The Shattered Isles are waiting, Slayer.</p>
-        </div>
-
-        <form
-          onSubmit={handleSubmit}
-          className="flex flex-col gap-4 rounded-2xl border border-border bg-surface/80 p-6 shadow-[0_16px_48px_-16px] shadow-black/60 backdrop-blur-sm"
-        >
+    <AuthLayout>
+      <AuthCard title="Welcome back, Slayer" subtitle="Sign in to return to the Shattered Isles.">
+        <form onSubmit={handleSubmit} className="auth-form" noValidate>
           {displayedError && <Banner>{displayedError}</Banner>}
 
           <TextField
@@ -84,6 +70,7 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             disabled={submitting}
+            autoFocus
           />
 
           <TextField
@@ -93,46 +80,25 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             disabled={submitting}
-            rightAdornment={
-              <button
-                type="button"
-                className="rounded px-1.5 py-1 text-xs font-medium text-text-muted transition-colors duration-150 hover:text-text"
-                onClick={() => setShowPassword((v) => !v)}
-                tabIndex={-1}
-              >
-                {showPassword ? "Hide" : "Show"}
-              </button>
-            }
+            rightAdornment={<RevealToggle shown={showPassword} onToggle={() => setShowPassword((v) => !v)} />}
           />
 
-          <Button type="submit" loading={submitting} className="mt-1 w-full">
+          <Button type="submit" size="lg" block loading={submitting} loadingLabel="Signing in…">
             Sign in
           </Button>
 
-          <div className="flex items-center gap-3 text-xs text-text-faint">
-            <div className="h-px flex-1 bg-border" />
-            or
-            <div className="h-px flex-1 bg-border" />
-          </div>
+          <div className="divider">or</div>
 
-          <Button type="button" variant="secondary" className="w-full" loading={discordSubmitting} onClick={handleDiscord}>
-            Continue with Discord
+          <Button variant="discord" size="lg" block loading={discordSubmitting} loadingLabel="Opening Discord…" onClick={handleDiscord}>
+            <DiscordIcon />Continue with Discord
           </Button>
 
-          <div className="mt-1 flex items-center justify-between text-[13px]">
-            <button
-              type="button"
-              className="rounded font-medium text-accent transition-colors duration-150 hover:text-accent-hover"
-              onClick={onCreateAccount}
-            >
-              Create account
-            </button>
-            <span className="cursor-not-allowed text-text-faint" title="Not available yet">
-              Forgot password
-            </span>
-          </div>
+          <p className="auth-foot">
+            New to Mystic Paradox?
+            <button type="button" className="link" onClick={onCreateAccount}>Create an account</button>
+          </p>
         </form>
-      </div>
-    </div>
+      </AuthCard>
+    </AuthLayout>
   );
 }

@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "launcher"
-version = "0.1.16"
+version = "0.1.50"
 dependencies = [
  "base64 0.22.1",
  "dunce",
@@ -2231,8 +2231,11 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tauri-plugin-window-state",
+ "time",
+ "tokio",
  "url",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

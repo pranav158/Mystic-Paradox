@@ -3,18 +3,20 @@
   "description": "Mystic Paradox launcher — sign in, verify your install, and play Dauntless",
   "author": "Mystic Paradox (pranav158)",
   "private": true,
-  "version": "0.1.16",
+  "version": "0.1.50",
   "type": "module",
   "scripts": {
+    "test:workflow": "node --test scripts/launch-workflow.test.cjs",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "release:launcher": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-launcher-release.ps1",
-    "publish:launcher": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-launcher-update.ps1",
-    "test": "cargo test --manifest-path src-tauri/Cargo.toml"
+    "publish:launcher": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-launcher-update.ps1"
   },
   "dependencies": {
+    "@fontsource-variable/cinzel": "^5.3.0",
+    "@fontsource-variable/inter": "^5.3.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-process": "^2.3.1",
@@ -24,21 +26,12 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.3.2",
     "@tauri-apps/cli": "^2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
-    "tailwindcss": "^4.3.2",
+    "jsdom": "29.1.1",
     "typescript": "~5.8.3",
     "vite": "^7.0.4"
-  },
-  "license": "AGPL-3.0-only",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/pranav158/Mystic-Paradox.git",
-    "directory": "ParadoxLauncher"
-  },
-  "bugs": "https://github.com/pranav158/Mystic-Paradox/issues",
-  "homepage": "https://github.com/pranav158/Mystic-Paradox/tree/main/ParadoxLauncher"
+  }
 }

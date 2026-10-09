@@ -1,0 +1,548 @@
+/* App frame: custom title bar, sidebar, scrolling main area. */
+
+/* ---- Title bar (the window is frameless) -------------------------------- */
+
+.titlebar {
+  position: fixed;
+  z-index: 100;
+  top: 0;
+  right: 0;
+  left: 0;
+  display: flex;
+  justify-content: flex-end;
+  height: var(--titlebar-h);
+  pointer-events: none;
+}
+
+.titlebar-drag {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+}
+
+.window-controls {
+  position: relative;
+  display: flex;
+  border-bottom-left-radius: 12px;
+  background: linear-gradient(90deg, rgba(5, 10, 18, 0), rgba(5, 10, 18, 0.28) 30%);
+  pointer-events: auto;
+}
+
+.wc {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: var(--titlebar-h);
+  color: rgba(240, 246, 255, 0.92);
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.75));
+  transition: background-color var(--t-fast), color var(--t-fast);
+}
+
+.wc svg {
+  width: 14px;
+  height: 14px;
+}
+
+.wc:hover {
+  background: rgba(255, 255, 255, 0.09);
+  color: #fff;
+}
+
+.wc:active {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.wc-close:hover {
+  background: #d63a4f;
+}
+
+/* ---- Shell grid ------------------------------------------------------------ */
+
+.shell {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  background: var(--bg);
+  transition: grid-template-columns var(--t-slow) var(--ease-out);
+}
+
+.shell[data-compact="true"] {
+  --sidebar-w: 84px;
+}
+
+.main {
+  position: relative;
+  min-width: 0;
+  overflow: hidden auto;
+  container: main / inline-size;
+}
+
+/* ---- Sidebar ---------------------------------------------------------------- */
+
+.sidebar {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: calc(var(--titlebar-h) - 6px) 14px 14px;
+  border-right: 1px solid rgba(160, 195, 240, 0.08);
+  background: linear-gradient(180deg, rgba(11, 19, 32, 0.97), rgba(6, 11, 19, 0.99));
+  box-shadow: 18px 0 50px -30px rgba(0, 0, 0, 0.9);
+}
+
+.sidebar::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 300px;
+  background: radial-gradient(70% 60% at 50% 18%, rgba(91, 163, 255, 0.13), transparent 70%);
+  pointer-events: none;
+}
+
+.brand {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 12px 0 26px;
+  text-align: center;
+}
+
+.brand-mark {
+  width: 60px;
+  height: 60px;
+  color: #e3eeff;
+  filter: drop-shadow(0 0 20px rgba(91, 163, 255, 0.45));
+  transition: width var(--t-slow) var(--ease-out), height var(--t-slow) var(--ease-out), transform var(--t-slow) var(--ease-spring);
+}
+
+.brand:hover .brand-mark {
+  transform: rotate(18deg) scale(1.04);
+}
+
+.brand-mark svg {
+  width: 100%;
+  height: 100%;
+}
+
+.brand-name,
+.brand-sub {
+  max-height: 40px;
+  white-space: nowrap;
+  /* Expanding: wait for the rail to widen before the text fades in. */
+  transition: opacity 220ms var(--ease-out) 200ms, max-height var(--t-slow) var(--ease-out), margin var(--t-slow) var(--ease-out);
+}
+
+.brand-name {
+  margin-top: 14px;
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+}
+
+.brand-sub {
+  margin-top: 4px;
+  color: var(--ink-3);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.38em;
+  text-transform: uppercase;
+}
+
+.nav {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.nav-indicator {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 48px;
+  border: 1px solid var(--aether-line);
+  border-radius: 14px;
+  background: linear-gradient(90deg, rgba(91, 163, 255, 0.2), rgba(91, 163, 255, 0.05) 70%, rgba(91, 163, 255, 0));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 10px 30px -14px rgba(91, 163, 255, 0.6);
+  pointer-events: none;
+  transform: translate3d(0, calc(var(--nav-index, 0) * 54px), 0);
+  transition: transform var(--t-slow) var(--ease-spring), opacity var(--t-med);
+  view-transition-name: nav-indicator;
+}
+
+.nav-indicator::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: -1px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--aether);
+  box-shadow: 0 0 12px var(--aether);
+}
+
+.nav-indicator[data-hidden="true"] {
+  opacity: 0;
+}
+
+.nav-item {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 48px;
+  padding: 0 15px;
+  border-radius: 14px;
+  color: var(--ink-2);
+  font-size: 14.5px;
+  font-weight: 560;
+  white-space: nowrap;
+  transition: color var(--t-med), background-color var(--t-med), padding var(--t-slow) var(--ease-out);
+}
+
+.nav-item svg {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  transition: transform var(--t-med) var(--ease-spring), color var(--t-med);
+}
+
+.nav-item:hover {
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--ink);
+}
+
+.nav-item:hover svg {
+  transform: translateY(-1px) scale(1.1);
+}
+
+.nav-item[aria-current="page"] {
+  color: #fff;
+}
+
+.nav-item[aria-current="page"] svg {
+  color: var(--aether-hi);
+}
+
+.nav-label,
+.me-copy,
+.services-copy,
+.collapse-label {
+  transition: opacity 220ms var(--ease-out) 200ms;
+}
+
+/* Compact tooltips escape the rail; the sidebar sits above main (z-index 3). */
+.nav-item[data-tip]::after,
+.sidebar-foot [data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  z-index: 10;
+  top: 50%;
+  left: calc(100% + 14px);
+  padding: 6px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: rgba(10, 18, 31, 0.96);
+  box-shadow: var(--shadow-pop);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-6px, -50%);
+  transition: opacity var(--t-fast), transform var(--t-med) var(--ease-out);
+}
+
+.nav-item[data-tip]:hover::after,
+.sidebar-foot [data-tip]:hover::after {
+  opacity: 1;
+  transform: translate(0, -50%);
+}
+
+.sidebar-foot {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: auto;
+}
+
+/* ---- Account chip ---------------------------------------------------------- */
+
+.me {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid transparent;
+  border-radius: 16px;
+  text-align: left;
+  transition: background-color var(--t-med), border-color var(--t-med);
+}
+
+.me:hover {
+  border-color: var(--line);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.me[aria-current="page"] {
+  border-color: var(--aether-line);
+  background: var(--aether-a10);
+}
+
+.avatar {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  flex: none;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #4a8cf0, #1b3b74);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 6px 18px -8px rgba(74, 140, 240, 0.85);
+  color: #fff;
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.me-copy,
+.services-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.me-name,
+.me-sub,
+.services-title,
+.services-sub {
+  display: block;
+}
+
+.services-wrap {
+  position: relative;
+}
+
+.me-name {
+  overflow: hidden;
+  font-size: 13.5px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.me-sub {
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- Services card and popover ------------------------------------------- */
+
+.services {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  padding: 12px 12px 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  text-align: left;
+  transition: background-color var(--t-med), border-color var(--t-med);
+}
+
+.services:hover,
+.services[aria-expanded="true"] {
+  border-color: var(--line-2);
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.services-title {
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.services-sub {
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.services .chev {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--ink-3);
+  transition: transform var(--t-med) var(--ease-out);
+}
+
+.services[aria-expanded="true"] .chev {
+  transform: rotate(-90deg);
+}
+
+.glass.services-pop {
+  position: absolute;
+  z-index: 20;
+  bottom: calc(100% + 10px);
+  left: 0;
+  width: 272px;
+  padding: 16px;
+  border-radius: 18px;
+  box-shadow: inset 0 1px 0 var(--sheen), var(--shadow-pop);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(8px) scale(0.98);
+  transform-origin: bottom left;
+  transition: opacity var(--t-med) var(--ease-out), transform var(--t-med) var(--ease-out);
+}
+
+.glass.services-pop[data-open="true"] {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
+}
+
+.pop-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  font-family: var(--font-display);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.pop-rows {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 14px;
+  font-size: 12.5px;
+}
+
+.pop-rows dt {
+  color: var(--ink-3);
+}
+
+.pop-rows dd {
+  color: var(--ink);
+  text-align: right;
+}
+
+.collapse-toggle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 12px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: background-color var(--t-fast), color var(--t-fast);
+}
+
+.collapse-toggle svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  transition: transform var(--t-slow) var(--ease-spring);
+}
+
+.collapse-toggle:hover {
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--ink);
+}
+
+/* ---- Compact rail ----------------------------------------------------------- */
+
+.shell[data-compact="true"] .sidebar {
+  padding-right: 12px;
+  padding-left: 12px;
+}
+
+.shell[data-compact="true"] .brand-mark {
+  width: 42px;
+  height: 42px;
+}
+
+.shell[data-compact="true"] .brand-name,
+.shell[data-compact="true"] .brand-sub {
+  max-height: 0;
+  margin: 0;
+  overflow: hidden;
+  opacity: 0;
+}
+
+.shell[data-compact="true"] .nav-item {
+  justify-content: center;
+  padding: 0;
+}
+
+.shell[data-compact="true"] .nav-label,
+.shell[data-compact="true"] .me-copy,
+.shell[data-compact="true"] .services-copy,
+.shell[data-compact="true"] .services .chev,
+.shell[data-compact="true"] .collapse-label,
+.shell[data-compact="true"] .brand-name,
+.shell[data-compact="true"] .brand-sub {
+  /* Collapsing: hide at once, before the rail narrows. */
+  transition-delay: 0ms;
+  transition-duration: 90ms;
+}
+
+.shell[data-compact="true"] .nav-label,
+.shell[data-compact="true"] .me-copy,
+.shell[data-compact="true"] .services-copy,
+.shell[data-compact="true"] .services .chev,
+.shell[data-compact="true"] .collapse-label {
+  position: absolute;
+  width: 0;
+  overflow: hidden;
+  opacity: 0;
+}
+
+.shell[data-compact="true"] .me,
+.shell[data-compact="true"] .services,
+.shell[data-compact="true"] .collapse-toggle {
+  justify-content: center;
+  padding-right: 0;
+  padding-left: 0;
+}
+
+.shell[data-compact="true"] .services {
+  height: 44px;
+}
+
+.shell[data-compact="true"] .collapse-toggle svg {
+  transform: rotate(180deg);
+}
+
+.shell[data-compact="true"] .glass.services-pop {
+  bottom: 0;
+  left: calc(100% + 12px);
+  transform-origin: bottom left;
+}
+
+.shell:not([data-compact="true"]) [data-tip]::after {
+  display: none;
+}

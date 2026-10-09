@@ -1,0 +1,213 @@
+/* Sign-in, registration, username and status screens. */
+
+.auth {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(440px, 1fr);
+  background: var(--bg);
+}
+
+.auth > .art {
+  position: relative;
+  z-index: 0;
+  inset: auto;
+}
+
+.auth > .art::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(90deg, rgba(5, 10, 18, 0.1) 40%, rgba(5, 10, 18, 0.92) 100%),
+    linear-gradient(0deg, rgba(5, 10, 18, 0.9) 0%, rgba(5, 10, 18, 0) 48%);
+}
+
+.auth-brand {
+  position: absolute;
+  z-index: 2;
+  right: 56px;
+  bottom: 52px;
+  left: 52px;
+  pointer-events: none;
+  animation: rise 700ms var(--ease-out) 120ms both;
+}
+
+.auth-brand-mark {
+  width: 52px;
+  height: 52px;
+  color: #e3eeff;
+  filter: drop-shadow(0 0 18px rgba(91, 163, 255, 0.5));
+}
+
+.auth-brand-mark svg {
+  width: 100%;
+  height: 100%;
+}
+
+.auth-brand-name {
+  margin-top: 16px;
+  font-family: var(--font-display);
+  font-size: clamp(30px, 2.6vw + 6px, 44px);
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  line-height: 1.1;
+  text-shadow: 0 2px 30px rgba(0, 0, 0, 0.6);
+}
+
+.auth-brand-tag {
+  max-width: 40ch;
+  margin-top: 10px;
+  color: rgba(226, 235, 249, 0.82);
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+.auth-panel {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  padding: calc(var(--titlebar-h) + 20px) 44px 32px;
+  overflow-y: auto;
+  background:
+    radial-gradient(120% 70% at 100% 0%, rgba(91, 163, 255, 0.11), transparent 60%),
+    linear-gradient(180deg, #08111d, #050a12);
+}
+
+.glass.auth-card {
+  width: min(420px, 100%);
+  padding: 32px 30px 28px;
+  border-radius: var(--r-2xl);
+  animation: rise 560ms var(--ease-out) both;
+}
+
+.auth-head {
+  margin-bottom: 22px;
+}
+
+.auth-title {
+  font-family: var(--font-display);
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  line-height: 1.2;
+}
+
+.auth-sub {
+  margin-top: 6px;
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--ink-4);
+  font-size: 12px;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: var(--line-2);
+}
+
+.auth-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--ink-3);
+  font-size: 13px;
+}
+
+.link {
+  border-radius: 6px;
+  color: var(--aether-hi);
+  font-weight: 600;
+  transition: color var(--t-fast);
+}
+
+.link:hover {
+  color: #c5e1ff;
+}
+
+.btn-discord {
+  border-color: rgba(120, 130, 255, 0.35);
+  background: rgba(88, 101, 242, 0.16);
+  color: #dfe2ff;
+}
+
+.btn-discord:hover:not(:disabled) {
+  background: rgba(88, 101, 242, 0.28);
+}
+
+/* Status screens reuse the auth frame with a centred card. */
+.status-card {
+  text-align: center;
+}
+
+.status-card .auth-head {
+  margin-bottom: 10px;
+}
+
+.status-mark {
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 18px;
+  color: #e3eeff;
+  filter: drop-shadow(0 0 18px rgba(91, 163, 255, 0.5));
+  animation: hover-float 5s var(--ease-in-out) infinite;
+}
+
+.status-mark svg {
+  width: 100%;
+  height: 100%;
+}
+
+.status-card .loader-bar {
+  width: 140px;
+  margin: 20px auto 0;
+}
+
+.status-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.status-actions.single {
+  grid-template-columns: 1fr;
+}
+
+@media (max-width: 1080px) {
+  .auth {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .auth > .art {
+    position: absolute;
+    inset: 0;
+  }
+
+  .auth-brand {
+    display: none;
+  }
+
+  .auth-panel {
+    background: radial-gradient(80% 60% at 50% 40%, rgba(5, 10, 18, 0.55), rgba(5, 10, 18, 0.85));
+  }
+}

@@ -3,7 +3,7 @@ use std::fs;
 use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 
-use crate::commands::auth::{api_base_url, http_client, refresh_native_session, safe_api_error};
+use crate::commands::auth::{api_base_url, http_client, safe_api_error, send_authorized};
 use crate::launch::logs;
 
 #[derive(Serialize)]
@@ -23,6 +23,111 @@ pub fn native_get_log_paths(app: AppHandle) -> Result<LogPaths, String> {
         sessions_root: root.to_string_lossy().into_owned(),
         latest_session_dir: latest.map(|p| p.to_string_lossy().into_owned()),
     })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub id: String,
+    pub started_at: String,
+    pub exited_at: Option<String>,
+    pub exit_code: Option<u32>,
+    pub channel: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredSessionMetadata {
+    launch_session_id: String,
+    started_at: String,
+    account_id: String,
+    channel: String,
+    exit_code: Option<u32>,
+    exited_at: Option<String>,
+}
+
+/// The newest Play sessions of one account on this PC, read from each session folder's
+/// metadata.json (written once the game process starts). Attempts that failed before spawn have
+/// no metadata and are not listed. Other accounts' sessions on a shared PC are never returned.
+#[tauri::command]
+pub async fn native_recent_sessions(
+    app: AppHandle,
+    account_id: String,
+    limit: Option<u32>,
+) -> Result<Vec<SessionSummary>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = logs::sessions_root(&app)?;
+        Ok(read_recent_sessions(
+            &root,
+            &account_id,
+            limit.unwrap_or(5).clamp(1, 20) as usize,
+        ))
+    })
+    .await
+    .map_err(|_| "The session history task stopped unexpectedly.".to_string())?
+}
+
+fn read_recent_sessions(
+    root: &std::path::Path,
+    account_id: &str,
+    limit: usize,
+) -> Vec<SessionSummary> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<SessionSummary> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter_map(|entry| fs::read(entry.path().join("metadata.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<StoredSessionMetadata>(&bytes).ok())
+        .filter(|metadata| metadata.account_id == account_id)
+        .map(|metadata| SessionSummary {
+            id: metadata.launch_session_id,
+            started_at: metadata.started_at,
+            exited_at: metadata.exited_at,
+            exit_code: metadata.exit_code,
+            channel: metadata.channel,
+        })
+        .collect();
+    // RFC 3339 UTC timestamps from one writer sort correctly as strings.
+    sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    sessions.truncate(limit);
+    sessions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_sessions_are_this_accounts_newest_first() {
+        let root = std::env::temp_dir().join(format!(
+            "mysticparadox-sessions-test-{}",
+            std::process::id()
+        ));
+        let write = |id: &str, account: &str, started: &str| {
+            let dir = root.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let metadata = serde_json::json!({
+                "launchSessionId": id, "startedAt": started, "accountId": account, "displayName": "x",
+                "gameExePath": "x", "channel": "stable", "exitCode": 0, "exitedAt": started
+            });
+            fs::write(dir.join("metadata.json"), metadata.to_string()).unwrap();
+        };
+        write("a", "me", "2026-10-01T10:00:00.000Z");
+        write("b", "me", "2026-10-03T10:00:00.000Z");
+        write("c", "someone-else", "2026-10-04T10:00:00.000Z");
+        write("d", "me", "2026-10-02T10:00:00.000Z");
+        fs::create_dir_all(root.join("no-metadata")).unwrap();
+
+        let ids: Vec<String> = read_recent_sessions(&root, "me", 2)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, vec!["b".to_string(), "d".to_string()]);
+        assert!(read_recent_sessions(&root.join("missing"), "me", 5).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
 }
 
 #[tauri::command]
@@ -73,22 +178,23 @@ pub async fn native_upload_last_session(app: AppHandle) -> Result<u32, String> {
             return Err("No log files were found in the last session.".to_string());
         }
 
-        let refreshed = refresh_native_session(&app)?;
         let client = http_client()?;
         let base = api_base_url();
         let mut uploaded = 0u32;
         for name in files {
             let bytes =
                 fs::read(dir.join(&name)).map_err(|e| format!("Couldn't read {name}: {e}"))?;
-            let response = client
-                .put(format!(
-                    "{base}/launcher/v1/logs/sessions/{session_id}/{name}"
-                ))
-                .bearer_auth(&refreshed.access_token)
-                .header("Content-Type", "application/octet-stream")
-                .body(bytes)
-                .send()
-                .map_err(|_| "Couldn't reach the Mystic Paradox server right now.".to_string())?;
+            let response = send_authorized(&app, |token| {
+                client
+                    .put(format!(
+                        "{base}/launcher/v1/logs/sessions/{session_id}/{name}"
+                    ))
+                    .bearer_auth(token)
+                    .header("Content-Type", "application/octet-stream")
+                    .body(bytes.clone())
+                    .send()
+                    .map_err(|_| "Couldn't reach the Mystic Paradox server right now.".to_string())
+            })?;
             if !response.status().is_success() {
                 return Err(safe_api_error(response, "Log upload failed."));
             }

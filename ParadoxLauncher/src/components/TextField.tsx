@@ -3,34 +3,42 @@ import { useId, type InputHTMLAttributes, type ReactNode } from "react";
 interface TextFieldProps extends Omit<InputHTMLAttributes<HTMLInputElement>, "id"> {
   label: string;
   error?: string;
+  hint?: ReactNode;
+  hintTone?: "ok" | "muted";
   rightAdornment?: ReactNode;
 }
 
-export function TextField({ label, error, rightAdornment, className, ...inputProps }: TextFieldProps) {
+export function TextField({ label, error, hint, hintTone = "muted", rightAdornment, className, ...inputProps }: TextFieldProps) {
   const id = useId();
+  const describedBy = error ? `${id}-error` : hint ? `${id}-hint` : undefined;
 
   return (
-    <div className="flex flex-col gap-1.5">
-      <label htmlFor={id} className="text-[13px] font-medium text-text-muted">
-        {label}
-      </label>
-      <div className="relative">
+    <div className="field">
+      <label htmlFor={id} className="field-label">{label}</label>
+      <div className="field-control">
         <input
           id={id}
-          className={`w-full rounded-lg border bg-bg/60 px-3 py-2.5 text-sm text-text placeholder:text-text-faint transition-[border-color,box-shadow] duration-150 ease-(--ease-out-quart) focus:outline-none focus:border-accent focus:shadow-[0_0_0_3px] focus:shadow-accent/15 disabled:opacity-50 ${
-            error ? "border-danger" : "border-border hover:border-border-strong"
-          } ${rightAdornment ? "pr-12" : ""} ${className ?? ""}`}
+          className={`input${rightAdornment ? " has-adornment" : ""}${className ? ` ${className}` : ""}`}
           aria-invalid={Boolean(error)}
-          aria-describedby={error ? `${id}-error` : undefined}
+          aria-describedby={describedBy}
           {...inputProps}
         />
-        {rightAdornment && <div className="absolute inset-y-0 right-2 flex items-center">{rightAdornment}</div>}
+        {rightAdornment && <div className="field-adornment">{rightAdornment}</div>}
       </div>
-      {error && (
-        <p id={`${id}-error`} className="text-[13px] text-danger">
-          {error}
-        </p>
-      )}
+      {error ? (
+        <p id={`${id}-error`} className="field-error" role="alert">{error}</p>
+      ) : hint ? (
+        <p id={`${id}-hint`} className={`field-hint${hintTone === "ok" ? " ok" : ""}`}>{hint}</p>
+      ) : null}
     </div>
+  );
+}
+
+/** Show/Hide toggle for password fields. */
+export function RevealToggle({ shown, onToggle }: { shown: boolean; onToggle: () => void }) {
+  return (
+    <button type="button" className="btn btn-ghost" onClick={onToggle} tabIndex={-1} aria-pressed={shown}>
+      {shown ? "Hide" : "Show"}
+    </button>
   );
 }

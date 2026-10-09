@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { AuthProvider, useAuth } from "./auth/AuthContext";
 import { PolicyProvider } from "./policy/PolicyContext";
 import { LoginScreen } from "./screens/LoginScreen";
@@ -6,177 +6,146 @@ import { RegisterScreen } from "./screens/RegisterScreen";
 import { SetUsernameScreen } from "./screens/SetUsernameScreen";
 import { DashboardShell } from "./screens/DashboardShell";
 import { Button } from "./components/Button";
-import mysticLogo from "./assets/mystic_full.png";
+import { TitleBar } from "./components/TitleBar";
+import { AuthCard, AuthLayout } from "./components/AuthLayout";
+import { AetherMark } from "./components/AetherMark";
+import { SparkIcon } from "./components/icons";
 import { checkLauncherUpdate, installLauncherUpdate, type LauncherUpdate } from "./api/updates";
 import { sanitizeError } from "./lib/sanitize";
 
 const DEV = import.meta.env.DEV;
 
+function UpdateToast({ update }: { update: LauncherUpdate }) {
+  const [installing, setInstalling] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const notes = update.body?.trim().split("\n")[0]?.slice(0, 160);
+
+  return (
+    <div className="glass glass-strong toast" role="status">
+      <div className="toast-icon"><SparkIcon /></div>
+      <div className="toast-copy">
+        <p className="toast-title">Launcher {update.version} is ready</p>
+        <p className="toast-body">{error ?? notes ?? "Security and compatibility updates are ready to install."}</p>
+      </div>
+      <Button
+        size="sm"
+        loading={installing}
+        loadingLabel="Installing…"
+        onClick={() => {
+          setInstalling(true);
+          setError(null);
+          void installLauncherUpdate(update).catch((err) => {
+            setInstalling(false);
+            if (DEV) console.error("[updater] install failed:", err);
+            setError(sanitizeError(err instanceof Error ? err.message : String(err)));
+          });
+        }}
+      >
+        Update now
+      </Button>
+    </div>
+  );
+}
+
+function StatusScreen({ title, children, busy = false }: { title: string; children?: ReactNode; busy?: boolean }) {
+  return (
+    <AuthLayout>
+      <AuthCard title={title} className="status-card" icon={<div className="status-mark"><AetherMark title={null} /></div>}>
+        {children}
+        {busy && <div className="loader-bar" role="progressbar" aria-label={title} />}
+      </AuthCard>
+    </AuthLayout>
+  );
+}
+
 function AppShell() {
   const { status, authError, retrySavedSession, forgetSavedSession } = useAuth();
   const [showRegister, setShowRegister] = useState(false);
   const [launcherUpdate, setLauncherUpdate] = useState<LauncherUpdate | null>(null);
-  const [installingUpdate, setInstallingUpdate] = useState(false);
-  const [updateError, setUpdateError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Check for a launcher self-update on app START, regardless of auth status. Previously this was
-    // gated behind status === "signedIn", so a persistent/saved session (or a launcher that can't
-    // reach the account server, or is stuck at login) would never self-update. The updater is
-    // independent of login, so run it as soon as the app mounts.
+    // Check for a launcher self-update on app start, whatever the auth state, then every 30 minutes.
     let cancelled = false;
-    void checkLauncherUpdate()
-      .then((update) => {
-        if (!cancelled) {
-          if (update) {
-            if (DEV) console.log("[updater] new version available:", update.version);
-            setLauncherUpdate(update);
-          } else {
-            if (DEV) console.log("[updater] already on latest");
-          }
-        }
-      })
-      .catch((err) => {
-        if (DEV) console.warn("[updater] check failed:", err);
-      });
-    return () => { cancelled = true; };
-  }, []);
-
-  // Re-check every 30 min for long-running sessions (also independent of auth status).
-  useEffect(() => {
-    const interval = setInterval(() => {
+    const check = () => {
       void checkLauncherUpdate()
         .then((update) => {
-          if (update) {
-            if (DEV) console.log("[updater] periodic check found new version:", update.version);
-            setLauncherUpdate(update);
-          }
+          if (cancelled || !update) return;
+          if (DEV) console.log("[updater] new version available:", update.version);
+          setLauncherUpdate(update);
         })
-        .catch(() => {});
-    }, 30 * 60 * 1000);
-    return () => clearInterval(interval);
+        .catch((err) => {
+          if (DEV) console.warn("[updater] check failed:", err);
+        });
+    };
+    check();
+    const interval = setInterval(check, 30 * 60 * 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, []);
 
-  const updateBanner = launcherUpdate ? (
-    <div className="fixed inset-x-5 top-5 z-50 mx-auto flex max-w-xl items-center justify-between gap-4 rounded-xl border border-accent/30 bg-surface/95 px-4 py-3 shadow-[0_16px_50px_-20px] shadow-black/70 backdrop-blur">
-      <div className="min-w-0">
-        <p className="text-[12px] font-semibold text-text">Mystic Paradox {launcherUpdate.version} is ready</p>
-        <p className="mt-0.5 truncate text-[11px] text-text-muted">{updateError ?? "A new version is ready to install."}</p>
-      </div>
-      <Button
-        disabled={installingUpdate}
-        onClick={() => {
-          setInstallingUpdate(true);
-          setUpdateError(null);
-          void installLauncherUpdate(launcherUpdate).catch((err) => {
-            setInstallingUpdate(false);
-            const message = sanitizeError(err instanceof Error ? err.message : String(err));
-            if (DEV) console.error("[updater] install failed:", err);
-            setUpdateError(message);
-          });
-        }}
-      >
-        {installingUpdate ? "Installing…" : "Update"}
-      </Button>
-    </div>
-  ) : null;
+  const toast = launcherUpdate ? <UpdateToast update={launcherUpdate} /> : null;
 
+  let screen;
   if (status === "checking") {
-    return (
-      <div className="relative flex h-full items-center justify-center overflow-hidden">
-        <div className="aether-halo pointer-events-none absolute inset-0" />
-        <div className="relative flex flex-col items-center">
-          <img src={mysticLogo} alt="Mystic Development" className="h-24 w-24 object-contain drop-shadow-[0_0_18px_rgba(139,116,255,0.16)]" />
-          <p className="mt-1 text-sm font-medium text-text">Mystic Paradox</p>
-          <div className="mt-3 h-0.5 w-28 overflow-hidden rounded-full bg-border">
-            <div className="h-full w-1/2 animate-[loading-slide_1.4s_ease-in-out_infinite] rounded-full bg-accent" />
-          </div>
-          <p className="mt-3 text-xs text-text-muted">Restoring your session…</p>
-        </div>
-      </div>
+    screen = (
+      <StatusScreen title="Restoring your session" busy>
+        <p className="auth-sub">Contacting the Mystic Paradox account server…</p>
+      </StatusScreen>
     );
-  }
-
-  if (status === "awaitingDiscord") {
-    return (
-      <div className="relative flex h-full items-center justify-center overflow-hidden px-6">
-        <div className="aether-halo pointer-events-none absolute inset-0" />
-        <div className="relative w-full max-w-sm rounded-2xl border border-border bg-surface/80 p-6 text-center shadow-[0_16px_48px_-16px] shadow-black/60">
-          <p className="text-sm font-medium text-text">Waiting for Discord…</p>
-          <p className="mt-1.5 text-[13px] leading-relaxed text-text-muted">
-            Complete sign-in in the browser window that just opened.
-          </p>
-        </div>
-      </div>
+  } else if (status === "awaitingDiscord") {
+    screen = (
+      <StatusScreen title="Waiting for Discord" busy>
+        <p className="auth-sub">Finish signing in in the browser window that just opened.</p>
+      </StatusScreen>
     );
-  }
-
-  if (status === "restoreFailed") {
-    return (
-      <>{updateBanner}
-      <div className="relative flex h-full items-center justify-center overflow-hidden px-6">
-        <div className="aether-halo pointer-events-none absolute inset-0" />
-        <div className="relative w-full max-w-sm rounded-2xl border border-border bg-surface/90 p-6 text-center shadow-[0_16px_48px_-16px] shadow-black/60">
-          <img src={mysticLogo} alt="Mystic Development" className="mx-auto h-24 w-24 object-contain drop-shadow-[0_0_18px_rgba(139,116,255,0.16)]" />
-          <p className="mt-1 text-[10px] font-semibold uppercase tracking-[0.22em] text-text-faint">By Mystic Development</p>
-          <h1 className="mt-4 text-lg font-semibold text-text">Your session is still saved</h1>
-          <p className="mt-2 text-[13px] leading-relaxed text-text-muted">
-            {authError ?? "The launcher couldn't contact the account server yet."}
-          </p>
-          <div className="mt-5 grid grid-cols-2 gap-3">
-            <Button onClick={() => void retrySavedSession()}>Retry</Button>
-            <Button variant="secondary" onClick={() => void forgetSavedSession()}>Sign in again</Button>
-          </div>
+  } else if (status === "restoreFailed") {
+    screen = (
+      <StatusScreen title="Your session is still saved">
+        <p className="auth-sub">{authError ?? "The launcher couldn't contact the account server yet."}</p>
+        <div className="status-actions">
+          <Button onClick={() => void retrySavedSession()}>Retry</Button>
+          <Button variant="secondary" onClick={() => void forgetSavedSession()}>Sign in again</Button>
         </div>
-      </div>
-      </>
+      </StatusScreen>
     );
-  }
-
-  if (status === "awaitingUsername") {
-    return <SetUsernameScreen />;
-  }
-
-  if (status === "pendingApproval") {
-    return (
-      <>{updateBanner}
-      <div className="relative flex h-full items-center justify-center overflow-hidden px-6">
-        <div className="aether-halo pointer-events-none absolute inset-0" />
-        <div className="relative w-full max-w-sm rounded-2xl border border-border bg-surface/90 p-7 text-center shadow-[0_16px_48px_-16px] shadow-black/60">
-          <img src={mysticLogo} alt="Mystic Development" className="mx-auto h-24 w-24 object-contain" />
-          <p className="mt-4 text-[10px] font-semibold uppercase tracking-[0.22em] text-accent-hover">Closed testing</p>
-          <h1 className="mt-2 text-xl font-semibold text-text">Request received</h1>
-          <p className="mt-2 text-[13px] leading-relaxed text-text-muted">
-            Your username is reserved. An administrator must approve the account before it can sign in or launch Dauntless.
-          </p>
-          <Button className="mt-6 w-full" variant="secondary" onClick={() => void forgetSavedSession()}>
-            Back to sign in
-          </Button>
+  } else if (status === "awaitingUsername") {
+    screen = <SetUsernameScreen />;
+  } else if (status === "pendingApproval") {
+    screen = (
+      <StatusScreen title="Request received">
+        <p className="auth-sub">
+          Your username is reserved. An administrator approves closed-test accounts; once yours is approved, sign in to play.
+        </p>
+        <div className="status-actions single">
+          <Button block variant="secondary" onClick={() => void forgetSavedSession()}>Back to sign in</Button>
         </div>
-      </div>
-      </>
+      </StatusScreen>
     );
+  } else if (status === "signedIn") {
+    screen = <DashboardShell />;
+  } else {
+    screen = showRegister
+      ? <RegisterScreen onBackToLogin={() => setShowRegister(false)} />
+      : <LoginScreen onCreateAccount={() => setShowRegister(true)} />;
   }
 
-  if (status === "signedIn") {
-    return <>{updateBanner}<DashboardShell /></>;
-  }
-
-  return showRegister ? (
-    <>{updateBanner}<RegisterScreen onBackToLogin={() => setShowRegister(false)} /></>
-  ) : (
-    <>{updateBanner}<LoginScreen onCreateAccount={() => setShowRegister(true)} /></>
+  return (
+    <>
+      {screen}
+      {toast}
+    </>
   );
 }
 
 export default function App() {
   return (
-    <div className="h-full bg-bg">
-      <AuthProvider>
-        <PolicyProvider>
-          <AppShell />
-        </PolicyProvider>
-      </AuthProvider>
-    </div>
+    <AuthProvider>
+      <PolicyProvider>
+        <AppShell />
+        <TitleBar />
+      </PolicyProvider>
+    </AuthProvider>
   );
 }

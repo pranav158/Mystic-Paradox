@@ -1,0 +1,557 @@
+/* Reusable surfaces and controls. */
+
+/* ---- Glass ------------------------------------------------------------- */
+
+.glass {
+  position: relative;
+  isolation: isolate;
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  background: linear-gradient(180deg, var(--glass-top), var(--glass-bottom));
+  box-shadow: inset 0 1px 0 var(--sheen), var(--shadow-card);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+}
+
+.glass-strong {
+  background: linear-gradient(180deg, rgba(18, 29, 47, 0.9), rgba(8, 14, 25, 0.94));
+}
+
+/* Cursor spotlight and rim light; pointerFx.ts feeds --mx/--my. */
+.glow {
+  --mx: -600px;
+  --my: -600px;
+  position: relative;
+  isolation: isolate;
+}
+
+.glow::before,
+.glow::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  border-radius: inherit;
+  opacity: 0;
+  transition: opacity var(--t-med) var(--ease-out);
+}
+
+.glow::before {
+  inset: 0;
+  z-index: -1;
+  background: radial-gradient(380px circle at var(--mx) var(--my), rgba(110, 175, 255, 0.11), transparent 62%);
+}
+
+.glow::after {
+  inset: -1px;
+  padding: 1px;
+  background: radial-gradient(240px circle at var(--mx) var(--my), rgba(160, 205, 255, 0.6), transparent 70%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+}
+
+.glow:hover::before,
+.glow:hover::after,
+.glow:focus-visible::before,
+.glow:focus-visible::after {
+  opacity: 1;
+}
+
+.lift {
+  transition:
+    transform var(--t-med) var(--ease-out),
+    border-color var(--t-med) var(--ease-out),
+    box-shadow var(--t-med) var(--ease-out),
+    background-color var(--t-med) var(--ease-out);
+}
+
+.lift:hover {
+  transform: translateY(-3px);
+  border-color: var(--line-2);
+  box-shadow: inset 0 1px 0 var(--sheen), 0 32px 70px -32px rgba(0, 0, 0, 0.92), 0 0 0 1px rgba(91, 163, 255, 0.05);
+}
+
+.lift:active {
+  transform: translateY(-1px) scale(0.995);
+}
+
+/* ---- Buttons ------------------------------------------------------------ */
+
+.btn {
+  --h: 40px;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: var(--h);
+  padding: 0 16px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  transition:
+    transform var(--t-fast) var(--ease-out),
+    background-color var(--t-med) var(--ease-out),
+    border-color var(--t-med) var(--ease-out),
+    box-shadow var(--t-med) var(--ease-out),
+    color var(--t-med) var(--ease-out),
+    opacity var(--t-med) var(--ease-out),
+    filter var(--t-med) var(--ease-out);
+}
+
+.btn svg {
+  flex: none;
+  width: 17px;
+  height: 17px;
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+}
+
+.btn-primary {
+  color: #fff;
+  background: linear-gradient(180deg, #67adff, #2f7bef);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32), inset 0 0 0 1px rgba(170, 210, 255, 0.25), 0 10px 26px -12px rgba(47, 123, 239, 0.85);
+}
+
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32), inset 0 0 0 1px rgba(170, 210, 255, 0.3), 0 16px 34px -12px rgba(47, 123, 239, 0.95);
+}
+
+.btn-secondary {
+  border-color: var(--line-2);
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--ink);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  border-color: var(--line-3);
+  background: rgba(255, 255, 255, 0.085);
+}
+
+.btn-ghost {
+  color: var(--ink-2);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.055);
+  color: var(--ink);
+}
+
+.btn-danger {
+  border-color: var(--bad-line);
+  background: var(--bad-a);
+  color: #ffd3da;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: rgba(255, 113, 134, 0.22);
+}
+
+.btn-lg {
+  --h: 48px;
+  padding: 0 22px;
+  border-radius: 14px;
+  font-size: 15px;
+}
+
+.btn-sm {
+  --h: 32px;
+  padding: 0 12px;
+  border-radius: 10px;
+  font-size: 12.5px;
+}
+
+.btn-block {
+  width: 100%;
+}
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  color: var(--ink-3);
+  transition: background-color var(--t-fast), color var(--t-fast), transform var(--t-fast) var(--ease-out);
+}
+
+.icon-button svg {
+  width: 18px;
+  height: 18px;
+}
+
+.icon-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--ink);
+}
+
+.icon-button:active:not(:disabled) {
+  transform: scale(0.92);
+}
+
+.icon-button.spinning svg {
+  animation: spin 0.9s linear infinite;
+}
+
+/* ---- Chips, dots ---------------------------------------------------------- */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.055);
+  color: var(--ink-2);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chip svg {
+  width: 13px;
+  height: 13px;
+}
+
+.chip.good, .tone-good { --tone: var(--ok); }
+.chip.warn, .tone-warn { --tone: var(--warn); }
+.chip.bad, .tone-bad { --tone: var(--bad); }
+.chip.live, .tone-live { --tone: var(--aether); }
+
+.chip.good, .chip.warn, .chip.bad, .chip.live {
+  border-color: color-mix(in srgb, var(--tone) 32%, transparent);
+  background: color-mix(in srgb, var(--tone) 13%, transparent);
+  color: color-mix(in srgb, var(--tone) 55%, white);
+}
+
+.chip.accent {
+  border-color: var(--aether-line);
+  background: var(--aether-a10);
+  color: var(--aether-hi);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 10px currentColor;
+}
+
+.dot.pulse {
+  animation: live-ring 1.8s var(--ease-out) infinite;
+}
+
+.status-dot {
+  --tone: var(--ink-4);
+  width: 9px;
+  height: 9px;
+  flex: none;
+  border-radius: 50%;
+  color: var(--tone);
+  background: var(--tone);
+  box-shadow: 0 0 10px var(--tone);
+}
+
+.status-dot.online { --tone: var(--ok); animation: live-ring 2.4s var(--ease-out) infinite; }
+.status-dot.degraded { --tone: var(--warn); }
+.status-dot.unreachable { --tone: var(--bad); }
+.status-dot.checking { animation: fade-in 0.9s var(--ease-in-out) infinite alternate; }
+
+/* ---- Fields --------------------------------------------------------------- */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.field-label {
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.field-control {
+  position: relative;
+}
+
+.input {
+  width: 100%;
+  height: 46px;
+  padding: 0 14px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: rgba(4, 9, 16, 0.55);
+  color: var(--ink);
+  font-size: 14px;
+  transition: border-color var(--t-med), box-shadow var(--t-med), background-color var(--t-med);
+}
+
+.input::placeholder {
+  color: var(--ink-4);
+}
+
+.input:hover:not(:disabled) {
+  border-color: var(--line-3);
+}
+
+.input:focus {
+  border-color: var(--aether);
+  background: rgba(4, 9, 16, 0.78);
+  box-shadow: 0 0 0 4px rgba(91, 163, 255, 0.16);
+}
+
+.input[aria-invalid="true"] {
+  border-color: rgba(255, 113, 134, 0.7);
+}
+
+.input:disabled {
+  opacity: 0.55;
+}
+
+.input.has-adornment {
+  padding-right: 68px;
+}
+
+.field-adornment {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  transform: translateY(-50%);
+}
+
+.field-adornment .btn {
+  --h: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.field-hint {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+.field-hint.ok {
+  color: var(--ok);
+}
+
+.field-error {
+  color: #ff9cab;
+  font-size: 12.5px;
+}
+
+/* ---- Banners -------------------------------------------------------------- */
+
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.5;
+  animation: rise var(--t-med) var(--ease-out) both;
+}
+
+.banner svg {
+  width: 17px;
+  height: 17px;
+  flex: none;
+  margin-top: 1px;
+}
+
+.banner.danger {
+  border-color: var(--bad-line);
+  background: var(--bad-a);
+  color: #ffd3da;
+}
+
+.banner.success {
+  border-color: var(--ok-line);
+  background: var(--ok-a);
+  color: #c9f6e1;
+}
+
+/* ---- Switch and segmented control -------------------------------------- */
+
+.switch {
+  position: relative;
+  width: 46px;
+  height: 26px;
+  flex: none;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+  transition: background-color var(--t-med), border-color var(--t-med);
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+  transition: transform var(--t-med) var(--ease-spring);
+}
+
+.switch[aria-checked="true"] {
+  border-color: transparent;
+  background: var(--aether);
+}
+
+.switch[aria-checked="true"]::after {
+  transform: translateX(20px);
+}
+
+.segmented {
+  --count: 3;
+  --index: 0;
+  position: relative;
+  display: inline-grid;
+  grid-auto-columns: 1fr;
+  grid-auto-flow: column;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.segmented-thumb {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 4px;
+  width: calc((100% - 8px) / var(--count));
+  border-radius: 9px;
+  background: linear-gradient(180deg, rgba(91, 163, 255, 0.36), rgba(91, 163, 255, 0.18));
+  box-shadow: inset 0 0 0 1px rgba(140, 190, 255, 0.36), 0 6px 16px -8px rgba(91, 163, 255, 0.7);
+  transform: translateX(calc(var(--index) * 100%));
+  transition: transform var(--t-slow) var(--ease-spring);
+}
+
+.segmented button {
+  position: relative;
+  z-index: 1;
+  height: 32px;
+  padding: 0 16px;
+  border-radius: 9px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  font-weight: 600;
+  transition: color var(--t-med);
+}
+
+.segmented button:hover {
+  color: var(--ink);
+}
+
+.segmented button[aria-pressed="true"] {
+  color: #fff;
+}
+
+/* ---- Loaders -------------------------------------------------------------- */
+
+.loader-bar {
+  position: relative;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.loader-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 40%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, var(--aether-hi), transparent);
+  animation: slide-across 1.25s var(--ease-in-out) infinite;
+}
+
+/* ---- Toast ---------------------------------------------------------------- */
+
+.glass.toast {
+  position: fixed;
+  z-index: 90;
+  top: calc(var(--titlebar-h) + 10px);
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: min(580px, calc(100% - 40px));
+  padding: 12px 12px 12px 16px;
+  border-radius: 18px;
+  box-shadow: inset 0 1px 0 var(--sheen), var(--shadow-pop);
+  transform: translateX(-50%);
+  animation: toast-in 560ms var(--ease-spring) both;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translate(-50%, -16px) scale(0.97); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+.toast-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  flex: none;
+  border-radius: 12px;
+  background: var(--aether-a20);
+  color: var(--aether-hi);
+}
+
+.toast-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.toast-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.toast-title {
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+.toast-body {
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

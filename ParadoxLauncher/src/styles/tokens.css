@@ -1,0 +1,65 @@
+/* Design tokens. Dark only: the launcher has no light theme. */
+:root {
+  color-scheme: dark;
+
+  --font-display: "Cinzel Variable", "Cinzel", "Trajan Pro", Georgia, serif;
+  --font-body: "Inter Variable", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
+
+  --bg: #050a12;
+  --bg-raise: #0a1320;
+
+  --ink: #eef3fb;
+  --ink-2: #b9c5d8;
+  --ink-3: #8191a8;
+  --ink-4: #5b6a80;
+
+  --aether: #5ba3ff;
+  --aether-hi: #8cc6ff;
+  --aether-lo: #2a6fe0;
+  --aether-a10: rgba(91, 163, 255, 0.1);
+  --aether-a20: rgba(91, 163, 255, 0.2);
+  --aether-line: rgba(120, 175, 255, 0.26);
+
+  --gold: #e0c287;
+  --gold-lo: #b8955a;
+
+  --ok: #45d99b;
+  --ok-a: rgba(69, 217, 155, 0.13);
+  --ok-line: rgba(69, 217, 155, 0.32);
+  --warn: #f2c56c;
+  --warn-a: rgba(242, 197, 108, 0.13);
+  --warn-line: rgba(242, 197, 108, 0.32);
+  --bad: #ff7186;
+  --bad-a: rgba(255, 113, 134, 0.13);
+  --bad-line: rgba(255, 113, 134, 0.32);
+
+  --line: rgba(164, 198, 240, 0.11);
+  --line-2: rgba(164, 198, 240, 0.2);
+  --line-3: rgba(164, 198, 240, 0.32);
+  --sheen: rgba(255, 255, 255, 0.07);
+
+  --glass-top: rgba(22, 35, 56, 0.6);
+  --glass-bottom: rgba(9, 16, 28, 0.72);
+  --glass-blur: 18px;
+
+  --r-2xl: 26px;
+  --r-xl: 22px;
+  --r-lg: 18px;
+  --r-md: 14px;
+  --r-sm: 10px;
+
+  --shadow-card: 0 24px 60px -30px rgba(0, 0, 0, 0.85), 0 2px 10px -4px rgba(0, 0, 0, 0.5);
+  --shadow-pop: 0 30px 80px -24px rgba(0, 0, 0, 0.92), 0 0 0 1px rgba(0, 0, 0, 0.35);
+
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.45, 0.64, 1);
+  --t-fast: 140ms;
+  --t-med: 240ms;
+  --t-slow: 460ms;
+
+  --sidebar-w: 252px;
+  --titlebar-h: 38px;
+  --gutter: clamp(22px, 3.4vw, 56px);
+}

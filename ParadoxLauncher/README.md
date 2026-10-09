@@ -1,7 +1,7 @@
 # Mystic Paradox Launcher
 
 The Windows desktop launcher for Mystic Paradox. It signs players in, verifies a supported Dauntless
-1.12.0 installation, installs signed runtime updates, obtains a one-time game exchange code, and
+1.14.7 installation, installs signed runtime updates, obtains a one-time game exchange code, and
 launches the game.
 
 > [!IMPORTANT]
@@ -10,22 +10,26 @@ launches the game.
 
 ## What is included
 
-- Tauri 2 shell with React, TypeScript, Vite, and Tailwind assets.
+- Tauri 2 shell with React, TypeScript and Vite.
 - Native account authentication and Discord deep-link completion.
 - Credential Manager storage with a current-user DPAPI-encrypted fallback.
 - Executable/runtime hashing, signed runtime downloads, and signed launcher updates.
 - Per-session game log collection with user-controlled upload actions.
+- Launcher Guard Lite: an observe-only reporter that checks the signed runtime file list at Play and
+  sends signed heartbeats with the game's process identity and loaded-module digest. It never ends a game.
 
 This directory contains source and project-owned branding only. It does not contain the game client,
-game binaries, extracted assets, runtime DLLs, private signing keys, or credentials.
+game binaries, extracted assets, runtime DLLs, private signing keys, or credentials. The default build
+plays on dedicated servers (Ramsgate, Training Grounds and dedicated hunts) and needs only
+`MysticParadox.dll` and `winmm.dll` next to the game.
 
 ## Supported target
 
 | Property | Value |
 |---|---|
 | Operating system | Windows x64 |
-| Game version | Dauntless 1.12.0 |
-| Changelist | 392819 |
+| Game version | Dauntless 1.14.7 |
+| Changelist | 647472 |
 | Desktop stack | Tauri 2 / Rust / WebView2 |
 
 ## Prerequisites
@@ -49,17 +53,20 @@ From the repository root:
     npm ci
     npm run tauri dev
 
-Debug native requests default to http://127.0.0.1:3000. Frontend status requests use
-VITE_API_BASE_URL. MYSTPAX_API_BASE_URL overrides the native Rust API origin at compile time.
+Debug native requests default to http://127.0.0.1:3000; release builds use the project's backend.
+`MYSTICPARADOX_API_BASE_URL` overrides the native Rust API origin at compile time, and
+`VITE_API_BASE_URL` the frontend's.
+
+To preview the UI in a browser with mocked native calls, run `npx vite` and open http://localhost:1420/.
 
 ## Self-host build
 
 Use [docs/SELF_HOSTING.md](../docs/SELF_HOSTING.md) for the full source-to-Ramsgate flow. The root
-configurator generates:
+configurator (`scripts/configure-selfhost.ps1`) generates:
 
 - ParadoxLauncher/.env with the frontend API origin;
-- .selfhost/build-env.ps1 with MYSTPAX_API_BASE_URL, MYSTPAX_RUNTIME_ENDPOINT, and
-  MYSTPAX_RUNTIME_PUBLIC_KEY_B64;
+- .selfhost/build-env.ps1 with `MYSTICPARADOX_API_BASE_URL`, `MYSTICPARADOX_RUNTIME_ENDPOINT` and
+  `MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64`;
 - .selfhost/tauri.selfhost.conf.json with a CSP for the custom origin;
 - an Ed25519 runtime-update signing pair under the ignored .secrets directory.
 
@@ -70,14 +77,14 @@ Dot-source the environment in the same PowerShell used for Tauri:
     Set-Location ParadoxLauncher
     npm ci
     npm run build
-    npm test
     npm run tauri -- dev --config ..\.selfhost\tauri.selfhost.conf.json
 
 For a packaged build:
 
     npm run tauri -- build --config ..\.selfhost\tauri.selfhost.conf.json
 
-This compiles both the React/Vite assets and the native Tauri application.
+This compiles both the React/Vite assets and the native Tauri application. Runtime downloads are then
+accepted only over HTTPS from the host and port of `MYSTICPARADOX_RUNTIME_ENDPOINT`.
 
 ## Runtime updates versus launcher updates
 
@@ -120,10 +127,17 @@ Session logs are stored under:
 
     npm ci
     npm run build
-    npm test
+    npm run test:workflow
+    cd src-tauri
+    cargo fmt -- --check
+    cargo clippy --all-targets -- -D warnings
+    cargo test
+    cd ..
     npm run tauri build
 
-The unsigned development build does not require release signing keys.
+The unsigned development build does not require release signing keys. Some Rust tests write
+temporary files; if your temp folder blocks freshly built test binaries, point `TMP`/`TEMP` at an
+ignored folder such as `src-tauri\target\test-tmp`.
 
 ## Security model
 
@@ -133,6 +147,7 @@ The unsigned development build does not require release signing keys.
   Ed25519 signature before replacement.
 - Launcher updates are verified by Tauri's updater signature.
 - One-time game exchange codes are short-lived and are not printed to logs.
+- The game runs in a Job Object that ends with the launcher; Guard only reports.
 - Signing material belongs only in ignored .secrets directories.
 
 Report vulnerabilities according to [SECURITY.md](../SECURITY.md).
@@ -141,3 +156,5 @@ Report vulnerabilities according to [SECURITY.md](../SECURITY.md).
 
 Licensed under GNU Affero General Public License v3.0 only. See [LICENSE](../LICENSE),
 [NOTICE.md](../NOTICE.md), and [ADDITIONAL_TERMS.md](../ADDITIONAL_TERMS.md).
+
+Based on **Undaunted** by gwog :3 (https://github.com/SyST3MDeV/Undaunted).

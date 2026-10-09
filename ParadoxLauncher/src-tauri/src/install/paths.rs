@@ -55,7 +55,7 @@ pub fn canonicalize_game_exe(candidate: &Path) -> Result<PathBuf, String> {
 /// Resolves the game executable from a folder selected by the player.  The
 /// normal installation is the Archon folder itself, but accepting its parent
 /// as well makes the picker natural to use without a broad recursive search.
-/// Only the expected executable name in known 1.12.0 locations is accepted.
+/// Only the expected executable name in known Dauntless install locations is accepted.
 pub fn find_game_executable(install_folder: &Path) -> Result<PathBuf, String> {
     let folder = dunce::canonicalize(install_folder)
         .map_err(|_| "That folder doesn't exist.".to_string())?;
@@ -99,8 +99,10 @@ mod tests {
 
     #[test]
     fn finds_executable_from_dauntless_parent_folder() {
-        let root =
-            std::env::temp_dir().join(format!("mystpax-install-path-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "mysticparadox-install-path-test-{}",
+            std::process::id()
+        ));
         let exe_dir = root.join("Archon").join("Binaries").join("Win64");
         fs::create_dir_all(&exe_dir).unwrap();
         fs::write(exe_dir.join(GAME_EXE_NAME), b"test").unwrap();
@@ -110,6 +112,7 @@ mod tests {
             resolved.file_name().and_then(|name| name.to_str()),
             Some(GAME_EXE_NAME)
         );
+        // The resolver canonicalizes, so compare canonical forms (CI temp paths can be 8.3 short names).
         let expected_dir = dunce::canonicalize(&exe_dir).unwrap();
         assert_eq!(resolved.parent(), Some(expected_dir.as_path()));
 

@@ -2,7 +2,7 @@ import { generateKeyPairSync, createPublicKey } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-const output = resolve(process.argv[2] ?? ".secrets/mystic-runtime-update");
+const output = resolve(process.argv[2] ?? "../.secrets/mystic-runtime-update");
 const { privateKey, publicKey } = generateKeyPairSync("ed25519", {
   privateKeyEncoding: { type: "pkcs8", format: "pem" },
   publicKeyEncoding: { type: "spki", format: "pem" },

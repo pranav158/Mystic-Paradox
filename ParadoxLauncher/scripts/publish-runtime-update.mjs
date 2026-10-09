@@ -21,13 +21,19 @@ function argList(name) {
 const dllPath = resolve(arg("dll"));
 const version = arg("version");
 const target = arg("target", "client");
-const targetChangelist = Number(arg("changelist", "392819"));
+const targetChangelist = Number(arg("changelist", "647472"));
 const channel = arg("channel", "stable");
 const outputRoot = resolve(arg("output", "../ParadoxBackend/updates"));
 const baseUrl = (arg("base-url", "https://paradox.mysticfox.dev")).replace(/\/$/, "");
 const signingKeyPath = resolve(arg("key", ".secrets/mystic-runtime-update.private.pem"));
 const extraPaths = argList("extra").map((p) => resolve(p));
 const signingKey = createPrivateKey(readFileSync(signingKeyPath));
+// Feed extras: the winmm proxy, plus any names a private P2P build lists in scripts/p2p/runtime-extra-names.json.
+const p2pExtraNamesPath = new URL("./p2p/runtime-extra-names.json", import.meta.url);
+const allowedExtraNames = new Set([
+  "winmm.dll",
+  ...(existsSync(p2pExtraNamesPath) ? JSON.parse(readFileSync(p2pExtraNamesPath, "utf8")) : []),
+]);
 
 if (!version || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
   throw new Error("--version must be a SemVer such as 0.4.13");
@@ -79,9 +85,10 @@ if (prevManifest && prevManifest.extraFiles) {
 }
 
 for (const extraPath of extraPaths) {
-  if (!extraPath.toLowerCase().endsWith(".dll")) throw new Error(`Extra file must be a .dll: ${extraPath}`);
   const extraName = basename(extraPath);
-  if (!extraName) throw new Error(`Invalid extra file name: ${extraPath}`);
+  if (!allowedExtraNames.has(extraName)) {
+    throw new Error(`Extra file is not on the runtime allowlist: ${extraName || extraPath}`);
+  }
   const extraBytes = readFileSync(extraPath);
   if (extraBytes.length === 0 || extraBytes.length > 200 * 1024 * 1024) throw new Error(`Extra file size is outside the safe range: ${extraPath}`);
   const extraSha256 = createHash("sha256").update(extraBytes).digest("hex");

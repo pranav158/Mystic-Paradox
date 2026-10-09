@@ -54,6 +54,9 @@ export interface LauncherPolicy {
   channel: "stable" | "beta" | "dev";
   managedFeatureIds: string[];
   logUpload: { auto: boolean };
+  guardEnforcement: "ENFORCE" | "OBSERVE";
+  diagnosticsProfile: "PRODUCTION" | "DEVELOPMENT";
+  p2pEmergencyStop: boolean;
 }
 
 export interface LogPaths {

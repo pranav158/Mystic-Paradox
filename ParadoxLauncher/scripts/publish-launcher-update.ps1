@@ -1,19 +1,22 @@
 param(
-  [Parameter(Mandatory = $true)]
-  [string]$UpdateRoot,
+  [string]$UpdateRoot = "$PSScriptRoot\..\..\ParadoxBackend\updates",
   [string]$BaseUrl = "https://paradox.mysticfox.dev",
-  [string]$Notes = "Mystic Paradox launcher update"
+  [string]$Notes = "Mystic Paradox launcher update",
+  [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
 $launcherRoot = (Resolve-Path "$PSScriptRoot\..").Path
 $config = Get-Content "$launcherRoot\src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
 $version = [string]$config.version
-& "$PSScriptRoot\build-launcher-release.ps1"
-if ($LASTEXITCODE -ne 0) { throw "Launcher build failed." }
+$productName = [string]$config.productName
+if (-not $SkipBuild) {
+  & "$PSScriptRoot\build-launcher-release.ps1"
+  if ($LASTEXITCODE -ne 0) { throw "Launcher build failed." }
+}
 
 $bundleDir = Join-Path $launcherRoot "src-tauri\target\release\bundle\nsis"
-$artifact = Join-Path $bundleDir "Mystic Paradox Launcher_${version}_x64-setup.exe"
+$artifact = Join-Path $bundleDir "${productName}_${version}_x64-setup.exe"
 $signatureFile = "$artifact.sig"
 if (-not (Test-Path $artifact) -or -not (Test-Path $signatureFile)) {
   throw "Signed NSIS updater artifacts were not produced."
@@ -34,6 +37,7 @@ $manifest = [ordered]@{
 }
 $latestDir = Join-Path $UpdateRoot "launcher\windows\x86_64"
 New-Item -ItemType Directory -Path $latestDir -Force | Out-Null
-$manifest | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $releaseDir "manifest.json")
-$manifest | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $latestDir "latest.json")
+$manifestJson = ($manifest | ConvertTo-Json) + [Environment]::NewLine
+[System.IO.File]::WriteAllText((Join-Path $releaseDir "manifest.json"), $manifestJson, [System.Text.UTF8Encoding]::new($false))
+[System.IO.File]::WriteAllText((Join-Path $latestDir "latest.json"), $manifestJson, [System.Text.UTF8Encoding]::new($false))
 Write-Host "Published launcher $version to $latestDir"

@@ -1,24 +1,36 @@
 import type { ButtonHTMLAttributes } from "react";
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: "primary" | "secondary";
+  variant?: "primary" | "secondary" | "ghost" | "danger" | "discord";
+  size?: "sm" | "md" | "lg";
+  block?: boolean;
   loading?: boolean;
+  loadingLabel?: string;
 }
 
-export function Button({ variant = "primary", loading = false, disabled, className, children, ...rest }: ButtonProps) {
-  const base =
-    "rounded-lg px-4 py-2.5 text-sm font-semibold transition-[background-color,border-color,box-shadow] duration-150 ease-(--ease-out-quart) focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50";
-
-  const variants = {
-    primary:
-      "bg-accent text-[oklch(0.13_0.02_255)] hover:bg-accent-hover active:bg-accent shadow-[0_1px_12px_-2px] shadow-accent/30",
-    secondary:
-      "bg-surface-raised text-text border border-border hover:border-border-strong hover:bg-[oklch(0.25_0.03_280)] active:bg-surface-raised",
-  };
+export function Button({
+  variant = "primary",
+  size = "md",
+  block = false,
+  loading = false,
+  loadingLabel = "Please wait…",
+  disabled,
+  className,
+  children,
+  type = "button",
+  ...rest
+}: ButtonProps) {
+  const classes = [
+    "btn",
+    variant === "discord" ? "btn-secondary btn-discord" : `btn-${variant}`,
+    size === "md" ? "" : `btn-${size}`,
+    block ? "btn-block" : "",
+    className ?? "",
+  ].filter(Boolean).join(" ");
 
   return (
-    <button className={`${base} ${variants[variant]} ${className ?? ""}`} disabled={disabled || loading} {...rest}>
-      {loading ? "Please wait…" : children}
+    <button type={type} className={classes} disabled={disabled || loading} aria-busy={loading || undefined} {...rest}>
+      {loading ? <><span className="spinner" aria-hidden="true" />{loadingLabel}</> : children}
     </button>
   );
 }

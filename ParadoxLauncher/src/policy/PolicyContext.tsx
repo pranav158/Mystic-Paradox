@@ -17,25 +17,36 @@ export function usePolicy(): PolicyContextValue {
 }
 
 export function PolicyProvider({ children }: { children: ReactNode }) {
-  const { status } = useAuth();
+  const { status, account } = useAuth();
   const [policy, setPolicy] = useState<LauncherPolicy | null>(null);
   const mountedRef = useRef(true);
+  const accountKey = status === "signedIn" ? account?.userId ?? null : null;
+  const identityRef = useRef({ key: accountKey, generation: 0 });
+  if (identityRef.current.key !== accountKey) {
+    identityRef.current = { key: accountKey, generation: identityRef.current.generation + 1 };
+  }
+  const pendingRef = useRef<{ generation: number; promise: Promise<LauncherPolicy | null> } | null>(null);
+  const [policyGeneration, setPolicyGeneration] = useState(-1);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
 
-  const refreshPolicy = useCallback(async () => {
-    try {
-      const next = await getPolicy();
-      if (mountedRef.current) setPolicy(next);
+  const refreshPolicy = useCallback((): Promise<LauncherPolicy | null> => {
+    const identity = identityRef.current;
+    if (!identity.key) return Promise.resolve(null);
+    if (pendingRef.current?.generation === identity.generation) return pendingRef.current.promise;
+    const promise = getPolicy().then((next) => {
+      if (!mountedRef.current || identityRef.current !== identity) return null;
+      setPolicy(next);
+      setPolicyGeneration(identity.generation);
       return next;
-    } catch {
-      // Policy is best-effort: a failed refresh keeps whatever was last known (or the
-      // safe "no tester features" default) rather than blocking sign-in or Play.
-      return null;
-    }
+    }).catch(() => null).finally(() => {
+      if (pendingRef.current?.promise === promise) pendingRef.current = null;
+    });
+    pendingRef.current = { generation: identity.generation, promise };
+    return promise;
   }, []);
 
   useEffect(() => {
@@ -47,9 +58,10 @@ export function PolicyProvider({ children }: { children: ReactNode }) {
     } else {
       setPolicy(null);
     }
-  }, [status, refreshPolicy]);
+  }, [status, accountKey, refreshPolicy]);
 
-  const value = useMemo(() => ({ policy, refreshPolicy }), [policy, refreshPolicy]);
+  const visiblePolicy = accountKey && policyGeneration === identityRef.current.generation ? policy : null;
+  const value = useMemo(() => ({ policy: visiblePolicy, refreshPolicy }), [visiblePolicy, refreshPolicy]);
 
   return <PolicyContext.Provider value={value}>{children}</PolicyContext.Provider>;
 }

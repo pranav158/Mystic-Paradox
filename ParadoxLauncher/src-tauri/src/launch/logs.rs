@@ -63,14 +63,10 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-pub fn iso8601_now() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    let days = (secs / 86400) as i64;
-    let time_of_day = secs % 86400;
+/// RFC 3339 UTC with milliseconds, e.g. `2026-10-09T12:00:00.000Z`.
+pub fn format_epoch_rfc3339(seconds: i64, millis: u32) -> String {
+    let days = seconds.div_euclid(86400);
+    let time_of_day = seconds.rem_euclid(86400);
     let (h, m, s) = (
         time_of_day / 3600,
         (time_of_day % 3600) / 60,
@@ -80,8 +76,32 @@ pub fn iso8601_now() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
 }
 
+pub fn iso8601_now() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format_epoch_rfc3339(now.as_secs() as i64, now.subsec_millis())
+}
+
 pub fn append_launcher_log(dir: &Path, line: &str) {
     let path = dir.join("launcher.log");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "[{}] {line}", iso8601_now());
+    }
+}
+
+/// Exit/shutdown tracing that needs neither an AppHandle nor a running Play attempt, so a
+/// windowless launcher closed with no game running still leaves a record of how far its cleanup
+/// got and which stage it stopped in. Sits next to the Sessions tree under the same Logs folder.
+pub fn append_shutdown_log(line: &str) {
+    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+        return;
+    };
+    let dir = PathBuf::from(local).join("MysticParadox").join("Logs");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("launcher-exit.log");
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "[{}] {line}", iso8601_now());
     }
@@ -106,7 +126,7 @@ pub fn write_metadata(dir: &Path, metadata: &SessionMetadata) {
     }
 }
 
-/// Best-effort: copies any ParadoxRuntime DLL log (`mysticparadox_dll_port*.log`, written
+/// Best-effort: copies any combined runtime DLL log (`mysticparadox_dll_port*.log`, written
 /// beside the game exe — see ParadoxRuntime/dllmain.cpp's MpLogDir()) modified since launch
 /// into the session folder. The DLL doesn't accept a log-path argument, so this is the
 /// non-invasive way to get its output into the per-session folder without changing the
@@ -182,5 +202,14 @@ mod tests {
         assert_eq!(stamp.len(), 24);
         assert!(stamp.starts_with("20"));
         assert!(stamp.ends_with('Z'));
+    }
+
+    #[test]
+    fn epoch_formatter_emits_rfc3339_utc() {
+        assert_eq!(format_epoch_rfc3339(0, 0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_epoch_rfc3339(1_700_000_000, 123),
+            "2023-11-14T22:13:20.123Z"
+        );
     }
 }

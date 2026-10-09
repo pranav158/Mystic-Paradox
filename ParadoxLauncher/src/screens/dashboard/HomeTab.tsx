@@ -1,16 +1,35 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { getVersion } from "@tauri-apps/api/app";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { useAuth } from "../../auth/AuthContext";
 import { usePolicy } from "../../policy/PolicyContext";
-import { getInstallStatus, pickInstallPath, isGameRunning, secureLaunch, checkRuntimeUpdate, installRuntimeUpdate, type InstallStatus } from "../../api/tauri";
+import { useServices } from "../../services/ServicesContext";
+import {
+  checkRuntimeUpdate,
+  getInstallStatus,
+  getRecentSessions,
+  installRuntimeUpdate,
+  isGameRunning,
+  onGameExited,
+  pickInstallPath,
+  secureLaunch,
+  type InstallStatus,
+  type RuntimeUpdateStatus,
+} from "../../api/tauri";
 import { sanitizeError } from "../../lib/sanitize";
-import { PlayIcon } from "../../components/icons";
+import { buildName, describeExit, formatClock, formatDuration, formatWhen, type SessionSummary } from "../../lib/sessions";
+import { AccountIcon, AlertIcon, BuildIcon, CheckIcon, ChevronRightIcon, HistoryIcon, PlayIcon, RuntimeIcon } from "../../components/icons";
+import { AetherMark } from "../../components/AetherMark";
+import { ArtBackdrop } from "../../components/ArtBackdrop";
 
 function gameRootPath(exePath: string): string {
   return exePath
     .replace(/\\Archon\\Binaries\\Win64\\Dauntless-Win64-Shipping\.exe$/i, "")
     .replace(/\\Binaries\\Win64\\Dauntless-Win64-Shipping\.exe$/i, "")
     .replace(/\\Dauntless-Win64-Shipping\.exe$/i, "");
+}
+
+/** Stagger index for the `.reveal` entry animation. */
+function at(index: number): CSSProperties {
+  return { "--i": index } as CSSProperties;
 }
 
 type PlayPhase =
@@ -36,12 +55,31 @@ function phaseLabel(phase: PlayPhase): string | null {
   }
 }
 
-export function HomeTab() {
-  const { account } = useAuth();
+type RuntimeView =
+  | { state: "idle" }
+  | { state: "checking" }
+  | { state: "known"; status: RuntimeUpdateStatus }
+  | { state: "unavailable" };
+
+// The manifest check is a network call; reuse a recent answer when Home remounts on tab switches.
+let runtimeCache: { channel: string; at: number; status: RuntimeUpdateStatus } | null = null;
+const RUNTIME_CACHE_MS = 120_000;
+
+interface HomeTabProps {
+  onOpenAccount?: () => void;
+  onNavigate?: (tab: "settings" | "library") => void;
+}
+
+export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: HomeTabProps) {
+  const { account, accountCheckedAt, accountRefreshing, accountRefreshError } = useAuth();
   const { policy, refreshPolicy } = usePolicy();
+  const services = useServices();
   const [install, setInstall] = useState<InstallStatus | null>(null);
   const [phase, setPhase] = useState<PlayPhase>({ status: "idle" });
-  const [launcherVersion, setLauncherVersion] = useState<string>("");
+  const [runtime, setRuntime] = useState<RuntimeView>({ state: "idle" });
+  const [runtimeNonce, setRuntimeNonce] = useState(0);
+  const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
+  const [sessionsNonce, setSessionsNonce] = useState(0);
   const mountedRef = useRef(true);
   const playLockRef = useRef(false);
 
@@ -53,10 +91,14 @@ export function HomeTab() {
   const refreshInstall = useCallback(async () => {
     setPhase({ status: "verifying" });
     try {
+      // Startup prefetch already lives in Rust. Home only reads installation health;
+      // policy changes must not restart repair or reset an active Play operation.
       const status = await getInstallStatus();
+      // Home remounts on every tab switch; keep showing a running game instead of offering Play.
+      const running = await isGameRunning().catch(() => false);
       if (mountedRef.current) {
         setInstall(status);
-        setPhase({ status: "idle" });
+        setPhase({ status: running ? "running" : "idle" });
       }
     } catch {
       if (mountedRef.current) {
@@ -70,90 +112,130 @@ export function HomeTab() {
   }, [refreshInstall]);
 
   useEffect(() => {
-    getVersion().then((v) => { if (mountedRef.current) setLauncherVersion(v); }).catch(() => {});
+    // Rust emits this when the client it launched exits, so Play comes back on its own.
+    const unlistenPromise = onGameExited(() => {
+      if (!mountedRef.current) return;
+      setPhase((current) => current.status === "running" ? { status: "idle" } : current);
+      setSessionsNonce((value) => value + 1);
+      getInstallStatus()
+        .then((status) => { if (mountedRef.current) setInstall(status); })
+        .catch(() => {});
+    });
+    return () => { void unlistenPromise.then((unlisten) => unlisten()); };
   }, []);
 
+  // Real runtime state from the signed manifest for this account's channel.
+  const channel = policy?.channel;
+  const located = install?.located === true;
+  useEffect(() => {
+    if (!channel || !located) {
+      setRuntime({ state: "idle" });
+      return;
+    }
+    if (runtimeCache && runtimeCache.channel === channel && Date.now() - runtimeCache.at < RUNTIME_CACHE_MS) {
+      setRuntime({ state: "known", status: runtimeCache.status });
+      return;
+    }
+    let cancelled = false;
+    setRuntime({ state: "checking" });
+    checkRuntimeUpdate(channel)
+      .then((status) => {
+        runtimeCache = { channel, at: Date.now(), status };
+        if (!cancelled) setRuntime({ state: "known", status });
+      })
+      .catch(() => { if (!cancelled) setRuntime({ state: "unavailable" }); });
+    return () => { cancelled = true; };
+  }, [channel, located, runtimeNonce]);
+
+  const invalidateRuntime = useCallback(() => {
+    runtimeCache = null;
+    setRuntimeNonce((value) => value + 1);
+  }, []);
+
+  // This account's recent Play sessions, read from the local session folders.
+  const accountId = account?.userId;
+  useEffect(() => {
+    if (!accountId) return;
+    let cancelled = false;
+    getRecentSessions(accountId, 4)
+      .then((next) => { if (!cancelled) setSessions(next); })
+      .catch(() => { if (!cancelled) setSessions([]); });
+    return () => { cancelled = true; };
+  }, [accountId, sessionsNonce]);
+
   const handleLocate = useCallback(async () => {
+    if (playLockRef.current) return;
+    playLockRef.current = true;
     setPhase({ status: "locating" });
     try {
-      const status = await pickInstallPath();
+      let status = await pickInstallPath();
+      if (status.located) {
+        try {
+          const freshPolicy = await refreshPolicy();
+          if (!mountedRef.current) return;
+          if (!freshPolicy) throw new Error("Account policy unavailable");
+          await installRuntimeUpdate(freshPolicy.channel);
+          status = await getInstallStatus();
+        } catch {
+          // Keep the selected path. Play will retry signed runtime repair if this first pass fails.
+        }
+      }
       if (mountedRef.current) {
         setInstall(status);
         setPhase({ status: "idle" });
+        invalidateRuntime();
       }
     } catch (err) {
       if (mountedRef.current) {
         setPhase({ status: "error", message: sanitizeError(typeof err === "string" ? err : undefined) || "Couldn't locate Dauntless." });
       }
+    } finally {
+      playLockRef.current = false;
     }
-  }, []);
+  }, [refreshPolicy, invalidateRuntime]);
 
   const handleRepair = useCallback(async () => {
-    if (!install || !install.located || !install.error || phase.status !== "idle" && phase.status !== "error") return;
+    if (!install || !install.located || !install.error || playLockRef.current || (phase.status !== "idle" && phase.status !== "error")) return;
+    playLockRef.current = true;
     setPhase({ status: "updatingRuntime" });
     try {
-      await installRuntimeUpdate(policy?.channel ?? "stable");
+      const freshPolicy = await refreshPolicy();
+      if (!freshPolicy) throw "Couldn't verify your account access. Check your connection and try again.";
+      if (!mountedRef.current) return;
+      await installRuntimeUpdate(freshPolicy.channel);
       const refreshed = await getInstallStatus();
       if (mountedRef.current) {
         setInstall(refreshed);
         setPhase({ status: "idle" });
+        invalidateRuntime();
       }
     } catch (err) {
       if (mountedRef.current) {
         setPhase({ status: "error", message: sanitizeError(typeof err === "string" ? err : undefined) || "Couldn't repair the installation." });
       }
+    } finally {
+      playLockRef.current = false;
     }
-  }, [install, phase.status, policy]);
+  }, [install, phase.status, refreshPolicy, invalidateRuntime]);
 
   const handlePlay = useCallback(async () => {
-    if (!install || !account || playLockRef.current || phase.status !== "idle") return;
+    if (!install || !account || playLockRef.current || (phase.status !== "idle" && phase.status !== "error")) return;
     playLockRef.current = true;
+    setPhase({ status: "requestingSession" });
 
     try {
-      // Flags/channel are re-synced from the account's policy immediately before launch —
-      // the runtime caches several of them for the process lifetime, so this has to happen
-      // before spawn, not just periodically in the background.
+      // Re-sync flags and channel from current account policy immediately before launch.
       const freshPolicy = await refreshPolicy();
-      const channel = freshPolicy?.channel ?? "stable";
-
-      // Project-owned runtime updates happen before the native launch boundary.
-      // Rust then re-hashes the executable, rotates the secure session, requests
-      // the one-time ticket, and spawns without exposing credentials to JS.
-      setPhase({ status: "verifying" });
-      let verified = await getInstallStatus();
-      if (!verified.located) {
-        setInstall(verified);
-        setPhase({ status: "error", message: "Installation not found. Locate it again." });
-        return;
+      if (!freshPolicy) throw new Error("Couldn't verify your account access. Check your connection and try again.");
+      if (!mountedRef.current) return;
+      // Rust repairs/verifies signed runtime, validates the executable and entitlement, then requests the ticket.
+      setPhase({ status: "launching" });
+      await secureLaunch(freshPolicy.channel);
+      if (mountedRef.current) {
+        setPhase({ status: "running" });
+        setSessionsNonce((value) => value + 1);
+        invalidateRuntime();
       }
-      if (verified.error) {
-        setPhase({ status: "updatingRuntime" });
-        await installRuntimeUpdate(channel);
-        verified = await getInstallStatus();
-      }
-      if (!verified.located || verified.error || !verified.exeSha256) {
-        setInstall(verified);
-        setPhase({ status: "error", message: verified.error ?? "Couldn't verify the installation." });
-        return;
-      }
-      setInstall(verified);
-
-      const runtime = await checkRuntimeUpdate(channel);
-      if (runtime.available) {
-        setPhase({ status: "updatingRuntime" });
-        await installRuntimeUpdate(channel);
-        const refreshed = await getInstallStatus();
-        if (!refreshed.located || refreshed.error) {
-          setInstall(refreshed);
-          setPhase({ status: "error", message: refreshed.error ?? "Runtime update did not complete." });
-          return;
-        }
-        setInstall(refreshed);
-      }
-
-      setPhase({ status: "requestingSession" });
-      await secureLaunch(channel);
-      if (mountedRef.current) setPhase({ status: "running" });
     } catch (err) {
       if (mountedRef.current) {
         setPhase({ status: "error", message: sanitizeError(typeof err === "string" ? err : err instanceof Error ? err.message : undefined) || "Couldn't launch Dauntless." });
@@ -161,196 +243,262 @@ export function HomeTab() {
     } finally {
       playLockRef.current = false;
     }
-  }, [install, account, phase.status, refreshPolicy]);
+  }, [install, account, phase.status, refreshPolicy, invalidateRuntime]);
+
+  const handleCheckStatus = useCallback(async () => {
+    if (playLockRef.current) return;
+    playLockRef.current = true;
+    setPhase({ status: "checkingStatus" });
+    try {
+      const running = await isGameRunning();
+      if (!mountedRef.current) return;
+      if (running) {
+        setPhase({ status: "running" });
+      } else {
+        const fresh = await getInstallStatus();
+        if (mountedRef.current) setInstall(fresh);
+        if (mountedRef.current) setPhase({ status: "idle" });
+        setSessionsNonce((value) => value + 1);
+      }
+    } catch {
+      if (mountedRef.current) setPhase({ status: "running" });
+    } finally {
+      playLockRef.current = false;
+    }
+  }, []);
 
   const progressLabel = phaseLabel(phase);
-  const isTester = policy?.roles.includes("tester") ?? false;
-  const buildLabel = isTester ? "Tester build" : "Preview build";
-
-  const located = install?.located === true;
   const hasError = install?.error != null;
-
-  const canPlay = located && !hasError && install?.exeSha256 != null && phase.status === "idle";
-  const canLocate = phase.status === "idle" || phase.status === "error";
+  const runtimeRepairRequired = install?.runtimeRepairRequired === true;
+  const fatalInstallError = hasError && !runtimeRepairRequired;
   const gameRunning = phase.status === "running";
-  const canRepair = located && hasError && !gameRunning && (phase.status === "idle" || phase.status === "error");
-  const busy = phase.status !== "idle" && phase.status !== "error" && phase.status !== "running" && phase.status !== "checkingStatus";
+  const ready = located && !fatalInstallError;
+  const canPlay = ready && (install?.exeSha256 != null || runtimeRepairRequired) && (phase.status === "idle" || phase.status === "error");
+  const canRepair = located && runtimeRepairRequired && !gameRunning && (phase.status === "idle" || phase.status === "error");
+  const busy = phase.status !== "idle" && phase.status !== "error" && phase.status !== "running";
+  const liveSession = gameRunning && sessions?.[0] && !sessions[0].exitedAt ? sessions[0] : null;
+
+  const statusTitle = gameRunning
+    ? "Dauntless is running"
+    : ready
+      ? runtimeRepairRequired ? "Runtime will be repaired" : "Ready to launch"
+      : located
+        ? "Installation needs attention"
+        : "Select your game folder";
+  const statusDescription = gameRunning
+    ? liveSession
+      ? `Started at ${formatClock(Date.parse(liveSession.startedAt))}. Play returns when the game closes.`
+      : "Play returns when the game closes."
+    : ready && runtimeRepairRequired
+      ? "The signed runtime is downloaded and verified when you press Play."
+      : ready
+        ? "Game folder found. Files and the signed runtime are verified with the server on Play."
+        : located && hasError
+          ? sanitizeError(install?.error)
+          : "Point the launcher at your Dauntless folder to get started.";
+
+  const buttonText = gameRunning
+    ? "Check status"
+    : busy
+      ? progressLabel ?? "Please wait…"
+      : canPlay
+        ? "Play"
+        : canRepair
+          ? "Repair"
+          : "Locate game";
+  const buttonAction = gameRunning ? handleCheckStatus : canPlay ? handlePlay : canRepair ? handleRepair : handleLocate;
+  const playVariant = busy ? " is-busy" : gameRunning ? " is-running" : canPlay ? "" : " is-secondary";
+
+  // ---- Status cards: every value below comes from a native call or the backend. ----
+  const target = install?.targetChangelist ?? null;
+  const targetName = buildName(target);
+  const buildValue = target ? `Dauntless ${targetName ?? `CL ${target}`}` : "Dauntless";
+  const serverChangelist = services.supportedChangelist;
+  const buildMatches = target != null && serverChangelist != null && target === serverChangelist;
+  const buildMismatch = target != null && serverChangelist != null && target !== serverChangelist;
+  const buildNote = target == null
+    ? "Reading the launcher target…"
+    : serverChangelist == null
+      ? services.health === "unreachable" ? `CL ${target} · server unreachable` : `CL ${target}`
+      : buildMatches
+        ? `CL ${target} · matches server`
+        : `Server expects CL ${serverChangelist}`;
+
+  const accountStatus = account?.status === "banned"
+    ? "Account banned"
+    : account?.status === "disabled"
+      ? "Account disabled"
+      : account?.approvalStatus === "pending"
+        ? "Approval pending"
+        : account?.approvalStatus === "rejected"
+          ? "Access rejected"
+          : account?.status === "active" && account.approvalStatus === "approved"
+            ? "Access approved"
+            : "Status unavailable";
+  const accountNote = accountRefreshing
+    ? "Refreshing status…"
+    : accountRefreshError
+      ? "Status sync delayed"
+      : accountCheckedAt
+        ? `${accountStatus} · ${formatClock(accountCheckedAt)}`
+        : accountStatus;
+
+  let runtimeValue = "Needs setup";
+  let runtimeNote = "Select your game folder";
+  let runtimeTone: "" | " good" | " warn" | " busy" = "";
+  if (located && runtimeRepairRequired) {
+    runtimeValue = "Repair needed";
+    runtimeNote = "Fixed automatically on Play";
+    runtimeTone = " warn";
+  } else if (located && runtime.state === "checking") {
+    runtimeValue = "Checking…";
+    runtimeNote = `Signed ${channel ?? "runtime"} manifest`;
+    runtimeTone = " busy";
+  } else if (located && runtime.state === "known" && runtime.status.version) {
+    runtimeValue = `Runtime v${runtime.status.version}`;
+    runtimeNote = runtime.status.available ? "Update installs on Play" : `Up to date · ${channel ?? "stable"} channel`;
+    runtimeTone = runtime.status.available ? " warn" : " good";
+  } else if (located && runtime.state === "known") {
+    runtimeValue = "No release published";
+    runtimeNote = `Nothing on the ${channel ?? "stable"} channel`;
+    runtimeTone = " warn";
+  } else if (located && runtime.state === "unavailable") {
+    runtimeValue = "Not checked";
+    runtimeNote = "Play verifies it anyway";
+  } else if (located) {
+    runtimeValue = "Waiting for account";
+    runtimeNote = "Checked once your policy loads";
+  }
+
+  const heroCopy = gameRunning
+    ? "Your Slayer is out in the Shattered Isles. The launcher keeps watch until the game closes."
+    : "Ramsgate is waiting. Prepare your Slayer and return to the Shattered Isles.";
+  const nonStableChannel = channel && channel !== "stable" ? channel : null;
 
   return (
-    <div className="flex min-h-full flex-col">
-      <header
-        className="aether-veil relative flex h-72 shrink-0 flex-col justify-end overflow-hidden border-b border-border px-8 pb-8"
-      >
+    <div className="home">
+      <ArtBackdrop />
+      <div className="watermark" aria-hidden="true"><AetherMark title={null} /></div>
 
-        <div aria-hidden className="absolute right-10 top-8 hidden items-center gap-2 rounded-full border border-accent/20 bg-bg/25 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-accent-hover sm:flex">
-          <span className="h-1.5 w-1.5 rounded-full bg-online shadow-[0_0_8px] shadow-online" />
-          {launcherVersion ? `${buildLabel} ${launcherVersion}` : buildLabel}
-        </div>
-
-        <div className="relative">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-accent-hover">Welcome back, {account?.displayName ?? "Slayer"}</p>
-          <h1 className="mt-2 max-w-lg text-[34px] font-semibold leading-tight tracking-tight text-white [text-wrap:balance]">
-            Return to the light
-          </h1>
-          <p className="mt-2 max-w-lg text-[13px] leading-relaxed text-white/70">Ramsgate is waiting. Verify your installation, prepare your Slayer, and return to the Shattered Isles.</p>
-        </div>
+      <header className="hero">
+        <p className="eyebrow reveal" style={at(0)}>Welcome back,</p>
+        <h1 className="hero-name reveal" style={at(1)} title={account?.displayName}>{account?.displayName ?? "Slayer"}</h1>
+        <span className="hero-rule" aria-hidden="true" />
+        <p className="hero-copy reveal" style={at(2)}>{heroCopy}</p>
+        {(gameRunning || nonStableChannel) && (
+          <div className="hero-chips reveal" style={at(3)}>
+            {gameRunning && <span className="chip good"><span className="dot pulse" />Playing now</span>}
+            {nonStableChannel && <span className="chip accent">{nonStableChannel === "beta" ? "Beta" : "Dev"} channel</span>}
+          </div>
+        )}
       </header>
 
-      <div className="flex flex-1 flex-col gap-6 px-8 py-7">
-        <section className="grid items-center gap-5 rounded-2xl border border-border bg-surface p-6 shadow-[0_18px_50px_-36px] shadow-black md:grid-cols-[minmax(0,1fr)_auto]">
-          <div className="flex min-w-0 items-center gap-4">
-            <span className="relative flex h-2.5 w-2.5 shrink-0">
-              <span
-                className={`absolute h-full w-full rounded-full ${gameRunning ? "animate-ping bg-online/50 [animation-duration:1.5s]" : ""}`}
-              />
-              <span
-                className={`h-2.5 w-2.5 rounded-full ${gameRunning ? "bg-online" : located ? "bg-accent" : "bg-text-faint"}`}
-              />
-            </span>
-            <div className="min-w-0">
-              <p className="text-sm font-medium text-text">
-                {gameRunning ? "Dauntless is running" : located ? "Installation located" : "No installation set"}
-              </p>
-              <p className="mt-0.5 text-[13px] text-text-muted">
-                {gameRunning
-                  ? "Dauntless is running now."
-                  : located && hasError
-                  ? sanitizeError(install.error)
-                  : located
-                  ? "Verified and ready to launch."
-                  : "Select your Dauntless 1.12.0 folder to get started."}
-              </p>
-              {located && !hasError && install?.exePath && <p className="mt-2 max-w-full truncate font-mono text-[11px] text-text-faint" title={gameRootPath(install.exePath)}>{gameRootPath(install.exePath)}</p>}
+      <div className="home-body">
+        <div className="home-primary">
+          <section className="glass glow launch reveal" style={at(3)} aria-label="Installation and launch status">
+            <div className="launch-emblem"><AetherMark title={null} /></div>
+            <div className="launch-copy">
+              <h2 className="launch-title" aria-live="polite">
+                <span key={busy ? progressLabel : statusTitle} className="swap">{busy ? progressLabel : statusTitle}</span>
+                {ready && !busy && !gameRunning && !runtimeRepairRequired && (
+                  <span className="badge-ok" aria-label="Verified"><CheckIcon /></span>
+                )}
+              </h2>
+              <p className="launch-desc">{statusDescription}</p>
+              {located && install?.exePath && (
+                <p className="launch-path mono" title={gameRootPath(install.exePath)}>{gameRootPath(install.exePath)}</p>
+              )}
+              {busy && <div className="loader-bar" role="progressbar" aria-label="Launcher task in progress" aria-valuetext={progressLabel ?? "Working"} />}
+              {phase.status === "error" && <p className="launch-error" role="alert">{phase.message}</p>}
             </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-3 md:justify-end">
-            {progressLabel && (
-              <p className="animate-pulse text-[13px] text-accent-hover [animation-duration:1.5s]">{progressLabel}</p>
-            )}
-
-            {phase.status === "error" && (
-              <p className="max-w-[28ch] text-[13px] text-danger">{phase.message}</p>
-            )}
-
-            {(gameRunning || phase.status === "checkingStatus") && (
-              <button
-                onClick={async () => {
-                  setPhase({ status: "checkingStatus" });
-                  try {
-                    const running = await isGameRunning();
-                    if (!mountedRef.current) return;
-                    if (running) {
-                      setPhase({ status: "running" });
-                    } else {
-                      const fresh = await getInstallStatus();
-                      if (mountedRef.current) setInstall(fresh);
-                      await new Promise((r) => setTimeout(r, 2000));
-                      if (mountedRef.current) setPhase({ status: "idle" });
-                    }
-                  } catch {
-                    if (mountedRef.current) setPhase({ status: "idle" });
-                  }
-                }}
-                disabled={busy}
-                className="flex h-12 min-w-[132px] shrink-0 items-center justify-center gap-2 rounded-xl border border-accent-muted bg-accent-muted/10 px-5 text-[13px] font-semibold text-accent-hover transition-all hover:bg-accent-muted/25 hover:border-accent/40 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {busy ? "Checking…" : "Check status"}
-              </button>
-            )}
-
-            {canPlay && !gameRunning && (
-              <button
-                onClick={handlePlay}
-                disabled={busy}
-                className="flex h-12 min-w-[132px] shrink-0 items-center justify-center gap-2.5 rounded-xl bg-accent px-5 text-[13px] font-semibold text-[oklch(0.13_0.02_255)] shadow-[0_2px_18px_-3px] shadow-accent/45 transition-all duration-150 ease-(--ease-out-quart) hover:bg-accent-hover active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <PlayIcon className="h-4 w-4" />
-                Play
-              </button>
-            )}
-
-            {canRepair && !gameRunning && (
-              <button
-                onClick={handleRepair}
-                disabled={busy}
-                className="flex h-12 min-w-[132px] shrink-0 items-center justify-center gap-2 rounded-xl border border-accent-muted bg-accent-muted/20 px-5 text-[13px] font-semibold text-accent-hover transition-all hover:bg-accent-muted/40 hover:border-accent/40 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {busy ? "Repairing…" : "Repair"}
-              </button>
-            )}
-
-            {!located && canLocate && !gameRunning && (
-              <button
-                onClick={handleLocate}
-                disabled={busy}
-                className="flex h-12 min-w-[132px] shrink-0 items-center justify-center gap-2 rounded-xl border border-accent-muted bg-accent-muted/30 px-5 text-[13px] font-semibold text-accent-hover transition-all hover:bg-accent-muted/50 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Locate game
-              </button>
-            )}
-          </div>
-        </section>
-
-        <section className="grid gap-3 sm:grid-cols-3">
-          {[
-            ["Build", "1.12.0 · checked at launch", "The native launcher verifies the supported client before issuing a session."],
-            ["Account", account?.displayName ?? "Signed in", "Your launcher identity is passed to the game session."],
-            ["Runtime", located && !hasError ? "Ready to launch" : "Needs setup", "Both project runtime DLLs are checked with the installation."],
-          ].map(([label, value, body]) => (
-            <div key={label} className="rounded-xl border border-border/80 bg-surface/60 px-4 py-3.5">
-              <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-text-faint">{label}</p>
-              <p className="mt-1 text-[13px] font-medium text-text">{value}</p>
-              <p className="mt-1 text-[11px] leading-relaxed text-text-muted">{body}</p>
+            <div className="launch-actions">
+              <div className={`play-wrap${canPlay && !gameRunning && !busy ? " is-ready" : ""}`}>
+                <button type="button" onClick={buttonAction} disabled={busy} className={`play${playVariant}`}>
+                  {busy ? <span className="spinner" aria-hidden="true" /> : gameRunning ? <span className="dot pulse" aria-hidden="true" /> : canPlay ? <PlayIcon /> : null}
+                  <span key={buttonText} className="swap">{buttonText}</span>
+                </button>
+              </div>
+              {canRepair && canPlay && (
+                <button type="button" className="btn btn-ghost btn-sm launch-secondary" onClick={handleRepair}>
+                  Repair
+                </button>
+              )}
             </div>
-          ))}
-        </section>
+          </section>
 
-        <section>
-          <div className="mb-3 flex items-baseline justify-between">
-            <h2 className="text-sm font-semibold text-text">From the field</h2>
-            <span className="text-xs text-text-faint">Dispatches from the project</span>
-          </div>
+          <section className="stats" aria-label="Launcher details">
+            <article className="glass glow lift stat reveal" style={at(4)}>
+              <div className={`stat-icon${buildMatches ? " good" : buildMismatch ? " warn" : ""}`}><BuildIcon /></div>
+              <div className="stat-copy">
+                <div className="stat-label">Build</div>
+                <div className="stat-value">{buildValue}</div>
+                <div className="stat-note"><span key={buildNote} className="swap">{buildNote}</span></div>
+              </div>
+            </article>
+            <button
+              type="button"
+              className="glass glow lift stat reveal"
+              style={at(5)}
+              onClick={onOpenAccount}
+              aria-label={`Manage ${account?.displayName ?? "your"} account. ${accountNote}.`}
+            >
+              <div className="stat-icon"><AccountIcon /></div>
+              <div className="stat-copy">
+                <div className="stat-label">Account</div>
+                <div className="stat-value">{account?.displayName ?? "Signed in"}</div>
+                <div className="stat-note" aria-live="polite"><span key={accountNote} className="swap">{accountNote}</span></div>
+              </div>
+              <ChevronRightIcon className="chev" />
+            </button>
+            <button
+              type="button"
+              className="glass glow lift stat reveal"
+              style={at(6)}
+              onClick={() => onNavigate("library")}
+              aria-label={`Runtime: ${runtimeValue}. ${runtimeNote}. Open the library.`}
+            >
+              <div className={`stat-icon${runtimeTone}`}>{runtimeTone === " warn" ? <AlertIcon /> : <RuntimeIcon />}</div>
+              <div className="stat-copy">
+                <div className="stat-label">Runtime</div>
+                <div className="stat-value"><span key={runtimeValue} className="swap">{runtimeValue}</span></div>
+                <div className="stat-note"><span key={runtimeNote} className="swap">{runtimeNote}</span></div>
+              </div>
+              <ChevronRightIcon className="chev" />
+            </button>
+          </section>
+        </div>
 
-          <div className="flex flex-col divide-y divide-border overflow-hidden rounded-2xl border border-border bg-surface">
-            {MOCK_NEWS.map((item) => (
-              <article key={item.title} className="group px-6 py-4 transition-colors duration-150 hover:bg-surface-raised/60">
-                <div className="flex items-center justify-between gap-4">
-                  <div className="flex items-center gap-2.5">
-                    <span className="rounded-md bg-accent-faint px-2 py-0.5 text-[11px] font-medium text-accent-hover">
-                      {item.tag}
-                    </span>
-                    <h3 className="text-sm font-medium text-text">{item.title}</h3>
-                  </div>
-                  <time className="shrink-0 text-xs text-text-faint">{item.date}</time>
-                </div>
-                <p className="mt-1.5 max-w-[65ch] text-[13px] leading-relaxed text-text-muted">{item.body}</p>
-              </article>
-            ))}
-          </div>
-        </section>
+        <aside className="home-side">
+          <section className="glass panel reveal" style={at(7)} aria-label="Recent sessions">
+            <div className="panel-head">
+              <h2 className="panel-title"><HistoryIcon />Recent sessions</h2>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => onNavigate("settings")}>Logs</button>
+            </div>
+            {sessions == null ? (
+              <div className="loader-bar" />
+            ) : sessions.length === 0 ? (
+              <p className="panel-empty">No sessions yet. Your Play history on this PC appears here.</p>
+            ) : (
+              <ul className="session-list">
+                {sessions.map((session, index) => {
+                  const outcome = describeExit(session.exitCode, session.exitedAt, gameRunning && index === 0);
+                  const duration = session.exitedAt || outcome.tone === "live" ? formatDuration(session.startedAt, session.exitedAt) : null;
+                  return (
+                    <li key={session.id}>
+                      <span className={`dot tone-${outcome.tone}${outcome.tone === "live" ? " pulse" : ""}`} aria-hidden="true" />
+                      <div className="session-body">
+                        <div className="session-when">{formatWhen(session.startedAt)}</div>
+                        <div className="session-meta">{outcome.label}{session.channel !== "stable" ? ` · ${session.channel}` : ""}</div>
+                      </div>
+                      <span className="session-meta">{duration ?? ""}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+        </aside>
       </div>
     </div>
   );
 }
-
-const MOCK_NEWS = [
-  {
-    tag: "Project",
-    title: "The forges of Ramsgate are lit again",
-    date: "Jul 10",
-    body: "The launcher is in early preview while accounts and matchmaking are still being reforged. Thanks for scouting ahead.",
-  },
-  {
-    tag: "Runtime",
-    title: "1.12.0 client verified",
-    date: "Jul 6",
-    body: "Executable hash checks for the final Dauntless build are in place — no patched or unknown binaries slip through.",
-  },
-  {
-    tag: "Roadmap",
-    title: "Hunting parties return soon",
-    date: "Jul 2",
-    body: "Friends, parties, and Behemoth hunts with a full crew of four are next on the trail after launch is stable.",
-  },
-];

@@ -10,17 +10,9 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+# Old frontend build kept locally for comparison; never source.
+dist_locked_old
 *.local
-
-# Local configuration and release signing material
-.env
-.env.*
-!.env.example
-.secrets/
-
-# Legacy/custom Cargo output directories
-src-tauri/target2/
-dist_locked_old/
 
 # Editor directories and files
 .vscode/*
