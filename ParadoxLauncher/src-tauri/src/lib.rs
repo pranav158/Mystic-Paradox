@@ -2,9 +2,12 @@ mod auth;
 mod commands;
 mod install;
 mod launch;
-// rustfmt resolves `mod` files whatever their cfg, and the public tree has no p2p folder: format it with
-// `rustfmt --edition 2021 --check src/p2p/mod.rs` instead.
-#[cfg(feature = "p2p")]
+// rustfmt resolves `mod` files whatever their cfg, and the public tree has neither folder: format them with
+// `rustfmt --edition 2021 --check src/p2p/mod.rs src/anticheat/mod.rs` instead.
+#[cfg(mystic_anticheat)]
+#[rustfmt::skip]
+mod anticheat;
+#[cfg(mystic_p2p)]
 #[rustfmt::skip]
 mod p2p;
 
@@ -89,15 +92,15 @@ pub fn run() {
             // Guard heartbeats for the processes this launcher protects (observe-only).
             launch::guard_loop::start(app.handle().clone());
             // P2P builds only: host presence, the control channel and host/join sessions.
-            #[cfg(feature = "p2p")]
+            #[cfg(mystic_p2p)]
             p2p::start(app.handle().clone());
 
             Ok(())
         });
     // A P2P build adds its own commands (p2p/mod.rs).
-    #[cfg(feature = "p2p")]
+    #[cfg(mystic_p2p)]
     let builder = builder.invoke_handler(launcher_commands!(p2p::native_get_p2p_host_settings));
-    #[cfg(not(feature = "p2p"))]
+    #[cfg(not(mystic_p2p))]
     let builder = builder.invoke_handler(launcher_commands!());
     let app = builder
         .build(tauri::generate_context!())

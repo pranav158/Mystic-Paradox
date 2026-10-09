@@ -53,9 +53,9 @@ pub(crate) struct GuardPayload {
     issued_at: String,
     expires_at: String,
     pub(crate) artifacts: Vec<GuardArtifact>,
-    // Integrity-check policy, read only by a P2P build (p2p/guard_checks.rs).
-    #[cfg(feature = "p2p")]
-    pub(crate) executable_memory_policy: crate::p2p::guard_checks::ExecutableMemoryPolicy,
+    // Integrity-check policy, read only with the anti-cheat module (anticheat/guard_checks.rs).
+    #[cfg(mystic_anticheat)]
+    pub(crate) executable_memory_policy: crate::anticheat::guard_checks::ExecutableMemoryPolicy,
 }
 
 #[derive(Clone, Deserialize)]
@@ -65,9 +65,9 @@ pub(crate) struct GuardArtifact {
     size: u64,
     pub(crate) sha256: String,
     required: bool,
-    #[cfg(feature = "p2p")]
+    #[cfg(mystic_anticheat)]
     #[serde(default)]
-    pub(crate) protected_regions: Vec<crate::p2p::guard_checks::ProtectedRegion>,
+    pub(crate) protected_regions: Vec<crate::anticheat::guard_checks::ProtectedRegion>,
 }
 
 #[derive(Serialize, Clone)]
@@ -224,13 +224,13 @@ fn verify_envelope(
     Ok(payload)
 }
 
-/// The integrity-check policy a P2P build reads from the manifest (p2p/guard_checks.rs).
-#[cfg(feature = "p2p")]
+/// The integrity-check policy the anti-cheat module reads from the manifest (anticheat/guard_checks.rs).
+#[cfg(mystic_anticheat)]
 fn integrity_policy_is_valid(payload: &GuardPayload) -> bool {
-    crate::p2p::guard_checks::policy_is_valid(&payload.executable_memory_policy)
+    crate::anticheat::guard_checks::policy_is_valid(&payload.executable_memory_policy)
 }
 
-#[cfg(not(feature = "p2p"))]
+#[cfg(not(mystic_anticheat))]
 fn integrity_policy_is_valid(_payload: &GuardPayload) -> bool {
     true
 }
@@ -376,26 +376,105 @@ fn verify_artifacts(app: &AppHandle, payload: &GuardPayload) -> Result<(), Strin
         if !artifact.required {
             continue;
         }
-        if artifact.size == 0
-            || artifact.sha256.len() != 64
-            || !artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err("Guard manifest contains an invalid artifact record.".to_string());
-        }
-        let path = artifact_path(app, artifact)?;
-        let metadata = std::fs::metadata(&path)
-            .map_err(|_| format!("Required Guard artifact {} is missing.", artifact.name))?;
-        if !metadata.is_file()
-            || metadata.len() != artifact.size
-            || !verify::hash_file_sha256(&path)?.eq_ignore_ascii_case(&artifact.sha256)
-        {
-            return Err(format!(
-                "Guard artifact {} failed verification.",
-                artifact.name
-            ));
-        }
+        verify_installed(app, artifact, verify::hash_file_sha256)?;
     }
     Ok(())
+}
+
+/// One signed artifact is installed with its signed size and SHA-256.
+fn verify_installed(
+    app: &AppHandle,
+    artifact: &GuardArtifact,
+    hash: fn(&Path) -> Result<String, String>,
+) -> Result<(), String> {
+    if artifact.size == 0
+        || artifact.sha256.len() != 64
+        || !artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("Guard manifest contains an invalid artifact record.".to_string());
+    }
+    let path = artifact_path(app, artifact)?;
+    let metadata = std::fs::metadata(&path)
+        .map_err(|_| format!("Required Guard artifact {} is missing.", artifact.name))?;
+    if !metadata.is_file()
+        || metadata.len() != artifact.size
+        || !hash(&path)?.eq_ignore_ascii_case(&artifact.sha256)
+    {
+        return Err(format!(
+            "Guard artifact {} failed verification.",
+            artifact.name
+        ));
+    }
+    Ok(())
+}
+
+/// How long the co-op switch reuses a verified manifest before fetching it again.
+#[cfg(mystic_p2p)]
+const ROLE_LOOKUP_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The current signed manifest of a channel without a Guard session, reused for a few minutes.
+#[cfg(mystic_p2p)]
+fn cached_manifest(
+    app: &AppHandle,
+    channel: &str,
+    access_token: &str,
+) -> Result<GuardPayload, String> {
+    type Cache = Mutex<HashMap<String, (std::time::Instant, GuardPayload)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached = cache
+        .lock()
+        .ok()
+        .and_then(|entries| entries.get(channel).cloned());
+    if let Some((fetched_at, payload)) = cached {
+        if fetched_at.elapsed() < ROLE_LOOKUP_TTL
+            && validate_manifest_window(
+                &payload.issued_at,
+                &payload.expires_at,
+                OffsetDateTime::now_utc(),
+            )
+            .is_ok()
+        {
+            return Ok(payload);
+        }
+    }
+    let payload = fetch_manifest(app, channel, access_token)?;
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(
+            channel.to_string(),
+            (std::time::Instant::now(), payload.clone()),
+        );
+    }
+    Ok(payload)
+}
+
+/// The names of the artifacts the current signed Guard manifest of `channel` lists under `roles`, in that order,
+/// each installed next to the game with its signed size and SHA-256. The co-op switch (p2p/mod.rs) reads its
+/// files this way, so their names are feed data rather than code.
+#[cfg(mystic_p2p)]
+pub(crate) fn installed_artifacts_by_role(
+    app: &AppHandle,
+    channel: &str,
+    access_token: &str,
+    roles: &[&str],
+) -> Result<Vec<String>, String> {
+    let payload = cached_manifest(app, channel, access_token)?;
+    let mut names = Vec::with_capacity(roles.len());
+    for role in roles {
+        let mut matching = payload
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.role == *role);
+        let artifact = matching
+            .next()
+            .ok_or_else(|| format!("the signed Guard manifest lists no {role} file"))?;
+        if matching.next().is_some() {
+            return Err(format!("the signed Guard manifest lists {role} twice"));
+        }
+        verify_installed(app, artifact, verify::hash_file_sha256_cached)?;
+        names.push(artifact.name.clone());
+    }
+    Ok(names)
 }
 
 fn wide_string(value: &[u16]) -> String {
@@ -413,7 +492,7 @@ fn filetime_to_iso(value: FILETIME) -> String {
 }
 
 /// A module loaded in the protected process (Toolhelp snapshot). Guard Lite reads only path and size.
-#[cfg_attr(not(feature = "p2p"), allow(dead_code))]
+#[cfg_attr(not(mystic_anticheat), allow(dead_code))]
 pub(crate) struct LoadedModule {
     pub(crate) path: String,
     pub(crate) name: String,
@@ -421,9 +500,9 @@ pub(crate) struct LoadedModule {
     pub(crate) size: u32,
 }
 
-/// Integrity findings of a heartbeat. A P2P build measures them (p2p/guard_checks.rs); the public
-/// dedicated-only build runs Guard Lite, an observer (signed manifest and artifacts, process identity,
-/// loaded-module digest, debugger flag) that reports these as zero.
+/// Integrity findings of a heartbeat. The anti-cheat module measures them (anticheat/guard_checks.rs, when built in)
+/// while the co-op switch is on; otherwise Guard runs as Guard Lite, an observer (signed manifest and artifacts,
+/// process identity, loaded-module digest, debugger flag) that reports these as zero.
 #[derive(Default)]
 pub(crate) struct IntegritySignals {
     pub(crate) private_executable_bytes: usize,
@@ -432,7 +511,7 @@ pub(crate) struct IntegritySignals {
     pub(crate) protected_page_mismatch_count: usize,
 }
 
-#[cfg(feature = "p2p")]
+#[cfg(mystic_anticheat)]
 fn integrity_signals(
     process: HANDLE,
     process_id: u32,
@@ -440,11 +519,17 @@ fn integrity_signals(
     game_dir: &Path,
     modules: &[LoadedModule],
 ) -> IntegritySignals {
+    // Guard Lite while co-op is off: the heavy checks belong to co-op play only.
+    if !crate::p2p::coop_active() {
+        return IntegritySignals::default();
+    }
     // SAFETY: collect_signals passes its open process handle and that process's module snapshot.
-    unsafe { crate::p2p::guard_checks::collect(process, process_id, payload, game_dir, modules) }
+    unsafe {
+        crate::anticheat::guard_checks::collect(process, process_id, payload, game_dir, modules)
+    }
 }
 
-#[cfg(not(feature = "p2p"))]
+#[cfg(not(mystic_anticheat))]
 fn integrity_signals(
     _process: HANDLE,
     _process_id: u32,

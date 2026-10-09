@@ -23,7 +23,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The backend's latest verdict for one protected role. P2P host presence reports it.
 #[derive(Clone)]
-#[cfg_attr(not(feature = "p2p"), allow(dead_code))]
+#[cfg_attr(not(mystic_p2p), allow(dead_code))]
 pub struct GuardVerdict {
     pub session_id: String,
     pub sequence: u64,
@@ -52,7 +52,7 @@ fn set_verdict(role: &'static str, verdict: Option<GuardVerdict>) {
 }
 
 /// The latest verdict for `client` or `host`, if that process has a live Guard session.
-#[cfg_attr(not(feature = "p2p"), allow(dead_code))]
+#[cfg_attr(not(mystic_p2p), allow(dead_code))]
 pub fn latest_verdict(role: &str) -> Option<GuardVerdict> {
     verdicts()
         .lock()
@@ -69,9 +69,9 @@ pub fn clear() {
 }
 
 fn protected_processes() -> [(&'static str, Option<u32>); 2] {
-    #[cfg(feature = "p2p")]
+    #[cfg(mystic_p2p)]
     let host = crate::p2p::guarded_host_process_id();
-    #[cfg(not(feature = "p2p"))]
+    #[cfg(not(mystic_p2p))]
     let host = None;
     [("client", process::game_process_id()), ("host", host)]
 }

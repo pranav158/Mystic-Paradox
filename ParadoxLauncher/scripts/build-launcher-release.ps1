@@ -1,10 +1,10 @@
 param(
   [string]$SigningKey = "$PSScriptRoot\..\.secrets\mystic-launcher.key",
-  [string]$SigningPasswordFile = "$PSScriptRoot\..\.secrets\mystic-launcher.password",
-  # Builds the P2P launcher (Steam transport, host/join sessions). Without it the build is the
-  # default dedicated-only launcher.
-  [switch]$P2P
+  [string]$SigningPasswordFile = "$PSScriptRoot\..\.secrets\mystic-launcher.password"
 )
+# The optional modules are compiled in when their folders are present (src-tauri\build.rs): src-tauri\src\p2p (co-op
+# hunts, used only while the runtime co-op switch is on) and src-tauri\src\anticheat. Without them the build is the
+# dedicated-only launcher with Guard Lite.
 
 $ErrorActionPreference = "Stop"
 if (-not (Test-Path -LiteralPath $SigningKey)) { throw "Missing Tauri signing key: $SigningKey" }
@@ -19,7 +19,9 @@ try {
   # working directory to the launcher rather than requiring callers to cd first.
   Set-Location -LiteralPath (Split-Path -Parent $PSScriptRoot)
   $buildArgs = @("--bundles", "nsis")
-  if ($P2P) { $buildArgs += @("--features", "p2p") }
+  $coop = if (Test-Path -LiteralPath "src-tauri\src\p2p\mod.rs") { "included" } else { "absent (dedicated-only)" }
+  $antiCheat = if ($coop -eq "included" -and (Test-Path -LiteralPath "src-tauri\src\anticheat\mod.rs")) { "included" } else { "absent (Guard Lite)" }
+  Write-Host "Launcher build; co-op module: $coop; anti-cheat module: $antiCheat"
   npm.cmd run tauri build -- @buildArgs
   if ($LASTEXITCODE -ne 0) { throw "Tauri release build failed with exit code $LASTEXITCODE" }
 

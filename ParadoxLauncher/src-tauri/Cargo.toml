@@ -15,14 +15,6 @@ edition = "2021"
 name = "launcher_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[features]
-# P2P player-hosted hunts: the Steam transport, host/join sessions and the P2P
-# control loop. Off by default, so the default build is the dedicated-only launcher (Ramsgate,
-# Training and dedicated hunts) that never loads Steam. Build the P2P launcher with `--features p2p`
-# (`scripts/build-launcher-release.ps1 -P2P`). The public repo gets none of this (scripts/public-export).
-default = []
-p2p = []
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

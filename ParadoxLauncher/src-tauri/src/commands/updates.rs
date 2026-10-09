@@ -178,9 +178,6 @@ fn installed_runtime_state(
     let mut all_current = main_current;
 
     for extra in &manifest.extra_files {
-        if !is_installed_extra(&extra.name) {
-            continue;
-        }
         if !is_safe_extra_name(&extra.name) {
             return Err(format!("Rejected unsafe extra file name: {}", extra.name));
         }
@@ -364,11 +361,7 @@ pub async fn install_runtime_update(
 
     // Install extra files first — they must be fetched even when the main DLL is current.
     // Each install_extra_file already skips when the target file matches the published hash.
-    for extra in manifest
-        .extra_files
-        .iter()
-        .filter(|extra| is_installed_extra(&extra.name))
-    {
+    for extra in &manifest.extra_files {
         install_extra_file(&directory, extra, token.as_deref()).await?;
     }
 
@@ -440,30 +433,17 @@ pub async fn install_runtime_update(
     })
 }
 
-/// The feed extras this build installs: the winmm proxy, and in a P2P build the P2P files. The feed
-/// can list more; a build skips the rest and leaves copies already on disk alone.
-fn is_installed_extra(name: &str) -> bool {
-    if name.eq_ignore_ascii_case("winmm.dll") {
-        return true;
-    }
-    #[cfg(feature = "p2p")]
-    if crate::p2p::RUNTIME_ARTIFACT_NAMES
-        .iter()
-        .any(|p2p| p2p.eq_ignore_ascii_case(name))
-    {
-        return true;
-    }
-    false
-}
-
-/// A flat file name this build installs, and never the runtime DLL itself.
+/// Every extra the signed feed lists is installed: the winmm proxy and any optional module's runtime files (the
+/// co-op files, for example). Their names are feed data, and each file carries its own runtime signature, checked
+/// before it is written. Only a flat, plain file name is accepted, and never the runtime DLL itself.
 fn is_safe_extra_name(name: &str) -> bool {
     !name.is_empty()
-        && !name.contains('/')
-        && !name.contains('\\')
+        && name.len() <= 96
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         && !name.contains("..")
         && name != "."
-        && is_installed_extra(name)
         && !name.eq_ignore_ascii_case(RUNTIME_DLL_NAME)
 }
 
@@ -640,27 +620,26 @@ mod tests {
     }
 
     #[test]
-    fn extras_this_build_does_not_install_are_ignored() {
-        let directory = temporary_directory("feed-only-extra");
+    fn every_feed_extra_is_part_of_the_installed_set() {
+        let directory = temporary_directory("feed-extra");
         let main = b"main-runtime";
         std::fs::write(directory.join(RUNTIME_DLL_NAME), main).unwrap();
 
-        let state = installed_runtime_state(&directory, &manifest(main, "feed-only.bin", b"other"))
-            .unwrap();
-        assert!(state.main_current);
-        assert!(state.all_current);
-        assert!(!is_installed_extra("feed-only.bin"));
-        assert!(is_installed_extra("winmm.dll"));
-        std::fs::remove_dir_all(directory).unwrap();
-    }
+        let missing =
+            installed_runtime_state(&directory, &manifest(main, "coop-module.dll", b"other"))
+                .unwrap();
+        assert!(missing.main_current);
+        assert!(!missing.all_current);
 
-    #[cfg(feature = "p2p")]
-    #[test]
-    fn p2p_builds_install_the_p2p_extras() {
-        for name in crate::p2p::RUNTIME_ARTIFACT_NAMES {
-            assert!(is_installed_extra(name));
-            assert!(is_installed_extra(&name.to_ascii_uppercase()));
-        }
+        std::fs::write(directory.join("coop-module.dll"), b"other").unwrap();
+        let present =
+            installed_runtime_state(&directory, &manifest(main, "coop-module.dll", b"other"))
+                .unwrap();
+        assert!(present.all_current);
+        assert!(
+            installed_runtime_state(&directory, &manifest(main, "../escape.dll", b"x")).is_err()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -689,13 +668,15 @@ mod tests {
     }
 
     #[test]
-    fn runtime_extra_files_remain_flat_installed_names() {
+    fn runtime_extra_files_remain_flat_plain_names() {
         assert!(is_safe_extra_name("winmm.dll"));
         assert!(is_safe_extra_name("WINMM.DLL"));
+        assert!(is_safe_extra_name("coop-admission.key"));
         assert!(!is_safe_extra_name("../winmm.dll"));
         assert!(!is_safe_extra_name("nested/winmm.dll"));
         assert!(!is_safe_extra_name("nested\\winmm.dll"));
-        assert!(!is_safe_extra_name("notes.txt"));
+        assert!(!is_safe_extra_name("name with spaces.dll"));
+        assert!(!is_safe_extra_name(""));
         assert!(!is_safe_extra_name(RUNTIME_DLL_NAME));
         assert!(!is_safe_extra_name("mysticparadox.dll"));
         assert!(!is_safe_extra_name("MYSTICPARADOX.DLL"));

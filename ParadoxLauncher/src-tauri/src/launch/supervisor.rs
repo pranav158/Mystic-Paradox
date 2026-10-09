@@ -86,7 +86,7 @@ pub fn terminate_all(exit_code: u32) -> Result<(), String> {
 /// create a child before this call, so assigning its process handle to the launcher Job Object
 /// first closes the short child-process escape window present with std::process::Command::spawn.
 /// Used for the P2P player host.
-#[cfg_attr(not(feature = "p2p"), allow(dead_code))]
+#[cfg_attr(not(mystic_p2p), allow(dead_code))]
 pub fn resume_initial_thread(process_id: u32) -> Result<(), String> {
     if process_id == 0 {
         return Err("Couldn't resume an invalid protected process.".to_string());

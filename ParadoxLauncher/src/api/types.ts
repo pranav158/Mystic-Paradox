@@ -56,7 +56,8 @@ export interface LauncherPolicy {
   logUpload: { auto: boolean };
   guardEnforcement: "ENFORCE" | "OBSERVE";
   diagnosticsProfile: "PRODUCTION" | "DEVELOPMENT";
-  p2pEmergencyStop: boolean;
+  /** The server's half of the co-op switch; absent on a dedicated-only server. */
+  coopHunts: boolean;
 }
 
 export interface LogPaths {

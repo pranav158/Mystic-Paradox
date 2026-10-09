@@ -10,13 +10,10 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 /// Every build needs the runtime and the winmm proxy that loads it next to the game exe.
 pub(crate) const CORE_RUNTIME_ARTIFACT_NAMES: [&str; 2] = ["MysticParadox.dll", "winmm.dll"];
 
-/// The files this build requires, hashes at Play and reports to the backend for the game ticket.
+/// The files every Play requires, hashes and reports to the backend for the game ticket. While the co-op switch is
+/// on, Play adds the co-op files (`p2p::prepare_play`).
 pub(crate) fn required_runtime_artifact_names() -> Vec<&'static str> {
-    #[cfg_attr(not(feature = "p2p"), allow(unused_mut))]
-    let mut names = CORE_RUNTIME_ARTIFACT_NAMES.to_vec();
-    #[cfg(feature = "p2p")]
-    names.extend(crate::p2p::RUNTIME_ARTIFACT_NAMES);
-    names
+    CORE_RUNTIME_ARTIFACT_NAMES.to_vec()
 }
 
 fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
@@ -345,12 +342,10 @@ mod tests {
     }
 
     #[test]
-    fn required_set_follows_the_build() {
-        let names = required_runtime_artifact_names();
-        assert_eq!(&names[..2], &CORE_RUNTIME_ARTIFACT_NAMES);
-        #[cfg(feature = "p2p")]
-        assert_eq!(&names[2..], &crate::p2p::RUNTIME_ARTIFACT_NAMES);
-        #[cfg(not(feature = "p2p"))]
-        assert_eq!(names.len(), 2);
+    fn every_play_requires_the_core_set() {
+        assert_eq!(
+            required_runtime_artifact_names(),
+            CORE_RUNTIME_ARTIFACT_NAMES.to_vec()
+        );
     }
 }

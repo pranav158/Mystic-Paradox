@@ -6,18 +6,18 @@ pub mod process;
 pub mod supervisor;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "p2p")]
+#[cfg(mystic_p2p)]
 use std::time::Duration;
 use std::time::Instant;
 
 /// How long launcher exit waits for owned player-host supervisors to fence their server, stop
-/// their Steam session and reap their child before the Job Object is used as the hard boundary.
+/// their transport session and reap their child before the Job Object is used as the hard boundary.
 /// The supervisor's own graceful window is six seconds, so the first drain has to cover it.
-#[cfg(feature = "p2p")]
+#[cfg(mystic_p2p)]
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(7);
 /// A second, shorter drain after the Job Object is terminated: a killed child lets its supervisor
 /// finish unregistering almost immediately.
-#[cfg(feature = "p2p")]
+#[cfg(mystic_p2p)]
 const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Set as soon as an orderly launcher exit begins. Every entry point that would start new work
@@ -54,8 +54,8 @@ fn timed<T>(name: &str, action: impl FnOnce() -> T) -> T {
 /// material is cleared last.
 ///
 /// In a P2P build this coordinator also tells launcher-owned supervisors to stop, waits for them
-/// (bounded) to release their child and Steam session and runs the native Steam shutdown, which
-/// joins the transport worker before the DLL is unloaded. Order matters: new work is refused
+/// (bounded) to release their child and transport session and runs the transport module's shutdown,
+/// which joins its worker before the module is unloaded. Order matters: new work is refused
 /// first, owned sessions are drained next, and only then is the shared transport allowed to go away.
 pub fn shutdown_all() {
     if SHUTDOWN_STARTED.swap(true, Ordering::AcqRel) {
@@ -78,13 +78,13 @@ pub fn shutdown_all() {
     // Stop accepting new work before anything is torn down.
     timed("guard_loop_stop", guard_loop::stop);
     // The control loop must not issue a fresh bootstrap whose transport is about to be unloaded.
-    #[cfg(feature = "p2p")]
+    #[cfg(mystic_p2p)]
     timed("control_loop_stop", crate::p2p::stop_control_loop);
 
     // Ask every launcher-owned supervisor to stop, then wait for the registry to drain. A
-    // supervisor only unregisters after it has fenced its server, stopped its Steam session and
+    // supervisor only unregisters after it has fenced its server, stopped its transport session and
     // reaped its child, so an empty registry means that work really is finished.
-    #[cfg(feature = "p2p")]
+    #[cfg(mystic_p2p)]
     {
         let requested = timed("stop_sessions", crate::p2p::stop_all_sessions);
         stage("stop_sessions", &format!("requested={requested}"));
@@ -98,7 +98,7 @@ pub fn shutdown_all() {
             stage("terminate_job", &format!("error={error}"));
         }
     });
-    #[cfg(feature = "p2p")]
+    #[cfg(mystic_p2p)]
     {
         let drained_after_kill = crate::p2p::drain_sessions(POST_KILL_DRAIN_TIMEOUT);
         stage("drain_after_kill", &format!("drained={drained_after_kill}"));

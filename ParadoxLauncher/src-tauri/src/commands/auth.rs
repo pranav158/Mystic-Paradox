@@ -14,7 +14,7 @@ use crate::auth::session_epoch;
 /// with a new bearer token. The Job Object is the hard boundary for any process that does not
 /// stop cleanly.
 fn revoke_local_guard_state() {
-    #[cfg(feature = "p2p")]
+    #[cfg(mystic_p2p)]
     crate::p2p::stop_all_sessions();
     let _ = crate::launch::supervisor::terminate_all(0xE304);
     crate::launch::guard_loop::clear();
@@ -553,7 +553,9 @@ pub struct NativePolicy {
     pub log_upload: NativeLogUpload,
     pub guard_enforcement: String,
     pub diagnostics_profile: String,
-    pub p2p_emergency_stop: bool,
+    /// The server's half of the co-op switch (p2p/mod.rs); absent on a dedicated-only server.
+    #[serde(default)]
+    pub coop_hunts: bool,
 }
 
 // Shared by native_get_policy (badge/channel, exposed to JS) and secure_launch's flag

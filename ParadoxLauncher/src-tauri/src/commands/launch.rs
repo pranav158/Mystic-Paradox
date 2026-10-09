@@ -28,8 +28,8 @@ struct GameSessionRequest<'a> {
     runtime_channel: &'a str,
     // The backend compares the installed set and release version with the latest signed manifest
     // for the server-derived account channel. Presence-only checks are not an authority boundary;
-    // every required file is hashed here: the runtime and winmm proxy, plus the Steam transport,
-    // Steam runtime and admission key in a P2P build (`verify::required_runtime_artifact_names`).
+    // every required file is hashed here: the runtime and winmm proxy (`verify::required_runtime_artifact_names`),
+    // plus the co-op files while the co-op switch is on (`p2p::prepare_play`).
     runtime_manifest_version: &'a str,
     runtime_artifacts: &'a [RuntimeArtifactHash],
 }
@@ -154,7 +154,8 @@ fn secure_launch_after_runtime(
         return Err("Dauntless is already running.".to_string());
     }
     let executable_sha256 = verify::hash_file_sha256(&exe_path)?;
-    let runtime_artifacts = verify::required_runtime_artifact_names()
+    #[cfg_attr(not(mystic_p2p), allow(unused_mut))]
+    let mut runtime_artifacts = verify::required_runtime_artifact_names()
         .into_iter()
         .map(|name| {
             Ok(RuntimeArtifactHash {
@@ -178,6 +179,19 @@ fn secure_launch_after_runtime(
             "Your account access changed. Press Play again to pick up the new settings."
                 .to_string(),
         );
+    }
+    // The co-op switch for this Play: with co-op on, the co-op files join the reported runtime set and the
+    // transport starts before the game (process::spawn_game).
+    #[cfg(mystic_p2p)]
+    for name in crate::p2p::prepare_play(
+        &app,
+        policy.coop_hunts,
+        &policy.channel,
+        &refreshed.access_token,
+        session_dir,
+    ) {
+        let sha256 = verify::hash_file_sha256(&game_dir.join(&name))?;
+        runtime_artifacts.push(RuntimeArtifactHash { name, sha256 });
     }
 
     // The session directory is created before runtime preparation so early failures are retained.

@@ -35,7 +35,7 @@ pub fn append_active_session_log(line: &str) {
 /// Releases resources a Play attempt started, on every exit path once nothing needs them.
 fn release_play_resources() {
     // A P2P build releases the transport it started for Play.
-    #[cfg(feature = "p2p")]
+    #[cfg(mystic_p2p)]
     crate::p2p::release_play_transport();
 }
 
@@ -262,7 +262,7 @@ pub fn spawn_game(
 
     // A P2P build starts its co-op transport here, before the game process exists. The default
     // dedicated-only build has none.
-    #[cfg(feature = "p2p")]
+    #[cfg(mystic_p2p)]
     crate::p2p::start_play_transport(game_dir, session_dir)?;
 
     // Root cause of "no audio only when launched by the launcher" (confirmed: non-elevated, launcher

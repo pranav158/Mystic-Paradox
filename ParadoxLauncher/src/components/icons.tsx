@@ -249,13 +249,15 @@ export function AlertIcon(props: IconProps) {
   );
 }
 
-export function SteamIcon(props: IconProps) {
+/** Co-op connection: three linked peers. */
+export function CoopIcon(props: IconProps) {
   return (
     <Icon {...props}>
-      <circle cx="12" cy="12" r="8.5" />
-      <circle cx="15" cy="9.5" r="2.2" />
-      <path d="m13.2 11-3.5 3.2" />
-      <circle cx="8.8" cy="15.2" r="1.5" />
+      <circle cx="6" cy="12" r="2.5" />
+      <circle cx="18" cy="6.5" r="2.5" />
+      <circle cx="18" cy="17.5" r="2.5" />
+      <path d="m8.3 10.9 7.4-3.3" />
+      <path d="m8.3 13.1 7.4 3.3" />
     </Icon>
   );
 }

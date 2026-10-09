@@ -56,7 +56,7 @@ mockIPC((cmd) => {
     case "native_refresh_account":
       return delay(account);
     case "native_get_policy":
-      return delay({ policyVersion: "preview", roles: ["tester"], channel, managedFeatureIds: [], logUpload: { auto: false }, guardEnforcement: "OBSERVE", diagnosticsProfile: "PRODUCTION", p2pEmergencyStop: false }, 200);
+      return delay({ policyVersion: "preview", roles: ["tester"], channel, managedFeatureIds: [], logUpload: { auto: false }, guardEnforcement: "OBSERVE", diagnosticsProfile: "PRODUCTION", coopHunts: false }, 200);
     case "native_get_server_status":
       return params.has("offline") ? Promise.reject("offline") : delay({ online: true, supportedBuildChangelist: 647472 }, 300);
     case "get_install_status":
@@ -72,7 +72,7 @@ mockIPC((cmd) => {
     case "native_get_log_paths":
       return delay({ sessionsRoot: "C:\\Users\\Slayer\\AppData\\Local\\MysticParadox\\Logs\\Sessions", latestSessionDir: "C:\\Users\\Slayer\\AppData\\Local\\MysticParadox\\Logs\\Sessions\\s1" });
     case "native_get_p2p_host_settings":
-      return { available: !params.has("nop2p"), memoryNotice: "Hosting a party hunt uses about 4 GB of extra memory.", steamTransportReady: false, steamId: null, steamStatus: "UNAVAILABLE", steamStatusDetail: "Steam transport starts automatically when you press Play.", steamCheckedAt: iso(0) };
+      return { available: !params.has("nop2p"), memoryNotice: "Hosting a party hunt uses about 4 GB of extra memory.", transportReady: false, transportStatus: "UNAVAILABLE", transportStatusDetail: "The co-op connection starts automatically when you press Play.", transportCheckedAt: iso(0) };
     case "secure_launch":
       return delay(null, 2400);
     case "pick_install_path":
