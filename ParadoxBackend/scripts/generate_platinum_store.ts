@@ -46,10 +46,17 @@ import { fileURLToPath } from "node:url";
 const ScriptDir = path.dirname(fileURLToPath(import.meta.url));
 const MetagameRoot = path.resolve(ScriptDir, "..");
 const ProjectRoot = path.resolve(MetagameRoot, "..");
-const CatalogPath = process.env.MYSTICPARADOX_CATALOG_1_12_PATH
-    ? path.resolve(process.env.MYSTICPARADOX_CATALOG_1_12_PATH)
-    : path.join(ProjectRoot, "Items_Analysis", "catalog_1_12.jsonl");
-const StoreImagesPath = path.join(ProjectRoot, "Items_Analysis", "store_item_images_1_12.jsonl");
+// The 1.12 export where present (the store was first built from it), otherwise a 1.14.7 export.
+function ExportFile(baseName: string): string {
+    const Legacy = path.join(ProjectRoot, "Items_Analysis", `${baseName}_1_12.jsonl`);
+    const Current = path.join(ProjectRoot, "Items_Analysis", `${baseName}_1_14_7.jsonl`);
+    return fs.existsSync(Legacy) || !fs.existsSync(Current) ? Legacy : Current;
+}
+const CatalogOverride = process.env.MYSTICPARADOX_CATALOG_1_12_PATH ?? process.env.MYSTICPARADOX_CATALOG_PATH;
+const CatalogPath = CatalogOverride ? path.resolve(CatalogOverride) : ExportFile("catalog");
+const StoreImagesPath = process.env.MYSTICPARADOX_STORE_IMAGES_PATH
+    ? path.resolve(process.env.MYSTICPARADOX_STORE_IMAGES_PATH)
+    : ExportFile("store_item_images");
 const CapturePath = path.join(ProjectRoot, "DauntlessEndpointDocumentation", "Store", "Product", "Skus");
 const DataDir = path.join(MetagameRoot, "game-data");
 const OutputPath = path.join(DataDir, "platinum_store.json");

@@ -18,7 +18,8 @@ const CatalogPath = CatalogOverride
     ? path.resolve(CatalogOverride)
     : path.join(ProjectRoot, "Items_Analysis", "catalog_1_14_7.jsonl");
 const OutputName = "inventory_storage_policy.json";
-const OutputPath = path.join(MetagameRoot, "game-data", OutputName);
+const GameDataRoot = path.join(MetagameRoot, "game-data");
+const OutputPath = path.join(GameDataRoot, OutputName);
 
 type CatalogRow = {
     itemId: string;
@@ -33,7 +34,7 @@ function WalkSourceFiles(directory: string): string[] {
         const FullPath = path.join(directory, Entry.name);
         if (Entry.isDirectory()) {
             Out.push(...WalkSourceFiles(FullPath));
-        } else if (/\.(ts|json)$/i.test(Entry.name) && Entry.name !== OutputName) {
+        } else if (/\.(ts|json)$/i.test(Entry.name) && Entry.name !== OutputName && !Entry.name.endsWith(".example.json")) {
             Out.push(FullPath);
         }
     }
@@ -52,7 +53,8 @@ for (const Line of CatalogText.split(/\r?\n/)) {
     if (typeof Row.itemId === "string" && Row.itemId.length > 0) Catalog.set(Row.itemId, Row);
 }
 
-const SourceFiles = WalkSourceFiles(SourceRoot).sort();
+// Ids the server code references, plus every id the game data serves (stores, progression, Slayer's Path).
+const SourceFiles = [...WalkSourceFiles(SourceRoot), ...WalkSourceFiles(GameDataRoot)].sort();
 const ReferencedIds = new Set<string>();
 for (const SourceFile of SourceFiles) {
     const Text = fs.readFileSync(SourceFile, "utf8");
@@ -79,7 +81,7 @@ const Document = {
     catalogSha256: crypto.createHash("sha256").update(CatalogText).digest("hex"),
     generatedAt: "2026-10-08",
     referencedCatalogIds: Object.keys(Entries).length,
-    sourceScope: ["src/**/*.ts", "src/**/*.json"],
+    sourceScope: ["src/**/*.ts", "src/**/*.json", "game-data/*.json"],
     entries: Entries,
 };
 

@@ -39,5 +39,10 @@ if (Run.length < All.length) {
     for (const file of All.filter((file) => !Run.includes(file))) console.log(`[tests]   ${file}`);
 }
 
+// With no files, node --test would fall back to its default search (which includes compiled build output).
+if (Run.length === 0) {
+    console.log("[tests] nothing to run");
+    process.exit(0);
+}
 const Result = spawnSync(process.execPath, ["--import", "tsx", "--test", ...Run], { cwd: Root, stdio: "inherit" });
 process.exit(Result.status === null ? 1 : Result.status);

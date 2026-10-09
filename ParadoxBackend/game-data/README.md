@@ -30,12 +30,19 @@ files until every real file is present.
 
 ## Real data
 
-Extract with CatalogExporter first (see `docs/GENERATING_GAME_DATA.md`), then run the generators. Each
-one previews by default and writes with `--apply`:
+Extract with CatalogExporter first (see `docs/GENERATING_GAME_DATA.md`); the generators read
+`<repository>/Items_Analysis`. Run them in this order:
 
 ```bash
-npm run generate:progression-config -- --apply
-npm run generate:slayers-path -- --apply
-npm run generate:ladyluck-store -- --apply
-npm run inventory:storage-policy:generate
+cp slayers_path.example.json slayers_path.json          # base graph the generator fills in
+npm run generate:slayers-path -- --apply                # Slayer's Path nodes from the export
+node scripts/generate_slayers_path_definitions.cjs --apply
+npm run generate:progression-config -- --apply          # from raw/progression_config.source.json
+npm run generate:ladyluck-store -- --apply              # from raw/ladyluck_store.source.json
+npm run reward-cache:generate                           # from the catalog; also writes the storage policy
+npm run platinum:generate                               # from the catalog and store images; also the policy
 ```
+
+The `generate:*` scripts preview without `--apply`; the others write directly. `npm run
+inventory:storage-policy:generate` rebuilds the storage policy alone (from the catalog, for every item
+the code and the game data reference). Set `MYSTICPARADOX_CATALOG_PATH` to read another catalog.
