@@ -3,7 +3,7 @@
   "description": "Mystic Paradox launcher — sign in, verify your install, and play Dauntless",
   "author": "Mystic Paradox (pranav158)",
   "private": true,
-  "version": "0.1.50",
+  "version": "0.1.53",
   "type": "module",
   "scripts": {
     "test:workflow": "node --test scripts/launch-workflow.test.cjs",

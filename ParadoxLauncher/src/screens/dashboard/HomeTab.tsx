@@ -16,7 +16,7 @@ import {
 } from "../../api/tauri";
 import { sanitizeError } from "../../lib/sanitize";
 import { buildName, describeExit, formatClock, formatDuration, formatWhen, type SessionSummary } from "../../lib/sessions";
-import { AccountIcon, AlertIcon, BuildIcon, CheckIcon, ChevronRightIcon, HistoryIcon, PlayIcon, RuntimeIcon } from "../../components/icons";
+import { AccountIcon, AlertIcon, BuildIcon, CheckIcon, HistoryIcon, PlayIcon, RuntimeIcon } from "../../components/icons";
 import { AetherMark } from "../../components/AetherMark";
 import { ArtBackdrop } from "../../components/ArtBackdrop";
 
@@ -426,8 +426,8 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
             </div>
           </section>
 
-          <section className="stats" aria-label="Launcher details">
-            <article className="glass glow lift stat reveal" style={at(4)}>
+          <section className="glass glow stats reveal" style={at(4)} aria-label="Launcher details">
+            <article className="stat">
               <div className={`stat-icon${buildMatches ? " good" : buildMismatch ? " warn" : ""}`}><BuildIcon /></div>
               <div className="stat-copy">
                 <div className="stat-label">Build</div>
@@ -437,8 +437,7 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
             </article>
             <button
               type="button"
-              className="glass glow lift stat reveal"
-              style={at(5)}
+              className="stat"
               onClick={onOpenAccount}
               aria-label={`Manage ${account?.displayName ?? "your"} account. ${accountNote}.`}
             >
@@ -448,12 +447,10 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
                 <div className="stat-value">{account?.displayName ?? "Signed in"}</div>
                 <div className="stat-note" aria-live="polite"><span key={accountNote} className="swap">{accountNote}</span></div>
               </div>
-              <ChevronRightIcon className="chev" />
             </button>
             <button
               type="button"
-              className="glass glow lift stat reveal"
-              style={at(6)}
+              className="stat"
               onClick={() => onNavigate("library")}
               aria-label={`Runtime: ${runtimeValue}. ${runtimeNote}. Open the library.`}
             >
@@ -463,13 +460,12 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
                 <div className="stat-value"><span key={runtimeValue} className="swap">{runtimeValue}</span></div>
                 <div className="stat-note"><span key={runtimeNote} className="swap">{runtimeNote}</span></div>
               </div>
-              <ChevronRightIcon className="chev" />
             </button>
           </section>
         </div>
 
         <aside className="home-side">
-          <section className="glass panel reveal" style={at(7)} aria-label="Recent sessions">
+          <section className="glass panel reveal" style={at(5)} aria-label="Recent sessions">
             <div className="panel-head">
               <h2 className="panel-title"><HistoryIcon />Recent sessions</h2>
               <button type="button" className="btn btn-ghost btn-sm" onClick={() => onNavigate("settings")}>Logs</button>
