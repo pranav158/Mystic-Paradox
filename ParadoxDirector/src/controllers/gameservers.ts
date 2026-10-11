@@ -20,6 +20,8 @@ import path from "node:path";
 import { kill } from "node:process";
 import { logger } from "../logger";
 import { loadGameData } from "../gameData/loader";
+import { PortPool } from "./portPool";
+import { CreateSerialGate, HubSupervisor, HubLogLevel } from "./hubSupervisor";
 
 // Hunt tables from ParadoxDirector/game-data (gameData/loader.ts), exported from the client by CatalogExporter.
 const PlayerHuntTable = loadGameData<any>("player_hunts_table.json");
@@ -59,12 +61,9 @@ type ExpectedPlayer = {
 };
 
 export let Gameservers: Gameserver[] = [];
-let FreePorts: number[] = [];
-
-// Both hubs are cleared to undefined while they restart (see CleanupServer's fencing comment);
-// every reader already handles the missing case, so the declarations have to allow it.
-let RamsgateServer : Gameserver | undefined;
-let TrainingDojoServer : Gameserver | undefined;
+// [2026-10-10 1.14.7] Hunt ports are leased per launch id (portPool.ts): a late or duplicate release cannot
+// free a port that a newer hunt holds.
+const Ports = new PortPool();
 
 const PORT_RANGE_BEGIN = Number(process.env.PORT_RANGE_BEGIN!);
 const PORT_RANGE_END = Number(process.env.PORT_RANGE_END!);
@@ -133,6 +132,45 @@ const METAGAME_API_KEY = process.env.METAGAME_API_KEY!;
 const MY_IP = process.env.MY_IP!;
 const SECONDS_TO_WAIT_BETWEEN_GAMESERVER_STARTUP = Number(process.env.SECONDS_TO_WAIT_BETWEEN_GAMESERVER_STARTUP!);
 const GAMESERVER_READY_TIMEOUT_MS = Number(process.env.GAMESERVER_READY_TIMEOUT_MS ?? "30000");
+
+// [2026-10-10 1.14.7] The persistent hubs are owned by one HubSupervisor each (hubSupervisor.ts): one start
+// in flight per hub, retries with capped backoff after a failed start or a crash loop, and both hubs'
+// cold starts serialized through one gate (never Ramsgate and the dojo at once). The supervisor's
+// `current` is undefined while a hub is down or restarting, so the getters answer "not ready" instead of
+// handing out a dead address (the 2026-10-04 fencing rule).
+//   HUB_PROMPT_RESTART=1 (default)  a hub exit restarts the hub at once (exit event, or a getter that finds
+//                                   the process gone or the hub missing), subject to the crash-loop backoff.
+//   HUB_PROMPT_RESTART=0            hub exits are noticed only by the 60 s watchdog, as before; the getters
+//                                   still refuse a dead hub but never start one. A failed start is still
+//                                   retried on its backoff timer and by the watchdog.
+//                                   0, false, no and off (any case) all switch it off.
+// A hub start other than the boot start first waits (capped at 60 s) for the hunt ServerLaunchQueue tail as
+// it stands at that moment, so a prompt restart is spaced behind hunt cold starts already queued by the same
+// SECONDS_TO_WAIT_BETWEEN_GAMESERVER_STARTUP stagger hunts get from each other (the FAsyncLoadingThread rule
+// in Startup). The hub is not added to the stagger: hunts queued after it do not wait for it.
+const HUB_PROMPT_RESTART = !/^(0|false|no|off)$/i.test((process.env.HUB_PROMPT_RESTART ?? "1").trim());
+const HUB_HUNT_QUEUE_WAIT_CAP_MS = 60_000;
+const StartHubSerialized = CreateSerialGate();
+const HubLog = (Level: HubLogLevel, Message: string, Error?: unknown) =>
+    Error === undefined ? logger[Level](Message) : logger[Level]({ error: Error }, Message);
+const RamsgateHub = new HubSupervisor<Gameserver>({
+    label: "ramsgate",
+    start: (Reason) => StartHubSerialized(async () => {
+        if (Reason !== "boot") await WaitForHuntLaunchQueue("ramsgate");
+        return StartServer(RAMSGATE_MAP_PATH, undefined, undefined, undefined, true, false);
+    }),
+    isAlive: (Server) => IsProcessAlive(Server.processId),
+    log: HubLog
+});
+const TrainingHub = new HubSupervisor<Gameserver>({
+    label: "training_dojo",
+    start: (Reason) => StartHubSerialized(async () => {
+        if (Reason !== "boot") await WaitForHuntLaunchQueue("training_dojo");
+        return StartServer(TRAINING_DOJO_MAP_PATH, undefined, undefined, undefined, false, true);
+    }),
+    isAlive: (Server) => IsProcessAlive(Server.processId),
+    log: HubLog
+});
 
 // Trials uses 181 real numbered arena rows. Keep the live default at one week, but permit short,
 // deterministic UTC buckets for end-to-end rotation testing (for example, 30 minutes). The injected
@@ -298,46 +336,74 @@ function WaitForServerReady(Child: ReturnType<typeof spawn>, LaunchId: string, P
     });
 }
 
-export async function CleanupServer(ServerToShutdown: Gameserver){    Gameservers = Gameservers.filter(Server => Server !== ServerToShutdown);
+// [1.14.7 FENCING 2026-10-04] The hub reference is cleared BEFORE its restart, so the getters throw their
+// existing "not ready" (callers wait on that) instead of returning the dead hub's address.
+// [2026-10-05] A failed restart must never escape to the watchdog's setInterval (an unhandled rejection
+// once killed the whole DeployServer and with it the healthy Ramsgate).
+// [2026-10-10 1.14.7] The hub supervisors own the restart: CleanupServer no longer awaits it (the watchdog
+// pass stays short, which ends the stale-snapshot port race), HubSupervisor.ensure() never rejects, and a
+// failed restart is retried with backoff instead of being "left down until the next request" (nothing ever
+// retried it). Idempotent: the exit event, the getters and the watchdog may all report the same server.
+export async function CleanupServer(ServerToShutdown: Gameserver, Reason: string = "watchdog"){
+    const Listed = Gameservers.includes(ServerToShutdown);
+    if (Listed) Gameservers = Gameservers.filter(Server => Server !== ServerToShutdown);
 
-    // [1.14.7 FENCING 2026-10-04] Clear the cached reference BEFORE awaiting the restart. Previously it was
-    // only reassigned after StartServer resolved, so for the whole restart window the getter still returned
-    // the dead hub's address and matchmaking handed it to clients. Undefined makes the getter throw its
-    // existing "not ready", which callers already handle by waiting.
-    // [2026-10-05] A failed RESTART must never escape this function. CleanupServer is awaited from
-    // RunWatchdog, which is driven by a bare setInterval, so a rejection here became an unhandled
-    // rejection and killed the whole DeployServer - observed live: the dojo failed its 30s readiness
-    // window ("training_dojo port 8789 did not report ready within 30000ms"), the process exited 1, and
-    // with it went matchmaking for the *healthy* Ramsgate hub. Losing one hub is survivable; losing the
-    // supervisor is not. The reference stays undefined, so the getters report "not ready" (callers
-    // already wait on that) instead of handing out a dead address.
-    const RestartHub = async (Label: string, Map: string, IsRamsgate: boolean, IsTrainingDojo: boolean) => {
-        try {
-            return await StartServer(Map, undefined, undefined, undefined, IsRamsgate, IsTrainingDojo);
-        } catch (Error) {
-            logger.error({ error: Error }, `${Label} failed to restart - left down until the next request; supervisor stays up`);
-            return undefined;
+    if(ServerToShutdown.isRamsgate || ServerToShutdown.isTrainingDojo){
+        const Hub = ServerToShutdown.isRamsgate ? RamsgateHub : TrainingHub;
+        if (ServerToShutdown === Hub.current) {
+            logger.warn(ServerToShutdown.isRamsgate
+                ? `RAMSGATE HAS FALLEN (${Reason})! Restarting!`
+                : `Training Dojo down (${Reason})! Restarting!`);
+            Hub.onExit(ServerToShutdown, Reason);
+        } else if (Listed) {
+            // Never current: the hub exited during its own readiness wait. Its start attempt reports the
+            // failure and schedules the retry; nothing restarts here.
+            logger.info(`[HubSupervisor] ${ServerToShutdown.isRamsgate ? "ramsgate" : "training_dojo"} pid=${ServerToShutdown.processId} exited during startup (${Reason}); its start attempt handles the retry`);
         }
-    };
-
-    if(ServerToShutdown.isRamsgate){
-        logger.warn("RAMSGATE HAS FALLEN! Restarting!");
-
-        RamsgateServer = undefined;
-        RamsgateServer = await RestartHub("ramsgate", RAMSGATE_MAP_PATH, true, false);
+        return;
     }
-    else if(ServerToShutdown.isTrainingDojo){
-        logger.warn("Training Dojo Crashed! Restarting!");
 
-        TrainingDojoServer = undefined;
-        TrainingDojoServer = await RestartHub("training_dojo", TRAINING_DOJO_MAP_PATH, false, true);
-    }
-    else{
-        FreePorts.push(ServerToShutdown.port);
+    // Owner-checked: a no-op when the exit event already returned the port (or a newer hunt holds it).
+    Ports.release(ServerToShutdown.port, ServerToShutdown.launchId);
+}
+
+// [2026-10-10 1.14.7] Watchdog fallback for a hunt whose exit event never arrived after it left Gameservers
+// (a timed-out start whose kill was issued, or a lost child handle): its lease is returned once the
+// recorded pid is gone. A lease whose pid is still alive stays held - that process may still own the socket.
+export function ReclaimOrphanedPortLeases(): void {
+    const Reclaimed = Ports.reclaim(
+        (Owner) => Gameservers.some((Server) => Server.launchId === Owner),
+        (Pid) => IsProcessAlive(Pid)
+    );
+    for (const Lease of Reclaimed) {
+        logger.warn(`[PortPool] reclaimed port ${Lease.port} from launch ${Lease.owner} (pid=${Lease.pid ?? "none"} gone, no exit event)`);
     }
 }
 
+// [2026-10-10 1.14.7] Watchdog safety net for the hubs: retries a hub whose start failed (it is in neither
+// Gameservers nor its supervisor) and restarts a dead hub that sent no exit event.
+export function TickPersistentHubs(): void {
+    RamsgateHub.tick();
+    TrainingHub.tick();
+}
+
 let ServerLaunchQueue: Promise<void> = Promise.resolve();
+
+// [2026-10-10 1.14.7] Hub restarts wait for the hunt stagger tail captured now (only hunts already queued),
+// capped so a burst of matchmaking requests cannot keep a down hub down. Never rejects.
+async function WaitForHuntLaunchQueue(Label: string): Promise<void> {
+    const Tail = ServerLaunchQueue.catch(() => {});
+    const StartedAt = performance.now();
+    let CapTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+    const TimedOut = await Promise.race([
+        Tail.then(() => false),
+        new Promise<boolean>((resolve) => { CapTimer = globalThis.setTimeout(() => resolve(true), HUB_HUNT_QUEUE_WAIT_CAP_MS); })
+    ]);
+    globalThis.clearTimeout(CapTimer);
+    const WaitedMs = Math.round(performance.now() - StartedAt);
+    if (TimedOut) logger.warn(`[HubSupervisor] ${Label} hunt launch queue still busy after ${WaitedMs} ms - cold-starting anyway`);
+    else if (WaitedMs >= 100) logger.info(`[HubSupervisor] ${Label} waited ${WaitedMs} ms for the hunt launch queue before cold start`);
+}
 
 async function StartServer(Map: string, Behemoth: string | undefined, MatchmakerHuntId: string | undefined, ExpectedPlayers: ExpectedPlayer[] | undefined, IsRamsgate: boolean, IsTrainingDojo: boolean){
     // The stagger queue exists to stop a BURST of hunt-server spawns (real matchmaking requests)
@@ -352,7 +418,8 @@ async function StartServer(Map: string, Behemoth: string | undefined, Matchmaker
         await LaunchProc;
     }
 
-    let Port;
+    let Port: number | undefined;
+    const Id = crypto.randomUUID();
 
     if(IsRamsgate){
         Port = RAMSGATE_PORT;
@@ -367,14 +434,15 @@ async function StartServer(Map: string, Behemoth: string | undefined, Matchmaker
         if(CountHuntServers() >= MAX_CONCURRENT_HUNT_SERVERS){
             throw new NoHuntCapacityError(CountHuntServers(), MAX_CONCURRENT_HUNT_SERVERS);
         }
-        Port = FreePorts.pop();
+        Port = Ports.take(Id);
     }
-
-    const Id = crypto.randomUUID();
 
     if(Port == undefined){
         throw new Error("No free ports left!");
     }
+    // TS does not narrow a `let` inside the exit closure below.
+    const LeasedPort: number = Port;
+    const IsHunt = !IsRamsgate && !IsTrainingDojo;
 
     // Per-gameserver console capture (organized under the debug dir) so the
     // dedicated-server output can be grepped directly. Piping also drains
@@ -403,25 +471,34 @@ async function StartServer(Map: string, Behemoth: string | undefined, Matchmaker
         ...(ArenaWeekMatch ? { MYSTICPARADOX_TRIALS_WEEK: ArenaWeekMatch[1] } : {})
     };
 
-    const Child = spawn(GAMESERVER_BINARY_PATH, [
-        METAGAME_API_KEY,
-        Port.toString(),
-        Map,
-        Behemoth != undefined ? Behemoth : "NO_BEHEMOTH",
-        MatchmakerHuntId != undefined ? MatchmakerHuntId : "NO_MM_HUNTID",
-        ExpectedPlayers != undefined ? TransformExpectedPlayerArgs(ExpectedPlayers) : "NO_EXPECTED_PLAYERS",
-        MY_IP + ":" + Port.toString(),
-        ...STANDARD_GAMESERVER_ARGS
-    ], {
-        // [1.14.7] The game executable is a GUI application, so it creates a render window even
-        // with -nullrhi. windowsHide sets STARTF_USESHOWWINDOW=SW_HIDE, which is what keeps the
-        // dedicated hubs headless on this box. stdout/stderr remain piped to the per-port log
-        // either way. Set GAMESERVER_WINDOWS_HIDE=0 to show the window for interactive debugging.
-        windowsHide: (process.env.GAMESERVER_WINDOWS_HIDE ?? "1") !== "0",
-        stdio: ["ignore", "pipe", "pipe"],
-        // The DLL prints this child-only correlation value only after Listen succeeds.
-        env: ChildEnvironment
-    });
+    let Child: ReturnType<typeof spawn>;
+    try {
+        Child = spawn(GAMESERVER_BINARY_PATH, [
+            METAGAME_API_KEY,
+            Port.toString(),
+            Map,
+            Behemoth != undefined ? Behemoth : "NO_BEHEMOTH",
+            MatchmakerHuntId != undefined ? MatchmakerHuntId : "NO_MM_HUNTID",
+            ExpectedPlayers != undefined ? TransformExpectedPlayerArgs(ExpectedPlayers) : "NO_EXPECTED_PLAYERS",
+            MY_IP + ":" + Port.toString(),
+            ...STANDARD_GAMESERVER_ARGS
+        ], {
+            // [1.14.7] The game executable is a GUI application, so it creates a render window even
+            // with -nullrhi. windowsHide sets STARTF_USESHOWWINDOW=SW_HIDE, which is what keeps the
+            // dedicated hubs headless on this box. stdout/stderr remain piped to the per-port log
+            // either way. Set GAMESERVER_WINDOWS_HIDE=0 to show the window for interactive debugging.
+            windowsHide: (process.env.GAMESERVER_WINDOWS_HIDE ?? "1") !== "0",
+            stdio: ["ignore", "pipe", "pipe"],
+            // The DLL prints this child-only correlation value only after Listen succeeds.
+            env: ChildEnvironment
+        });
+    } catch (SpawnError) {
+        // [2026-10-10 1.14.7] A synchronous spawn failure has no child and no exit event: return the lease.
+        if (IsHunt) Ports.release(LeasedPort, Id);
+        LogStream.end();
+        throw SpawnError;
+    }
+    if (IsHunt) Ports.attachPid(LeasedPort, Id, Child.pid);
 
     Child.stdout?.pipe(LogStream);
     Child.stderr?.pipe(LogStream);
@@ -436,13 +513,18 @@ async function StartServer(Map: string, Behemoth: string | undefined, Matchmaker
 
         // [2026-07-17] Reclaim immediately instead of waiting up to 60s for the watchdog — this lag was
         // part of the port/RAM leak under churn. For a HUNT, drop it from the live list and return its
-        // port to the pool right now. Ramsgate/Dojo are intentionally LEFT in the list so the watchdog's
-        // CleanupServer path detects the dead process and restarts them.
-        if(!IsRamsgate && !IsTrainingDojo){
-            Gameservers = Gameservers.filter((Server) => Server.processId !== Child.pid);
-            if(Port != undefined && !FreePorts.includes(Port)){
-                FreePorts.push(Port);
-            }
+        // port to the pool right now: the process is confirmed gone, and the release is owner-checked.
+        // [2026-10-10 1.14.7] A hub exit now reaches its supervisor at once (CleanupServer -> onExit, with
+        // crash-loop backoff) instead of waiting up to 60 s for the watchdog. A hub that exits during its
+        // own readiness wait is not current yet: CleanupServer only logs it and the start's rejection drives
+        // the retry. HUB_PROMPT_RESTART=0 leaves hubs listed for the watchdog, as before.
+        if(IsHunt){
+            Gameservers = Gameservers.filter((Server) => Server.launchId !== Id);
+            Ports.release(LeasedPort, Id);
+        }
+        else if(HUB_PROMPT_RESTART){
+            const Hub = Gameservers.find((Server) => Server.launchId === Id);
+            if (Hub) void CleanupServer(Hub, `exit code=${code ?? "null"} signal=${signal ?? "null"}`);
         }
     });
 
@@ -480,8 +562,12 @@ async function StartServer(Map: string, Behemoth: string | undefined, Matchmaker
     catch (Err: any) {
         NewGameserver.state = "failed";
         Gameservers = Gameservers.filter((Server) => Server !== NewGameserver);
-        if (!IsRamsgate && !IsTrainingDojo && !FreePorts.includes(Port)) FreePorts.push(Port);
-        if (Child.exitCode == undefined) Child.kill();
+        // [2026-10-10 1.14.7] Return a hunt's port only when its process is really gone. A timed-out child
+        // that is still alive is killed and its exit event releases the port (owner-checked); if that event
+        // never arrives, the watchdog reclaims the lease once the pid is gone (ReclaimOrphanedPortLeases).
+        const Gone = Child.pid === undefined || Child.exitCode !== null || Child.signalCode !== null;
+        if (!Gone) Child.kill();
+        else if (IsHunt) Ports.release(LeasedPort, Id);
         throw Err instanceof GameserverStartupError ? Err : new GameserverStartupError(`${Label} port ${Port} readiness failed: ${Err?.message ?? Err}`);
     }
 
@@ -525,28 +611,37 @@ export function GetPersistentHubStatus(){
     };
 
     return {
-        ramsgate: Describe(RamsgateServer),
-        trainingDojo: Describe(TrainingDojoServer)
+        ramsgate: Describe(RamsgateHub.current),
+        trainingDojo: Describe(TrainingHub.current)
     };
+}
+
+// [2026-10-10 1.14.7] Both getters check ready AND alive (the Training getter used to hand out a dead dojo's
+// address for up to 60 s). A dead hub is reported to its supervisor, which restarts it; a missing hub asks
+// the supervisor for a start (it honours the backoff and joins a start already in flight). Either way the
+// caller gets the synchronous "not ready" it already waits on. With HUB_PROMPT_RESTART=0 the getters only
+// refuse; the watchdog restarts.
+function HubConnectionDetails(Hub: HubSupervisor<Gameserver>, Name: string){
+    const Server = Hub.current;
+    if (Server && Server.state === "ready" && IsProcessAlive(Server.processId)) {
+        return {
+            host: MY_IP,
+            port: Server.port
+        };
+    }
+    if (HUB_PROMPT_RESTART) {
+        if (Server && !IsProcessAlive(Server.processId)) void CleanupServer(Server, "getter: process gone");
+        else if (!Server) void Hub.ensure("request");
+    }
+    throw new GameserverStartupError(`${Name} is not ready`);
 }
 
 export function GetRamsgateConnectionDetails(){
-    if (!RamsgateServer || RamsgateServer.state !== "ready") throw new GameserverStartupError("Ramsgate is not ready");
-    if (!IsProcessAlive(RamsgateServer.processId)) {
-        throw new GameserverStartupError("Ramsgate process is gone");
-    }
-    return {
-        host: MY_IP,
-        port: RamsgateServer.port
-    };
+    return HubConnectionDetails(RamsgateHub, "Ramsgate");
 }
 
 export function GetTrainingDojoConnectionDetails(){
-    if (!TrainingDojoServer || TrainingDojoServer.state !== "ready") throw new GameserverStartupError("Training Dojo is not ready");
-    return {
-        host: MY_IP,
-        port: TrainingDojoServer.port
-    };
+    return HubConnectionDetails(TrainingHub, "Training Dojo");
 }
 
 // [2026-07-19] Public Hunt Server Reuse (Part B). If a live, ready, non-full public-hunt server already
@@ -1123,7 +1218,7 @@ export function ValidateHuntTableData() {
 export async function Startup(){
     ValidateHuntTableData();
     for(let i = PORT_RANGE_BEGIN; i <= PORT_RANGE_END - 2; i++){
-        FreePorts.push(i);
+        Ports.add(i);
     }
 
     // Do not cold-start both UE processes concurrently. Each process mounts the full pak set and
@@ -1131,23 +1226,16 @@ export async function Startup(){
     // FAsyncLoadingThread before it could create/listen on its NetDriver. Keep the starts serialized,
     // Ramsgate first, but still attempt Dojo and report both failures instead of losing a healthy
     // sibling when one hub fails.
+    // [2026-10-10 1.14.7] Through the hub supervisors and their shared start gate: still sequential,
+    // Ramsgate first, but a failed boot start is now retried with backoff instead of staying down.
     const Failures: string[] = [];
-    try {
-        RamsgateServer = await StartServer(RAMSGATE_MAP_PATH, undefined, undefined, undefined, true, false);
-    } catch (Error) {
-        Failures.push(`ramsgate: ${String(Error)}`);
-    }
-
-    try {
-        TrainingDojoServer = await StartServer(TRAINING_DOJO_MAP_PATH, undefined, undefined, undefined, false, true);
-    } catch (Error) {
-        Failures.push(`training_dojo: ${String(Error)}`);
-    }
+    if (!(await RamsgateHub.ensure("boot"))) Failures.push("ramsgate");
+    if (!(await TrainingHub.ensure("boot"))) Failures.push("training_dojo");
 
     // [2026-10-05] Report, do not throw. The bootstrap does catch this rejection, but a failed hub start
     // is not fatal to the service: the healthy sibling must keep serving. Throwing here also marked the
     // whole DeployServer unready even when Ramsgate itself was listening.
     if (Failures.length > 0) {
-        logger.warn(`Persistent hub startup reported failures (${Failures.join("; ")}) - continuing with whichever hubs are up`);
+        logger.warn(`Persistent hub startup reported failures (${Failures.join("; ")}) - continuing with whichever hubs are up; retrying with backoff until up`);
     }
 }

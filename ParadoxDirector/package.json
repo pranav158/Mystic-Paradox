@@ -9,7 +9,9 @@
   ],
   "scripts": {
     "dev": "tsx --env-file=.env src/server.ts",
-    "build": "tsc",
+    "clean": "node scripts/clean-dist.cjs",
+    "build": "npm run clean && tsc",
+    "prestart": "node scripts/ensure-build-fresh.cjs",
     "start": "node --env-file=.env dist/server.js",
     "generate:hunt-tables": "node scripts/import_hunt_tables.cjs",
     "test": "node scripts/run-tests.cjs",

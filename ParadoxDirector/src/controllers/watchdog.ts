@@ -11,13 +11,19 @@
 
 import { kill } from "node:process";
 import { logger } from "../logger";
-import { Gameserver, Gameservers, CleanupServer, LogMissingHuntRequests } from "./gameservers";
+import { Gameserver, Gameservers, CleanupServer, LogMissingHuntRequests, ReclaimOrphanedPortLeases, TickPersistentHubs } from "./gameservers";
 
 /**
  * Watchdog: reclaims dead gameservers — frees ports for hunts, restarts the persistent Ramsgate/Dojo.
  * Abandoned/empty hunts are NOT reaped here by wall-clock (that would kill an active long hunt); the
  * gameserver DLL self-terminates when it has had no client connections for a grace period, and that
  * exit is what this watchdog (and the process exit handler) reclaims.
+ *
+ * [2026-10-10 1.14.7] CleanupServer no longer awaits a hub restart (the hub supervisors own it), so a pass
+ * is short and cannot release a port from a stale snapshot. After the dead-server sweep the pass also
+ * returns hunt port leases whose process is gone but whose exit event never arrived, and ticks both hub
+ * supervisors: that retries a hub whose start failed (it is in neither Gameservers nor its supervisor) and
+ * restarts a dead hub that sent no exit event.
  */
 
 function IsGameserverStillAlive(GameserverToCheck: Gameserver){
@@ -39,9 +45,12 @@ export async function RunWatchdog(){
         if(!IsGameserverStillAlive(Server)){
             logger.warn(`Cleaning up dead gameserver on port ${Server.port}`);
 
-            await CleanupServer(Server);
+            await CleanupServer(Server, "watchdog: process gone");
         }
     }
+
+    ReclaimOrphanedPortLeases();
+    TickPersistentHubs();
 
     // Keeps content-coverage gaps visible. A missing hunt row is silent otherwise: the client
     // retries, each attempt logs one error, and the underlying cause scrolls away.
