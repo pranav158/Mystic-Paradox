@@ -30,6 +30,8 @@ import { MongoInventoryTransactionRepository } from "./repositories/MongoInvento
 import { MongoFriendshipRepository } from "./repositories/MongoFriendshipRepository";
 import { MongoAdminRepository } from "./repositories/MongoAdminRepository";
 import { MongoEscalationProgressRepository } from "./repositories/MongoEscalationProgressRepository";
+import { MongoBountyStateRepository } from "./repositories/MongoBountyStateRepository";
+import { MongoCooldownStateRepository } from "./repositories/MongoCooldownStateRepository";
 import { MongoEntitlementRepository } from "./repositories/MongoEntitlementRepository";
 import { MongoPartyRepository } from "./repositories/MongoPartyRepository";
 import { MongoLauncherGuardRepository } from "./repositories/MongoLauncherGuardRepository";
@@ -50,6 +52,8 @@ export function CreateMongoRepositoryProvider(): RepositoryProvider {
         progressionTracks: new MongoProgressionTrackRepository(),
         progressionGrants: new MongoProgressionGrantRepository(),
         escalationProgress: new MongoEscalationProgressRepository(),
+        bountyStates: new MongoBountyStateRepository(),
+        cooldownStates: new MongoCooldownStateRepository(),
         launcherAccounts: new MongoLauncherAccountRepository(),
         authIdentities: new MongoAuthIdentityRepository(),
         refreshSessions: new MongoRefreshSessionRepository(),

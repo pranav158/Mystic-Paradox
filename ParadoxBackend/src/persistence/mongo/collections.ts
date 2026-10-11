@@ -33,6 +33,10 @@ export const Collections = {
     ProgressionObjectiveEvents: "progressionObjectiveEvents",
     ProgressionTransactions: "progressionTransactions",
     EscalationProgress: "escalationProgress",
+    // Per-account bounty state for GET/POST /bounty/:userId (src/bountyState.ts). _id = userId.
+    BountyStates: "bountyStates",
+    // Per-account cooldowns for GET /cooldown/:userId and PUT /cooldown/batch/:userId (src/cooldownState.ts). _id = userId.
+    CooldownStates: "cooldownStates",
 
     // [hardening] Idempotency ledger for POST /inventory transactions (see
     // contracts/InventoryTransactionRepository.ts). _id = sha256(userId, characterId,

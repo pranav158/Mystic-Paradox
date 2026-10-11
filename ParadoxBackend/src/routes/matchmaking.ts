@@ -17,6 +17,7 @@ import { CheckAndUpdateQueueStatus, FetchLiveHubStatus, GetCandidateStatusPeriod
 import { GetPartyForPlayer } from "../controllers/party";
 import { sessionRegistry } from "../realtime/SessionRegistry";
 import { ResolveMatchmakingParty } from "../matchmakingParty";
+import { EncryptionKeyStore, EncryptionKeyTokenFingerprint } from "../encryptionKeyStore";
 
 export const matchmakingRouter = Router();
 
@@ -89,9 +90,15 @@ matchmakingRouter.get("/candidate/regions", HasParadoxBackendAuth, (req: any, re
 // The client receives a key from /key/generate; NOTHING was giving the hub the matching one. /key/generate
 // now records what it issued and /key/consume hands it back, so both ends share one 256-bit FEAESKey - which
 // is exactly what the capture note in the docs describes ("they generate a key ... used to encode UDP").
-const PendingEncryptionKeys = new Map<string, { key: string; nonce: string; token: string; at: number }>();
-const kPendingKeyTtlMs = 30 * 60 * 1000;
-let MostRecentEncryptionKey: { candidateId: string; key: string; nonce: string; token: string; at: number } | null = null;
+//
+// [2026-10-10 FIX] /key/consume must hand each joining player THEIR key. The game server never names a candidate
+// (it sends { token, gameId }), so every consume fell back to the most recent key issued anywhere. Solo play hid
+// it; in the first two-player party (19:41) the leader generated a key, the member generated one 170 ms later,
+// and the leader's join got the member's key: "UWorld::SendChallengeControlMessage: encryption failure
+// [SessionIdMismatch]" and the leader was dropped to the login screen. The token we issue is the caller's own
+// bearer token, unique per player, and the server sends it back on consume - so keys are also kept per token
+// (encryptionKeyStore.ts).
+const EncryptionKeys = new EncryptionKeyStore();
 
 matchmakingRouter.post("/key/generate", HasParadoxBackendAuth, async (req: any, res) => {
     const Key = crypto.randomBytes(32).toString("hex");
@@ -100,14 +107,10 @@ matchmakingRouter.post("/key/generate", HasParadoxBackendAuth, async (req: any, 
     const Token = AuthHeader.startsWith("bearer ") ? AuthHeader.slice("bearer ".length) : AuthHeader;
     const CandidateId = String(req.body && req.body.candidateId ? req.body.candidateId : "");
 
-    const IssuedAt = Date.now();
-    if (CandidateId.length > 0) {
-        PendingEncryptionKeys.set(CandidateId, { key: Key, nonce: Nonce, token: Token, at: IssuedAt });
-    }
-    MostRecentEncryptionKey = { candidateId: CandidateId, key: Key, nonce: Nonce, token: Token, at: IssuedAt };
+    EncryptionKeys.issue(CandidateId, { key: Key, nonce: Nonce, token: Token, at: Date.now() });
 
     logger.info("key/generate served (256-bit key + nonce; candidateId="
-        + (CandidateId || "none") + ")");
+        + (CandidateId || "none") + " token=" + EncryptionKeyTokenFingerprint(Token) + ")");
 
     res.status(200);
     res.json({
@@ -123,28 +126,19 @@ matchmakingRouter.post("/key/generate", HasParadoxBackendAuth, async (req: any, 
 matchmakingRouter.post("/key/consume", HasParadoxBackendAuth, async (req: any, res) => {
     const Body = req.body ?? {};
     const CandidateId = String(Body.candidateId ?? req.query?.candidateId ?? "");
+    const ConsumeToken = Body.token ?? req.query?.token;
+    const TokenFp = EncryptionKeyTokenFingerprint(ConsumeToken);
 
     logger.info("key/consume request: candidateId=" + (CandidateId || "none")
-        + " bodyKeys=" + Object.keys(Body).join(","));
+        + " bodyKeys=" + Object.keys(Body).join(",") + " token=" + TokenFp);
 
-    const Now = Date.now();
-    for (const [IssuedId, Issued] of PendingEncryptionKeys) {
-        if (Now - Issued.at > kPendingKeyTtlMs) {
-            PendingEncryptionKeys.delete(IssuedId);
-        }
-    }
-
-    let Match: { key: string; nonce: string; token: string } | null = null;
-    if (CandidateId.length > 0 && PendingEncryptionKeys.has(CandidateId)) {
-        const Issued = PendingEncryptionKeys.get(CandidateId)!;
-        Match = { key: Issued.key, nonce: Issued.nonce, token: Issued.token };
-    }
-    else if (MostRecentEncryptionKey && Now - MostRecentEncryptionKey.at <= kPendingKeyTtlMs) {
-        Match = {
-            key: MostRecentEncryptionKey.key,
-            nonce: MostRecentEncryptionKey.nonce,
-            token: MostRecentEncryptionKey.token
-        };
+    const Lookup = EncryptionKeys.lookup(CandidateId, ConsumeToken, Date.now());
+    const Match = Lookup.issued;
+    const MatchedBy = Lookup.matchedBy;
+    if (Lookup.unknownToken && Match !== null) {
+        // With several players generating keys the most recent key can be someone else's.
+        logger.warn("key/consume: token " + TokenFp
+            + " matches no issued key; falling back to the most recent key (may belong to another player)");
     }
 
     if (Match === null) {
@@ -154,7 +148,8 @@ matchmakingRouter.post("/key/consume", HasParadoxBackendAuth, async (req: any, r
         return;
     }
 
-    logger.info("key/consume served the issued key (candidateId=" + (CandidateId || "most-recent") + ")");
+    logger.info("key/consume served the issued key (matchedBy=" + MatchedBy + " candidateId=" + (CandidateId || "none")
+        + " token=" + TokenFp + ")");
     res.status(200);
     res.json({
         key: Match.key,

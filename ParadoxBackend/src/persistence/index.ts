@@ -35,6 +35,8 @@ export * from "./contracts/WalletRepository";
 export * from "./contracts/ProgressionTrackRepository";
 export * from "./contracts/ProgressionGrantRepository";
 export * from "./contracts/EscalationProgressRepository";
+export * from "./contracts/BountyStateRepository";
+export * from "./contracts/CooldownStateRepository";
 export * from "./contracts/UnitOfWork";
 export * from "./contracts/LauncherAccountRepository";
 export * from "./contracts/AuthIdentityRepository";

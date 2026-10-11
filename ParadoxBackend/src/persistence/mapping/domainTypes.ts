@@ -202,6 +202,38 @@ export interface ProgressionGrantRecord {
 // Talent/unlock entries are intentionally retained as opaque JSON-compatible objects:
 // their exact wire fields are owned by the 1.12 game serializer and must round-trip
 // without the backend deleting fields it does not understand.
+// Per-account bounty state (GET/POST /bounty/:userId - see src/bountyState.ts for the merge rules). `bounty` is the
+// wire object exactly as the game server sent it; `group` is the bounty component it belongs to.
+export type BountyGroup = "base" | "daily" | "weekly" | "unassigned";
+
+export interface StoredBounty {
+    group: BountyGroup;
+    bounty: Record<string, any>;
+    /** Backend time this instance was first seen claimed (absent for claims stored before 10 Oct 14:00). */
+    claimedAt?: string;
+    /** The one currency grant this claim funded (season challenges: Cache Coins) - a claim funds at most one. */
+    rewardCredit?: { catalogId: string; amount: number; transactionId: string; at: string };
+}
+
+export interface BountyStateRecord {
+    userId: string;
+    bounties: StoredBounty[];
+    draftData: { base?: Record<string, unknown>; daily?: Record<string, unknown>; weekly?: Record<string, unknown> };
+    updateVersion: number;
+    createdAt: string;
+    updatedAt: string;
+}
+
+// Per-account cooldowns (GET /cooldown/:userId, PUT /cooldown/batch/:userId - see src/cooldownState.ts). `startedDate`
+// is the game's own cooldown_started_date string, stored verbatim.
+export interface CooldownStateRecord {
+    userId: string;
+    entries: { id: string; startedDate: string; updatedAt: string }[];
+    updateVersion: number;
+    createdAt: string;
+    updatedAt: string;
+}
+
 export interface EscalationProgressRecord {
     userId: string;
     seasonId: string;

@@ -16,6 +16,8 @@ import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { logger } from "../logger";
 import { AddEncounteredContent, GetBreadcrumbsForCharacterIdAndUserId, GetPlayerJourney, QueryEncounteredContent, SavePlayerJourney, SetBreadcrumbsForCharacterIdAndUserId, GrantProgressionXp, GetPersistedProgressionForUser, CaptureProgressionObjectiveEvent, GetPersistedObjectivesForUser, ConfirmPublicProgressionRank, IsAuthorizedProgressionReader, IsAuthorizedProgressionReporter, IsApprovedXpProgressionTrack, IsValidProgressionGrantId, ProgressionGrantConflictError, IsCharacterOwnedByUser } from "../controllers/progression";
 import { GetUnlockedNodeIds, GrantSlayersPathRewards } from "../controllers/slayersPath";
+import { IsPrestigeSourceTrack } from "../controllers/wallet";
+import { MonitorProgressionReport, MonitorProgressionServed, MonitorSourceOf } from "../diagnostics/economyMonitor";
 
 // Game data from ParadoxBackend/game-data (gameData/loader.ts; the loader also strips a UTF-8 BOM).
 // [1.12.0] The Slayer's Path graph was captured from production.
@@ -487,6 +489,8 @@ progressionRouter.post("/progression/:userId", HasParadoxBackendAuth, async (req
         logger.debug("Progression/objective event received for no-player sentinel - discarding, not persisting");
     }
     else{
+        // [diagnostics 2026-10-10] [PrestigeMon] - the season/prestige track values the server reports here.
+        MonitorProgressionReport(RequestorAccountId, MonitorSourceOf(req.AuthData), req.body, IsPrestigeSourceTrack);
         // [WP-1 stage 1, plan section 6.3] Raw capture only — no reducer yet. This used to
         // silently discard the body entirely, which is why mastery/hunt-pass XP never
         // accumulated even though the server returned 200 OK for these calls.
@@ -609,6 +613,7 @@ progressionRouter.get("/progression/:userId", HasParadoxBackendAuth, async (req:
     const Payload = await GetPersistedProgressionForUser(RequestorAccountId, DEFAULT_PROGRESSION_IDS);
 
     logger.info(`Progression fetched for userId ${RequestorAccountId} (${Payload.length} tracks, persisted)`);
+    MonitorProgressionServed(RequestorAccountId, Payload, IsPrestigeSourceTrack);
 
     res.status(200);
     res.json({

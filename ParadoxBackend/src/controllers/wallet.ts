@@ -15,6 +15,8 @@ import { IsValidBalanceCatalogId } from "../persistence/contracts/WalletReposito
 import { logger } from "../logger";
 import { loadGameData } from "../gameData/loader";
 import { PLATINUM_AGGREGATE_ID, ProjectBalances, ResolvePlatinumSpend, SumPlatinum } from "../platinumWallet";
+import { MonitorPrestigeFunding, PrestigeSourceState } from "../diagnostics/economyMonitor";
+import { FundChallengeReward } from "./challengeRewards";
 
 const NO_PLAYER_SENTINEL = "INVALID";
 
@@ -171,6 +173,22 @@ function PrestigeSourcesByRewardCatalogId(): Map<string, PrestigeRewardSource[]>
     return PrestigeSourcesCache ??= BuildPrestigeRewardSources();
 }
 
+// [diagnostics 2026-10-10] For diagnostics/economyMonitor.ts: which catalog ids are gated rewards, and which
+// progression tracks fund them. Never throw (a missing game-data file means "nothing is gated").
+export function IsPrestigeGatedReward(catalogId: string): boolean {
+    try { return (PrestigeSourcesByRewardCatalogId().get(catalogId)?.length ?? 0) > 0; } catch { return false; }
+}
+
+let PrestigeSourceTrackIdsCache: Set<string> | undefined;
+export function IsPrestigeSourceTrack(progressionId: string): boolean {
+    try {
+        PrestigeSourceTrackIdsCache ??= new Set([...PrestigeSourcesByRewardCatalogId().values()].flat().map((Source) => Source.progressionId));
+        return PrestigeSourceTrackIdsCache.has(progressionId);
+    } catch {
+        return false;
+    }
+}
+
 export class InsufficientPrestigeProgressError extends Error {
     constructor(userId: string, catalogId: string, requestedQuantity: number, availableQuantity: number) {
         super(`Insufficient banked prestige: user ${userId} requested ${requestedQuantity} of ${catalogId} but only ${availableQuantity} banked across eligible tracks`);
@@ -190,9 +208,18 @@ async function SpendBankedPrestigeForReward(userId: string, catalogId: string, q
     let Remaining = quantity;
     const Spends: { progressionId: string; amount: number }[] = [];
     let TotalAvailable = 0;
+    const Observed: PrestigeSourceState[] = [];
 
     for (const Source of Sources) {
         const Track = await GetRepositories().progressionTracks.get(userId, Source.progressionId, session);
+        Observed.push({
+            progressionId: Source.progressionId,
+            progress: Track?.progress ?? 0,
+            xpPerLevel: Source.xpPerLevel,
+            rewardQuantityPerLevel: Source.rewardQuantityPerLevel,
+            confirmedFremiumRank: Track?.confirmedFremiumRank,
+            confirmedPremiumRank: Track?.confirmedPremiumRank,
+        });
         const BankedLevels = Math.floor((Track?.progress ?? 0) / Source.xpPerLevel);
         const AvailableFromSource = BankedLevels * Source.rewardQuantityPerLevel;
         TotalAvailable += AvailableFromSource;
@@ -213,8 +240,11 @@ async function SpendBankedPrestigeForReward(userId: string, catalogId: string, q
 
     if (Remaining > 0) {
         logger.warn(`[Prestige] ${userId} rejected: requested ${quantity} of ${catalogId}, only ${TotalAvailable} banked across [${Sources.map((s) => s.progressionId).join(", ")}]`);
+        MonitorPrestigeFunding(userId, catalogId, quantity, Observed, `rejected (banked ${TotalAvailable})`);
         throw new InsufficientPrestigeProgressError(userId, catalogId, quantity, TotalAvailable);
     }
+    MonitorPrestigeFunding(userId, catalogId, quantity, Observed,
+        `funded from [${Spends.map((Spend) => `${Spend.progressionId}-${Spend.amount}`).join(", ")}]`);
 
     for (const Spend of Spends) {
         const Updated = await GetRepositories().progressionTracks.spend(userId, Spend.progressionId, Spend.amount, session);
@@ -239,14 +269,25 @@ async function SpendBankedPrestigeForReward(userId: string, catalogId: string, q
 // finding out on its next unrelated GET /inventory or GET /store/balance - the same "tell the
 // client what actually happened, right now" fix already applied to non-currency stacked items in
 // RunInventoryTransaction (see inventory.ts's BUG D fix comment).
-export async function ApplyCurrencyDeltas(userId: string, adds: any[], removes: any[], session?: ClientSession): Promise<Record<string, number>> {
+export async function ApplyCurrencyDeltas(userId: string, adds: any[], removes: any[], session?: ClientSession, transactionId?: string, allowChallengeRewardFunding = false): Promise<Record<string, number>> {
     const TouchedBalances: Record<string, number> = {};
     if (!userId || userId === NO_PLAYER_SENTINEL) return TouchedBalances;
 
     for (const Item of (adds ?? [])) {
         if (typeof Item?.catalogId === "string" && Item.catalogId.startsWith("CURRENCY_")) {
             const Quantity = Number(Item.quantity ?? 0);
-            await SpendBankedPrestigeForReward(userId, Item.catalogId, Quantity, session);
+            // [2026-10-10] A season challenge's coin reward is funded by that challenge's claim (once per claim, recorded
+            // on the claim in this same transaction - controllers/challengeRewards.ts); anything else that is gated
+            // still needs banked prestige progress.
+            const Funded = allowChallengeRewardFunding
+                ? await FundChallengeReward(userId, Item.catalogId, Quantity, transactionId, session)
+                : undefined;
+            if (Funded) {
+                MonitorPrestigeFunding(userId, Item.catalogId, Quantity, [],
+                    `funded by season challenge ${Funded.bountyId} (claimedAt ${Funded.claimedAt ?? "before 10 Oct 14:00"})`);
+            } else {
+                await SpendBankedPrestigeForReward(userId, Item.catalogId, Quantity, session);
+            }
             TouchedBalances[Item.catalogId] = await AddCurrency(userId, Item.catalogId, Quantity, session);
         }
     }

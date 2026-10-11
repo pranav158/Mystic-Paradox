@@ -422,6 +422,10 @@ export type InventoryTransactionOptions = {
     // onGrant may return an annotator: it receives the item additions that survived normalization and
     // returns extra fields stored on the ledger row by the same completion write (no extra collection).
     onGrant?: (repos: RepositoryProvider, session: ClientSession) => Promise<InventoryLedgerAnnotator | void>;
+
+    // [2026-10-10] Lets a season challenge's claim fund a CURRENCY_SEASONAL_COIN grant (controllers/challengeRewards.ts).
+    // Set only by POST /inventory for dedicated-server requests; store purchases and every other caller leave it off.
+    allowChallengeRewardFunding?: boolean;
 };
 
 export type InventoryLedgerAnnotator = (accepted: { createdInstancedItems: any[]; acceptedStackedAdds: any[] }) =>
@@ -485,7 +489,8 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
             // to back it - see wallet.ts) in addition to InsufficientBalanceError; both abort this
             // whole transaction before anything below it runs.
             StepStartedAt = Date.now();
-            const TouchedCurrencyBalances = await ApplyCurrencyDeltas(UserId, EffectiveStackedItemsToAdd, StackedItemsToRemove, Session);
+            const TouchedCurrencyBalances = await ApplyCurrencyDeltas(UserId, EffectiveStackedItemsToAdd, StackedItemsToRemove, Session,
+                TransactionId, Options.allowChallengeRewardFunding === true);
             Timing.wallet += Date.now() - StepStartedAt;
 
             // Non-inventory grants (entitlements, progression) - see InventoryTransactionOptions.onGrant.

@@ -30,6 +30,8 @@ import { InventoryTransactionRepository } from "./InventoryTransactionRepository
 import { FriendshipRepository } from "./FriendshipRepository";
 import { AdminRepository } from "./AdminRepository";
 import { EscalationProgressRepository } from "./EscalationProgressRepository";
+import { BountyStateRepository } from "./BountyStateRepository";
+import { CooldownStateRepository } from "./CooldownStateRepository";
 import { EntitlementRepository } from "./EntitlementRepository";
 import { PartyRepository } from "./PartyRepository";
 import { LauncherGuardRepository } from "./LauncherGuardRepository";
@@ -50,6 +52,8 @@ export interface RepositoryProvider {
     progressionTracks: ProgressionTrackRepository;
     progressionGrants: ProgressionGrantRepository;
     escalationProgress: EscalationProgressRepository;
+    bountyStates: BountyStateRepository;
+    cooldownStates: CooldownStateRepository;
 
     // Launcher auth (Plans/LAUNCHER_BACKEND_AUTH_REQUIREMENTS.md) — additive,
     // does not change any existing game route's behavior.

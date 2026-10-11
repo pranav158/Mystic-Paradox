@@ -17,6 +17,11 @@ const progressionconfig = loadGameData<any>("progression_config.json");
 import { GetEscalationProgress, SaveEscalationProgress } from "../controllers/escalationProgress";
 import { GetEntitlementsForUser } from "../controllers/entitlements";
 import { ACTIVE_HUNTPASS_PROGRESSION_ID } from "../controllers/progression";
+import { MonitorBountyLoad, MonitorBountySave, MonitorCooldownLoad, MonitorCooldownSave, MonitorSourceOf } from "../diagnostics/economyMonitor";
+import { CooldownSaveValidationError, IsAuthorizedCooldownReader, IsAuthorizedCooldownWriter } from "../cooldownState";
+import { GetCooldownState, SaveCooldowns } from "../controllers/cooldowns";
+import { BountyGroupCounts, BountySaveValidationError, BountyStatePayload, IsAuthorizedBountyReader, IsAuthorizedBountyWriter } from "../bountyState";
+import { GetBountyState, SaveBountyState } from "../controllers/bounty";
 import { EscalationSeasonProgressUpdate, IsAuthorizedEscalationReader, IsAuthorizedEscalationWriter } from "../escalationProgress";
 
 export const systemRouter = Router();
@@ -548,32 +553,55 @@ systemRouter.get("/huntpass/:userId", HasParadoxBackendAuth, (req: any, res) => 
     });
 });
 
-// TODO: Cooldowns might be gameplay-important, impl if so
+// [2026-10-10] Per-account cooldowns, persisted in Mongo (src/cooldownState.ts). These were stubs: the GET answered an
+// empty payload and the PUT discarded every save, so the daily bounty's and the patrol bonus's once-per-period gates
+// never found their cooldown and fired on every arrival (38_ section 19.7). MYSTICPARADOX_COOLDOWN_PERSISTENCE=off
+// restores the stubs.
+const COOLDOWN_PERSISTENCE = !/^(0|false|off|no)$/i.test(process.env.MYSTICPARADOX_COOLDOWN_PERSISTENCE ?? "");
+const COOLDOWN_NO_PLAYER = "INVALID";
 
-systemRouter.get("/cooldown/:userId", HasParadoxBackendAuth, (req: any, res) => {
-	logger.debug("Cooldowns (stubbed)");
-
-	res.status(200);
-	res.json({
-		code: null,
-		message: "OK",
-		payload: {
-
-		}
-	});
+systemRouter.get("/cooldown/:userId", HasParadoxBackendAuth, async (req: any, res) => {
+	const UserId = String(req.params.userId);
+	if (!IsAuthorizedCooldownReader(req.AuthData, UserId)) {
+		logger.warn(`Rejected cross-account cooldown read actor=${req.AuthData?.userId ?? "unknown"} target=${UserId}`);
+		res.status(403).send();
+		return;
+	}
+	if (!COOLDOWN_PERSISTENCE || UserId === COOLDOWN_NO_PLAYER) {
+		MonitorCooldownLoad(UserId, MonitorSourceOf(req.AuthData), [], COOLDOWN_PERSISTENCE ? "no-player sentinel" : "persistence off (stub)");
+		res.status(200).json({ code: null, message: "OK", payload: {} });
+		return;
+	}
+	const { payload, list, record } = await GetCooldownState(UserId);
+	MonitorCooldownLoad(UserId, MonitorSourceOf(req.AuthData), list, `stored version=${record?.updateVersion ?? 0}, served as an id->date map`);
+	res.status(200).json({ code: null, message: "OK", payload });
 });
 
-systemRouter.put("/cooldown/batch/:userId", HasParadoxBackendAuth, (req: any, res) => {
-	logger.info("Add Cooldowns (stubbed)");
-
-	res.status(200);
-	res.json({
-		code: null,
-		message: "OK",
-		payload: {
-
+systemRouter.put("/cooldown/batch/:userId", HasParadoxBackendAuth, async (req: any, res) => {
+	const UserId = String(req.params.userId);
+	if (!IsAuthorizedCooldownWriter(req.AuthData)) {
+		logger.warn(`Rejected cooldown write without gameserver authority actor=${req.AuthData?.userId ?? "unknown"} target=${UserId}`);
+		res.status(403).send();
+		return;
+	}
+	if (!COOLDOWN_PERSISTENCE || UserId === COOLDOWN_NO_PLAYER) {
+		MonitorCooldownSave(UserId, MonitorSourceOf(req.AuthData), req.body, COOLDOWN_PERSISTENCE ? "no-player sentinel, not stored" : "persistence off (stub), not stored");
+		res.status(200).json({ code: null, message: "OK", payload: {} });
+		return;
+	}
+	try {
+		const { payload, record } = await SaveCooldowns(UserId, req.body);
+		MonitorCooldownSave(UserId, MonitorSourceOf(req.AuthData), req.body, `stored -> ${record.entries.length} cooldown(s) version=${record.updateVersion}`);
+		res.status(200).json({ code: null, message: "OK", payload });
+	}
+	catch (Err) {
+		if (Err instanceof CooldownSaveValidationError) {
+			MonitorCooldownSave(UserId, MonitorSourceOf(req.AuthData), req.body, `REJECTED ${Err.message}`);
+			res.status(400).json({ code: null, message: "Bad Request", payload: {} });
+			return;
 		}
-	});
+		throw Err;
+	}
 });
 
 systemRouter.get("/bounty/game-data", HasParadoxBackendAuth, (req: any, res) => {
@@ -607,76 +635,60 @@ systemRouter.get("/bounty/game-data", HasParadoxBackendAuth, (req: any, res) => 
   });
 });
 
-systemRouter.get("/bounty/:userId", HasParadoxBackendAuth, (req: any, res) => { // TODO: This masks /bounty/game-data Right now they seem to have compatible schema, but I could be wrong about that.
-	logger.info("Bounties (stubbed)");
+// [2026-10-10] Per-account bounty state, persisted in Mongo (src/bountyState.ts has the wire shape and merge rules).
+// These routes were stubs that discarded every save, so each arrival re-seeded the season challenges at progress 0
+// and auto-drafted the daily bounty again (38_ section 19.4). The GET also masks /bounty/game-data above only for the
+// literal id "game-data", which is registered first. MYSTICPARADOX_BOUNTY_PERSISTENCE=off restores the stubs.
+const BOUNTY_PERSISTENCE = !/^(0|false|off|no)$/i.test(process.env.MYSTICPARADOX_BOUNTY_PERSISTENCE ?? "");
+const BOUNTY_NO_PLAYER = "INVALID";
 
-	res.status(200);
-	res.json({
-		code: null,
-		message: "OK",
-		payload: {
-			season_start_date: "2020-08-23T00:00:00.000Z",
-			season_end_date: "2099-01-01T00:00:00.000Z",
-			bounties: [],
-			draft_data: {
-				current_draft_choices: [],
-    			previous_draft_selections: [],
-    			bronze_count: 0,
-    			silver_count: 0,
-    			gold_count: 0,
-			},
-			draft_data_daily: {
-				current_draft_choices: [],
-    			previous_draft_selections: [],
-    			bronze_count: 0,
-    			silver_count: 0,
-    			gold_count: 0,
-			},
-			draft_data_weekly: {
-				current_draft_choices: [],
-    			previous_draft_selections: [],
-    			bronze_count: 0,
-    			silver_count: 0,
-    			gold_count: 0,
-			}
-		}
-	})
+systemRouter.get("/bounty/:userId", HasParadoxBackendAuth, async (req: any, res) => {
+	const UserId = String(req.params.userId);
+	if (!IsAuthorizedBountyReader(req.AuthData, UserId)) {
+		logger.warn(`Rejected cross-account bounty read actor=${req.AuthData?.userId ?? "unknown"} target=${UserId}`);
+		res.status(403).send();
+		return;
+	}
+	if (!BOUNTY_PERSISTENCE || UserId === BOUNTY_NO_PLAYER) {
+		MonitorBountyLoad(UserId, MonitorSourceOf(req.AuthData), BOUNTY_PERSISTENCE ? "no-player sentinel" : "persistence off (stub)");
+		res.status(200).json({ code: null, message: "OK", payload: BountyStatePayload(undefined) });
+		return;
+	}
+
+	const { payload, record } = await GetBountyState(UserId);
+	MonitorBountyLoad(UserId, MonitorSourceOf(req.AuthData), `stored ${JSON.stringify(BountyGroupCounts(record))} version=${record?.updateVersion ?? 0}`);
+	res.status(200).json({ code: null, message: "OK", payload });
 });
 
-systemRouter.post("/bounty/:userId", HasParadoxBackendAuth, (req: any, res) => { // TODO: This masks /bounty/game-data Right now they seem to have compatible schema, but I could be wrong about that.
-	logger.info("Set Bounties (stubbed)");
+systemRouter.post("/bounty/:userId", HasParadoxBackendAuth, async (req: any, res) => {
+	const UserId = String(req.params.userId);
+	if (!IsAuthorizedBountyWriter(req.AuthData)) {
+		logger.warn(`Rejected bounty write without gameserver authority actor=${req.AuthData?.userId ?? "unknown"} target=${UserId}`);
+		res.status(403).send();
+		return;
+	}
+	if (!BOUNTY_PERSISTENCE || UserId === BOUNTY_NO_PLAYER) {
+		MonitorBountySave(UserId, MonitorSourceOf(req.AuthData), req.body, BOUNTY_PERSISTENCE ? "no-player sentinel, not stored" : "persistence off (stub), not stored");
+		res.status(200).json({ code: null, message: "OK", payload: BountyStatePayload(undefined) });
+		return;
+	}
 
-	res.status(200);
-	res.json({
-		code: null,
-		message: "OK",
-		payload: {
-			season_start_date: "2020-08-23T00:00:00.000Z",
-			season_end_date: "2099-01-01T00:00:00.000Z",
-			bounties: [],
-			draft_data: {
-				current_draft_choices: [],
-    			previous_draft_selections: [],
-    			bronze_count: 0,
-    			silver_count: 0,
-    			gold_count: 0,
-			},
-			draft_data_daily: {
-				current_draft_choices: [],
-    			previous_draft_selections: [],
-    			bronze_count: 0,
-    			silver_count: 0,
-    			gold_count: 0,
-			},
-			draft_data_weekly: {
-				current_draft_choices: [],
-    			previous_draft_selections: [],
-    			bronze_count: 0,
-    			silver_count: 0,
-    			gold_count: 0,
-			}
+	try {
+		const { payload, record, summary } = await SaveBountyState(UserId, req.body);
+		MonitorBountySave(UserId, MonitorSourceOf(req.AuthData), req.body,
+			`stored ${summary.mode}${summary.group ? `:${summary.group}` : ""} incoming=${summary.incoming} removed=${summary.removed}`
+			+ ` -> ${JSON.stringify(BountyGroupCounts(record))} version=${record.updateVersion}`);
+		// The same envelope as the GET (the full merged state), as the live service answered a save.
+		res.status(200).json({ code: null, message: "OK", payload });
+	}
+	catch (Err) {
+		if (Err instanceof BountySaveValidationError) {
+			MonitorBountySave(UserId, MonitorSourceOf(req.AuthData), req.body, `REJECTED ${Err.message}`);
+			res.status(400).json({ code: null, message: "Bad Request", payload: {} });
+			return;
 		}
-	})
+		throw Err;
+	}
 });
 
 systemRouter.get("/all/", HasParadoxBackendAuth, (req: any, res) => {

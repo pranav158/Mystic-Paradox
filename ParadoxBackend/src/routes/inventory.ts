@@ -13,7 +13,9 @@ import { Router } from "express";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { logger } from "../logger";
 import { GetInventoryForUserIdAndCharacterId, RunInventoryTransaction, UpdateInstancedItem, InventoryTransactionConflictError, InventoryTransactionMismatchError, InsufficientStackedItemError } from "../controllers/inventory";
-import { InsufficientBalanceError, InsufficientPrestigeProgressError } from "../controllers/wallet";
+import { InsufficientBalanceError, InsufficientPrestigeProgressError, IsPrestigeGatedReward } from "../controllers/wallet";
+import { MonitorGrant, MonitorInventoryOutcome, MonitorInventoryRequest, MonitorSourceOf } from "../diagnostics/economyMonitor";
+import { IsChallengeRewardGrant, WaitForFundableSeasonClaim } from "../controllers/challengeRewards";
 import { ValidateInventoryTransactionBody, InventoryBodyHasGrantOrSpend, ValidateInstancedItemUpdateBody } from "../validation";
 import { CaptureInventoryTransaction, CaptureEvent } from "../diagnostics/capture";
 import { GetCharactersForUid } from "../controllers/character";
@@ -205,6 +207,19 @@ inventoryRouter.post("/inventory", HasParadoxBackendAuth, async (req: any, res) 
         saveInstancedItems: InstancedItemsToSave,
     });
 
+    // [diagnostics 2026-10-10] [GrantMon]: one line per server-issued transaction (who granted what, with the game's own
+    // `source` string when it sends one) - see diagnostics/economyMonitor.ts.
+    MonitorGrant(req.AuthData, UserId, TransactionId, req.body);
+
+    // [diagnostics 2026-10-10] Always-on [PrestigeMon]/[DraftMon] lines for the few catalog ids they watch.
+    const MonitorFlags = MonitorInventoryRequest({
+        transactionId: TransactionId,
+        userId: UserId,
+        source: MonitorSourceOf(req.AuthData),
+        addStackedItems: StackedItemsToAdd,
+        removeStackedItems: StackedItemsToRemove,
+    }, IsPrestigeGatedReward);
+
     if(UserId === NO_PLAYER_SENTINEL){
         logger.debug(`POST /inventory called with no-player sentinel (userId=INVALID) for transactionId ${TransactionId} - no-op transaction, not touching DB`);
 
@@ -252,11 +267,20 @@ inventoryRouter.post("/inventory", HasParadoxBackendAuth, async (req: any, res) 
         return;
     }
 
+    // [2026-10-10] A season challenge's coin reward may arrive ~50 ms before the bounty save that claims the challenge;
+    // give that claim a moment to land so it can fund the grant (controllers/challengeRewards.ts).
+    const IsDedicatedServer = req.AuthData.IsGameserver === true && ExtensionTransaction == undefined;
+    if (IsDedicatedServer && Array.isArray(StackedItemsToAdd)
+        && StackedItemsToAdd.some((Item: any) => IsChallengeRewardGrant(Item?.catalogId, Item?.quantity))) {
+        const Ready = await WaitForFundableSeasonClaim(UserId);
+        if (!Ready) logger.warn(`transactionId ${TransactionId}: challenge-reward currency with no claimed, uncredited season challenge after 1.5 s`);
+    }
+
     let TransactionResult: any;
     try {
         ExtensionTransaction?.report?.("applying");
         TransactionResult = await RunInventoryTransaction(UserId, CharacterId, TransactionId, InstancedItemsToAdd, StackedItemsToAdd, InstancedItemsToRemove, StackedItemsToRemove, InstancedItemsToSave,
-            ExtensionTransaction?.options ?? {});
+            { ...(ExtensionTransaction?.options ?? {}), allowChallengeRewardFunding: IsDedicatedServer });
     } catch (Err) {
         CaptureInventoryTransaction({
             phase: "error",
@@ -267,6 +291,7 @@ inventoryRouter.post("/inventory", HasParadoxBackendAuth, async (req: any, res) 
             isGameserver: req.AuthData.IsGameserver === true,
             error: Err,
         });
+        MonitorInventoryOutcome(MonitorFlags, TransactionId, undefined, Err);
         const ExtensionDenial = ExtensionTransaction?.errorResponse?.(Err);
         if (ExtensionDenial != undefined) {
             res.status(ExtensionDenial.status).json(ExtensionDenial.body);
@@ -330,6 +355,7 @@ inventoryRouter.post("/inventory", HasParadoxBackendAuth, async (req: any, res) 
             isGameserver: req.AuthData.IsGameserver === true,
             result: TransactionResult,
         });
+        MonitorInventoryOutcome(MonitorFlags, TransactionId, TransactionResult);
 
         logger.info(`Ran transactionId ${TransactionId} for userId ${UserId} and characterId ${CharacterId}`);
 
