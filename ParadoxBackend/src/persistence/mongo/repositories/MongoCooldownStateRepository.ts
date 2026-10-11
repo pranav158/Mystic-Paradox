@@ -27,7 +27,7 @@ export class MongoCooldownStateRepository implements CooldownStateRepository {
 
     async get(userId: string): Promise<CooldownStateRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.CooldownStates).findOne({ _id: userId as any });
+        const Doc = await Db.collection(Collections.CooldownStates).findOne({ _id: { $eq: userId as any } });
         return Doc == undefined ? undefined : this.MapDocument(Doc);
     }
 
@@ -56,7 +56,7 @@ export class MongoCooldownStateRepository implements CooldownStateRepository {
         }
 
         const Result = await Db.collection(Collections.CooldownStates).findOneAndReplace(
-            { _id: record.userId as any, updateVersion: expectedVersion },
+            { _id: { $eq: record.userId as any }, updateVersion: { $eq: expectedVersion } },
             Document,
             { returnDocument: "after" }
         );

@@ -27,7 +27,7 @@ export class MongoBountyStateRepository implements BountyStateRepository {
 
     async get(userId: string, session?: ClientSession): Promise<BountyStateRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.BountyStates).findOne({ _id: userId as any }, { session });
+        const Doc = await Db.collection(Collections.BountyStates).findOne({ _id: { $eq: userId as any } }, { session });
         return Doc == undefined ? undefined : this.MapDocument(Doc);
     }
 
@@ -57,7 +57,7 @@ export class MongoBountyStateRepository implements BountyStateRepository {
         }
 
         const Result = await Db.collection(Collections.BountyStates).findOneAndReplace(
-            { _id: record.userId as any, updateVersion: expectedVersion },
+            { _id: { $eq: record.userId as any }, updateVersion: { $eq: expectedVersion } },
             Document,
             { returnDocument: "after", session }
         );
