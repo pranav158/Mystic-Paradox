@@ -167,7 +167,9 @@ pub async fn native_upload_last_session(app: AppHandle) -> Result<u32, String> {
         let Some(dir) = logs::latest_session_dir(&app)? else {
             return Err("No session logs found yet — play once first.".to_string());
         };
-        let session_id = dir
+        // The folder's name: the Play attempt's correlation id (launch/logs.rs), which groups the uploads on the
+        // server. It is not a credential; the bearer token authorizes the upload.
+        let session_folder = dir
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| "Invalid session folder.".to_string())?
@@ -187,7 +189,7 @@ pub async fn native_upload_last_session(app: AppHandle) -> Result<u32, String> {
             let response = send_authorized(&app, |token| {
                 client
                     .put(format!(
-                        "{base}/launcher/v1/logs/sessions/{session_id}/{name}"
+                        "{base}/launcher/v1/logs/sessions/{session_folder}/{name}"
                     ))
                     .bearer_auth(token)
                     .header("Content-Type", "application/octet-stream")
