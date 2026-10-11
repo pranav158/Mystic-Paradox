@@ -84,11 +84,12 @@ launcherLogsRouter.put(
             SendLauncherError(res, new LauncherApiError("AUTH_VALIDATION_FAILED", "Invalid session id or file name."));
             return;
         }
-        if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        // byteLength, not length: unlike a string or an array, only a binary body has it.
+        if (!Buffer.isBuffer(req.body) || req.body.byteLength === 0) {
             SendLauncherError(res, new LauncherApiError("AUTH_VALIDATION_FAILED", "The uploaded file was empty."));
             return;
         }
-        if (req.body.length > MAX_UPLOAD_BYTES) {
+        if (req.body.byteLength > MAX_UPLOAD_BYTES) {
             SendLauncherError(res, new LauncherApiError("AUTH_VALIDATION_FAILED", "The uploaded file is too large."));
             return;
         }
@@ -100,7 +101,7 @@ launcherLogsRouter.put(
             res.status(413).json({ error: { code: "LOG_UPLOAD_QUOTA", message: "Session limit reached for this account." } });
             return;
         }
-        if (Usage.totalBytes + (req.body as Buffer).length > MAX_ACCOUNT_STORAGE_BYTES) {
+        if (Usage.totalBytes + (req.body as Buffer).byteLength > MAX_ACCOUNT_STORAGE_BYTES) {
             res.status(413).json({ error: { code: "LOG_UPLOAD_QUOTA", message: "Storage quota reached for this account." } });
             return;
         }

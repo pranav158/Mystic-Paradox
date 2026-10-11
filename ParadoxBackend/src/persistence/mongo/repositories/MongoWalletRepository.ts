@@ -21,7 +21,7 @@ import { WalletRecord } from "../../mapping/domainTypes";
 export class MongoWalletRepository implements WalletRepository {
     async findByUserId(userId: string, session?: ClientSession): Promise<WalletRecord | undefined> {
         const Db = await GetMongoDb();
-        const Doc = await Db.collection(Collections.Wallets).findOne({ _id: userId as any }, { session });
+        const Doc = await Db.collection(Collections.Wallets).findOne({ _id: { $eq: userId as any } }, { session });
 
         if (Doc == undefined) {
             return undefined;

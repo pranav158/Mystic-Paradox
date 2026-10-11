@@ -25,7 +25,7 @@ export class MongoPlayerJourneyRepository implements PlayerJourneyRepository {
 
     async findByUserId(userId: string): Promise<PlayerJourneyRecord | undefined> {
         const Db = await this.getDb();
-        const Doc = await Db.collection(Collections.PlayerJourney).findOne({ _id: userId as any });
+        const Doc = await Db.collection(Collections.PlayerJourney).findOne({ _id: { $eq: userId as any } });
 
         if (Doc == undefined) {
             return undefined;

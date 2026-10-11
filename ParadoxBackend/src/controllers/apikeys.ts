@@ -12,12 +12,7 @@
 import { GetRepositories } from "../persistence";
 import { ApiKeyRepository } from "../persistence/contracts/ApiKeyRepository";
 import { logger } from "../logger";
-import {
-    AcceptsLegacyApiKeyHashes,
-    FindApiKeyRecord,
-    HashApiKey,
-    LegacySha256ApiKeyHash
-} from "../security/apiKeyHash";
+import { FindApiKeyRecord, HashApiKey } from "../security/apiKeyHash";
 
 function HashGameserverAPIKey(GameserverAPIKeyToHash: string){
     return HashApiKey(GameserverAPIKeyToHash, "gameserver");
@@ -59,39 +54,18 @@ export async function DrainAndRegisterAPIKeys(){
 
     await GetRepositories().apiKeys.clearGameServerKeysToRegister();
 
+    // Count the stored hashes rather than reading the key list's size into the log line.
+    let Registered = 0;
     for(const APIKey of APIKeysToRegister){
         await GetRepositories().apiKeys.insertGameServerKeyHash(HashGameserverAPIKey(APIKey.key));
+        Registered++;
     }
 
-    logger.info(`Registered ${APIKeysToRegister.length} new Gameserver API Key(s) on boot!`);
+    logger.info(`Registered ${Registered} new Gameserver API Key(s) on boot!`);
 }
 
-// HMAC hashes already written for keys that first matched a legacy SHA-256 record, so concurrent requests from
-// the same hub do not each insert one.
-const UpgradedGameserverKeyHashes = new Set<string>();
-
+// Only HMAC records match (security/apiKeyHash.ts); a pre-HMAC SHA-256 record must be registered again.
 export async function IsValidGameserverAPIKey(GameserverAPIKey: string){
     const AllAPIKeyHashes = await GetRepositories().apiKeys.findAllGameServerKeyHashes();
-
-    const HmacHash = HashGameserverAPIKey(GameserverAPIKey);
-    if (FindApiKeyRecord(AllAPIKeyHashes, HmacHash)) {
-        return true;
-    }
-
-    // Pre-HMAC record (plain SHA-256). Accepted during the migration; the HMAC form is stored alongside it so this
-    // key matches by HMAC from now on. The legacy record is kept: another service on older code may still need it.
-    if (!AcceptsLegacyApiKeyHashes() || !FindApiKeyRecord(AllAPIKeyHashes, LegacySha256ApiKeyHash(GameserverAPIKey))) {
-        return false;
-    }
-    if (!UpgradedGameserverKeyHashes.has(HmacHash)) {
-        UpgradedGameserverKeyHashes.add(HmacHash);
-        try {
-            await GetRepositories().apiKeys.insertGameServerKeyHash(HmacHash);
-            logger.info("[API keys] A gameserver key matched a legacy SHA-256 record; stored its HMAC form.");
-        } catch (error) {
-            UpgradedGameserverKeyHashes.delete(HmacHash);
-            logger.warn({ error }, "[API keys] Could not store the HMAC form of a legacy gameserver key");
-        }
-    }
-    return true;
+    return FindApiKeyRecord(AllAPIKeyHashes, HashGameserverAPIKey(GameserverAPIKey)) !== undefined;
 }

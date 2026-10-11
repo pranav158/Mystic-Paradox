@@ -484,20 +484,21 @@ function IsGauntletOrigin(req: any): boolean {
 
 // NOTE: the client requests these with an EMPTY season segment ("/progression//INVALID"), so
 // named ":season" parameters never match (Express params are non-empty). Regex routes are used so
-// the empty segment is accepted - that is the whole reason the first attempt still 404'd.
-systemRouter.get(/^\/progression\/([^/]*)\/([^/]+)$/, HasParadoxBackendAuth, (req: any, res, next) => {
+// the empty segment is accepted - that is the whole reason the first attempt still 404'd. They are case-insensitive
+// ("i") like Express's string routes, so an upper-case path still meets HasParadoxBackendAuth here.
+systemRouter.get(/^\/progression\/([^/]*)\/([^/]+)$/i, HasParadoxBackendAuth, (req: any, res, next) => {
     if (!IsGauntletOrigin(req)) { next(); return; }
     logger.info(`Gauntlet progression requested season='${req.params[0]}' user='${req.params[1]}' (1.14.7 stub)`);
     res.status(200).json(GauntletEnvelope({}));
 });
 
-systemRouter.get(/^\/rewards\/personal\/([^/]*)\/([^/]+)$/, HasParadoxBackendAuth, (req: any, res, next) => {
+systemRouter.get(/^\/rewards\/personal\/([^/]*)\/([^/]+)$/i, HasParadoxBackendAuth, (req: any, res, next) => {
     if (!IsGauntletOrigin(req)) { next(); return; }
     logger.info(`Gauntlet personal rewards requested season='${req.params[0]}' user='${req.params[1]}' (1.14.7 stub)`);
     res.status(200).json(GauntletEnvelope({}));
 });
 
-systemRouter.get(/^\/rewards\/guild\/([^/]*)\/([^/]+)$/, HasParadoxBackendAuth, (req: any, res, next) => {
+systemRouter.get(/^\/rewards\/guild\/([^/]*)\/([^/]+)$/i, HasParadoxBackendAuth, (req: any, res, next) => {
     if (!IsGauntletOrigin(req)) { next(); return; }
     logger.info(`Gauntlet guild rewards requested season='${req.params[0]}' user='${req.params[1]}' (1.14.7 stub)`);
     res.status(200).json(GauntletEnvelope({}));
@@ -505,7 +506,7 @@ systemRouter.get(/^\/rewards\/guild\/([^/]*)\/([^/]+)$/, HasParadoxBackendAuth, 
 
 // NOTE: Express 5 (path-to-regexp v6+) rejects a bare "*" route; use an explicit regex so this
 // keeps working regardless of the path that follows.
-systemRouter.get(/^\/leaderboard\/get_leaderboard\//, HasParadoxBackendAuth, (req: any, res, next) => {
+systemRouter.get(/^\/leaderboard\/get_leaderboard\//i, HasParadoxBackendAuth, (req: any, res, next) => {
     if (!IsGauntletOrigin(req)) { next(); return; }
     logger.info(`Gauntlet leaderboard requested (1.14.7 stub)`);
     res.status(200).json(GauntletEnvelope({ entries: [] }));

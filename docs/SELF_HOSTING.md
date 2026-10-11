@@ -271,6 +271,13 @@ The configurator does not set NODE_ENV. If you run the backend with NODE_ENV=pro
 requires MYSTICPARADOX_SERVICE_ROLE=api and a MYSTICPARADOX_METRICS_TOKEN, and refuses to start
 without them.
 
+Every backend route has a per-address request budget: 600 requests a minute, and 6000 for calls
+that carry the gameserver key, because all hubs and hunts on one host share its address. A client
+over budget gets HTTP 429. Raise the budgets with MYSTICPARADOX_RATE_LIMIT_PER_MINUTE and
+MYSTICPARADOX_GAMESERVER_RATE_LIMIT_PER_MINUTE (for example when many players share one address),
+or turn them off with MYSTICPARADOX_RATE_LIMIT=off. The stricter limits on login, registration,
+update downloads and log uploads always apply.
+
 Director essentials:
 
 | Setting | Expected |
@@ -616,9 +623,10 @@ A 1.12.0 deployment from the `dauntless-1.12.0` tag needs, in this order:
    1.12.0 carries over.
 2. New game data from the 1.14.7 install (step 4), including the files 1.12.0 did not have.
 3. TARGET_CHANGELIST=647472 and APPROVED_EXECUTABLE_SHA256 of the 1.14.7 executable in the backend
-   .env; an API_KEY_HASH_SECRET if you have none (existing SHA-256 key records keep working while
-   API_KEY_LEGACY_SHA256 is `accept`, the default); any MYSTPAX_ environment key renamed to
-   MYSTICPARADOX_, including the launcher build variables in .selfhost/build-env.ps1.
+   .env; an API_KEY_HASH_SECRET if you have none, then every API key registered again under it (for
+   example in GAMESERVER_API_KEYS), because key records stored as plain SHA-256 no longer match; any
+   MYSTPAX_ environment key renamed to MYSTICPARADOX_, including the launcher build variables in
+   .selfhost/build-env.ps1.
 4. A rebuilt runtime, loader and launcher, a new runtime version published with
    `--changelist 647472`, and the new launcher on every player PC.
 5. A MongoDB backup, then the one-off account-data migrations in ParadoxBackend. Each is a dry run

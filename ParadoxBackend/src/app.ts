@@ -11,6 +11,7 @@
  */
 
 import express from "express";
+import { rateLimit } from "express-rate-limit";
 import { loginRouter } from "./routes/login.js";
 import { logger } from "./logger.js";
 import { eosRouter } from "./routes/eos.js";
@@ -31,6 +32,7 @@ import { launcherLogsRouter } from "./routes/launcherLogs.js";
 import { adminLauncherLogsRouter } from "./routes/adminLauncherLogs.js";
 import { adminRouter } from "./routes/admin.js";
 import { sanitizeUrlForLog } from "./security/logRedaction.js";
+import { RequestRateLimitOptions } from "./security/rateLimit.js";
 import { GetRequestId, RequestContextMiddleware } from "./observability/requestContext.js";
 import { launcherGuardRouter } from "./routes/launcherGuard.js";
 import { GetPersistenceLifecycle } from "./persistence";
@@ -201,6 +203,10 @@ app.get("/health/ready", async (_req, res) => {
         persistence: persistenceHealthy ? "ready" : "unavailable"
     });
 });
+
+// Per-address request budget for every router below (security/rateLimit.ts). The health probes above stay outside
+// it; the request log above still records each 429.
+app.use(rateLimit(RequestRateLimitOptions()));
 
 app.use("/", metricsRouter);
 

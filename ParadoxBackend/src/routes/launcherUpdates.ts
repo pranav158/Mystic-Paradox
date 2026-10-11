@@ -461,13 +461,14 @@ launcherUpdatesRouter.post(
             res.status(401).json({ error: "Invalid update publisher credentials." });
             return;
         }
-        let target: string, channel: string, platform: string;
+        let target: string, channel: string, platform: string, version: string;
         try {
             target = segment(req.params.target, "target");
             channel = segment(req.params.channel, "channel");
             platform = segment(req.params.platform, "platform");
+            // The version names a folder and the artifact file below, so it passes the same segment check.
+            version = segment(req.header("x-update-version") ?? "", "version");
         } catch { res.status(400).json({ error: "Invalid runtime update metadata." }); return; }
-        const version = req.header("x-update-version") ?? "";
         const changelist = Number(req.header("x-update-changelist"));
         const signatureText = req.header("x-update-signature") ?? "";
         if (!RUNTIME_TARGETS.has(target) || !/^[A-Za-z0-9._-]+$/.test(channel) || platform !== "windows-x86_64" ||
@@ -475,8 +476,9 @@ launcherUpdatesRouter.post(
             res.status(400).json({ error: "Invalid runtime update metadata." });
             return;
         }
+        // byteLength, not length: unlike a string or an array, only a binary body has it.
         const bytes = req.body as Buffer;
-        if (bytes.length === 0 || bytes.length > 200 * 1024 * 1024) {
+        if (bytes.byteLength === 0 || bytes.byteLength > 200 * 1024 * 1024) {
             res.status(413).json({ error: "Runtime update is outside the allowed size." });
             return;
         }
@@ -498,7 +500,7 @@ launcherUpdatesRouter.post(
         fs.writeFileSync(artifactPath, bytes, { flag: "wx" });
         const manifest = {
             schema: 1, component: "ParadoxRuntime", target, version, channel, targetChangelist: changelist,
-            platform, size: bytes.length, sha256, signature: signatureText, file: artifactName,
+            platform, size: bytes.byteLength, sha256, signature: signatureText, file: artifactName,
             publishedAt: new Date().toISOString(),
             url: `${UPDATE_PUBLIC_BASE_URL}/launcher/v1/runtime/${encodeURIComponent(target)}/${encodeURIComponent(channel)}/${platform}/download`,
             extraFiles: [] as { name: string; size: number; sha256: string; signature: string; url: string }[],
@@ -544,7 +546,7 @@ launcherUpdatesRouter.post(
         if (!RUNTIME_TARGETS.has(target) || platform !== "windows-x86_64" || !allowedExtra.has(filename.toLowerCase())) {
             res.status(400).json({ error: "Invalid extra-file target/platform/name." }); return;
         }
-        if (!Buffer.isBuffer(req.body) || req.body.length === 0 || req.body.length > 200 * 1024 * 1024) {
+        if (!Buffer.isBuffer(req.body) || req.body.byteLength === 0 || req.body.byteLength > 200 * 1024 * 1024) {
             res.status(413).json({ error: "Extra file is outside the allowed size." }); return;
         }
         const bytes = req.body as Buffer;
@@ -562,7 +564,7 @@ launcherUpdatesRouter.post(
         const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
         fs.writeFileSync(path.join(versionDir, filename), bytes);
         const extra = {
-            name: filename, size: bytes.length, sha256, signature: signature.toString("base64"),
+            name: filename, size: bytes.byteLength, sha256, signature: signature.toString("base64"),
             url: `${UPDATE_PUBLIC_BASE_URL}/launcher/v1/runtime/${encodeURIComponent(target)}/${encodeURIComponent(channel)}/${platform}/extra/${encodeURIComponent(filename)}`,
         };
         const extras = Array.isArray(manifest.extraFiles) ? manifest.extraFiles.filter((e: any) => e && e.name !== filename) : [];
@@ -570,7 +572,7 @@ launcherUpdatesRouter.post(
         manifest.extraFiles = extras;
         fs.writeFileSync(path.join(versionDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
         fs.writeFileSync(latestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-        res.status(201).json({ name: filename, sha256, size: bytes.length });
+        res.status(201).json({ name: filename, sha256, size: bytes.byteLength });
     },
 );
 

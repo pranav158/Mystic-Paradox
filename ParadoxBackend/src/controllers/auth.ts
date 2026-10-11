@@ -12,7 +12,7 @@
 import jwt, {JwtPayload} from "jsonwebtoken";
 import { GetRepositories } from "../persistence";
 import { logger } from "../logger";
-import { AcceptsLegacyApiKeyHashes, FindApiKeyRecord, HashApiKey, LegacySha256ApiKeyHash } from "../security/apiKeyHash";
+import { FindApiKeyRecord, HashApiKey } from "../security/apiKeyHash";
 
 const PRIVKEY = Buffer.from(process.env.AUTH_SIGNING_PRIVKEY_B64!, "base64").toString("utf-8");
 const PUBKEY = Buffer.from(process.env.AUTH_SIGNING_PUBKEY_B64!, "base64").toString("utf-8");
@@ -26,24 +26,21 @@ export async function DrainAndRegisterUserAPIKeys(){
 
     await GetRepositories().apiKeys.clearUserKeysToRegister();
 
+    // Count the stored hashes rather than reading the key list's size into the log line.
+    let Registered = 0;
     for(const APIKey of APIKeysToRegister){
         await GetRepositories().apiKeys.insertUserKeyHash(APIKey.userId, HashUserAPIKey(APIKey.key));
+        Registered++;
     }
 
-    logger.info(`Registered ${APIKeysToRegister.length} new User API Key(s) on boot!`);
+    logger.info(`Registered ${Registered} new User API Key(s) on boot!`);
 }
 
 export async function GetUserIDForAPIKey(UserAPIKey: string){
     const AllAPIKeyHashes = await GetRepositories().apiKeys.findAllUserKeyHashes();
 
-    // HMAC records first; a pre-HMAC (plain SHA-256) record still matches during the migration. User key records
-    // are keyed by userId, so they are not rewritten here - re-register the key to move it to HMAC.
-    const Match = FindApiKeyRecord(AllAPIKeyHashes, HashUserAPIKey(UserAPIKey))
-        ?? (AcceptsLegacyApiKeyHashes()
-            ? FindApiKeyRecord(AllAPIKeyHashes, LegacySha256ApiKeyHash(UserAPIKey))
-            : undefined);
-
-    return Match?.userId;
+    // Only HMAC records match; a user key stored before HMAC hashing (plain SHA-256) must be registered again.
+    return FindApiKeyRecord(AllAPIKeyHashes, HashUserAPIKey(UserAPIKey))?.userId;
 }
 
 function SignMetagameJWTForUid(userId: string){

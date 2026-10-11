@@ -13,10 +13,9 @@
 // as HMAC-SHA256 under a server-side secret, domain-separated by scope, instead of a plain SHA-256. A copy of the
 // key collections alone no longer lets anyone test guesses offline, which matters while a key is human-chosen.
 //
-// Migration: records written before this change are plain SHA-256. They keep matching (AcceptsLegacyApiKeyHashes)
-// so services that still present an old key - including a VPS sharing this database on older code - keep working;
-// a successful legacy gameserver match also stores the HMAC form. Set API_KEY_LEGACY_SHA256=reject once every
-// consumer uses HMAC-registered keys, then delete the legacy records.
+// [2026-10-11] Records written before this change (plain SHA-256) no longer match: the migration fallback and its
+// API_KEY_LEGACY_SHA256 switch are gone. Register such a key again (GAMESERVER_API_KEYS, or the keys-to-register
+// collection drained at boot) to store its HMAC form.
 import crypto from "node:crypto";
 
 const MIN_SECRET_LENGTH = 32;
@@ -41,15 +40,6 @@ export function HashApiKey(value: string, scope: "gameserver" | "user"): string 
         .update("\0")
         .update(value, "utf8")
         .digest("hex");
-}
-
-/** The pre-HMAC record format: plain SHA-256 of the key. */
-export function LegacySha256ApiKeyHash(value: string): string {
-    return crypto.createHash("sha256").update(value, "utf8").digest("hex");
-}
-
-export function AcceptsLegacyApiKeyHashes(): boolean {
-    return (process.env.API_KEY_LEGACY_SHA256 ?? "accept").trim().toLowerCase() !== "reject";
 }
 
 /** Constant-time comparison of one hex hash against stored records; returns the first match. */
