@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- libjuice v1.7.4 (MPL-2.0, third_party\, restored by prepare-dependencies.ps1) as a static library. -->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{3589DF96-FF7E-42F0-B518-8BCFD3F8B38D}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>libjuice</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)build\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)build\obj\libjuice\$(Configuration)\</IntDir>
+    <TargetName>libjuice</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <SDLCheck>false</SDLCheck>
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>JUICE_STATIC;JUICE_EXPORTS;USE_NETTLE=0;_CRT_SECURE_NO_WARNINGS;_WINSOCK_DEPRECATED_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">RELEASE=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)third_party\libjuice-1.7.4\include;$(ProjectDir)third_party\libjuice-1.7.4\include\juice;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Release'">MultiThreaded</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="third_party\libjuice-1.7.4\src\addr.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\agent.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\crc32.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\const_time.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\conn.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\conn_poll.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\conn_thread.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\conn_mux.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\base64.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\hash.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\hmac.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\ice.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\juice.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\log.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\random.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\server.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\stun.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\timestamp.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\tcp.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\turn.c" />
+    <ClCompile Include="third_party\libjuice-1.7.4\src\udp.c" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -19,6 +19,14 @@
 
 using namespace SDK;
 
+// [2026-10-11 1.14.7 P2P host MULTIHOME] Defined in dllmain.cpp (MpCarryMultihomeIntoEngineLine): the MULTIHOME the
+// served engine FCommandLine carries, empty when none. Used by Listen to check a pinned listen address.
+std::wstring MpEngineCommandLineMultihome();
+// [2026-10-11 1.14.7 O3] Defined in dllmain.cpp (also declared in RuntimeShared.h, which this file does not include
+// because its IsReadablePointer would clash with the one below): the shared log writer and the production log profile.
+void MpLogRawPort(int Port, const std::string& Msg);
+bool MpProductionLogProfile();
+
 namespace Networking {
     UNetDriver* NetDriver = nullptr;
 
@@ -58,42 +66,13 @@ namespace Networking {
         return IsReadablePointer(Data, static_cast<size_t>(Num) * sizeof(void*));
     }
 
-    // Log directory derived from the game .exe path (mirrors dllmain's MpLogDir) so net
-    // telemetry appears on the VPS too. The previous hardcoded dev-box debug path only
-    // exists on the dev box, so every NetLog write silently failed on the VPS and the
-    // [TickNetLoop] actor-loop telemetry (the exact evidence needed for the 2-player join)
-    // was lost. Not under loader lock (called from Listen()/TickNetworking() on MainThread),
-    // so a plain function-local static is safe.
-    static const char* NetLogDir() {
-        static char Dir[MAX_PATH] = { 0 };
-        static bool Ready = false;
-        if (!Ready) {
-            char ExePath[MAX_PATH];
-            DWORD n = GetModuleFileNameA(nullptr, ExePath, MAX_PATH);
-            if (n > 0 && n < MAX_PATH) {
-                int slash = -1;
-                for (DWORD i = 0; i < n; ++i) { if (ExePath[i] == '\\' || ExePath[i] == '/') { slash = (int)i; } }
-                if (slash >= 0) {
-                    for (int i = 0; i <= slash; ++i) { Dir[i] = ExePath[i]; }
-                    Dir[slash + 1] = '\0';
-                }
-            }
-            Ready = true;
-        }
-        return Dir;
-    }
-
+    // Same file as dllmain's MpLog ("<exedir>\mysticparadox_dll_port<port>.log") so [TickNetLoop]
+    // and [NetTickTrace] lines interleave in one per-port log. (The exe directory is resolved by dllmain's MpLogDir; the
+    // local NetLogDir copy went with the per-line std::ofstream on 11 Oct.)
     static void NetLog(int Port, const std::string& Msg) {
-        char Path[MAX_PATH];
-        // Same file as dllmain's MpLog ("<exedir>\mysticparadox_dll_port<port>.log") so [TickNetLoop]
-        // and [NetTickTrace] lines interleave in one per-port log.
-        sprintf_s(Path, "%smysticparadox_dll_port%d.log", NetLogDir(), Port);
-
-        std::ofstream File(Path, std::ios::app);
-        if (File.is_open()) {
-            File << Msg << "\n";
-            File.flush();
-        }
+        // [2026-10-11 1.14.7 O3] Through dllmain's writer (one open handle, one WriteFile per line; it also honours
+        // MPLOG_OPEN_PER_LINE.flag and the DLL_PROCESS_DETACH rule) instead of a std::ofstream per line.
+        MpLogRawPort(Port, Msg);
     }
 
     // [A/B 2026-07-16] NATIVE_REPLICATION_ONLY.flag — reversible diagnostic switch for the
@@ -321,6 +300,20 @@ namespace Networking {
         return Actors;
     }
 
+    // [2026-10-11 1.14.7 O1/O2] One OpenChannels element, read under SEH. The walk used to call IsReadablePointer
+    // (VirtualQuery) on every open channel - hundreds per connection - and it runs for every (role, connection) pair on
+    // every connection-count change and every second for the churn diagnostic: ~roles x connections x channels system
+    // calls per join at 30-40 players. A channel whose Class (+0x10) or Actor (+0x70, the last 8 bytes of the old
+    // 0x78-byte check) cannot be read is skipped exactly as the unreadable one was; a misaligned pointer too.
+    static bool ActorChannelMatchesGuarded(UChannel* Channel, const void* ActorChannelClass, const AActor* Actor) {
+        if (!Channel || (reinterpret_cast<uintptr_t>(Channel) & 0x7) != 0) return false;
+        __try {
+            return Channel->Class == ActorChannelClass && ((UActorChannel*)Channel)->Actor == Actor;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
     static UActorChannel* GetActorChannelForConnectionAndActor(UNetConnection* Connection, AActor* Actor) {
         if (!IsReadablePointer(Connection, 0x80)) {
             return nullptr;
@@ -335,13 +328,10 @@ namespace Networking {
             return nullptr;
         }
 
+        const void* ActorChannelClass = UActorChannel::StaticClass();
         for (int32_t i = 0; i < ChannelCount; ++i) {
             UChannel* Channel = Channels[i];
-            if (!IsReadablePointer(Channel, 0x78)) {
-                continue;
-            }
-
-            if (Channel->Class == UActorChannel::StaticClass() && ((UActorChannel*)Channel)->Actor == Actor) {
+            if (ActorChannelMatchesGuarded(Channel, ActorChannelClass, Actor)) {
                 return ((UActorChannel*)Channel);
             }
         }
@@ -398,7 +388,8 @@ namespace Networking {
         // CreateChannelByName 0x03F62E90, SetChannelActor 0x03D8FB20. The driven Archon graph opens
         // this actor's channel itself, so the bootstrap only reports whether one exists.
         if (!ActorChannel || ActorChannel->Actor != Actor) {
-            NetLog(LastPort, "[PlayerRoleDirectChannel] actor="
+            // [2026-10-11 1.14.7 O3] Off with PRODUCTION_LOG_PROFILE.flag (one line per role x connection per edge).
+            if (!MpProductionLogProfile()) NetLog(LastPort, "[PlayerRoleDirectChannel] actor="
                 + std::to_string(reinterpret_cast<uintptr_t>(Actor)) + " conn="
                 + std::to_string(reinterpret_cast<uintptr_t>(Connection))
                 + " result=NO_CHANNEL (creation disabled on 1.14.7; the replication graph opens it)");
@@ -431,7 +422,7 @@ namespace Networking {
         const bool WroteData = false;
         Diag.WroteData = WroteData;
         if (OutDiag) *OutDiag = Diag;
-        NetLog(LastPort, "[PlayerRoleDirectChannel] actor="
+        if (!MpProductionLogProfile()) NetLog(LastPort, "[PlayerRoleDirectChannel] actor="   // [2026-10-11 O3]
             + std::to_string(reinterpret_cast<uintptr_t>(Actor)) + " conn="
             + std::to_string(reinterpret_cast<uintptr_t>(Connection)) + " channel="
             + std::to_string(reinterpret_cast<uintptr_t>(ActorChannel))
@@ -595,6 +586,24 @@ namespace Networking {
             return false;
         }
         if (!ListenHost.empty()) {
+            // [2026-10-11 1.14.7 P2P host MULTIHOME] url.Host does not choose the socket's address: the net driver binds
+            // GetLocalBindAddr (0x032AE2C0), i.e. MULTIHOME= from the engine's FCommandLine (GetMultihomeAddress
+            // 0x032AE4B0), else every interface. A pinned address is honoured only when the served engine line carries
+            // exactly that MULTIHOME (dllmain's HookFCommandLineGet carries it from the OS command line), so refuse the
+            // listen otherwise - for example when the FCommandLine::Get hook failed to install. Fails closed: the caller
+            // then fences the host (P2PHooks::OnListenFailed).
+            const std::wstring EngineMultihome = MpEngineCommandLineMultihome();
+            std::string HostText;
+            for (wchar_t Ch : ListenHost) HostText.push_back(static_cast<char>(Ch));
+            if (EngineMultihome.empty() || _wcsicmp(EngineMultihome.c_str(), ListenHost.c_str()) != 0) {
+                std::string EngineText;
+                for (wchar_t Ch : EngineMultihome) EngineText.push_back(static_cast<char>(Ch));
+                NetLog(Port, "[Networking::Listen] pinned listen address " + HostText + " is not the engine's MULTIHOME ("
+                    + (EngineText.empty() ? std::string("none - the engine would bind every interface") : EngineText)
+                    + "); refusing listen");
+                return false;
+            }
+            NetLog(Port, "[Networking::Listen] engine MULTIHOME matches the pinned listen address " + HostText);
             url.Host = FString(ListenHost.c_str());
         }
 
@@ -703,7 +712,13 @@ namespace Networking {
     // difference and the harness check stays valid.
     void AnnounceEngineReady(int Port) {
         if (P2PHooks::ReportsReadiness()) {
-            P2PHooks::ReportReady(Port);
+            // [2026-10-11 1.14.7 P2P host] The player-hosted server no longer takes this path (dllmain refuses
+            // MAP_URL_LISTEN.flag there - MpMapUrlListenEnabled); should it ever, a failed readiness report fences the
+            // host like the manual path does instead of being ignored.
+            if (!P2PHooks::ReportReady(Port)) {
+                NetLog(Port, "[EngineListen] player-host readiness report failed; fencing the host (OnListenFailed)");
+                P2PHooks::OnListenFailed();
+            }
             return;
         }
 

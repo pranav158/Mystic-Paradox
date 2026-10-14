@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
+#include <psapi.h>   // [2026-10-10] GetProcessMemoryInfo -> K32GetProcessMemoryInfo in kernel32 (PSAPI_VERSION 2); no psapi.lib
 #include <string>
 #include <set>
 #include <algorithm>
@@ -34,6 +35,7 @@
 #include "RuntimeShared.h"
 #include "P2PHooks.h"
 #include "deployment_config.generated.h"
+#include "BackendUrl.h"
 #include "resource.h"
 
 #include "SDK/GameplayAbilities_parameters.hpp"
@@ -58,6 +60,9 @@ using namespace SDK;
 
 // [1.14.7 loader state dump] defined later in this file; used by the watchdog thread.
 static void DumpLoadManagerEntries(const char* Tag);
+// [2026-10-13 realms S1] defined with the URL redirect below; Init resolves the backend address, MainThread logs it.
+static void MpResolveBackendAddress();
+static void MpLogBackendAddress();
 // [1.14.7 active hunt pass] defined later; used by the readiness predicate hook.
 static void* g_archonGameInstanceForHuntPass = nullptr;
 static void CallFindActiveHuntPassRow(const char* Why);
@@ -90,8 +95,9 @@ namespace Globals {
     // HuntCapability is the optional player-hosted mode (P2PHooks.h); only the module can select it.
     static ServerAuthMode AuthMode = ServerAuthMode::GlobalGameserver;
 
-    // [move10] Boot-patch status recorded during InitServerHooks (where InitLog is a
-    // loader-lock no-op) and emitted later from MainThread via MpLog so it is actually visible.
+    // Boot-patch status recorded during InitServerHooks (where InitLog is a loader-lock no-op) and emitted
+    // later from MainThread via MpLog so it is actually visible. (Named after the removed 1.12 Move10 patches;
+    // today it carries the WARP force status.)
     static std::string Move10Status;
 
     static std::wstring ServerAPIKeyStorage;
@@ -143,17 +149,126 @@ static const char* MpLogDir() {
 
 // [A/B 2026-07-16] Generic exe-relative sentinel-flag check (same convention as
 // MP_FORCE_WARP.flag): true iff <game-exe-dir>\<FileName> exists. Exe-relative so it works on
-// the VPS. Does a cheap GetFileAttributesW per call, so hot callers should cache the result.
+// the VPS.
+// [2026-10-10 1.14.7 CPU] Cached per name for 4 s. It used to call GetModuleFileNameW, build a std::wstring and
+// probe the file system on EVERY call, and about four call sites run every server frame (plus one per replicated
+// actor added to the graph). Now:
+//   * the exe directory is resolved once (MpResolveExeDirW, first thing in Init; never with a lock held) into POD
+//     storage published through an interlocked ready state;
+//   * each name's answer is kept in a fixed POD table (128 names x 64 chars) behind an SRWLOCK (constant-initialised,
+//     loader-lock safe); the lock covers only the table scan, never GetModuleFileNameW or the file probe;
+//   * a name is re-probed at most once every 4000 ms, so creating or deleting a live A/B flag (for example
+//     DISABLE_PLAYER_ROLE_GLOBAL_ROUTE.flag) takes effect within 4 s, and both of that flag's read sites see the
+//     same answer. A flag created and deleted again within 4 s may be missed. Call sites that keep the answer in a
+//     static (read-once flags) still read once and keep it for the process lifetime;
+//   * no heap and no CRT state, so it stays usable late in shutdown.
+// A name of 64+ chars, a full table, or UNCACHED_FLAG_FILES.flag (probed directly, once) probes on every call, as
+// before.
+static wchar_t g_MpExeDirW[MAX_PATH] = { 0 };
+static size_t g_MpExeDirLenW = 0;
+static volatile LONG g_MpExeDirState = 0;   // 0 = not resolved, 1 = being published, 2 = ready
+
+// Writes the exe path to Out and returns the length of its directory part (with the trailing separator); 0 on failure.
+static size_t MpExeDirFromModuleW(wchar_t (&Out)[MAX_PATH]) {
+    const DWORD n = GetModuleFileNameW(nullptr, Out, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return 0;
+    size_t Len = 0;
+    for (DWORD i = 0; i < n; ++i) { if (Out[i] == L'\\' || Out[i] == L'/') Len = static_cast<size_t>(i) + 1; }
+    return Len;
+}
+
+static void MpResolveExeDirW() {
+    if (InterlockedCompareExchange(&g_MpExeDirState, 0, 0) == 2) return;
+    wchar_t Local[MAX_PATH];
+    const size_t Len = MpExeDirFromModuleW(Local);
+    if (Len == 0) return;   // stays unresolved: every probe looks the path up itself (the old behaviour)
+    if (InterlockedCompareExchange(&g_MpExeDirState, 1, 0) != 0) return;   // another thread publishes the same path
+    for (size_t i = 0; i < Len; ++i) g_MpExeDirW[i] = Local[i];
+    g_MpExeDirW[Len] = L'\0';
+    g_MpExeDirLenW = Len;
+    InterlockedExchange(&g_MpExeDirState, 2);
+}
+
+static bool MpProbeExeRelativeFile(const wchar_t* Name, size_t NameLen) {
+    wchar_t Path[MAX_PATH];
+    size_t DirLen = 0;
+    if (InterlockedCompareExchange(&g_MpExeDirState, 0, 0) == 2) {
+        DirLen = g_MpExeDirLenW;
+        for (size_t i = 0; i < DirLen; ++i) Path[i] = g_MpExeDirW[i];
+    } else {
+        DirLen = MpExeDirFromModuleW(Path);
+    }
+    if (DirLen == 0 || DirLen + NameLen + 1 > MAX_PATH) return false;
+    for (size_t i = 0; i < NameLen; ++i) Path[DirLen + i] = Name[i];
+    Path[DirLen + NameLen] = L'\0';
+    return GetFileAttributesW(Path) != INVALID_FILE_ATTRIBUTES;
+}
+
+struct MpFlagCacheEntry { wchar_t Name[64]; size_t Len; bool Present; ULONGLONG CheckedMs; };
+static MpFlagCacheEntry g_MpFlagCache[128] = {};
+static int g_MpFlagCacheCount = 0;
+static SRWLOCK g_MpFlagCacheLock = SRWLOCK_INIT;
+static volatile LONG g_MpFlagCacheMode = -1;   // -1 = not decided, 1 = cached, 0 = UNCACHED_FLAG_FILES.flag
+static constexpr ULONGLONG kMpFlagRecheckMs = 4000;
+
+// Decided once: UNCACHED_FLAG_FILES.flag is probed directly (never cached) on the first call.
+static LONG MpDecideFlagCacheMode() {
+    const LONG Mode = InterlockedCompareExchange(&g_MpFlagCacheMode, 0, 0);
+    if (Mode >= 0) return Mode;
+    static const wchar_t kOff[] = L"UNCACHED_FLAG_FILES.flag";
+    const LONG Decided = MpProbeExeRelativeFile(kOff, (sizeof(kOff) / sizeof(kOff[0])) - 1) ? 0 : 1;
+    InterlockedCompareExchange(&g_MpFlagCacheMode, Decided, -1);
+    return InterlockedCompareExchange(&g_MpFlagCacheMode, 0, 0);
+}
+
 bool MpExeRelativeFlagPresent(const wchar_t* FileName) {
     if (!FileName) { return false; }
-    wchar_t ExePath[MAX_PATH];
-    DWORD n = GetModuleFileNameW(nullptr, ExePath, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) { return false; }
-    for (int i = (int)n - 1; i >= 0; --i) {
-        if (ExePath[i] == L'\\' || ExePath[i] == L'/') { ExePath[i + 1] = L'\0'; break; }
+    size_t Len = 0;
+    while (FileName[Len] && Len < MAX_PATH) ++Len;
+    MpResolveExeDirW();
+    if (MpDecideFlagCacheMode() != 1 || Len >= 64) return MpProbeExeRelativeFile(FileName, Len);
+
+    const ULONGLONG Now = GetTickCount64();
+    int Slot = -1;
+    AcquireSRWLockExclusive(&g_MpFlagCacheLock);
+    for (int i = 0; i < g_MpFlagCacheCount; ++i) {
+        const MpFlagCacheEntry& E = g_MpFlagCache[i];
+        if (E.Len != Len) continue;
+        size_t k = 0;
+        while (k < Len && E.Name[k] == FileName[k]) ++k;
+        if (k == Len) { Slot = i; break; }
     }
-    std::wstring FlagPath = std::wstring(ExePath) + FileName;
-    return GetFileAttributesW(FlagPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (Slot < 0 && g_MpFlagCacheCount < static_cast<int>(sizeof(g_MpFlagCache) / sizeof(g_MpFlagCache[0]))) {
+        Slot = g_MpFlagCacheCount++;
+        MpFlagCacheEntry& E = g_MpFlagCache[Slot];
+        for (size_t k = 0; k < Len; ++k) E.Name[k] = FileName[k];
+        E.Name[Len] = L'\0';
+        E.Len = Len;
+        E.Present = false;
+        E.CheckedMs = 0;
+    }
+    if (Slot >= 0 && g_MpFlagCache[Slot].CheckedMs != 0 && Now - g_MpFlagCache[Slot].CheckedMs < kMpFlagRecheckMs) {
+        const bool Present = g_MpFlagCache[Slot].Present;
+        ReleaseSRWLockExclusive(&g_MpFlagCacheLock);
+        return Present;
+    }
+    ReleaseSRWLockExclusive(&g_MpFlagCacheLock);
+
+    const bool Present = MpProbeExeRelativeFile(FileName, Len);   // outside the lock
+    if (Slot >= 0) {
+        AcquireSRWLockExclusive(&g_MpFlagCacheLock);
+        g_MpFlagCache[Slot].Present = Present;
+        g_MpFlagCache[Slot].CheckedMs = Now ? Now : 1;
+        ReleaseSRWLockExclusive(&g_MpFlagCacheLock);
+    }
+    return Present;
+}
+
+static const char* MpFlagCacheModeText() {
+    const LONG Mode = InterlockedCompareExchange(&g_MpFlagCacheMode, 0, 0);
+    return Mode == 1 ? "ON (each flag file re-checked at most every 4 s)"
+        : Mode == 0 ? "OFF (UNCACHED_FLAG_FILES.flag: every check probes the file)"
+                    : "not decided yet";
 }
 
 /*
@@ -170,6 +285,8 @@ bool MpExeRelativeFlagPresent(const wchar_t* FileName) {
  *   [Watchdog/thread][HangSuspect][HangTrace]  hang + reap diagnosis (raw current PE pointers)
  *   [ExitTrace][ExceptionTrace]                crash forensics
  *   [Lifecycle:*][NetConnEdge][PossessionRPC]  low-volume, edge-triggered
+ *                    ([2026-10-11] PRODUCTION_LOG_PROFILE.flag turns [Lifecycle:*] and [PossessionRPC] off on a
+ *                    server, with the other per-event traces listed at MpProductionLogProfile; [NetConnEdge] stays)
  *   [HuntTableGap][BleedoutBUG][BleedoutStuck] one-shot problem markers
  *
  * WHAT THIS FLAG NOW GATES:
@@ -205,30 +322,200 @@ static bool VerboseDiag() {
     return Cached == 1;
 }
 
-// [1.12.0] Persistent, flushed diagnostic log from MainThread/hooks only.
-// One file per server port so concurrently-spawned gameservers don't clobber each other.
-// Writes next to the game .exe (see MpLogDir) so logs are visible on the VPS too.
+/*
+ * [2026-10-11 1.14.7 O3 PRODUCTION LOG PROFILE] PRODUCTION_LOG_PROFILE.flag (default OFF, read once, servers only)
+ * silences the per-event diagnostic traces that a populated hub repeats for every player, join and RPC:
+ *   [HuntPassState] [ArrivalTrigger] (server lines) [EconTrace] [PlayerRoleChannel] [PostLoginPE] [PossessionRPC]
+ *   [Lifecycle:*] [EscalationFlow][Server] [SendPath] [FrankDroneDiag][Server] [PlayerRoleDirectChannel]
+ *   [WeaponXP][ServerKill]/[ServerGrant]/[ServerPlayerGrant] [TempestPerfectDodge][Server] [GrantTrace]
+ *   [CooldownTrace] [PAWN #] [TickDispatchInner] (periodic heartbeat)
+ * Only log lines are skipped: every write, guard, retry and fix that sits next to them still runs. Clients ignore the
+ * flag (it lives next to the shared game exe on a test box), so the client log stays complete.
+ */
+bool MpProductionLogProfile() {
+    static volatile LONG s_mode = -1;   // -1 = not decided, 0 = off, 1 = on
+    LONG Mode = s_mode;                 // plain aligned read once decided
+    if (Mode < 0) {
+        Mode = (Globals::AmServer && MpExeRelativeFlagPresent(L"PRODUCTION_LOG_PROFILE.flag")) ? 1 : 0;
+        InterlockedExchange(&s_mode, Mode);
+    }
+    return Mode == 1;
+}
+
+/*
+ * [1.12.0] Persistent, flushed diagnostic log from MainThread/hooks only.
+ * One file per server port so concurrently-spawned gameservers don't clobber each other.
+ * Writes next to the game .exe (see MpLogDir) so logs are visible on the VPS too.
+ *
+ * [2026-10-11 1.14.7 O3 log writer] Every line used to construct a std::ofstream: open, format, flush, close - a
+ * CreateFile + WriteFile + CloseHandle round trip plus CRT stream setup per line, on whatever thread logged. That is
+ * expensive on Windows and much worse under Wine (each open is a wineserver path walk). The file now stays open:
+ * one handle with FILE_APPEND_DATA, shared read/write/delete (tail -f, Networking.cpp's writer and rotation keep
+ * working), and one WriteFile per line straight into the OS cache - no CRT buffering, so a crash loses nothing that
+ * MpLog returned from. Same text format. Kept rules: nothing after DLL_PROCESS_DETACH (g_MpProcessDetaching) and no
+ * CRT stream object on this path. The handle follows Globals::Port (port 0 until Init parses it) and is reopened when
+ * the file was deleted or renamed away (file id compared at most every 5 s). The lock is only TRIED: a thread that
+ * cannot take it within a few ms (its owner killed by process exit, or a VEH line raised inside a write) writes its line
+ * through a private open/append/close instead, so logging can never deadlock. MPLOG_OPEN_PER_LINE.flag (read once)
+ * restores the old per-line std::ofstream path.
+ */
+static SRWLOCK g_MpLogLock = SRWLOCK_INIT;
+static HANDLE g_MpLogHandle = INVALID_HANDLE_VALUE;   // guarded by g_MpLogLock
+static int g_MpLogHandlePort = -1;
+static ULONGLONG g_MpLogIdCheckMs = 0;
+static volatile LONG g_MpLogMode = -1;   // -1 = not decided, 1 = one open handle, 0 = MPLOG_OPEN_PER_LINE.flag
+
+static LONG MpLogMode() {
+    LONG Mode = InterlockedCompareExchange(&g_MpLogMode, 0, 0);
+    if (Mode < 0) {
+        Mode = MpExeRelativeFlagPresent(L"MPLOG_OPEN_PER_LINE.flag") ? 0 : 1;
+        InterlockedExchange(&g_MpLogMode, Mode);
+    }
+    return Mode;
+}
+
+static HANDLE MpLogOpenAppend(const char* Path) {
+    return CreateFileA(Path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+static void MpLogWriteOnce(const char* Path, const char* Data, DWORD Len) {
+    const HANDLE H = MpLogOpenAppend(Path);
+    if (H == INVALID_HANDLE_VALUE) return;
+    DWORD Written = 0;
+    WriteFile(H, Data, Len, &Written, nullptr);
+    CloseHandle(H);
+}
+
+// True while the open handle still names the file at Path: not deleted, same volume and file index.
+static bool MpLogHandleStillCurrent(HANDLE H, const char* Path) {
+    BY_HANDLE_FILE_INFORMATION Mine{};
+    if (!GetFileInformationByHandle(H, &Mine) || Mine.nNumberOfLinks == 0) return false;
+    const HANDLE P = CreateFileA(Path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (P == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION Theirs{};
+    const bool Ok = GetFileInformationByHandle(P, &Theirs) != FALSE;
+    CloseHandle(P);
+    return Ok && Theirs.dwVolumeSerialNumber == Mine.dwVolumeSerialNumber
+        && Theirs.nFileIndexHigh == Mine.nFileIndexHigh && Theirs.nFileIndexLow == Mine.nFileIndexLow;
+}
+
+// One complete line (already terminated) into the per-port file. Port is the one Path was built for.
+static void MpLogWriteLine(const char* Path, int Port, const char* Data, DWORD Len) {
+    bool Locked = false;
+    for (int Try = 0; Try < 52 && !Locked; ++Try) {
+        Locked = TryAcquireSRWLockExclusive(&g_MpLogLock) != FALSE;
+        if (Locked) break;
+        if (Try < 32) YieldProcessor();
+        else if (Try < 48) SwitchToThread();
+        else Sleep(1);
+    }
+    if (!Locked) {
+        MpLogWriteOnce(Path, Data, Len);
+        return;
+    }
+    const ULONGLONG NowMs = GetTickCount64();
+    if (g_MpLogHandle != INVALID_HANDLE_VALUE && g_MpLogHandlePort != Port) {
+        CloseHandle(g_MpLogHandle);
+        g_MpLogHandle = INVALID_HANDLE_VALUE;
+    }
+    if (g_MpLogHandle != INVALID_HANDLE_VALUE && NowMs - g_MpLogIdCheckMs >= 5000) {
+        g_MpLogIdCheckMs = NowMs;
+        if (!MpLogHandleStillCurrent(g_MpLogHandle, Path)) {
+            CloseHandle(g_MpLogHandle);
+            g_MpLogHandle = INVALID_HANDLE_VALUE;
+        }
+    }
+    if (g_MpLogHandle == INVALID_HANDLE_VALUE) {
+        g_MpLogHandle = MpLogOpenAppend(Path);
+        g_MpLogHandlePort = Port;
+        g_MpLogIdCheckMs = NowMs;
+    }
+    if (g_MpLogHandle != INVALID_HANDLE_VALUE) {
+        DWORD Written = 0;
+        if (!WriteFile(g_MpLogHandle, Data, Len, &Written, nullptr)) {
+            CloseHandle(g_MpLogHandle);           // reopened by the next line
+            g_MpLogHandle = INVALID_HANDLE_VALUE;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_MpLogLock);
+}
+
+// Prefix + body + "\n" in one buffer (stack for ordinary lines), then one write.
+static void MpLogEmit(const char* Path, int Port, const char* Prefix, size_t PrefixLen, const std::string& Msg) {
+    const size_t Total = PrefixLen + Msg.size() + 1;
+    if (Total > 0x7FFFFFFFu) return;
+    char Stack[2048];
+    std::string Heap;
+    char* Buf = Stack;
+    if (Total > sizeof(Stack)) {
+        Heap.resize(Total);
+        Buf = &Heap[0];
+    }
+    if (PrefixLen) memcpy(Buf, Prefix, PrefixLen);
+    if (!Msg.empty()) memcpy(Buf + PrefixLen, Msg.data(), Msg.size());
+    Buf[Total - 1] = '\n';
+    MpLogWriteLine(Path, Port, Buf, static_cast<DWORD>(Total));
+}
+
 void MpLog(const std::string& Msg) {
     if (MpProcessDetaching()) {
         return;
     }
     char Path[MAX_PATH];
-    sprintf_s(Path, "%smysticparadox_dll_port%d.log", MpLogDir(), Globals::Port);
+    const int Port = Globals::Port;
+    sprintf_s(Path, "%smysticparadox_dll_port%d.log", MpLogDir(), Port);
 
-    std::ofstream File(Path, std::ios::app);
+    if (MpLogMode() == 0) {
+        // MPLOG_OPEN_PER_LINE.flag: the pre-11-Oct writer, unchanged.
+        std::ofstream File(Path, std::ios::app);
 
-    if (File.is_open()) {
-        SYSTEMTIME Now{};
-        GetLocalTime(&Now);
-        File << "["
-             << std::setfill('0') << std::setw(2) << Now.wHour << ":"
-             << std::setfill('0') << std::setw(2) << Now.wMinute << ":"
-             << std::setfill('0') << std::setw(2) << Now.wSecond << "."
-             << std::setfill('0') << std::setw(3) << Now.wMilliseconds << "] "
-             << "pid=" << GetCurrentProcessId() << " "
-             << Msg << "\n";
-        File.flush();
+        if (File.is_open()) {
+            SYSTEMTIME Now{};
+            GetLocalTime(&Now);
+            File << "["
+                 << std::setfill('0') << std::setw(2) << Now.wHour << ":"
+                 << std::setfill('0') << std::setw(2) << Now.wMinute << ":"
+                 << std::setfill('0') << std::setw(2) << Now.wSecond << "."
+                 << std::setfill('0') << std::setw(3) << Now.wMilliseconds << "] "
+                 << "pid=" << GetCurrentProcessId() << " "
+                 << Msg << "\n";
+            File.flush();
+        }
+        return;
     }
+
+    SYSTEMTIME Now{};
+    GetLocalTime(&Now);
+    char Prefix[64];
+    const int PrefixLen = sprintf_s(Prefix, "[%02d:%02d:%02d.%03d] pid=%lu ", static_cast<int>(Now.wHour),
+        static_cast<int>(Now.wMinute), static_cast<int>(Now.wSecond), static_cast<int>(Now.wMilliseconds),
+        static_cast<unsigned long>(GetCurrentProcessId()));
+    MpLogEmit(Path, Port, Prefix, PrefixLen > 0 ? static_cast<size_t>(PrefixLen) : 0, Msg);
+}
+
+// [2026-10-11 1.14.7 O3] Networking.cpp's NetLog (no timestamp prefix, its own port argument) through the same writer.
+// A line for another port than the open handle's is written with a private open so the shared handle never thrashes.
+void MpLogRawPort(int Port, const std::string& Msg) {
+    if (MpProcessDetaching()) return;
+    char Path[MAX_PATH];
+    sprintf_s(Path, "%smysticparadox_dll_port%d.log", MpLogDir(), Port);
+    if (MpLogMode() == 0) {
+        std::ofstream File(Path, std::ios::app);
+        if (File.is_open()) {
+            File << Msg << "\n";
+            File.flush();
+        }
+        return;
+    }
+    if (Port != Globals::Port) {
+        std::string Line = Msg;
+        Line.push_back('\n');
+        if (Line.size() <= 0x7FFFFFFFu) MpLogWriteOnce(Path, Line.data(), static_cast<DWORD>(Line.size()));
+        return;
+    }
+    MpLogEmit(Path, Port, nullptr, 0, Msg);
 }
 
 bool MpReadEnvironment(const char* Name, std::string& Value, size_t Maximum) {
@@ -259,6 +546,49 @@ bool IsReadablePointer(const void* Ptr, size_t Size) {
     uintptr_t End = Start + Size;
     uintptr_t RegionEnd = reinterpret_cast<uintptr_t>(Info.BaseAddress) + Info.RegionSize;
     return End >= Start && End <= RegionEnd;
+}
+
+/*
+ * [2026-10-11 1.14.7 O3 VirtualQuery] IsReadablePointer is a VirtualQuery system call (a wineserver round trip under
+ * Wine), and the server's net path asked it about the same few pointers ~20 + 4N times per frame: the NetDriver and
+ * every client connection, in SanitizeNetDriverClientConnections (three times a frame: the engine's TickDispatch hook
+ * and before the manual dispatch and flush), the tick hook's two connection loops, the graph drive and the player-role
+ * route checks. MpReadableThisFrame remembers a POSITIVE answer for one segment of the server game thread's frame and
+ * answers repeats from a 256-slot table; a negative answer is never cached. The segment ("epoch") ends at the top of
+ * GameEngineTickHook and on both sides of the native engine tick, which is where GC frees objects, so a remembered
+ * answer never spans a GC. Other threads, and the client, always call IsReadablePointer. Only a few call sites (the
+ * net driver / connection / graph checks listed above) use it; it is not a liveness test and was never meant to be
+ * one. NO_FRAME_POINTER_CACHE.flag (read once) sends every call to IsReadablePointer.
+ */
+struct MpReadableCacheSlot { const void* Ptr; size_t Size; uint32_t Epoch; };
+static MpReadableCacheSlot g_MpReadableCache[256] = {};
+static uint32_t g_MpReadableEpoch = 1;
+static DWORD g_MpReadableCacheThread = 0;   // the server game thread, set by GameEngineTickHook; 0 = cache unused
+static int g_MpReadableCacheMode = -1;      // -1 = not decided, 1 = on, 0 = NO_FRAME_POINTER_CACHE.flag
+
+// Game thread only.
+static void MpReadableCacheNextEpoch() {
+    if (++g_MpReadableEpoch == 0) {
+        for (MpReadableCacheSlot& Slot : g_MpReadableCache) Slot.Epoch = 0;
+        g_MpReadableEpoch = 1;
+    }
+}
+
+static bool MpReadableThisFrame(const void* Ptr, size_t Size) {
+    if (g_MpReadableCacheMode != 1 || g_MpReadableCacheThread == 0 || GetCurrentThreadId() != g_MpReadableCacheThread) {
+        return IsReadablePointer(Ptr, Size);
+    }
+    if (!Ptr || (reinterpret_cast<uintptr_t>(Ptr) & 0x7) != 0) return false;
+    const uintptr_t P = reinterpret_cast<uintptr_t>(Ptr);
+    MpReadableCacheSlot& Slot = g_MpReadableCache[((P >> 3) ^ (P >> 12)) & 0xFF];
+    if (Slot.Ptr == Ptr && Slot.Epoch == g_MpReadableEpoch && Slot.Size >= Size) return true;
+    if (!IsReadablePointer(Ptr, Size)) return false;
+    if (Slot.Ptr != Ptr || Slot.Epoch != g_MpReadableEpoch || Slot.Size < Size) {
+        Slot.Ptr = Ptr;
+        Slot.Size = Size;
+        Slot.Epoch = g_MpReadableEpoch;
+    }
+    return true;
 }
 
 // [2026-07-24 ROOT-CAUSE FIX for the Ramsgate->Training "new player" crash] Robust UObject liveness
@@ -345,8 +675,28 @@ std::string MpPtr(const void* Ptr) {
     return Ptr ? std::to_string(reinterpret_cast<uintptr_t>(Ptr)) : "null";
 }
 
+static void MpReapExit(const char* Reason);   // defined with the empty-server watchdog below
+
 // Game thread only.
+// [2026-10-11 1.14.7 P2P host] Servers exit through MpReapExit. UKismetSystemLibrary::QuitGame (0x03EE3FD0) with no
+// SpecificPlayer asks GetPlayerController(World, 0) (0x03E2F520) for a target and returns at once when there is none -
+// always the case on a server with no client since the local player was removed (0.2.110/0.2.111) - and when it does
+// find one (a remote player's controller) it runs the console command "quit" through that player, which at best
+// reaches UE's exit teardown: the path that hangs 60 s and aborts on this build (see MpReapExit). So every player-host
+// fence (P2PHooks::TickShutdown) ended in its 5 s TerminateProcess(0xE105) fallback. A server keeps nothing in process
+// (persistence is in the Metagame), so it now ends the way the empty-server reap does: TerminateProcess(0). The client
+// keeps QuitGame. SERVER_QUITGAME_EXIT.flag reverts servers to QuitGame (read once).
 void MpQuitGame() {
+    if (Globals::AmServer) {
+        static const bool UseQuitGame = MpExeRelativeFlagPresent(L"SERVER_QUITGAME_EXIT.flag");
+        if (!UseQuitGame) {
+            MpLog("[ServerQuit] quit requested on a server; ending through the reap path (QuitGame does nothing "
+                  "without a local PlayerController; SERVER_QUITGAME_EXIT.flag reverts)");
+            MpReapExit("server quit (MpQuitGame)");
+            return;
+        }
+        MpLog("[ServerQuit] SERVER_QUITGAME_EXIT.flag present: UKismetSystemLibrary::QuitGame (old path)");
+    }
     UKismetSystemLibrary::QuitGame(UWorld::GetWorld(), nullptr, EQuitPreference::Quit, true);
 }
 
@@ -646,6 +996,11 @@ void WINAPI RaiseExceptionHook(DWORD Code, DWORD Flags, DWORD ArgCount, const UL
     OrigRaiseException(Code, Flags, ArgCount, Args);
 }
 
+static void MpLogTravelCrashState(CONTEXT* Context);   // [1.14.7 travel-crash probe] defined with the world census
+static void MpReportZombieWorld(void* World, const char* Reason);   // [1.14.7 travel-crash probe] leftover-world holders
+static void MpReleaseZombieKeepFlags(void* const* Worlds, int NumWorlds, const char* Reason);   // [1.14.7 travel-crash fix]
+static bool MpZombieKeepFlagReleased(void* World);
+
 LONG WINAPI VectoredExceptionTrace(EXCEPTION_POINTERS* ExceptionInfo) {
     if (MpProcessDetaching()) {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -680,6 +1035,16 @@ LONG WINAPI VectoredExceptionTrace(EXCEPTION_POINTERS* ExceptionInfo) {
                 Context->Rdi = reinterpret_cast<uintptr_t>(s_EmptyNameEntry); // header 0 = empty, non-wide name.
                 InHandler = false;
                 return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
+            // [2026-10-10 1.14.7 travel-crash probe, observe-only] The hunt -> Ramsgate crash: UEngine::LoadMap reads
+            // the new world's null PersistentLevel through GetOutermost (helper 0x0285E6F0). Neither the helper nor its
+            // wrapper touches r12, which still holds LoadMap's FWorldContext, so the world it used is [r12+0x280].
+            // Dump that world's state once; the exception then continues exactly as before.
+            if (!Globals::AmServer && Context && IsReadablePointer(Context, sizeof(CONTEXT))
+                && Record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && Globals::BaseAddress
+                && Context->Rip == Globals::BaseAddress + 0x0285E6F0) {
+                MpLogTravelCrashState(Context);
             }
 
             // [1.14.7 2026-10-08] The two spline-fault recoveries that sat here (+0x1091D5D evaluator AV and
@@ -891,6 +1256,151 @@ static bool MpOsCommandLineHas(const wchar_t* Param) {
     return Os != nullptr && Param != nullptr && wcsstr(Os, Param) != nullptr;
 }
 
+/*
+ * [2026-10-11 1.14.7 P2P host MULTIHOME] The engine chooses the address its net driver binds in
+ * ISocketSubsystem::GetMultihomeAddress (0x032AE4B0, a vtable slot; GetLocalBindAddr 0x032AE2C0 calls it and falls
+ * back to every interface when it answers false):
+ *     FParse::Value(FCommandLine::Get(), L"MULTIHOME=", Home, 256)      // 0x02640610 / 0x025E8F70
+ * read on every bind from the string HookFCommandLineGet serves. OS-only switches never reach that string (every hub
+ * logs engineOriginalNullRHI=0 osNullRHI=1), so the -MULTIHOME=127.0.0.1 the launcher gives the player-hosted server
+ * - to bind loopback only, reachable through the relay alone - was ignored and the host bound every interface,
+ * bypassing relay admission. HookFCommandLineGet now carries it like -nullrhi: server role only, only when the OS line
+ * has it and the served line has none, and only a strict IPv4 or IPv6 literal (an invalid value would make the
+ * engine log "Invalid multihome IP address" and bind every interface anyway, so it is refused and logged instead).
+ * DeployServer launches pass no MULTIHOME: dedicated hubs and hunts are unchanged.
+ * The effective value (carried or the engine's own) is published once as POD for the watchdog thread's port probe
+ * (MpOurUdpPortIsFree) and for the listen check in Networking::Listen (MpEngineCommandLineMultihome). No revert flag:
+ * reverting would reopen the all-interfaces bind on the player host.
+ */
+static char g_MpEngineMultihomeA[64] = { 0 };          // effective MULTIHOME of the served engine line, "" = none
+static volatile LONG g_MpEngineMultihomeState = 0;     // 0 = served line not built yet, 1 = published
+
+// Strict dotted quad ("127.0.0.1"): four decimal parts 0..255, no sign, no empty part, no leading zero (octal-looking
+// parts are read differently by different parsers), at most 3 digits each.
+static bool MpParseIpv4Literal(const char* Text, uint32_t& OutHostOrder) {
+    if (!Text) return false;
+    uint32_t Result = 0;
+    const char* P = Text;
+    for (int Part = 0; Part < 4; ++Part) {
+        if (Part > 0) { if (*P != '.') return false; ++P; }
+        if (P[0] == '0' && P[1] >= '0' && P[1] <= '9') return false;
+        int Digits = 0;
+        uint32_t Value = 0;
+        while (*P >= '0' && *P <= '9') {
+            Value = Value * 10 + static_cast<uint32_t>(*P - '0');
+            ++P;
+            if (++Digits > 3) return false;
+        }
+        if (Digits == 0 || Value > 255) return false;
+        Result = (Result << 8) | Value;
+    }
+    if (*P != '\0') return false;
+    OutHostOrder = Result;
+    return true;
+}
+
+// IPv4 dotted quad, or an IPv6 text form (hex digits, ':' and an optional embedded dotted quad; at least two ':').
+static bool MpIsIpLiteralW(const std::wstring& Value) {
+    if (Value.empty() || Value.size() > 45) return false;
+    std::string Narrow;
+    for (wchar_t C : Value) {
+        if (C > 0x7F) return false;
+        Narrow.push_back(static_cast<char>(C));
+    }
+    uint32_t Ignored = 0;
+    if (MpParseIpv4Literal(Narrow.c_str(), Ignored)) return true;
+    int Colons = 0;
+    for (char C : Narrow) {
+        if (C == ':') { ++Colons; continue; }
+        if (!((C >= '0' && C <= '9') || (C >= 'a' && C <= 'f') || (C >= 'A' && C <= 'F') || C == '.')) return false;
+    }
+    return Colons >= 2;
+}
+
+// MULTIHOME value in an engine command line as FParse::Value (0x02640610) finds it: first case-insensitive match not
+// preceded by a letter or digit and outside double quotes; the value runs to the next blank, comma, quote or ')'.
+static std::wstring MpEngineLineMultihome(const wchar_t* Line) {
+    if (!Line) return {};
+    bool InQuotes = false;
+    wchar_t Prev = 0;
+    for (const wchar_t* P = Line; *P; ++P) {
+        if (*P == L'"') { InQuotes = !InQuotes; Prev = *P; continue; }
+        const bool PrevAlnum = (Prev >= L'0' && Prev <= L'9') || (Prev >= L'A' && Prev <= L'Z') || (Prev >= L'a' && Prev <= L'z');
+        if (!InQuotes && !PrevAlnum && _wcsnicmp(P, L"MULTIHOME=", 10) == 0) {
+            const wchar_t* V = P + 10;
+            const wchar_t* E = V;
+            while (*E && *E != L' ' && *E != L'\t' && *E != L',' && *E != L'"' && *E != L')') ++E;
+            return std::wstring(V, E);
+        }
+        Prev = *P;
+    }
+    return {};
+}
+
+// MULTIHOME value on the OS command line: the first argument -MULTIHOME=<v> (case-insensitive), split the way the
+// player-host module's launch check (CommandLineToArgvW) reads it. Found=false when there is none.
+static std::wstring MpOsCommandLineMultihome(bool& Found) {
+    Found = false;
+    LPCWSTR Os = OrigGetCommandLineW ? OrigGetCommandLineW() : GetCommandLineW();
+    if (!Os) return {};
+    int NumArgs = 0;
+    wchar_t** Args = CommandLineToArgvW(Os, &NumArgs);
+    if (!Args) return {};
+    std::wstring Value;
+    for (int Index = 1; Index < NumArgs; ++Index) {
+        if (Args[Index] && _wcsnicmp(Args[Index], L"-MULTIHOME=", 11) == 0) {
+            Value = Args[Index] + 11;
+            Found = true;
+            break;
+        }
+    }
+    LocalFree(Args);
+    return Value;
+}
+
+// Effective MULTIHOME of the served engine line (wide copy of the published POD), empty when there is none or the
+// line was never served. Used by Networking::Listen (declared there).
+std::wstring MpEngineCommandLineMultihome() {
+    if (InterlockedCompareExchange(&g_MpEngineMultihomeState, 0, 0) == 0) return {};
+    std::wstring Out;
+    for (const char* P = g_MpEngineMultihomeA; *P; ++P) Out.push_back(static_cast<wchar_t>(*P));
+    return Out;
+}
+
+// Inside HookFCommandLineGet's one-time build: carry the OS -MULTIHOME= on server roles, then publish the effective value.
+static void MpCarryMultihomeIntoEngineLine(std::wstring& Served) {
+    std::wstring Effective = MpEngineLineMultihome(Served.c_str());
+    if (Globals::AmServer) {
+        bool OsFound = false;
+        const std::wstring OsValue = MpOsCommandLineMultihome(OsFound);
+        if (OsFound && Effective.empty()) {
+            if (MpIsIpLiteralW(OsValue)) {
+                Served += L" -MULTIHOME=" + OsValue;
+                Effective = OsValue;
+                MpLog("[CommandLine] MULTIHOME=" + MpNarrow(OsValue) + " carried from the OS command line into the engine "
+                      "FCommandLine (server role; GetMultihomeAddress 0x032AE4B0 binds the net driver to it)");
+            } else {
+                MpLog("[CommandLine] MULTIHOME on the OS command line is not an IP literal (" + std::to_string(OsValue.size())
+                    + " chars); NOT carried - the engine binds every interface (a player-hosted server then refuses to listen)");
+            }
+        } else if (OsFound && _wcsicmp(Effective.c_str(), OsValue.c_str()) != 0) {
+            MpLog("[CommandLine] WARNING: the engine FCommandLine already has MULTIHOME=" + MpNarrow(Effective)
+                + ", which differs from the OS command line's; the engine's value is kept");
+        }
+    }
+    // Publish once. Only a validated literal fits the POD buffer; anything else is published as "" plus the
+    // warning, which makes the port probe fall back and the player-host listen check refuse.
+    if (!Effective.empty() && (!MpIsIpLiteralW(Effective) || Effective.size() >= sizeof(g_MpEngineMultihomeA))) {
+        MpLog("[CommandLine] WARNING: the engine FCommandLine's MULTIHOME is not an IP literal (" + std::to_string(Effective.size())
+            + " chars); the engine rejects it and binds every interface");
+        Effective.clear();
+    }
+    size_t Length = 0;
+    for (wchar_t C : Effective) g_MpEngineMultihomeA[Length++] = static_cast<char>(C);
+    g_MpEngineMultihomeA[Length] = '\0';
+    InterlockedExchange(&g_MpEngineMultihomeState, 1);
+}
+
 static const wchar_t* HookFCommandLineGet() {
     const wchar_t* Orig = OrigFCommandLineGet ? OrigFCommandLineGet() : nullptr;
     if (!Orig) return Orig;
@@ -924,6 +1434,8 @@ static const wchar_t* HookFCommandLineGet() {
             g_engineCmdLineServed += L" -nullrhi";
             MpLog("[CommandLine] appended -nullrhi to the engine FCommandLine (server role)");
         }
+        // [2026-10-11 1.14.7 P2P host MULTIHOME] The bind address, the same gap (see MpCarryMultihomeIntoEngineLine).
+        MpCarryMultihomeIntoEngineLine(g_engineCmdLineServed);
     }
     if (!g_engineCmdLineLoggedOnce) {
         g_engineCmdLineLoggedOnce = true;
@@ -931,7 +1443,8 @@ static const wchar_t* HookFCommandLineGet() {
             + std::to_string(g_engineCmdLineServed.find(L"-NoEAC") != std::wstring::npos ? 1 : 0)
             + " NullRHI=" + std::to_string(g_engineCmdLineServed.find(L"-nullrhi") != std::wstring::npos ? 1 : 0)
             + " engineOriginalNullRHI=" + std::to_string(EngineOriginalNullRhi ? 1 : 0)
-            + " osNullRHI=" + std::to_string(MpOsCommandLineHas(L"-nullrhi") ? 1 : 0));
+            + " osNullRHI=" + std::to_string(MpOsCommandLineHas(L"-nullrhi") ? 1 : 0)
+            + " Multihome=" + (g_MpEngineMultihomeA[0] ? std::string(g_MpEngineMultihomeA) : std::string("none")));
     }
     return g_engineCmdLineServed.c_str();
 }
@@ -1047,9 +1560,102 @@ static void MpLogSockAddr(const char* Tag, const void* Sa, int SaLen, int Len) {
         + " len=" + std::to_string(Len) + " role=" + (Globals::AmServer ? "server" : "client"));
 }
 
+/*
+ * [2026-10-11 1.14.7 O0 wire bytes] Bytes the server actually puts on the wire, per destination address, for the
+ * once-a-minute [PerfNet] line (scaling one Ramsgate toward 30-40 players needs the per-connection budget). The
+ * sendto hook below now always runs on servers (NO_PERF_DETAIL.flag turns the counting and the hook off) and only
+ * counts: relaxed atomics into a fixed 64-slot table keyed by address:port, no allocation, no lock, no logging, no CRT.
+ * The verbose per-packet lines stay opt-in (SOCKET_DIAG.flag). UE's IpNetDriver sends with ws2_32!sendto (SOCKET_DIAG
+ * captured "sendto -> 127.0.0.1:8790"); WSASendTo is not hooked because nothing in the net driver uses it.
+ * A slot whose peer sent nothing for a whole window is released by the reader, so a long-lived hub keeps room for new
+ * joiners; a send racing that release can land in a released slot and is then reported as "unattributed". Once all 64
+ * slots are busy, further peers count into "other".
+ */
+struct MpWireSlot {
+    std::atomic<uint64_t> Key{ 0 };
+    std::atomic<uint64_t> Bytes{ 0 };
+    std::atomic<uint64_t> Packets{ 0 };
+};
+static MpWireSlot g_wireSlots[64];
+static std::atomic<uint64_t> g_wireBytesTotal{ 0 };
+static std::atomic<uint64_t> g_wirePacketsTotal{ 0 };
+static std::atomic<uint64_t> g_wireBytesOther{ 0 };
+static volatile LONG g_wireCountOn = 0;   // set once by InstallSocketDiagnostics (server, !NO_PERF_DETAIL.flag)
+
+// Key from a sockaddr: tag(8) | IPv4 address(32) | port(16); IPv4-mapped IPv6 maps to the IPv4 key; other IPv6 uses a
+// 40-bit FNV-1a of the address. 0 = not countable.
+static uint64_t MpWireKeyFromSockAddr(const void* Sa, int SaLen) {
+    if (!Sa || SaLen < 8) return 0;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(Sa);
+    const uint16_t Family = static_cast<uint16_t>(p[0] | (p[1] << 8));
+    const uint64_t Port = static_cast<uint64_t>((p[2] << 8) | p[3]);
+    if (Family == 2 && SaLen >= 8) {
+        const uint64_t Addr = (static_cast<uint64_t>(p[4]) << 24) | (static_cast<uint64_t>(p[5]) << 16)
+            | (static_cast<uint64_t>(p[6]) << 8) | static_cast<uint64_t>(p[7]);
+        return (1ull << 56) | (Addr << 16) | Port;
+    }
+    if (Family == 23 && SaLen >= 24) {   // sockaddr_in6: family, port, flowinfo(4), address(16) at +8
+        const unsigned char* A = p + 8;
+        bool Mapped = A[10] == 0xFF && A[11] == 0xFF;
+        for (int i = 0; i < 10 && Mapped; ++i) Mapped = A[i] == 0;
+        if (Mapped) {
+            const uint64_t Addr = (static_cast<uint64_t>(A[12]) << 24) | (static_cast<uint64_t>(A[13]) << 16)
+                | (static_cast<uint64_t>(A[14]) << 8) | static_cast<uint64_t>(A[15]);
+            return (1ull << 56) | (Addr << 16) | Port;
+        }
+        uint64_t H = 1469598103934665603ull;
+        for (int i = 0; i < 16; ++i) { H ^= A[i]; H *= 1099511628211ull; }
+        return (2ull << 56) | ((H & 0xFFFFFFFFFFull) << 16) | Port;
+    }
+    return (3ull << 56) | (static_cast<uint64_t>(Family) << 16);
+}
+
+static std::string MpWireKeyText(uint64_t Key) {
+    const unsigned Tag = static_cast<unsigned>(Key >> 56);
+    const unsigned Port = static_cast<unsigned>(Key & 0xFFFF);
+    char Buf[64];
+    if (Tag == 1) {
+        const uint32_t A = static_cast<uint32_t>((Key >> 16) & 0xFFFFFFFFull);
+        sprintf_s(Buf, "%u.%u.%u.%u:%u", (A >> 24) & 0xFF, (A >> 16) & 0xFF, (A >> 8) & 0xFF, A & 0xFF, Port);
+    } else if (Tag == 2) {
+        sprintf_s(Buf, "v6#%010llX:%u", static_cast<unsigned long long>((Key >> 16) & 0xFFFFFFFFFFull), Port);
+    } else {
+        sprintf_s(Buf, "family%u", static_cast<unsigned>((Key >> 16) & 0xFFFF));
+    }
+    return Buf;
+}
+
+static void MpWireCount(uint64_t Key, uint64_t Bytes) {
+    g_wireBytesTotal.fetch_add(Bytes, std::memory_order_relaxed);
+    g_wirePacketsTotal.fetch_add(1, std::memory_order_relaxed);
+    if (Key == 0) {
+        g_wireBytesOther.fetch_add(Bytes, std::memory_order_relaxed);
+        return;
+    }
+    const unsigned Start = static_cast<unsigned>(((Key ^ (Key >> 23) ^ (Key >> 41)) * 0x9E3779B97F4A7C15ull) >> 58);
+    for (unsigned n = 0; n < 64; ++n) {
+        MpWireSlot& Slot = g_wireSlots[(Start + n) & 63];
+        uint64_t K = Slot.Key.load(std::memory_order_relaxed);
+        if (K == 0) {
+            uint64_t Expected = 0;
+            if (Slot.Key.compare_exchange_strong(Expected, Key, std::memory_order_relaxed)) K = Key;
+            else K = Expected;
+        }
+        if (K == Key) {
+            Slot.Bytes.fetch_add(Bytes, std::memory_order_relaxed);
+            Slot.Packets.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    g_wireBytesOther.fetch_add(Bytes, std::memory_order_relaxed);
+}
+
 static int __stdcall HookSendTo(uintptr_t S, const char* Buf, int Len, int Flags, const void* To, int ToLen) {
-    MpLogSockAddr("sendto ->", To, ToLen, Len);
-    return OrigSendTo ? OrigSendTo(S, Buf, Len, Flags, To, ToLen) : -1;
+    static const bool s_verbose = MpExeRelativeFlagPresent(L"SOCKET_DIAG.flag");   // [2026-10-11] read once
+    if (s_verbose) MpLogSockAddr("sendto ->", To, ToLen, Len);
+    const int R = OrigSendTo ? OrigSendTo(S, Buf, Len, Flags, To, ToLen) : -1;
+    if (R > 0 && g_wireCountOn) MpWireCount(MpWireKeyFromSockAddr(To, ToLen), static_cast<uint64_t>(R));
+    return R;
 }
 
 static int __stdcall HookRecvFrom(uintptr_t S, char* Buf, int Len, int Flags, void* From, int* FromLen) {
@@ -1104,7 +1710,11 @@ static void InstallSocketDiagnostics() {
     // is a CRT routine writing [rbp+0x3F0]). The measurements they were added for are complete (the client
     // sends 29-byte packets to 127.0.0.1:8790 and the hub receives them), and a diagnostic must not perturb
     // the path it measures. SOCKET_DIAG.flag beside the executable re-enables them.
-    if (!MpExeRelativeFlagPresent(L"SOCKET_DIAG.flag")) {
+    // [2026-10-11 1.14.7 O0] Exception: on servers the sendto hook is installed anyway, counting only (no logging, see
+    // MpWireCount), for the [PerfNet] bytes-per-peer line. NO_PERF_DETAIL.flag leaves sendto unhooked again.
+    const bool Verbose = MpExeRelativeFlagPresent(L"SOCKET_DIAG.flag");
+    const bool CountWire = Globals::AmServer && !MpExeRelativeFlagPresent(L"NO_PERF_DETAIL.flag");
+    if (!Verbose && !CountWire) {
         return;
     }
     HMODULE Ws2 = GetModuleHandleW(L"ws2_32.dll");
@@ -1116,7 +1726,13 @@ static void InstallSocketDiagnostics() {
     if (T1) {
         MH_STATUS C = MH_CreateHook(T1, HookSendTo, reinterpret_cast<LPVOID*>(&OrigSendTo));
         MH_STATUS E = C == MH_OK ? MH_EnableHook(T1) : C;
-        MpLog(std::string("[SocketDiag] sendto hook create=") + MH_StatusToString(C) + " enable=" + MH_StatusToString(E));
+        if (CountWire && C == MH_OK && E == MH_OK) InterlockedExchange(&g_wireCountOn, 1);
+        MpLog(std::string("[SocketDiag] sendto hook create=") + MH_StatusToString(C) + " enable=" + MH_StatusToString(E)
+            + " counting=" + (g_wireCountOn ? "1 ([PerfNet] bytes per peer)" : "0")
+            + " verbose=" + (Verbose ? "1 (SOCKET_DIAG.flag)" : "0"));
+    }
+    if (!Verbose) {
+        return;   // counting only: the receive hooks stay opt-in
     }
     void* T2 = reinterpret_cast<void*>(GetProcAddress(Ws2, "recvfrom"));
     if (T2) {
@@ -1534,6 +2150,8 @@ void MainThread() {
     InitLog("[MainThread] Built map part, calling MpLog...");
 
     MpLog(logMsg);
+    MpLog(std::string("[FlagCache] flag-file cache ") + MpFlagCacheModeText());
+    MpLogBackendAddress();   // [2026-10-13 realms S1] source=env|built-in, resolved in Init
     InitLog("[MainThread] MpLog returned, entering UWorld wait loop");
 
     if (Globals::AmServer && Globals::AuthMode == Globals::ServerAuthMode::Invalid) {
@@ -1563,10 +2181,9 @@ void MainThread() {
         }
     }
 
-    // [move10] Emit boot-patch status here (InitServerHooks recorded it under loader lock where
-    // InitLog is a no-op). If any line says ABORT, the flag patch did not apply as intended.
+    // Emit boot-patch status here (InitServerHooks recorded it under loader lock where InitLog is a no-op).
     if (Globals::AmServer && !Globals::Move10Status.empty()) {
-        MpLog(std::string("[move10] boot patch status:") + Globals::Move10Status);
+        MpLog(std::string("[BootPatch] status:") + Globals::Move10Status);
     }
 
     int waitCount = 0;
@@ -1660,17 +2277,61 @@ static void* EngineRealloc(void* Ptr, size_t NewSize) {
 // native event that only enables P2 after P1 leaves. Offsets from SDK: GameMode GameSession +0x278,
 // MatchState +0x2C0, NumSpectators +0x2CC, NumPlayers +0x2D0, NumTravellingPlayers +0x2DC,
 // ExpectedPlayerCount +0x498, MaxPlayers +0x49C; GameState MatchState +0x270; GameSession MaxPlayers +0x224.
+//
+// [2026-10-11 1.14.7 O2 join/leave hitch] The walk below visited GUObjectArray (~208k objects on Ramsgate, an IsA per
+// object) at EVERY connection-count change, match-state change and PostLogin-named ProcessEvent - several walks per
+// join or leave, the 277 ms frames seen on joins. The two objects now come from the world itself:
+// GWorld->AuthorityGameMode (+0x118) and GWorld->GameState (+0x120), the same reads the ExpectedPlayerCount sync and
+// the AFK timeout already use (Offsets::GWorld 0x06FC7F58), each checked as a live non-CDO object of the Archon class.
+// The walk's "first instance found" could even be a leftover from an earlier world; the world's pointers are the live
+// ones. Same line format. LEGACY_LIFECYCLE_WALK.flag (read once) restores the walks here, in the match-state tracker,
+// the progression-config resume and the arrival-trigger probe.
+static bool MpLegacyLifecycleWalk() {
+    static int s_mode = -1;
+    if (s_mode < 0) {
+        s_mode = MpExeRelativeFlagPresent(L"LEGACY_LIFECYCLE_WALK.flag") ? 1 : 0;
+        MpLog(std::string("[Lifecycle] GameMode/GameState lookup = ")
+            + (s_mode ? "full GObjects walk (LEGACY_LIFECYCLE_WALK.flag present)"
+                      : "world pointers GWorld+0x118 / +0x120 (default)"));
+    }
+    return s_mode == 1;
+}
+
+// Live non-CDO object of Cls, or nullptr. Game thread.
+static SDK::UObject* MpLiveObjectOfClass(SDK::UObject* Obj, SDK::UClass* Cls) {
+    if (!Obj || !Cls || !IsRegisteredLiveObject(Obj) || Obj->IsDefaultObject() || !Obj->Class
+        || !IsRegisteredLiveObject(Obj->Class) || !Obj->IsA(Cls)) {
+        return nullptr;
+    }
+    return Obj;
+}
+
+// The world's AArchonGameMode (+0x118) and AArchonGameState (+0x120); either may come back null. Game thread.
+static void MpWorldGameModeAndState(SDK::UObject*& OutGameMode, SDK::UObject*& OutGameState) {
+    OutGameMode = nullptr;
+    OutGameState = nullptr;
+    SDK::UWorld* World = SDK::UWorld::GetWorld();
+    if (!World || !IsReadablePointer(World, 0x128)) return;
+    const uintptr_t W = reinterpret_cast<uintptr_t>(World);
+    OutGameMode = MpLiveObjectOfClass(*reinterpret_cast<SDK::UObject**>(W + 0x118), SDK::AArchonGameMode::StaticClass());
+    OutGameState = MpLiveObjectOfClass(*reinterpret_cast<SDK::UObject**>(W + 0x120), SDK::AArchonGameState::StaticClass());
+}
+
 static void LogArchonLifecycle(const char* Tag) {
     if (!SDK::UObject::GObjects) { return; }
     SDK::UObject* GmObj = nullptr;
     SDK::UObject* GsObj = nullptr;
-    const int Count = SDK::UObject::GObjects->Num();
-    for (int i = 0; i < Count; i++) {
-        SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
-        if (!Obj || Obj->IsDefaultObject()) { continue; }
-        if (!GmObj && Obj->IsA(SDK::AArchonGameMode::StaticClass())) { GmObj = Obj; }
-        else if (!GsObj && Obj->IsA(SDK::AArchonGameState::StaticClass())) { GsObj = Obj; }
-        if (GmObj && GsObj) { break; }
+    if (!MpLegacyLifecycleWalk()) {
+        MpWorldGameModeAndState(GmObj, GsObj);
+    } else {
+        const int Count = SDK::UObject::GObjects->Num();
+        for (int i = 0; i < Count; i++) {
+            SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+            if (!Obj || Obj->IsDefaultObject()) { continue; }
+            if (!GmObj && Obj->IsA(SDK::AArchonGameMode::StaticClass())) { GmObj = Obj; }
+            else if (!GsObj && Obj->IsA(SDK::AArchonGameState::StaticClass())) { GsObj = Obj; }
+            if (GmObj && GsObj) { break; }
+        }
     }
 
     std::string Msg = std::string("[Lifecycle:") + Tag + "]";
@@ -1728,6 +2389,14 @@ static uint64_t g_LastGameModeSearchMs = 0;
 // persists for the whole process, so once published its pointer stays valid and NumPlayers/NumTravelling
 // are safe plain int reads from any thread.
 static std::atomic<void*> g_wdGameModePtr{ nullptr };
+// [1.14.7 2026-10-10] Set when this server booted without the phantom local player (every server role since 0.2.110;
+// false only if the byte guard in InitServerHooks failed); the first login then starts the match (MpStartMatchWithoutPhantom).
+static std::atomic<bool> g_NoLocalPlayerApplied{ false };
+static std::atomic<uint64_t> g_MpLastPostLoginMs{ 0 };   // [2026-10-10 arrival-trigger probe] last server K2_PostLogin
+// [2026-10-10 GrantTrace] The reflected (Blueprint/UFunction) call chain on this thread, written by the server
+// ProcessEventHook's depth guard and read by the inventory-transaction hook to name the Blueprint behind a grant.
+static thread_local SDK::UFunction* g_MpPeChain[64] = {};
+static thread_local int g_MpPeChainDepth = 0;
 
 // [1.14.7 WATCHDOG HEALTH FIX 2026-10-04] The watchdog thread used to dereference g_wdGameModePtr to read the
 // player counts. That pointer is only refreshed while the game thread keeps calling GameModeEmptyState(), so
@@ -1741,15 +2410,34 @@ static std::atomic<void*> g_wdGameModePtr{ nullptr };
 // succeeds. Measured on the Training hub: at t+150s the match state was LeavingMap and UDP 8789 was unbound,
 // yet the published counts stayed fresh (countsUsable=1, numPlayers=1) because the GameMode survives the map
 // exit - so a counts-based trigger never fires. The port is the honest signal.
+// [2026-10-11 1.14.7 P2P host] Probe the address the server is actually bound to. Windows lets a wildcard bind
+// (0.0.0.0:port) succeed while another socket holds a specific address on the same port (127.0.0.1:port) unless that
+// socket used SO_EXCLUSIVEADDRUSE, so once the player host binds loopback only (MULTIHOME, see
+// MpCarryMultihomeIntoEngineLine) an INADDR_ANY probe would report the port free while the host is serving, and the
+// 45 s rule in the watchdog thread would reap it about 45 s after its first GameMode sample. The engine binds the MULTIHOME address when its command line has one, else
+// every interface: the probe now binds the same address (a same-address bind fails while the server holds it, the
+// measured hub behaviour). This keeps the alive-but-unavailable exit for the host and for any server given a
+// MULTIHOME, which skipping the check for the player host would have lost. An address this IPv4 probe cannot
+// express (IPv6) means "cannot test": never act.
 static bool MpOurUdpPortIsFree() {
     const int Port = static_cast<int>(Globals::Port);
     if (Port <= 0 || Port > 65535) return false;      // unknown port: never act
+    uint32_t BindHostOrder = INADDR_ANY;
+    if (InterlockedCompareExchange(&g_MpEngineMultihomeState, 0, 0) != 0 && g_MpEngineMultihomeA[0] != '\0'
+        && !MpParseIpv4Literal(g_MpEngineMultihomeA, BindHostOrder)) {
+        static std::atomic<bool> s_loggedUntestable{ false };
+        if (!s_loggedUntestable.exchange(true, std::memory_order_relaxed)) {
+            MpLog(std::string("[Watchdog/thread] port probe: MULTIHOME=") + g_MpEngineMultihomeA
+                + " is not IPv4; the port-free check is off for this server (never acts)");
+        }
+        return false;
+    }
     SOCKET Probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (Probe == INVALID_SOCKET) return false;        // cannot test: never act
     sockaddr_in Addr{};
     Addr.sin_family = AF_INET;
     Addr.sin_port = htons(static_cast<u_short>(Port));
-    Addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    Addr.sin_addr.s_addr = htonl(BindHostOrder);
     const bool Bound = (bind(Probe, reinterpret_cast<sockaddr*>(&Addr), sizeof(Addr)) == 0);
     closesocket(Probe);
     return Bound;
@@ -1767,7 +2455,7 @@ static std::atomic<int>   g_wdIsHub{ -1 };   // -1 unknown, 0 disposable (reapab
  * [1.14.7 EMPTY-HUNT FIX 2026-10-09] Remote client connections, published by the game thread from
  * NetDriver->ClientConnections.Num (the [NetConnEdge] count).
  *
- * A 1.14.7 server always owns one local (phantom) player (38_ §12), so GameMode NumPlayers never drops
+ * Until runtime 0.2.110 a 1.14.7 server owned one local (phantom) player (38_ §12), so GameMode NumPlayers never dropped
  * below 1 and an emptied hunt never looked empty: every hunt stayed alive and the third one filled
  * DeployServer's cap ("Hunt server capacity reached (3/3)", 38_ §18.4). Measured on three hunts on 9 Oct:
  * [NetConnEdge] connCount 1 -> 0 when the player left, with NumPlayers=1 before and after. The connection
@@ -1808,8 +2496,169 @@ static std::atomic<bool> g_wdSawPlayer{ false };
 // Game thread id, published from the game thread. Needed to capture WHERE it is stuck (see below).
 static std::atomic<uint32_t> g_wdGameThreadId{ 0 };
 
+// [2026-10-10 1.14.7 RAM] Last GetTickCount64() at which the game thread saw at least one remote client connection
+// (stored every frame while ClientConnections.Num > 0). The hub working-set trim uses it so a client that connects and
+// leaves between two 2 s watchdog polls still breaks the idle window and re-arms the trim.
+static std::atomic<uint64_t> g_wdLastRemoteConnMs{ 0 };
+
+// [2026-10-10 1.14.7 Perf] Frame counters for the once-a-minute [Perf] line. Written by the game thread at the top of
+// GameEngineTickHook (servers only) with relaxed atomics; drained with exchange(0) by the watchdog thread. Reset on the
+// game thread at listen (StartEmptyWatchdogThread), so boot and map-load frames never reach the first window.
+// Read-only timing: nothing here changes the frame or net tick cadence.
+static std::atomic<uint64_t> g_perfFrames{ 0 };          // frame intervals measured (entry to entry)
+static std::atomic<uint64_t> g_perfFrameTicksSum{ 0 };   // QPC ticks summed over those intervals
+static std::atomic<uint64_t> g_perfFrameTicksMax{ 0 };
+static std::atomic<uint64_t> g_perfHitches{ 0 };         // intervals > 100 ms
+static std::atomic<uint64_t> g_perfEngineCalls{ 0 };     // OrigGameEngineTick calls timed
+static std::atomic<uint64_t> g_perfEngineTicksSum{ 0 };  // QPC ticks inside OrigGameEngineTick
+static std::atomic<int64_t>  g_perfLastFrameQpc{ 0 };    // 0 = start a new interval on the next frame
+static std::atomic<int64_t>  g_perfQpcFreq{ 0 };
+
+/*
+ * [2026-10-11 1.14.7 O0 measurement] The [Perf] timer covers only OrigGameEngineTick, but the replication-graph drive
+ * and the manual TickDispatch/TickFlush run after it, outside the timer, and an idle hub burns ~1.5 logical CPUs that
+ * the 0.5-1 ms engine tick does not explain. [PerfDetail] (same 60 s cadence, servers only) adds avg/max per call for
+ * the engine tick, graph drive, manual dispatch and manual flush; ReplicateActor calls and replicated bits per frame
+ * (and per connection); replication-graph sizes; [PerfThreads] the top threads by CPU with their start module+RVA;
+ * [PerfNet] wire bytes per peer (MpWireCount). Everything is counters and QPC reads on the game thread, read and
+ * logged by the watchdog thread; nothing changes a tick, rate or replication setting. NO_PERF_DETAIL.flag (read once)
+ * turns all of it off, including the sendto hook.
+ */
+struct MpPerfPhase {
+    std::atomic<uint64_t> Calls{ 0 };
+    std::atomic<uint64_t> Sum{ 0 };
+    std::atomic<uint64_t> Max{ 0 };
+};
+static MpPerfPhase g_perfPhaseEngine;     // OrigGameEngineTick (same calls as the [Perf] engine counters, plus max)
+static MpPerfPhase g_perfPhaseGraph;      // MpDriveReplicationGraph
+static MpPerfPhase g_perfPhaseDispatch;   // SafeManualTickDispatch
+static MpPerfPhase g_perfPhaseFlush;      // SafeManualTickFlush
+static std::atomic<uint64_t> g_perfRepActorCalls{ 0 };   // ReplicateActorFreqHook entries
+static std::atomic<uint64_t> g_perfRepActorBits{ 0 };    // sum of the native ReplicateActor return (bits written)
+// Replication-graph sizes, sampled by the game thread every 2 s (MpPerfSampleGraphCounts); -1 = not read.
+static std::atomic<int32_t> g_perfGraphConns{ -1 };
+static std::atomic<int32_t> g_perfGraphGlobalActors{ -1 };
+static std::atomic<int32_t> g_perfGraphActorInfoSum{ -1 };
+static std::atomic<int32_t> g_perfGraphActorInfoMax{ -1 };
+static std::atomic<int32_t> g_perfClientConns{ -1 };
+static std::atomic<int32_t> g_perfOpenChannelsSum{ -1 };
+static std::atomic<int32_t> g_perfOpenChannelsMax{ -1 };
+static std::atomic<uint64_t> g_perfGraphSampleMs{ 0 };
+// Replicated bits per connection (UActorChannel+0x28), game thread writes, watchdog drains. The reader asks for a reset
+// after each window; the game thread then clears the keys, so the table holds the connections of one window.
+struct MpRepBitsSlot {
+    std::atomic<void*> Conn{ nullptr };
+    std::atomic<uint64_t> Bits{ 0 };
+    std::atomic<uint64_t> Calls{ 0 };
+};
+static MpRepBitsSlot g_repBitsSlots[64];
+static std::atomic<uint64_t> g_repBitsOverflow{ 0 };
+static std::atomic<bool> g_repBitsResetRequested{ false };
+static void* g_repBitsLastConn = nullptr;   // game thread only
+static int g_repBitsLastSlot = -1;
+
+static bool MpPerfDetailEnabled() {
+    static volatile LONG s_mode = -1;   // -1 = not decided, 1 = on, 0 = off (client or NO_PERF_DETAIL.flag)
+    LONG Mode = s_mode;                 // plain aligned read: this runs for every replicated channel
+    if (Mode < 0) {
+        Mode = (Globals::AmServer && !MpExeRelativeFlagPresent(L"NO_PERF_DETAIL.flag")) ? 1 : 0;
+        InterlockedExchange(&s_mode, Mode);
+    }
+    return Mode == 1;
+}
+
+static void MpPerfPhaseAdd(MpPerfPhase& Phase, int64_t T0, int64_t T1) {
+    if (T1 <= T0) return;
+    const uint64_t D = static_cast<uint64_t>(T1 - T0);
+    Phase.Calls.fetch_add(1, std::memory_order_relaxed);
+    Phase.Sum.fetch_add(D, std::memory_order_relaxed);
+    uint64_t Max = Phase.Max.load(std::memory_order_relaxed);
+    while (D > Max && !Phase.Max.compare_exchange_weak(Max, D, std::memory_order_relaxed)) {}
+}
+
+static int64_t MpQpcNow() {
+    LARGE_INTEGER T{};
+    QueryPerformanceCounter(&T);
+    return T.QuadPart;
+}
+
+// Game thread (ReplicateActorFreqHook). Bits = the native ReplicateActor return; Conn = the channel's connection.
+static void MpRepBitsAdd(void* Conn, int64_t Bits) {
+    if (g_repBitsResetRequested.load(std::memory_order_relaxed)) {
+        for (MpRepBitsSlot& S : g_repBitsSlots) {
+            S.Conn.store(nullptr, std::memory_order_relaxed);
+            S.Bits.store(0, std::memory_order_relaxed);
+            S.Calls.store(0, std::memory_order_relaxed);
+        }
+        g_repBitsLastConn = nullptr;
+        g_repBitsLastSlot = -1;
+        g_repBitsResetRequested.store(false, std::memory_order_relaxed);
+    }
+    const uint64_t Add = Bits > 0 ? static_cast<uint64_t>(Bits) : 0;
+    int Slot = -1;
+    if (Conn && Conn == g_repBitsLastConn && g_repBitsLastSlot >= 0) {
+        Slot = g_repBitsLastSlot;
+    } else if (Conn) {
+        int Free = -1;
+        for (int i = 0; i < 64; ++i) {
+            void* K = g_repBitsSlots[i].Conn.load(std::memory_order_relaxed);
+            if (K == Conn) { Slot = i; break; }
+            if (!K && Free < 0) Free = i;
+        }
+        if (Slot < 0 && Free >= 0) {
+            g_repBitsSlots[Free].Conn.store(Conn, std::memory_order_relaxed);
+            Slot = Free;
+        }
+        g_repBitsLastConn = Slot >= 0 ? Conn : nullptr;
+        g_repBitsLastSlot = Slot;
+    }
+    if (Slot < 0) {
+        g_repBitsOverflow.fetch_add(Add, std::memory_order_relaxed);
+        return;
+    }
+    g_repBitsSlots[Slot].Bits.fetch_add(Add, std::memory_order_relaxed);
+    g_repBitsSlots[Slot].Calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void MpPerfFrameSample(int64_t NowQpc) {
+    int64_t Freq = g_perfQpcFreq.load(std::memory_order_relaxed);
+    if (Freq == 0) {
+        LARGE_INTEGER F{};
+        QueryPerformanceFrequency(&F);
+        Freq = F.QuadPart;
+        g_perfQpcFreq.store(Freq, std::memory_order_relaxed);
+    }
+    const int64_t Last = g_perfLastFrameQpc.exchange(NowQpc, std::memory_order_relaxed);
+    if (Last <= 0 || NowQpc <= Last) return;
+    const uint64_t D = static_cast<uint64_t>(NowQpc - Last);
+    g_perfFrames.fetch_add(1, std::memory_order_relaxed);
+    g_perfFrameTicksSum.fetch_add(D, std::memory_order_relaxed);
+    uint64_t Max = g_perfFrameTicksMax.load(std::memory_order_relaxed);
+    while (D > Max && !g_perfFrameTicksMax.compare_exchange_weak(Max, D, std::memory_order_relaxed)) {}
+    if (Freq > 0 && D * 10 > static_cast<uint64_t>(Freq)) g_perfHitches.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void MpPerfResetCounters() {
+    g_perfFrames.store(0, std::memory_order_relaxed);
+    g_perfFrameTicksSum.store(0, std::memory_order_relaxed);
+    g_perfFrameTicksMax.store(0, std::memory_order_relaxed);
+    g_perfHitches.store(0, std::memory_order_relaxed);
+    g_perfEngineCalls.store(0, std::memory_order_relaxed);
+    g_perfEngineTicksSum.store(0, std::memory_order_relaxed);
+    g_perfLastFrameQpc.store(0, std::memory_order_relaxed);
+    // [2026-10-11 1.14.7 O0] [PerfDetail] counters start at listen too.
+    for (MpPerfPhase* P : { &g_perfPhaseEngine, &g_perfPhaseGraph, &g_perfPhaseDispatch, &g_perfPhaseFlush }) {
+        P->Calls.store(0, std::memory_order_relaxed);
+        P->Sum.store(0, std::memory_order_relaxed);
+        P->Max.store(0, std::memory_order_relaxed);
+    }
+    g_perfRepActorCalls.store(0, std::memory_order_relaxed);
+    g_perfRepActorBits.store(0, std::memory_order_relaxed);
+    g_repBitsResetRequested.store(true, std::memory_order_relaxed);
+}
+
 // [2026-07-19 HANG DIAG] Breadcrumb ring of the last UFunction names the GAME THREAD dispatched through
-// ProcessEvent. Written on the game thread (ProcessEventHook already computes GetFullName() every call, so
+// ProcessEvent. Written on the game thread (ProcessEventHook already has the cached full name of every call, so
 // we just strncpy that into a fixed slot — NO extra name resolution, NO heap). The watchdog thread reads
 // these fixed char buffers when a hang is detected, so it never has to resolve an FName off-thread (which
 // previously crashed). When the game thread freezes inside a UFunction, ring[pos-1] IS that function.
@@ -2152,7 +3001,9 @@ struct BleedoutWatchEntry {
     float    DurationAtEntry;
     bool     Warned;
 };
-static BleedoutWatchEntry g_BleedWatch[8]{};
+// [2026-10-11 1.14.7 O1] 8 -> 64 slots: a 30-40 player hub can have more than eight players downed at once (the old
+// size was "a hunt caps at a handful"). Overwriting the oldest now logs once.
+static BleedoutWatchEntry g_BleedWatch[64]{};
 
 static void BleedoutWatchEnter(void* Comp, float Duration) {
     uint64_t Now = GetTickCount64();
@@ -2161,6 +3012,12 @@ static void BleedoutWatchEnter(void* Comp, float Duration) {
     // All slots busy: overwrite the oldest rather than silently dropping the new one.
     BleedoutWatchEntry* Oldest = &g_BleedWatch[0];
     for (auto& E : g_BleedWatch) if (E.EnteredMs < Oldest->EnteredMs) Oldest = &E;
+    static bool s_fullLogged = false;
+    if (!s_fullLogged) {
+        s_fullLogged = true;
+        MpLog("[BleedoutWatch] TABLE_FULL (" + std::to_string(std::size(g_BleedWatch))
+            + " players in bleedout at once); overwriting the oldest entry (logged once)");
+    }
     *Oldest = { Comp, Now, Duration, false };
 }
 
@@ -2276,6 +3133,16 @@ static void BleedoutNoteEvent(const std::string& FunctionName, void* Obj) {
 // Identification is strict, per the audit: SERVER ROLE + the CURRENT world + a ULocalPlayer
 // (APlayerController::Player at +0x298, Engine_classes.hpp). Remote players have Player == nullptr, but a
 // null network connection alone is NOT accepted as proof. Real players are never touched.
+// [2026-10-10 1.14.7 AFK] Verified mechanism (static, 1.14.7 exe): the AFK check 0x01CB8E50 runs only for a LOCAL
+// player controller (AController+0x294 bit 1, then vtable +0x6D8), i.e. on a client for its own controller. It
+// kicks when 0 < T < PC+0xC28 (idle seconds) && !PC+0xC2C (bNoAFK), with T = GS+0x410 ? GS+0x3FC : GS+0x3F8
+// (AArchonGameState::AFKTimeoutFriendly / AFKTimeout). Both GS floats replicate COND_InitialOnly
+// (GetLifetimeReplicatedProps 0x01901D60); InitGameState 0x019086E0 copies GM+0x468/+0x46C into them once.
+// Native constructor values: 600/600 (base), 180/600 (0x01A95040, Island by layout); live Ramsgate 600 s (two
+// client AFK kicks ~600 s after input). bNoAFK is not replicated, so setting it on a remote player's server-side
+// controller never had any effect. Since 0.2.111 no server role has a local controller, so the per-controller
+// exemption below is a fallback only (MpApplyAfkTimeout writes the replicated GS values instead). The port-free
+// watchdog stays as recovery for the phantom-failure case.
 // [1.14.7 ACCEPTANCE AID 2026-10-04] The 1.14.7 login screen waits behind PressStartScreen_bps_C, whose own
 // log says "UI Screen does not have a valid default focusable widget" - and it ignores synthetic input
 // entirely (verified: neither keybd_event nor SendInput with a centre-window click dismisses it). A scripted
@@ -2860,6 +3727,10 @@ static SDK::UWorld* MpOwningWorld(SDK::UObject* Obj) {
 
 static void AfkExemptionTick() {
     if (!Globals::AmServer) return;                        // server role only
+    // [2026-10-10 1.14.7 AFK] No local controller exists on any server role whose 0x03E07353 patch applied, and
+    // the AFK check (0x01CB8E50) runs only for local controllers, so this 5 s GObjects walk had no effect there.
+    // It still runs (unchanged) where the patch did not apply and a phantom local controller exists.
+    if (g_NoLocalPlayerApplied.load(std::memory_order_relaxed)) return;
     if (!SDK::UObject::GObjects) return;
 
     static uint64_t s_lastMs = 0;
@@ -2881,6 +3752,10 @@ static void AfkExemptionTick() {
         if (!IsReadablePointer(PC, 0xC30)) continue;        // covers bNoAFK at +0xC2C
         if (PC->Player == nullptr) continue;                // unattached controller
         // [1.14.7 FIX 2026-10-05] Cover REMOTE players as well, not just the hub's own.
+        // [2026-10-10 correction] The remote-player part of this never worked: bNoAFK is not replicated and a
+        // remote player's AFK check runs on that player's own client (0x01CB8E50, local controllers only), where
+        // it only disconnects that client. Only the hub's own local controller could make the hub leave its map.
+        // The note below is kept as history.
         //
         // The previous version required a verified ULocalPlayer here, which silently excluded every remote
         // player's controller - a remote player's APlayerController::Player is a UNetConnection, not a
@@ -2909,6 +3784,215 @@ static void AfkExemptionTick() {
     }
 }
 
+/*
+ * [2026-10-10 1.14.7 AFK] Server-side AFK timeout, written into the replicated AArchonGameState values.
+ *
+ * The client kicks itself (0x01CB8E50, local controllers only) when its idle time exceeds
+ * GS AFKTimeout (+0x3F8) / AFKTimeoutFriendly (+0x3FC); 0 or less never kicks. Both replicate COND_InitialOnly
+ * (GetLifetimeReplicatedProps 0x01901D60), so the value must be in place BEFORE a client's GameState channel opens:
+ *   - GameModeEmptyState writes it once a second (first call immediate). That runs only where EnableWatchdog is on:
+ *     every launch with the full DeployServer-style argument list (hubs, dedicated hunts and the P2P player host, on
+ *     any port; only the manual-test launch turns it off - see Init);
+ *   - the K2_PostLogin branch of the server ProcessEvent hook writes it for every login, before that connection's
+ *     first replication pass. (An older note here said this was the player host's only write path; it never was.)
+ * The GameMode copy (+0x468/+0x46C, read once by InitGameState 0x019086E0) is written too, so the two stay
+ * consistent. Both objects are taken from the world itself (GWorld->AuthorityGameMode +0x118, GameState +0x120),
+ * never from a cached pointer that may have outlived a map change. Same writes as the engine's own cheat
+ * UArchonCheatManager::AFKTimeout (0x018BE5C0). No hook, no byte patch.
+ *
+ * Values (read once, at listen, on the game thread; a change needs a restart and reaches clients that join after it):
+ *   HUB_AFK_TIMEOUT_SECONDS.txt   Ramsgate/Training (GameMode class name contains City / TrainingGrounds, the
+ *                                 g_wdIsHub rule, MpHubRoleFromGameModeClass). Default 1200 s (native Ramsgate is 600 s).
+ *   HUNT_AFK_TIMEOUT_SECONDS.txt  every other server instance, and every player-hosted server - a Training hosted on a
+ *                                 player's PC included (11 Oct). Default: native (no write).
+ *   Integer N: negative = native; 0 = never kick (warned: idle players then hold hub slots indefinitely);
+ *   1..59 -> 60; above 604800 -> 604800; an unreadable value keeps the default.
+ *   DISABLE_AFK_TIMEOUT_OVERRIDE.flag turns every write off (pure native).
+ */
+struct MpAfkSetting { int Seconds; const char* Source; };   // Seconds < 0 = native (no override)
+
+static MpAfkSetting MpAfkSecondsFromFile(const wchar_t* Name, int Default) {
+    MpAfkSetting R{ Default, "default" };
+    wchar_t Path[MAX_PATH];
+    size_t DirLen = 0;
+    if (InterlockedCompareExchange(&g_MpExeDirState, 0, 0) == 2) {
+        DirLen = g_MpExeDirLenW;
+        for (size_t i = 0; i < DirLen; ++i) Path[i] = g_MpExeDirW[i];
+    } else {
+        DirLen = MpExeDirFromModuleW(Path);
+    }
+    size_t NameLen = 0;
+    while (Name[NameLen]) ++NameLen;
+    if (DirLen == 0 || DirLen + NameLen + 1 > MAX_PATH) return R;
+    for (size_t i = 0; i < NameLen; ++i) Path[DirLen + i] = Name[i];
+    Path[DirLen + NameLen] = L'\0';
+    std::ifstream File(Path);
+    if (!File.is_open()) return R;
+    long long Value = 0;
+    if (!(File >> Value)) { R.Source = "file unreadable -> default"; return R; }
+    if (Value < 0)        { R.Seconds = -1; R.Source = "file (negative = native)"; return R; }
+    if (Value == 0)       { R.Seconds = 0; R.Source = "file (0 = never kick)"; return R; }
+    if (Value < 60)       { R.Seconds = 60; R.Source = "file (clamped to 60)"; return R; }
+    if (Value > 604800)   { R.Seconds = 604800; R.Source = "file (clamped to 604800)"; return R; }
+    R.Seconds = static_cast<int>(Value);
+    R.Source = "file";
+    return R;
+}
+
+// Game thread only (filled at listen from StartEmptyWatchdogThread, or by the first MpApplyAfkTimeout call).
+static bool g_MpAfkPrimed = false;
+static bool g_MpAfkDisabled = false;
+static MpAfkSetting g_MpAfkHub{ 1200, "default" };
+static MpAfkSetting g_MpAfkHunt{ -1, "default" };
+
+static std::string MpAfkSecondsText(const MpAfkSetting& S) {
+    return (S.Seconds < 0 ? std::string("native") : std::to_string(S.Seconds) + " s") + " (" + S.Source + ")";
+}
+
+static void MpAfkPrimeConfig() {
+    if (!Globals::AmServer || g_MpAfkPrimed) return;
+    g_MpAfkPrimed = true;
+    g_MpAfkDisabled = MpExeRelativeFlagPresent(L"DISABLE_AFK_TIMEOUT_OVERRIDE.flag");
+    g_MpAfkHub = MpAfkSecondsFromFile(L"HUB_AFK_TIMEOUT_SECONDS.txt", 1200);
+    g_MpAfkHunt = MpAfkSecondsFromFile(L"HUNT_AFK_TIMEOUT_SECONDS.txt", -1);
+    // [2026-10-13 realms hub] A hub the launcher started (MYSTICPARADOX_HOSTED_ROLE=HUB) takes its idle-kick timeout
+    // from MYSTICPARADOX_HUB_AFK_SECONDS when the launcher set it (the hook is -1 otherwise, always -1 on a dedicated
+    // server and in the build without the p2p module): no per-install text file in the host's game folder. The same
+    // floor as the file applies, so a value of 1..59 becomes 60; 0 = never kick. HUNT_AFK_TIMEOUT_SECONDS.txt is
+    // unchanged and DISABLE_AFK_TIMEOUT_OVERRIDE.flag still turns every write off.
+    bool HubFromLauncher = false;
+    if (Globals::AuthMode == Globals::ServerAuthMode::HuntCapability) {
+        const int LauncherAfk = P2PHooks::HubAfkSecondsOverride();
+        if (LauncherAfk >= 0) {
+            HubFromLauncher = true;
+            g_MpAfkHub = (LauncherAfk == 0) ? MpAfkSetting{ 0, "launcher role (0 = never kick)" }
+                : (LauncherAfk < 60)        ? MpAfkSetting{ 60, "launcher role (clamped to 60)" }
+                                            : MpAfkSetting{ LauncherAfk, "launcher role" };
+        }
+    }
+    if (g_MpAfkDisabled) {
+        MpLog("[AfkTimeout] override DISABLED by DISABLE_AFK_TIMEOUT_OVERRIDE.flag; every role keeps the native timeout");
+        return;
+    }
+    MpLog("[AfkTimeout] config hub=" + MpAfkSecondsText(g_MpAfkHub) + " hunt=" + MpAfkSecondsText(g_MpAfkHunt));
+    if (g_MpAfkHub.Seconds == 0) {
+        MpLog(HubFromLauncher
+            ? "[AfkTimeout] WARNING: MYSTICPARADOX_HUB_AFK_SECONDS = 0 -> hub players are never idle-kicked; idle "
+              "players can hold every hub slot indefinitely"
+            : "[AfkTimeout] WARNING: HUB_AFK_TIMEOUT_SECONDS.txt = 0 -> hub players are never idle-kicked; idle "
+              "players can hold every hub slot indefinitely");
+    }
+    if (g_MpAfkHunt.Seconds == 0) {
+        MpLog("[AfkTimeout] WARNING: HUNT_AFK_TIMEOUT_SECONDS.txt = 0 -> hunt players are never idle-kicked");
+    }
+}
+
+static bool MpAfkLiveObjectOf(SDK::UObject* Obj, SDK::UClass* Cls) {
+    return Obj && Cls && IsRegisteredLiveObject(Obj) && !Obj->IsDefaultObject() && Obj->Class
+        && IsRegisteredLiveObject(Obj->Class) && Obj->IsA(Cls);
+}
+
+static std::string MpAfkFloatText(float V) {
+    char Buf[32];
+    sprintf_s(Buf, "%.0f", static_cast<double>(V));
+    return Buf;
+}
+
+/*
+ * [2026-10-11 1.14.7 P2P host] Hub role from the GameMode class name (the g_wdIsHub rule): 1 = persistent hub
+ * (Ramsgate BPGM_City_C, Training BPGM_ArchonTrainingGrounds_C), 0 = disposable. A persistent hub is never reaped and
+ * gets the hub AFK timeout, because the DeployServer owns its lifecycle. A player-hosted (HuntCapability) server has
+ * no such owner: the launcher starts it for one session, so a Training hosted on a player's PC classified as a hub
+ * was never reaped when empty (both reap paths require hub == 0) and kept idle players for 1200 s. Under HuntCapability
+ * every class is disposable (0): empty-reap and hunt AFK rules. Dedicated Ramsgate/Training are unchanged.
+ * KEEP_HOSTED_HUB_ROLE.flag reverts (read once). Game thread only (both callers are).
+ *
+ * [2026-10-13 realms hub] The one exception is a launcher-declared hub: the launcher that runs a realm's Ramsgate or
+ * Training on the host's PC starts it with MYSTICPARADOX_HOSTED_ROLE=HUB, and P2PHooks::HostedRoleIsHub() then makes
+ * the named hub class persistent (role 1: never reaped, hub AFK rule - the launcher's supervisor owns its lifecycle,
+ * as the DeployServer does for a dedicated hub). A launcher role HUNT (also the default when the variable is absent)
+ * keeps today's behaviour for every class. The flag stays a manual override that wins over a HUNT role. A HUB role
+ * on a class that is not a named hub changes nothing (it is a hunt server by its map), and says so once.
+ */
+static int MpHubRoleFromGameModeClass(const std::string& ClassName) {
+    const bool NamedHub = ClassName.find("City") != std::string::npos
+        || ClassName.find("TrainingGrounds") != std::string::npos;
+    if (Globals::AuthMode == Globals::ServerAuthMode::HuntCapability && !NamedHub && P2PHooks::HostedRoleIsHub()) {
+        static bool s_loggedUnnamed = false;
+        if (!s_loggedUnnamed) {
+            s_loggedUnnamed = true;
+            MpLog("[HubRole] WARNING: " + ClassName + " -> disposable although the launcher role is HUB: the GameMode "
+                  "class is not a named hub class (City / TrainingGrounds), so empty-reap and hunt AFK rules apply");
+        }
+    }
+    if (!NamedHub || Globals::AuthMode != Globals::ServerAuthMode::HuntCapability) return NamedHub ? 1 : 0;
+    static const bool KeepHubRole = MpExeRelativeFlagPresent(L"KEEP_HOSTED_HUB_ROLE.flag");
+    static const bool LauncherHub = P2PHooks::HostedRoleIsHub();
+    static bool s_logged = false;
+    if (!s_logged) {
+        s_logged = true;
+        MpLog("[HubRole] " + ClassName + " -> " + (LauncherHub
+            ? std::string("persistent hub (launcher role): never reaped, hub AFK rule")
+            : KeepHubRole
+            ? std::string("persistent hub (KEEP_HOSTED_HUB_ROLE.flag, launcher role HUNT): never reaped, hub AFK rule")
+            : std::string("disposable (launcher role HUNT): reaped when empty, hunt AFK rules; "
+                          "KEEP_HOSTED_HUB_ROLE.flag reverts")));
+    }
+    return (LauncherHub || KeepHubRole) ? 1 : 0;
+}
+
+// Game thread only. HintGameMode is used only to classify the role while the world has no GameMode yet; it is never
+// a write target. Cheap: pointer checks, two IsA, no GObjects walk, no exceptions.
+static void MpApplyAfkTimeout(SDK::UObject* HintGameMode, const char* Why) {
+    if (!Globals::AmServer || !SDK::UObject::GObjects) return;
+    MpAfkPrimeConfig();
+    if (g_MpAfkDisabled) return;
+    SDK::UWorld* World = SDK::UWorld::GetWorld();
+    if (!World || !IsReadablePointer(World, 0x128)) return;
+    const uintptr_t W = reinterpret_cast<uintptr_t>(World);
+    SDK::UObject* GM = *reinterpret_cast<SDK::UObject**>(W + 0x118);   // UWorld::AuthorityGameMode
+    SDK::UObject* GS = *reinterpret_cast<SDK::UObject**>(W + 0x120);   // UWorld::GameState
+    if (!MpAfkLiveObjectOf(GS, SDK::AArchonGameState::StaticClass()) || !IsReadablePointer(GS, 0x400)) return;
+    const bool GmOk = MpAfkLiveObjectOf(GM, SDK::AArchonGameMode::StaticClass()) && IsReadablePointer(GM, 0x470);
+
+    static void* s_loggedGs = nullptr;   // one line per GameState instance
+    const bool LogThis = GS != s_loggedGs;
+    int Hub = g_wdIsHub.load(std::memory_order_relaxed);
+    std::string ClassName;
+    if (Hub < 0 || LogThis) {
+        SDK::UObject* ClassSource = GmOk ? GM
+            : (MpAfkLiveObjectOf(HintGameMode, SDK::AArchonGameMode::StaticClass()) ? HintGameMode : nullptr);
+        if (ClassSource) ClassName = ClassSource->Class->GetName();
+        if (Hub < 0 && !ClassName.empty()) {
+            Hub = MpHubRoleFromGameModeClass(ClassName);   // [2026-10-11] HuntCapability -> 0 (see there)
+        }
+    }
+    if (Hub < 0) return;   // role unknown: write nothing yet
+
+    const MpAfkSetting& S = Hub ? g_MpAfkHub : g_MpAfkHunt;
+    auto* AGS = static_cast<SDK::AArchonGameState*>(GS);
+    auto* AGM = GmOk ? static_cast<SDK::AArchonGameMode*>(GM) : nullptr;
+    const float GsA = AGS->AFKTimeout, GsB = AGS->AFKTimeoutFriendly;
+    const float GmA = AGM ? AGM->AFKTimeout : -1.0f, GmB = AGM ? AGM->AFKTimeoutFriendly : -1.0f;
+    std::string Applied;
+    if (S.Seconds < 0) {
+        Applied = "no override (native)";
+    } else {
+        const float V = static_cast<float>(S.Seconds);
+        if (GsA != V || GsB != V) { AGS->AFKTimeout = V; AGS->AFKTimeoutFriendly = V; }
+        if (AGM && (GmA != V || GmB != V)) { AGM->AFKTimeout = V; AGM->AFKTimeoutFriendly = V; }
+        Applied = "applied " + std::to_string(S.Seconds) + " s" + (S.Seconds == 0 ? " (never kick)" : "");
+    }
+    if (LogThis) {
+        s_loggedGs = GS;
+        MpLog(std::string("[AfkTimeout] role=") + (Hub ? "hub" : "hunt")
+            + " class=" + (ClassName.empty() ? std::string("?") : ClassName)
+            + " before GM=" + (AGM ? MpAfkFloatText(GmA) + "/" + MpAfkFloatText(GmB) : std::string("?"))
+            + " GS=" + MpAfkFloatText(GsA) + "/" + MpAfkFloatText(GsB)
+            + " -> " + Applied + " (why=" + Why + ") GS=" + MpPtr(GS));
+    }
+}
+
 // GAME-THREAD ONLY (walks GObjects / reads FName). Returns: 1 empty, 0 occupied, -1 unknown.
 static int GameModeEmptyState() {
     if (!SDK::UObject::GObjects) return -1;
@@ -2931,9 +4015,8 @@ static int GameModeEmptyState() {
         SDK::UObject* Cls = *reinterpret_cast<SDK::UObject**>(reinterpret_cast<uintptr_t>(g_CachedGameMode) + 0x10);
         if (Cls && IsReadablePointer(Cls, 0x20)) {
             std::string Name = Cls->GetName();   // safe: game thread
-            g_wdIsHub.store((Name.find("City") != std::string::npos
-                             || Name.find("TrainingGrounds") != std::string::npos) ? 1 : 0,
-                            std::memory_order_relaxed);
+            // [2026-10-11] HuntCapability -> 0 (see MpHubRoleFromGameModeClass).
+            g_wdIsHub.store(MpHubRoleFromGameModeClass(Name), std::memory_order_relaxed);
         }
     }
     uintptr_t Gm = reinterpret_cast<uintptr_t>(g_CachedGameMode);
@@ -2953,10 +4036,380 @@ static int GameModeEmptyState() {
 
     EnsureBleedoutDuration(g_CachedGameMode);
     BleedoutWatchTick();
-    AfkExemptionTick();
+    AfkExemptionTick();   // returns at once unless a phantom local controller exists (no-local-player patch failed)
+    {
+        // [2026-10-10 1.14.7 AFK] Once a second, first call immediate; see MpApplyAfkTimeout.
+        static uint64_t s_afkMs = 0;
+        const uint64_t AfkNow = GetTickCount64();
+        if (s_afkMs == 0 || AfkNow - s_afkMs >= 1000) {
+            s_afkMs = AfkNow;
+            MpApplyAfkTimeout(g_CachedGameMode, "tick");
+        }
+    }
     if (NumPlayers > 0) g_wdSawPlayer.store(true, std::memory_order_relaxed);
 
     return (NumPlayers <= 0 && NumTravelling <= 0) ? 1 : 0;
+}
+
+/*
+ * [2026-10-10 1.14.7 RAM] Server memory: backup OOM pool release, hub idle working-set trim, [Perf]/[Memory] lines.
+ * All three run on the empty-watchdog thread (never the game thread) and change no frame, tick or replication setting.
+ *
+ * Backup OOM pool (static proof, 1.14.7 exe): FGenericPlatformMemory::SetupMemoryPools (0x02525890, called from
+ * FWindowsPlatformMemory::Init 0x0266ACD0) does VirtualAlloc(NULL, 0x2000000, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+ * through the thunk 0x02661D90 and stores the block in the global 0x06DACBD0. Its only reader is
+ * FGenericPlatformMemory::OnOutOfMemory (0x02529C00), which skips a null pool (test rcx,rcx; je at 0x02529C6B) and
+ * otherwise frees it with VirtualFree(p, 0, MEM_RELEASE) before its fatal log. The pages are never touched, so the
+ * saving is 32 MB of commit charge (pagefile budget) per server, not resident RAM. Trade-off: on a real out-of-memory
+ * death the engine's (and our crash logging's) last 32 MB of headroom is gone. KEEP_OOM_POOL.flag keeps the pool.
+ */
+static const char* MpVerifyBackupOomPoolSites();   // defined after CwVerifySite (.pdata entry + bytes)
+
+static bool MpProcessMemory(PROCESS_MEMORY_COUNTERS_EX& Out) {
+    Out = {};
+    Out.cb = sizeof(Out);
+    return GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&Out), sizeof(Out)) != FALSE;
+}
+
+static std::string MpMiBText(SIZE_T Bytes) {
+    char Buf[32];
+    sprintf_s(Buf, "%.1f", static_cast<double>(Bytes) / (1024.0 * 1024.0));
+    return Buf;
+}
+
+static void MpReleaseBackupOomPool() {
+    if (const char* Why = MpVerifyBackupOomPoolSites()) {
+        MpLog(std::string("[Memory] backup OOM pool left alone: ") + Why + " (SetupMemoryPools +0x2525890 / "
+              "OnOutOfMemory +0x2529C00 not as verified on 1.14.7)");
+        return;
+    }
+    void* volatile* Slot = reinterpret_cast<void* volatile*>(Globals::BaseAddress + 0x06DACBD0);
+    if (!IsReadablePointer(const_cast<void**>(Slot), sizeof(void*))) {
+        MpLog("[Memory] backup OOM pool left alone: global +0x6DACBD0 unreadable");
+        return;
+    }
+    void* Block = *Slot;
+    MEMORY_BASIC_INFORMATION Mi{};
+    if (!Block || !VirtualQuery(Block, &Mi, sizeof(Mi)) || Mi.BaseAddress != Block || Mi.AllocationBase != Block
+        || Mi.RegionSize != 0x2000000 || Mi.State != MEM_COMMIT || Mi.Type != MEM_PRIVATE || Mi.Protect != PAGE_READWRITE) {
+        MpLog("[Memory] backup OOM pool left alone: block=" + MpPtr(Block) + " is not the expected 32 MB private "
+              "read-write allocation (region=" + std::to_string(static_cast<unsigned long long>(Mi.RegionSize)) + ")");
+        return;
+    }
+    PROCESS_MEMORY_COUNTERS_EX Before{}, After{};
+    const bool HaveBefore = MpProcessMemory(Before);
+    if (InterlockedCompareExchangePointer(reinterpret_cast<PVOID volatile*>(Slot), nullptr, Block) != Block) {
+        MpLog("[Memory] backup OOM pool left alone: the global changed while releasing it");
+        return;
+    }
+    if (!VirtualFree(Block, 0, MEM_RELEASE)) {
+        const DWORD Err = GetLastError();
+        InterlockedCompareExchangePointer(reinterpret_cast<PVOID volatile*>(Slot), Block, nullptr);   // still valid: put back
+        MpLog("[Memory] backup OOM pool kept: VirtualFree failed err=" + std::to_string(Err));
+        return;
+    }
+    const bool HaveAfter = MpProcessMemory(After);
+    MpLog("[Memory] released the engine's 32 MB backup out-of-memory pool block=" + MpPtr(Block)
+        + " (33554432 bytes of commit; OnOutOfMemory skips a null pool): private commit "
+        + (HaveBefore ? MpMiBText(Before.PrivateUsage) : std::string("?")) + " -> "
+        + (HaveAfter ? MpMiBText(After.PrivateUsage) : std::string("?")) + " MiB, working set "
+        + (HaveBefore ? MpMiBText(Before.WorkingSetSize) : std::string("?")) + " -> "
+        + (HaveAfter ? MpMiBText(After.WorkingSetSize) : std::string("?")) + " MiB");
+}
+
+// Hub idle working-set trim. Called only from the watchdog thread, so trims never overlap. SetProcessWorkingSetSizeEx
+// takes the process working-set lock, so the game thread can wait on it (page faults, VirtualQuery) for the trim's
+// duration; that is accepted only because no remote client has been connected for 60 s. A client whose handshake starts
+// inside that window gets a short pre-login hitch on its loading screen, and the next arrival soft-faults pages back in.
+static void MpTrimWorkingSet(uint64_t IdleMs) {
+    PROCESS_MEMORY_COUNTERS_EX Before{}, After{};
+    const bool HaveBefore = MpProcessMemory(Before);
+    LARGE_INTEGER T0{}, T1{}, F{};
+    QueryPerformanceFrequency(&F);
+    QueryPerformanceCounter(&T0);
+    const BOOL Ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1), 0);
+    const DWORD Err = Ok ? 0 : GetLastError();
+    QueryPerformanceCounter(&T1);
+    const bool HaveAfter = MpProcessMemory(After);
+    char Ms[32];
+    sprintf_s(Ms, "%.1f", F.QuadPart > 0 ? static_cast<double>(T1.QuadPart - T0.QuadPart) * 1000.0 / static_cast<double>(F.QuadPart) : -1.0);
+    MpLog("[WorkingSet] trimmed (hub idle: 0 remote connections for " + std::to_string(IdleMs / 1000) + " s): working set "
+        + (HaveBefore ? MpMiBText(Before.WorkingSetSize) : std::string("?")) + " -> "
+        + (HaveAfter ? MpMiBText(After.WorkingSetSize) : std::string("?")) + " MiB, private commit "
+        + (HaveAfter ? MpMiBText(After.PrivateUsage) : std::string("?")) + " MiB, " + Ms + " ms"
+        + (Ok ? std::string() : " (SetProcessWorkingSetSizeEx failed err=" + std::to_string(Err) + ")"));
+}
+
+// [2026-10-11 1.14.7 O0] avg/max of one phase in ms ("-" when it never ran in the window); drains the counters.
+static std::string MpPerfPhaseText(MpPerfPhase& Phase, int64_t Freq) {
+    const uint64_t Calls = Phase.Calls.exchange(0, std::memory_order_relaxed);
+    const uint64_t Sum = Phase.Sum.exchange(0, std::memory_order_relaxed);
+    const uint64_t Max = Phase.Max.exchange(0, std::memory_order_relaxed);
+    if (Freq <= 0 || Calls == 0) return "-";
+    char Buf[64];
+    const double MaxMs = static_cast<double>(Max) * 1000.0 / static_cast<double>(Freq);
+    const double AvgMs = static_cast<double>(Sum) * 1000.0 / static_cast<double>(Freq) / static_cast<double>(Calls);
+    sprintf_s(Buf, "%.3f/%.2f", AvgMs, MaxMs);
+    return Buf;
+}
+
+// [2026-10-11 1.14.7 O0] [PerfThreads]: CPU per thread since the previous call (watchdog thread only). Each thread's
+// start address comes from NtQueryInformationThread(ThreadQuerySetWin32StartAddress = 9) once per thread id and is
+// printed as module+RVA. Every handle is closed; nothing here touches game objects. Prime = take the baseline only.
+static void MpLogThreadCpu(bool Prime) {
+    using NtQueryInformationThreadFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    using GetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+    static NtQueryInformationThreadFn s_ntQit = reinterpret_cast<NtQueryInformationThreadFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    static GetThreadDescriptionFn s_getDesc = reinterpret_cast<GetThreadDescriptionFn>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
+    struct Prev { uint64_t Cpu100ns; uintptr_t Start; std::string Name; uint64_t SeenIter; };
+    static std::unordered_map<DWORD, Prev> s_prev;   // watchdog thread only
+    static uint64_t s_iter = 0;
+    static uint64_t s_lastMs = 0;
+    ++s_iter;
+    const uint64_t NowMs = GetTickCount64();
+    const uint64_t WindowMs = s_lastMs ? NowMs - s_lastMs : 0;
+    s_lastMs = NowMs;
+
+    HANDLE Snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (Snap == INVALID_HANDLE_VALUE) {
+        if (!Prime) MpLog("[PerfThreads] thread snapshot failed err=" + std::to_string(GetLastError()));
+        return;
+    }
+    struct Row { DWORD Tid; uint64_t Delta; uintptr_t Start; const std::string* Name; bool New; };
+    std::vector<Row> Rows;
+    uint64_t Total = 0;
+    int Threads = 0;
+    THREADENTRY32 Te{};
+    Te.dwSize = sizeof(Te);
+    const DWORD MyPid = GetCurrentProcessId();
+    if (Thread32First(Snap, &Te)) {
+        do {
+            if (Te.th32OwnerProcessID != MyPid) continue;
+            ++Threads;
+            HANDLE Th = OpenThread(THREAD_QUERY_INFORMATION, FALSE, Te.th32ThreadID);
+            if (!Th) Th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, Te.th32ThreadID);
+            if (!Th) continue;
+            FILETIME C{}, E{}, K{}, U{};
+            const bool HaveTimes = GetThreadTimes(Th, &C, &E, &K, &U) != FALSE;
+            auto It = s_prev.find(Te.th32ThreadID);
+            const bool New = It == s_prev.end();
+            if (New) {
+                Prev P{ 0, 0, std::string(), 0 };
+                if (s_ntQit) {
+                    PVOID StartAddr = nullptr;
+                    if (s_ntQit(Th, 9, &StartAddr, sizeof(StartAddr), nullptr) >= 0) P.Start = reinterpret_cast<uintptr_t>(StartAddr);
+                }
+                if (s_getDesc) {
+                    PWSTR Desc = nullptr;
+                    if (SUCCEEDED(s_getDesc(Th, &Desc)) && Desc) {
+                        for (const wchar_t* c = Desc; *c && P.Name.size() < 40; ++c) P.Name.push_back(*c < 0x80 ? static_cast<char>(*c) : '?');
+                        LocalFree(Desc);
+                    }
+                }
+                It = s_prev.emplace(Te.th32ThreadID, P).first;
+            }
+            CloseHandle(Th);
+            if (!HaveTimes) continue;
+            const uint64_t Cpu = ((static_cast<uint64_t>(K.dwHighDateTime) << 32) | K.dwLowDateTime)
+                + ((static_cast<uint64_t>(U.dwHighDateTime) << 32) | U.dwLowDateTime);
+            const uint64_t Delta = (!New && Cpu >= It->second.Cpu100ns) ? Cpu - It->second.Cpu100ns : (New ? Cpu : 0);
+            It->second.Cpu100ns = Cpu;
+            It->second.SeenIter = s_iter;
+            Total += Delta;
+            Rows.push_back({ Te.th32ThreadID, Delta, It->second.Start, &It->second.Name, New });
+        } while (Thread32Next(Snap, &Te));
+    }
+    CloseHandle(Snap);
+    for (auto It = s_prev.begin(); It != s_prev.end();) {   // forget exited threads
+        if (It->second.SeenIter != s_iter) It = s_prev.erase(It);
+        else ++It;
+    }
+    if (Prime || WindowMs == 0) return;
+
+    const double Denom = static_cast<double>(WindowMs) * 10000.0;   // 100 ns units in the window
+    std::sort(Rows.begin(), Rows.end(), [](const Row& A, const Row& B) { return A.Delta > B.Delta; });
+    const DWORD GameTid = g_wdGameThreadId.load(std::memory_order_relaxed);
+    auto RowText = [&](const Row& R) {
+        char Pct[32];
+        sprintf_s(Pct, "%.1f%%", static_cast<double>(R.Delta) * 100.0 / Denom);
+        return std::string(" tid=") + std::to_string(R.Tid) + (R.Tid == GameTid ? "(GAME)" : "") + " " + Pct
+            + " start=" + MpAddress(reinterpret_cast<void*>(R.Start))
+            + (R.Name && !R.Name->empty() ? " \"" + *R.Name + "\"" : std::string())
+            + (R.New ? " (new: since thread start)" : "");
+    };
+    char Head[160];
+    sprintf_s(Head, "[PerfThreads] %.1fs: process %.1f%% of one CPU over %d threads; top:",
+        static_cast<double>(WindowMs) / 1000.0, static_cast<double>(Total) * 100.0 / Denom, Threads);
+    std::string Line = Head;
+    bool GameShown = false;
+    for (size_t i = 0; i < Rows.size() && i < 6; ++i) {
+        Line += (i ? ";" : "") + RowText(Rows[i]);
+        if (Rows[i].Tid == GameTid) GameShown = true;
+    }
+    if (!GameShown && GameTid) {
+        for (const Row& R : Rows) {
+            if (R.Tid == GameTid) { Line += " | game:" + RowText(R); break; }
+        }
+    }
+    MpLog(Line);
+}
+
+// [2026-10-11 1.14.7 O0] [PerfDetail] and [PerfNet] (watchdog thread). Frames = the window's frame count.
+static void MpLogPerfDetail(uint64_t Frames, double WindowSec, int64_t Freq) {
+    const std::string Engine = MpPerfPhaseText(g_perfPhaseEngine, Freq);
+    const std::string Graph = MpPerfPhaseText(g_perfPhaseGraph, Freq);
+    const std::string Dispatch = MpPerfPhaseText(g_perfPhaseDispatch, Freq);
+    const std::string Flush = MpPerfPhaseText(g_perfPhaseFlush, Freq);
+    const uint64_t RepCalls = g_perfRepActorCalls.exchange(0, std::memory_order_relaxed);
+    const uint64_t RepBits = g_perfRepActorBits.exchange(0, std::memory_order_relaxed);
+    const double PerFrame = Frames ? 1.0 / static_cast<double>(Frames) : 0.0;
+
+    // Replicated bits per connection: drain, then ask the game thread to clear the keys for the next window.
+    struct ConnBits { void* Conn; uint64_t Bits; uint64_t Calls; };
+    std::vector<ConnBits> Conns;
+    for (MpRepBitsSlot& S : g_repBitsSlots) {
+        void* C = S.Conn.load(std::memory_order_relaxed);
+        const uint64_t B = S.Bits.exchange(0, std::memory_order_relaxed);
+        const uint64_t N = S.Calls.exchange(0, std::memory_order_relaxed);
+        if (C && (B || N)) Conns.push_back({ C, B, N });
+    }
+    const uint64_t BitsOverflow = g_repBitsOverflow.exchange(0, std::memory_order_relaxed);
+    g_repBitsResetRequested.store(true, std::memory_order_relaxed);
+    std::sort(Conns.begin(), Conns.end(), [](const ConnBits& A, const ConnBits& B) { return A.Bits > B.Bits; });
+
+    const uint64_t GraphStamp = g_perfGraphSampleMs.load(std::memory_order_relaxed);
+    const uint64_t NowMs = GetTickCount64();
+    const bool GraphFresh = GraphStamp != 0 && NowMs >= GraphStamp && NowMs - GraphStamp <= 10000;
+
+    char Buf[512];
+    sprintf_s(Buf, "[PerfDetail] %.1fs avg/max ms per call: engine tick %s, graph drive %s, manual dispatch %s, "
+        "manual flush %s; ReplicateActor %.1f calls/frame, %.0f kbit/s replicated (%.0f bits/frame)",
+        WindowSec, Engine.c_str(), Graph.c_str(), Dispatch.c_str(), Flush.c_str(),
+        static_cast<double>(RepCalls) * PerFrame,
+        WindowSec > 0 ? static_cast<double>(RepBits) / WindowSec / 1000.0 : 0.0,
+        static_cast<double>(RepBits) * PerFrame);
+    std::string Line = Buf;
+    if (GraphFresh) {
+        sprintf_s(Buf, "; graph: connections %d, global actors %d, actor-info per connection sum %d max %d; "
+            "client connections %d, open channels sum %d max %d",
+            g_perfGraphConns.load(std::memory_order_relaxed), g_perfGraphGlobalActors.load(std::memory_order_relaxed),
+            g_perfGraphActorInfoSum.load(std::memory_order_relaxed), g_perfGraphActorInfoMax.load(std::memory_order_relaxed),
+            g_perfClientConns.load(std::memory_order_relaxed), g_perfOpenChannelsSum.load(std::memory_order_relaxed),
+            g_perfOpenChannelsMax.load(std::memory_order_relaxed));
+        Line += Buf;
+    } else {
+        Line += "; graph: not sampled (no replication graph)";
+    }
+    if (!Conns.empty()) {
+        Line += "; top connections by replicated kbit/s:";
+        for (size_t i = 0; i < Conns.size() && i < 4; ++i) {
+            sprintf_s(Buf, " %s=%.1f(%llu calls)", MpPtr(Conns[i].Conn).c_str(),
+                WindowSec > 0 ? static_cast<double>(Conns[i].Bits) / WindowSec / 1000.0 : 0.0,
+                static_cast<unsigned long long>(Conns[i].Calls));
+            Line += Buf;
+        }
+        if (Conns.size() > 4) Line += " +" + std::to_string(Conns.size() - 4) + " more";
+    }
+    if (BitsOverflow) Line += "; untracked connections " + std::to_string(BitsOverflow) + " bits";
+    MpLog(Line);
+
+    if (!g_wireCountOn) return;
+    struct Peer { uint64_t Key; uint64_t Bytes; uint64_t Packets; };
+    std::vector<Peer> Peers;
+    uint64_t Unattributed = 0;
+    for (MpWireSlot& S : g_wireSlots) {
+        const uint64_t K = S.Key.load(std::memory_order_relaxed);
+        const uint64_t B = S.Bytes.exchange(0, std::memory_order_relaxed);
+        const uint64_t P = S.Packets.exchange(0, std::memory_order_relaxed);
+        if (K == 0) { Unattributed += B; continue; }
+        if (B == 0 && P == 0) {
+            uint64_t Expected = K;
+            S.Key.compare_exchange_strong(Expected, 0, std::memory_order_relaxed);   // idle for a window: release
+            continue;
+        }
+        bool Merged = false;   // a released slot can leave one peer in two slots for a window
+        for (Peer& Existing : Peers) {
+            if (Existing.Key == K) { Existing.Bytes += B; Existing.Packets += P; Merged = true; break; }
+        }
+        if (!Merged) Peers.push_back({ K, B, P });
+    }
+    const uint64_t TotalBytes = g_wireBytesTotal.exchange(0, std::memory_order_relaxed);
+    const uint64_t TotalPackets = g_wirePacketsTotal.exchange(0, std::memory_order_relaxed);
+    const uint64_t OtherBytes = g_wireBytesOther.exchange(0, std::memory_order_relaxed);
+    std::sort(Peers.begin(), Peers.end(), [](const Peer& A, const Peer& B) { return A.Bytes > B.Bytes; });
+    const double Sec = WindowSec > 0 ? WindowSec : 60.0;
+    sprintf_s(Buf, "[PerfNet] %.1fs: sent %.1f kB/s in %.0f packets/s to %zu peers",
+        Sec, static_cast<double>(TotalBytes) / Sec / 1000.0, static_cast<double>(TotalPackets) / Sec, Peers.size());
+    Line = Buf;
+    if (!Peers.empty()) {
+        Line += "; top:";
+        for (size_t i = 0; i < Peers.size() && i < 8; ++i) {
+            sprintf_s(Buf, " %s=%.2f kB/s (%.0f pkt/s)", MpWireKeyText(Peers[i].Key).c_str(),
+                static_cast<double>(Peers[i].Bytes) / Sec / 1000.0, static_cast<double>(Peers[i].Packets) / Sec);
+            Line += Buf;
+        }
+    }
+    if (OtherBytes) Line += "; other " + std::to_string(OtherBytes) + " bytes";
+    if (Unattributed) Line += "; unattributed " + std::to_string(Unattributed) + " bytes";
+    MpLog(Line);
+}
+
+// Once a minute from the watchdog thread. Reads only atomics the game thread published and this process's counters.
+static void MpLogPerfAndMemory(bool FirstWindow) {
+    if (MpProcessDetaching()) return;
+    const int64_t Freq = g_perfQpcFreq.load(std::memory_order_relaxed);
+    const uint64_t Frames = g_perfFrames.exchange(0, std::memory_order_relaxed);
+    const uint64_t Sum = g_perfFrameTicksSum.exchange(0, std::memory_order_relaxed);
+    const uint64_t Max = g_perfFrameTicksMax.exchange(0, std::memory_order_relaxed);
+    const uint64_t Hitches = g_perfHitches.exchange(0, std::memory_order_relaxed);
+    const uint64_t EngCalls = g_perfEngineCalls.exchange(0, std::memory_order_relaxed);
+    const uint64_t EngSum = g_perfEngineTicksSum.exchange(0, std::memory_order_relaxed);
+
+    const uint64_t NowMs = GetTickCount64();
+    const uint64_t ConnStamp = g_wdConnStampMs.load(std::memory_order_relaxed);
+    const int32_t Conn = g_wdConnCount.load(std::memory_order_relaxed);
+    const bool ConnFresh = ConnStamp != 0 && NowMs >= ConnStamp && NowMs - ConnStamp <= MP_WD_COUNTS_MAX_AGE_MS;
+    const std::string ConnText = std::to_string(Conn) + (ConnFresh ? "" : " (stale)");
+    const char* Mark = FirstWindow ? " (first window since listen)" : "";
+
+    char Line[320];
+    double WindowSec = 0.0;   // [2026-10-11 1.14.7 O0] for [PerfDetail]/[PerfNet] rates
+    if (Freq > 0 && Frames > 0 && Sum > 0) {
+        const double SumSec = static_cast<double>(Sum) / static_cast<double>(Freq);
+        WindowSec = SumSec;
+        const double AvgMs = SumSec * 1000.0 / static_cast<double>(Frames);
+        const double MaxMs = static_cast<double>(Max) * 1000.0 / static_cast<double>(Freq);
+        const double EngMs = EngCalls ? static_cast<double>(EngSum) * 1000.0 / static_cast<double>(Freq) / static_cast<double>(EngCalls) : 0.0;
+        sprintf_s(Line, "[Perf] %.1fs: %llu frames (%.1f/s), frame avg %.2f ms / max %.1f ms, hitches>100ms %llu, "
+            "engine tick %.2f ms/frame", SumSec, static_cast<unsigned long long>(Frames),
+            static_cast<double>(Frames) / SumSec, AvgMs, MaxMs, static_cast<unsigned long long>(Hitches), EngMs);
+    } else {
+        sprintf_s(Line, "[Perf] no frames measured in this window (game thread not ticking?)");
+    }
+    MpLog(std::string(Line) + ", connections " + ConnText + ", hub " + std::to_string(g_wdIsHub.load(std::memory_order_relaxed)) + Mark);
+
+    PROCESS_MEMORY_COUNTERS_EX Pm{};
+    if (MpProcessMemory(Pm)) {
+        static DWORD s_lastFaults = 0;   // watchdog thread only
+        const std::string Faults = s_lastFaults ? "+" + std::to_string(Pm.PageFaultCount - s_lastFaults) + " since last line"
+                                                : std::to_string(Pm.PageFaultCount) + " total";
+        s_lastFaults = Pm.PageFaultCount ? Pm.PageFaultCount : 1;
+        MpLog("[Memory] connections " + ConnText + ", working set " + MpMiBText(Pm.WorkingSetSize) + " MiB (peak "
+            + MpMiBText(Pm.PeakWorkingSetSize) + "), private commit " + MpMiBText(Pm.PrivateUsage) + " MiB, page faults "
+            + Faults + Mark);
+    }
+
+    // [2026-10-11 1.14.7 O0] Same cadence: phase timings, replication/graph sizes, wire bytes, threads.
+    if (MpPerfDetailEnabled()) {
+        static uint64_t s_lastDetailMs = 0;   // watchdog thread only; fallback window when no frames were measured
+        const uint64_t DetailNow = GetTickCount64();
+        if (WindowSec <= 0.0 && s_lastDetailMs) WindowSec = static_cast<double>(DetailNow - s_lastDetailMs) / 1000.0;
+        s_lastDetailMs = DetailNow;
+        MpLogPerfDetail(Frames, WindowSec, Freq);
+        MpLogThreadCpu(false);
+    }
 }
 
 // [2026-07-18] Background empty-server watchdog thread.
@@ -2970,7 +4423,8 @@ static int GameModeEmptyState() {
 // RAM. Safety (never kill an active/loading hunt): only CONTINUOUS emptiness counts — no remote client
 // connection && NumTravelling==0 for 50s straight after the last client left (5 min if none ever arrived);
 // any occupied OR unknown (-1, GameMode or NetDriver not resolved yet, stale sample) reading resets the
-// timer. On 1.14.7 NumPlayers cannot be used: the phantom local player keeps it at 1 (see g_wdConnCount).
+// timer. NumPlayers was unusable while the phantom local player kept it at 1 (removed in 0.2.110); the remote
+// connection count stays the signal (see g_wdConnCount).
 //
 // SCOPE: only DISPOSABLE instances self-terminate. The two persistent hubs the DeployServer keeps alive
 // — ramsgate (BPGM_City_C) and the training grounds (BPGM_ArchonTrainingGrounds_C) — are EXEMPT, so they
@@ -2981,6 +4435,10 @@ extern bool EnableWatchdog;   // defined later (global watchdog master switch, d
 static void StartEmptyWatchdogThread() {
     bool expected = false;
     if (!g_emptyWatchdogStarted.compare_exchange_strong(expected, true)) return;   // start once
+    // [2026-10-10 1.14.7] Called on the GAME thread at listen (both listen paths in GameEngineTickHook): reset the
+    // [Perf] counters so the first window starts here, and read the AFK value files before any client can log in.
+    MpPerfResetCounters();
+    MpAfkPrimeConfig();
     std::thread([] {
         float emptySec = 0.0f;
         const float POLL_SEC = 2.0f;
@@ -2988,9 +4446,43 @@ static void StartEmptyWatchdogThread() {
         bool hangSampled = false;   // one-shot [HangSuspect] capture per freeze episode (reset when ticks resume)
         MpLog("[Watchdog/thread] started (poll 2s; reaps a disposable instance with no client connection for 50s"
               " after its last client left, or 5 min if none ever arrived)");
+        // [2026-10-10 1.14.7 RAM] Read once at thread start (= listen). See the RAM block above StartEmptyWatchdogThread.
+        const uint64_t wdStartMs = GetTickCount64();
+        const bool keepOomPool = MpExeRelativeFlagPresent(L"KEEP_OOM_POOL.flag");
+        const bool perfLog = !MpExeRelativeFlagPresent(L"DISABLE_PERF_LOG.flag");
+        // Working-set trim: DeployServer instances only (never the P2P player host), and below only confirmed hubs.
+        const bool trimAllowed = Globals::AuthMode == Globals::ServerAuthMode::GlobalGameserver
+            && !MpExeRelativeFlagPresent(L"KEEP_WORKING_SET.flag");
+        bool oomPoolDone = false;
+        bool perfFirstWindow = true;
+        uint64_t idleSinceMs = 0;     // start of the current zero-connection period (0 = not idle)
+        bool idleTrimmed = false;     // one trim per idle period; re-armed once a client connects
+        uint64_t trimmedAtMs = 0;
+        MpLog(std::string("[Memory] backup OOM pool: ") + (keepOomPool ? "KEPT (KEEP_OOM_POOL.flag)" : "release at listen+30 s")
+            + "; hub idle working-set trim: "
+            + (trimAllowed ? "ON (confirmed hubs only, after 60 s with 0 remote connections, once per idle period)"
+                : (Globals::AuthMode == Globals::ServerAuthMode::GlobalGameserver ? "OFF (KEEP_WORKING_SET.flag)"
+                                                                                   : "OFF (not a DeployServer instance)"))
+            + "; [Perf]/[Memory] lines: " + (perfLog ? "every 60 s" : "OFF (DISABLE_PERF_LOG.flag)")
+            + "; [PerfDetail]/[PerfNet]/[PerfThreads]: "
+            + (perfLog && MpPerfDetailEnabled() ? "every 60 s" : (perfLog ? "OFF (NO_PERF_DETAIL.flag)" : "OFF")));
+        // [2026-10-11 1.14.7 O0] Baseline for the first [PerfThreads] window (CPU since listen, not since process start).
+        if (perfLog && MpPerfDetailEnabled()) MpLogThreadCpu(true);
         for (;;) {
             Sleep(static_cast<DWORD>(POLL_SEC * 1000.0f));
             ++iter;
+            if (MpProcessDetaching()) continue;   // never touch the CRT or log after DLL_PROCESS_DETACH
+            // [2026-10-10 1.14.7 RAM] Every server role (before the EnableWatchdog gate on purpose): the pool release
+            // once, 30 s after listen (its pages are untouched, so the connection state does not matter), and the
+            // [Perf]/[Memory] lines every 30 polls (~60 s; the rate is computed from measured frame time).
+            if (!oomPoolDone && GetTickCount64() - wdStartMs >= 30000) {
+                oomPoolDone = true;
+                if (!keepOomPool) MpReleaseBackupOomPool();
+            }
+            if (perfLog && (iter % 30) == 0) {
+                MpLogPerfAndMemory(perfFirstWindow);
+                perfFirstWindow = false;
+            }
             if (!EnableWatchdog) { emptySec = 0.0f; continue; }
             // CRASH-SAFE: this thread does NO GObjects walk and NO IsA/GetName calls (doing that off the
             // game thread raced actor spawn/destroy and faulted inside the game). It only reads values the
@@ -3066,6 +4558,31 @@ static void StartEmptyWatchdogThread() {
                     + " countsUsable=" + std::to_string(countsUsable ? 1 : 0)
                     + " empty=" + std::to_string(empty ? 1 : 0) + " emptySec=" + std::to_string(emptySec)
                     + "/" + std::to_string(static_cast<int>(emptyLimitSec)));
+            }
+            // [2026-10-10 1.14.7 RAM] Hub idle working-set trim. Only a CONFIRMED hub (hub == 1; never -1/unknown, never a
+            // hunt, never the P2P host), only after ZERO remote connections continuously for 60 s (usable counts, a
+            // connection sample at most 1 s old, nobody seamless-travelling; any connection seen by the game thread
+            // restarts the period), at most once per idle period (re-armed when a client connects). Runs here, on the
+            // watchdog thread. The server cannot see a hard-travel client before its handshake creates the connection,
+            // so an arrival can still coincide with a trim: performance only (see MpTrimWorkingSet).
+            {
+                const uint64_t NowMs = GetTickCount64();
+                const uint64_t LastConnMs = g_wdLastRemoteConnMs.load(std::memory_order_relaxed);
+                if (idleTrimmed && LastConnMs > trimmedAtMs) idleTrimmed = false;   // a client connected since: re-arm
+                const uint64_t ConnStamp = g_wdConnStampMs.load(std::memory_order_relaxed);
+                const bool ConnFresh = ConnStamp != 0 && NowMs >= ConnStamp && NowMs - ConnStamp <= 1000;
+                const bool IdleNow = hub == 1 && countsUsable && ConnFresh && connCount == 0 && numTravelling == 0
+                    && g_wdConnCount.load(std::memory_order_relaxed) == 0;
+                if (!IdleNow) {
+                    idleSinceMs = 0;
+                } else {
+                    if (idleSinceMs == 0 || LastConnMs >= idleSinceMs) idleSinceMs = NowMs;   // continuous zero only
+                    if (trimAllowed && !idleTrimmed && NowMs - idleSinceMs >= 60000) {
+                        idleTrimmed = true;
+                        trimmedAtMs = NowMs;
+                        MpTrimWorkingSet(NowMs - idleSinceMs);
+                    }
+                }
             }
             // [1.14.7 AVAILABILITY FIX 2026-10-04] A persistent hub that leaves its map becomes ALIVE BUT
             // UNAVAILABLE: the game's own AFK timeout kicks the phantom player, the match state goes to
@@ -3176,10 +4693,22 @@ bool IsLevelInitForActorHook(void* a1, char a2);
 // ExpectedPlayerCount is synchronized separately from the concrete launch roster below.
 // Default 4 (Dauntless party size). Override WITHOUT a rebuild by writing an integer into
 // <game-exe-dir>\HUB_MAX_PLAYERS.txt. Read once.
+// [2026-10-13 realms hub] A hub the launcher started (MYSTICPARADOX_HOSTED_ROLE=HUB) sets its cap with
+// MYSTICPARADOX_MAX_PLAYERS (1..64, validated by the p2p module): P2PHooks::MaxPlayersOverride() is consulted first
+// and then HUB_MAX_PLAYERS.txt is not read at all (no per-install text file in the host's game folder). The hook is 0
+// ("none") on a dedicated server, for a HUNT role and in the build without the p2p module, so those read the file as
+// before. A player-hosted server logs the source once.
 static int HubMaxPlayers() {
     static int Cached = -1;
     if (Cached < 0) {
+        const int LauncherMax = P2PHooks::MaxPlayersOverride();
+        if (LauncherMax >= 1 && LauncherMax <= 64) {
+            Cached = LauncherMax;
+            MpLog("[HubRole] max players " + std::to_string(Cached) + " (launcher MYSTICPARADOX_MAX_PLAYERS)");
+            return Cached;
+        }
         Cached = 4; // default party size
+        const char* MaxPlayersSource = "default";
         wchar_t ExePath[MAX_PATH];
         DWORD n = GetModuleFileNameW(nullptr, ExePath, MAX_PATH);
         if (n > 0 && n < MAX_PATH) {
@@ -3190,11 +4719,34 @@ static int HubMaxPlayers() {
             std::ifstream File(Path);
             if (File.is_open()) {
                 int Value = 0;
-                if ((File >> Value) && Value >= 1 && Value <= 64) { Cached = Value; }
+                if ((File >> Value) && Value >= 1 && Value <= 64) { Cached = Value; MaxPlayersSource = "HUB_MAX_PLAYERS.txt"; }
             }
+        }
+        if (Globals::AuthMode == Globals::ServerAuthMode::HuntCapability) {
+            MpLog("[HubRole] max players " + std::to_string(Cached) + " (" + MaxPlayersSource + ")");
         }
     }
     return Cached;
+}
+
+/*
+ * [2026-10-11 1.14.7 P2P host] MAP_URL_LISTEN.flag (the engine-listener A/B path) is refused on a player-hosted
+ * (HuntCapability) server. That path lets the engine create the GameNetDriver during map load and then only waits for
+ * UWorld::NetDriver, so it skips the player-host checks the manual Networking::Listen makes: PrepareListen (loopback
+ * bind address, and the engine MULTIHOME check) and the readiness report whose failure fences the host
+ * (P2PHooks::OnListenFailed). Both readers - GetGameDefaultMap (?listen) and GameEngineTickHook (wait for the engine
+ * listener) - ask here, so the host's map URL never carries ?listen and the host always listens manually. DeployServer
+ * instances keep the flag's behaviour. No revert flag (the refused path has no player-host safety).
+ */
+static bool MpMapUrlListenEnabled() {
+    if (!MpExeRelativeFlagPresent(L"MAP_URL_LISTEN.flag")) return false;
+    if (Globals::AuthMode != Globals::ServerAuthMode::HuntCapability) return true;
+    static volatile LONG s_logged = 0;
+    if (InterlockedCompareExchange(&s_logged, 1, 0) == 0) {
+        MpLog("[EngineListen] MAP_URL_LISTEN.flag REFUSED on this player-hosted server: the engine-listener path skips "
+              "PrepareListen and the readiness fence; listening through Networking::Listen instead");
+    }
+    return false;
 }
 
 // Count the concrete `playerUid:playerHuntId` entries supplied by DeployServer/PlayerHost in
@@ -3265,7 +4817,8 @@ FString* GetGameDefaultMap(FString* a1) {
     // UWorld::Listen) instead of this runtime creating one by hand. The manual path is what leaves the
     // world context invalid on 1.14.7: "WorldContext requested with invalid context object" appears 28
     // times per run with it and 0 times without it.
-    if (MpExeRelativeFlagPresent(L"MAP_URL_LISTEN.flag")) {
+    // [2026-10-11] Never on a player-hosted server (MpMapUrlListenEnabled).
+    if (MpMapUrlListenEnabled()) {
         FinalURL += std::wstring(L"?listen");
     }
 
@@ -3533,7 +5086,7 @@ void ServerBootCrash(void* param_1) {
 // (IsReadablePointer). We also declare two new size-specific readers.
 static uintptr_t SafeReadPtr(uintptr_t base, uintptr_t offset);
 static int SafeReadU8At(uintptr_t base, uintptr_t offset);
-// [1.14.7 identity diagnostic] defined near the Move10 patch helper; declared here because the
+// [1.14.7 identity diagnostic] defined near the byte-patch helper; declared here because the
 // client hook-install block appears earlier in this translation unit than the definition.
 static void InstallLoadMgrBeginHook(const char* Role);
 // [1.14.7 progression diagnostics] same reason: defined later, installed from InitServerHooks.
@@ -3566,8 +5119,6 @@ static void InstallMasteryProbe();
 static void InstallInteractionCalloutSetDisabledGuard();
 // [1.14.7 loader state dump] same reason: defined later, used from the server tick.
 static void DumpLoadManagerEntries(const char* Tag);
-// [1.14.7 synthetic net id] same reason: defined later, first used by the K2_PostLogin path.
-static bool EnsureSyntheticNetId(void* PlayerState);
 // [Group C cleanup 2026-07-13] ForceNetUpdateEnabled fwd-decl removed (Phase-0e experiment deleted).
 static int32_t SafeReadI32At(uintptr_t base, uintptr_t offset);
 static void* ResolveWeakObj(int32_t objectIndex, int32_t serialNumber);
@@ -4505,6 +6056,7 @@ static bool PlayerRepBoost();  // [fwd] defined with the replication helpers bel
 static void MpReportReplicationMembership();  // [fwd] 1.14.7 client-replication membership probe
 static void MpRouteBaseActorsToConnections(); // [fwd] 1.14.7 client PlayerState/GameState route fix
 static void MpDriveReplicationGraph(float DeltaTime);  // [fwd] 1.14.7 replication-graph drive
+static void DropStalePlayerControllerChannelQuarantine();  // [fwd] stale PC channel quarantine entries
 
 // [2026-07-20] FORCE_SERVER_MESH_POSE.flag — dedicated-server skeletal pose/socket fix.
 // See Progress/02_NETWORK_REPLICATION.md. HYPOTHESIS: on the -nullrhi dedicated server, skeletal meshes
@@ -4704,9 +6256,12 @@ static void ResetClientPlayerRoleRetryStateForTravel();
 static bool ValidateClientPossessionChain(UObject* PC, UObject* ExpectedPawn, UObject** OutPawn);
 static void MpTraceClientPlayerStateGap(UObject* PC);   // [1.14.7 client player-state probe]
 static void MpSendPathDiag();                          // [1.14.7 hub send-path probe]
-static void MpSuppressPhantomReplication();            // [1.14.7 phantom-pawn suppression]
-static void MpNetIdContractProbe();                    // [1.14.7 genuine net-id contract probe]
-static void MpCaptureGenuineNetIdType();               // [1.14.7 synthetic net-id type capture]
+static void MpProgressionWaitPoll();                   // [1.14.7 parked progression components, 2026-10-10]
+static void MpArrivalTriggerServerProbe();             // [1.14.7 Training arrival-trigger diagnostic, 2026-10-10]
+static void MpHuntPassServerStateTick();               // [1.14.7 2026-10-10] read-only [HuntPassState], server
+static void MpHuntPassClientProbe(UObject* PC);        // [1.14.7 2026-10-10] read-only [HuntPassProbe], client arrival
+static void MpCoinTossClientProbe(UObject* PC);        // [1.14.7 2026-10-10] read-only [CoinTossProbe], client arrival
+static void MpStartMatchWithoutPhantom(void* GameMode);  // [1.14.7 phantom removal: match start at the first login]
 static bool IsClientRolePumpPossessionStable(UObject* PC, UObject** OutPawn);
 static void TickFrankDroneClientDiag(void* Pawn, const char* Trigger);
 static std::string FrankDroneGateSummary(void* PlayerRole);
@@ -4728,14 +6283,516 @@ bool __fastcall FrankCanActivateAbilityBPHook(void* PlayerRole);
 // one: [ArchonInputActivate] never appeared at all in the stuck one.
 static UObject* s_LastPossessedPC = nullptr;
 static UObject* s_LastRestartPawn = nullptr;
+static void* s_LastPossessedWorld = nullptr;   // GWorld when s_LastPossessedPC was captured
 static uint64_t s_LastPossessedAtMs = 0;
 static bool s_ArchonInputActivated = false;
+
+// [2026-10-10 1.14.7] s_LastPossessedPC / s_LastRestartPawn belong to the world they were captured in, and nothing
+// cleared them. After a travel, or a disconnect back to the login screen, every probe kept validating the freed
+// controller: IsRegisteredLiveObject reads UObject::Index (+0x0C) from decommitted memory, its SEH caught each fault
+// and the VEH logged them (192 in 5 s on 10 Oct 19:41, after a rejected party join left the client on the login
+// screen). Forget the pair once GWorld (0x06FC7F58) is no longer the capture world; the next ClientRestart in the new
+// world is then a new possession, as before, and every reader already treats a null controller as "not yet".
+static void MpForgetPossessionIfWorldChanged() {
+    if (!s_LastPossessedPC && !s_LastRestartPawn) return;
+    void* World = *reinterpret_cast<void**>(Globals::BaseAddress + 0x06FC7F58);
+    if (World == s_LastPossessedWorld) return;
+    MpLog("[PossessionChain] world changed (captured=" + MpPtr(s_LastPossessedWorld) + " now=" + MpPtr(World)
+        + "): forgetting the tracked controller " + MpPtr(s_LastPossessedPC) + " and pawn " + MpPtr(s_LastRestartPawn));
+    s_LastPossessedPC = nullptr;
+    s_LastRestartPawn = nullptr;
+}
+
+// [2026-10-10 1.14.7 travel-crash probe, read-only, client only] The hunt -> Ramsgate crash (38_ §18.3, 22.4) is
+// UEngine::LoadMap (0x04271370) at 0x04272D28: `World()->PersistentLevel->GetOutermost()` with PersistentLevel null -
+// the shipping build drops the check() before LoadPackagesFully. It is the NEW world, and it faults 0.2 s after the
+// connect, far too soon for a disk load of Ramsgate (~4 s): LoadMap's FindPackage found the map already in memory.
+// Hypothesis: the previous Ramsgate UWorld survives the trip (something still references it); GC destroyed its level
+// and nulled PersistentLevel; on return LoadMap reuses that world. This census lists every UWorld at each world change
+// and 10 s / 60 s later: package, PersistentLevel, object flags, the GUObjectArray item flags (RootSet 0x40000000,
+// PendingKill 0x20000000, Unreachable 0x10000000) and how many objects still sit inside it. NO_WORLD_CENSUS.flag off.
+struct MpWorldCensusEntry {
+    void* World;
+    void* Outer;
+    void* Level;
+    uint32_t ObjectFlags;
+    int32_t ItemFlags;
+    int32_t Inside;
+};
+
+static int MpWorldCensusScan(MpWorldCensusEntry* Out, int Max, int* OutObjects) {
+    int Found = 0;
+    *OutObjects = 0;
+    __try {
+        SDK::TUObjectArray* Arr = SDK::UObject::GObjects.operator->();
+        const int Count = Arr ? Arr->NumElements : 0;
+        *OutObjects = Count;
+        SDK::UClass* WorldClass = SDK::UWorld::StaticClass();
+        for (int i = 0; i < Count && Found < Max; ++i) {
+            SDK::FUObjectItem* Chunk = Arr->Objects[i / SDK::TUObjectArray::ElementsPerChunk];
+            if (!Chunk) continue;
+            SDK::FUObjectItem* Item = &Chunk[i % SDK::TUObjectArray::ElementsPerChunk];
+            UObject* Obj = Item->Object;
+            if (!Obj || !Obj->Class) continue;
+            const uint32_t Flags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(Obj) + 0x08);
+            if (Flags & 0x10) continue;                       // RF_ClassDefaultObject
+            if (!Obj->IsA(WorldClass)) continue;
+            MpWorldCensusEntry& E = Out[Found++];
+            E.World = Obj;
+            E.Outer = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Obj) + 0x20);
+            E.Level = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Obj) + 0x30);   // UWorld::PersistentLevel
+            E.ObjectFlags = Flags;
+            E.ItemFlags = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Item) + 0x08);
+            E.Inside = 0;
+        }
+        // Second pass: objects whose Outer chain reaches each world (what the world still holds in memory).
+        for (int i = 0; i < Count && Found > 0; ++i) {
+            SDK::FUObjectItem* Chunk = Arr->Objects[i / SDK::TUObjectArray::ElementsPerChunk];
+            if (!Chunk) continue;
+            UObject* Obj = Chunk[i % SDK::TUObjectArray::ElementsPerChunk].Object;
+            if (!Obj) continue;
+            void* O = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Obj) + 0x20);
+            for (int Depth = 0; O && Depth < 16; ++Depth) {
+                for (int w = 0; w < Found; ++w) {
+                    if (Out[w].World == O) { ++Out[w].Inside; O = nullptr; break; }
+                }
+                if (O) O = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(O) + 0x20);
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -Found - 1;
+    }
+    return Found;
+}
+
+// Load/destroy state of a UObject from its ObjectFlags and its GUObjectArray item flags (UE 4.26 values).
+static std::string MpObjectStateFlags(uint32_t ObjectFlags, int32_t ItemFlags) {
+    std::string State;
+    const struct { uint32_t Bit; const char* Name; } kItem[] = {
+        { 0x40000000, "rootset" }, { 0x20000000, "pendingkill" }, { 0x10000000, "unreachable" },
+        { 0x08000000, "asyncloading" }, { 0x04000000, "async" } };
+    const struct { uint32_t Bit; const char* Name; } kObj[] = {
+        { 0x400, "needload" }, { 0x1000, "needpostload" }, { 0x8000, "begindestroyed" }, { 0x10000, "finishdestroyed" },
+        { 0x80000, "wasloaded" }, { 0x200000, "loadcompleted" } };
+    for (const auto& F : kItem) if (static_cast<uint32_t>(ItemFlags) & F.Bit) { State += F.Name; State += ','; }
+    for (const auto& F : kObj) if (ObjectFlags & F.Bit) { State += F.Name; State += ','; }
+    if (!State.empty()) State.pop_back();
+    return State;
+}
+
+static void MpWorldCensus(const char* Reason) {
+    MpWorldCensusEntry Entries[64]{};
+    int Objects = 0;
+    int Found = MpWorldCensusScan(Entries, 64, &Objects);
+    const bool Faulted = Found < 0;
+    if (Faulted) Found = -Found - 1;
+    void* Current = *reinterpret_cast<void**>(Globals::BaseAddress + 0x06FC7F58);
+    std::string Line = std::string("[WorldCensus] reason=") + Reason + " gworld=" + MpPtr(Current)
+        + " objects=" + std::to_string(Objects) + " worlds=" + std::to_string(Found) + (Faulted ? " (scan faulted)" : "");
+    for (int i = 0; i < Found; ++i) {
+        const MpWorldCensusEntry& E = Entries[i];
+        std::string Name = SafeObjectNameForDiagnostic(E.World);
+        std::string Pkg = E.Outer ? SafeObjectNameForDiagnostic(E.Outer) : std::string("none");
+        const std::string State = MpObjectStateFlags(E.ObjectFlags, E.ItemFlags);
+        // Compact: the package is only shown when it is not the world's own name.
+        Line += " | " + MpPtr(E.World) + " " + Name + (Pkg != Name ? " pkg=" + Pkg : std::string())
+            + (E.World == Current ? " CURRENT" : "")
+            + " level=" + (E.Level ? MpPtr(E.Level) : std::string("NULL"))
+            + (State.empty() ? "" : " [" + State + "]") + " inside=" + std::to_string(E.Inside);
+    }
+    MpLog(Line);
+    // A pending-kill world that is not the current one has outlived its map: name what keeps it (once per world), then
+    // release its stuck keep flags so the next GC (LoadMap's full purge at the latest) frees it.
+    void* Zombies[64];
+    int NumZombies = 0;
+    for (int i = 0; i < Found; ++i) {
+        if (Entries[i].World != Current && (Entries[i].ItemFlags & 0x20000000)) {
+            MpReportZombieWorld(Entries[i].World, Reason);
+            Zombies[NumZombies++] = Entries[i].World;
+        }
+    }
+    if (NumZombies > 0 && strcmp(Reason, "travel-crash") != 0) MpReleaseZombieKeepFlags(Zombies, NumZombies, Reason);
+}
+
+static bool MpReadWorldStateSafe(void* Obj, uint32_t* ObjFlags, int32_t* ItemFlags, void** Outer, void** Level) {
+    *ObjFlags = 0; *ItemFlags = 0; *Outer = nullptr; *Level = nullptr;
+    __try {
+        *ObjFlags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(Obj) + 0x08);
+        const int32_t Index = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Obj) + 0x0C);
+        *Outer = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Obj) + 0x20);
+        *Level = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Obj) + 0x30);
+        SDK::TUObjectArray* Arr = SDK::UObject::GObjects.operator->();
+        if (Arr && Index >= 0 && Index < Arr->NumElements) {
+            SDK::FUObjectItem* Chunk = Arr->Objects[Index / SDK::TUObjectArray::ElementsPerChunk];
+            if (Chunk) {
+                *ItemFlags = *reinterpret_cast<int32_t*>(
+                    reinterpret_cast<uintptr_t>(&Chunk[Index % SDK::TUObjectArray::ElementsPerChunk]) + 0x08);
+            }
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void MpLogTravelCrashState(CONTEXT* Context) {
+    static std::atomic<int> s_dumps{ 0 };
+    if (s_dumps.fetch_add(1) != 0) return;
+    void* WorldContext = reinterpret_cast<void*>(Context->R12);
+    void* World = nullptr;
+    if (WorldContext && IsReadablePointer(WorldContext, 0x288)) {
+        World = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(WorldContext) + 0x280);
+    }
+    void* GWorldNow = *reinterpret_cast<void**>(Globals::BaseAddress + 0x06FC7F58);
+    std::string Line = "[TravelCrash] LoadMap null PersistentLevel: context(r12)=" + MpPtr(WorldContext)
+        + " world=" + MpPtr(World) + " gworld=" + MpPtr(GWorldNow);
+    uint32_t ObjFlags = 0; int32_t ItemFlags = 0; void* Outer = nullptr; void* Level = nullptr;
+    if (World && MpReadWorldStateSafe(World, &ObjFlags, &ItemFlags, &Outer, &Level)) {
+        Line += " name=" + SafeObjectNameForDiagnostic(World) + " pkg=" + (Outer ? SafeObjectNameForDiagnostic(Outer) : std::string("none"))
+            + " level=" + (Level ? MpPtr(Level) : std::string("NULL")) + " objFlags=" + MpHex(ObjFlags)
+            + " item=" + MpHex(static_cast<uint32_t>(ItemFlags)) + " [" + MpObjectStateFlags(ObjFlags, ItemFlags) + "]";
+        uint32_t PkgFlags = 0; int32_t PkgItem = 0; void* PkgOuter = nullptr; void* Unused = nullptr;
+        if (Outer && MpReadWorldStateSafe(Outer, &PkgFlags, &PkgItem, &PkgOuter, &Unused)) {
+            Line += " pkgFlags=" + MpHex(PkgFlags) + " pkgItem=" + MpHex(static_cast<uint32_t>(PkgItem))
+                + " [" + MpObjectStateFlags(PkgFlags, PkgItem) + "]";
+        }
+    } else {
+        Line += " (world unreadable)";
+    }
+    MpLog(Line);
+    MpWorldCensus("travel-crash");
+}
+
+// [2026-10-10 1.14.7 travel-crash probe, read-only] 0.2.123 caught the crash (21:14:50): LoadMap reused the PREVIOUS
+// Ramsgate UWorld. On the way out (Ramsgate -> Training) LoadMap unrooted it and GC destroyed its level, yet the world
+// survived as pendingkill with 3 objects still inside; a reachable inner object keeps its Outer (the world) alive, since
+// GC never eliminates outer references. On return FindPackage found the leftover and LoadMap reused it. This names what
+// is left inside a pending-kill world and every live object that points at it (direct fields, plus one level of TArray
+// contents), once per such world. A holder found nowhere is a native FGCObject reference.
+struct MpRefHit {
+    void* Referencer;
+    void* Target;
+    uint32_t Offset;
+    int32_t ArrayIndex;   // -1 = the field itself, else an element of the TArray at Offset
+};
+
+static bool MpPtrSetHas(void* const* Set, uintptr_t P) {
+    if (!P) return false;
+    for (int Probe = 0, Slot = static_cast<int>((P >> 4) & 255); Probe < 256; ++Probe, Slot = (Slot + 1) & 255) {
+        if (!Set[Slot]) return false;
+        if (reinterpret_cast<uintptr_t>(Set[Slot]) == P) return true;
+    }
+    return false;
+}
+
+static void MpPtrSetAdd(void** Set, void* P) {
+    for (int Probe = 0, Slot = static_cast<int>((reinterpret_cast<uintptr_t>(P) >> 4) & 255); Probe < 256; ++Probe, Slot = (Slot + 1) & 255) {
+        if (!Set[Slot] || Set[Slot] == P) { Set[Slot] = P; return; }
+    }
+}
+
+static bool MpOuterChainReaches(void* Obj, void* World) {
+    void* O = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Obj) + 0x20);
+    for (int Depth = 0; O && Depth < 16; ++Depth) {
+        if (O == World) return true;
+        O = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(O) + 0x20);
+    }
+    return false;
+}
+
+// One level of TArray<UObject*>-shaped memory; its own SEH frame so a false-positive header only skips itself.
+static int MpScanPtrArraySafe(uintptr_t Data, int32_t Num, void* const* Set, void* Referencer, uint32_t Offset,
+                              MpRefHit* Hits, int Found, int MaxHits) {
+    __try {
+        const uintptr_t* Elems = reinterpret_cast<const uintptr_t*>(Data);
+        for (int32_t i = 0; i < Num && Found < MaxHits; ++i) {
+            if (MpPtrSetHas(Set, Elems[i])) Hits[Found++] = { Referencer, reinterpret_cast<void*>(Elems[i]), Offset, i };
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return Found;
+}
+
+static int MpZombieInnerScan(void* World, void** OutInner, int MaxInner) {
+    int Found = 0;
+    __try {
+        SDK::TUObjectArray* Arr = SDK::UObject::GObjects.operator->();
+        const int Count = Arr ? Arr->NumElements : 0;
+        for (int i = 0; i < Count && Found < MaxInner; ++i) {
+            SDK::FUObjectItem* Chunk = Arr->Objects[i / SDK::TUObjectArray::ElementsPerChunk];
+            if (!Chunk) continue;
+            void* Obj = Chunk[i % SDK::TUObjectArray::ElementsPerChunk].Object;
+            if (Obj && Obj != World && MpOuterChainReaches(Obj, World)) OutInner[Found++] = Obj;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return Found;
+}
+
+static int MpZombieRefScan(void* const* Set, void* World, MpRefHit* Hits, int MaxHits, int* OutScanned) {
+    int Found = 0;
+    *OutScanned = 0;
+    __try {
+        SDK::TUObjectArray* Arr = SDK::UObject::GObjects.operator->();
+        const int Count = Arr ? Arr->NumElements : 0;
+        for (int i = 0; i < Count && Found < MaxHits; ++i) {
+            SDK::FUObjectItem* Chunk = Arr->Objects[i / SDK::TUObjectArray::ElementsPerChunk];
+            if (!Chunk) continue;
+            void* Obj = Chunk[i % SDK::TUObjectArray::ElementsPerChunk].Object;
+            if (!Obj || MpPtrSetHas(Set, reinterpret_cast<uintptr_t>(Obj)) || MpOuterChainReaches(Obj, World)) continue;
+            void* Cls = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Obj) + 0x10);
+            if (!Cls) continue;
+            int32_t Size = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Cls) + 0x58);   // UStruct::Size
+            if (Size < 0x30) continue;
+            if (Size > 0x4000) Size = 0x4000;
+            ++*OutScanned;
+            for (uint32_t Off = 0x28; Off + 8 <= static_cast<uint32_t>(Size) && Found < MaxHits; Off += 8) {
+                const uintptr_t Q = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uintptr_t>(Obj) + Off);
+                if (MpPtrSetHas(Set, Q)) { Hits[Found++] = { Obj, reinterpret_cast<void*>(Q), Off, -1 }; continue; }
+                if (Q > 0x10000 && (Q & 7) == 0 && Off + 16 <= static_cast<uint32_t>(Size)) {
+                    const int32_t Num = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Obj) + Off + 8);
+                    const int32_t Max = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Obj) + Off + 12);
+                    if (Num > 0 && Num <= Max && Max <= 4096) Found = MpScanPtrArraySafe(Q, Num, Set, Obj, Off, Hits, Found, MaxHits);
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return Found;
+}
+
+static std::string MpObjectAndClassName(void* Obj) {
+    if (!Obj) return "null";
+    void* Cls = IsRegisteredLiveObject(Obj) ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Obj) + 0x10) : nullptr;
+    return SafeObjectNameForDiagnostic(Obj) + "(" + (Cls ? SafeObjectNameForDiagnostic(Cls) : std::string("?")) + ")";
+}
+
+static void MpReportZombieWorld(void* World, const char* Reason) {
+    static void* s_reported[16] = {};
+    for (void* P : s_reported) if (P == World) return;
+    for (void*& P : s_reported) if (!P) { P = World; break; }
+
+    void* Inner[48] = {};
+    const int NumInner = MpZombieInnerScan(World, Inner, 48);
+    void* Set[256] = {};
+    MpPtrSetAdd(Set, World);
+    void* Package = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(World) + 0x20);
+    if (Package) MpPtrSetAdd(Set, Package);
+    std::string InnerList;
+    for (int i = 0; i < NumInner; ++i) {
+        MpPtrSetAdd(Set, Inner[i]);
+        uint32_t Of = 0; int32_t It = 0; void* Ou = nullptr; void* Lv = nullptr;
+        MpReadWorldStateSafe(Inner[i], &Of, &It, &Ou, &Lv);
+        InnerList += " | " + MpPtr(Inner[i]) + " " + MpObjectAndClassName(Inner[i]) + " outer=" + MpObjectAndClassName(Ou)
+            + " [" + MpObjectStateFlags(Of, It) + "]";
+    }
+    MpLog(std::string("[ZombieWorld] reason=") + Reason + " world=" + MpPtr(World) + " " + MpObjectAndClassName(World)
+        + " pkg=" + MpObjectAndClassName(Package) + " inside=" + std::to_string(NumInner) + InnerList);
+
+    // The reference sweep is opt-in since 0.2.125: its one-level TArray reads treat byte arrays (UFunction::Script at
+    // +0x60) as pointer arrays, so it reported stale heap words as holders and raised ~190 first-chance faults per
+    // world (MpScanPtrArraySafe, 21:26:34), all logged by the VEH. The holder it was looking for is a keep flag, which
+    // the inner list above already shows.
+    static int s_refScan = -1;
+    if (s_refScan < 0) s_refScan = MpExeRelativeFlagPresent(L"ZOMBIE_REF_SCAN.flag") ? 1 : 0;
+    if (!s_refScan) return;
+    MpRefHit Hits[32] = {};
+    int Scanned = 0;
+    const uint64_t T0 = GetTickCount64();
+    const int NumHits = MpZombieRefScan(Set, World, Hits, 32, &Scanned);
+    std::string HitList;
+    for (int i = 0; i < NumHits; ++i) {
+        HitList += " | " + MpObjectAndClassName(Hits[i].Referencer) + " +" + MpHex(Hits[i].Offset)
+            + (Hits[i].ArrayIndex >= 0 ? "[" + std::to_string(Hits[i].ArrayIndex) + "]" : std::string())
+            + " -> " + MpObjectAndClassName(Hits[i].Target);
+    }
+    MpLog("[ZombieWorld] holders of " + MpPtr(World) + ": " + std::to_string(NumHits) + " reference(s) from "
+        + std::to_string(Scanned) + " objects scanned in " + std::to_string(GetTickCount64() - T0) + " ms"
+        + (NumHits == 0 ? " (none in UObject memory: a native FGCObject holds it)" : "") + HitList);
+}
+
+// [2026-10-10 1.14.7 travel-crash FIX] Root cause, proven on 0.2.124 (leftovers at 21:26:34 and 21:26:48, crash on the
+// second one at 21:27:14): every leftover world held exactly one chain, `default_input_bpc_C [pendingkill,async]` ->
+// its PlayerController -> PersistentLevel -> UWorld -> package. GUObjectArray item flag 0x04000000 is
+// EInternalObjectFlags::Async, one of GarbageCollectionKeepFlags: the 1.14.7 mark phase (0x027D9580 and its three
+// siblings pass FastKeepFlags = 0x0E000000) keeps such an object even when it is PendingKill, and GC never eliminates
+// Outer references, so one input component whose Async flag was never cleared keeps its whole world alive. LoadMap
+// runs a full-purge CollectGarbage (0x027DFE10, called at 0x042721A6 with KeepFlags 0, after the old world is detached
+// and before FindPackage), so clearing that stale bit lets the purge free the leftover and LoadMap loads the map fresh
+// instead of reusing a world whose PersistentLevel is gone (0x04272D28).
+// Touched: only objects that are PendingKill, not RootSet, carry Async without AsyncLoading, and whose Outer chain
+// reaches a pending-kill UWorld that is not GWorld; only the Async bit is cleared. AsyncLoading/RootSet holders are
+// counted, never changed. KEEP_STUCK_ASYNC_FLAGS.flag reverts (report only).
+static void* s_ZombieKeepReleased[16] = {};
+static int s_ZombieKeepReleasedNext = 0;
+
+static bool MpZombieKeepFlagReleased(void* World) {
+    for (void* P : s_ZombieKeepReleased) if (P && P == World) return true;
+    return false;
+}
+
+static int MpWorldIndexInOuterChain(void* Obj, void* const* Worlds, int NumWorlds) {
+    void* O = Obj;
+    for (int Depth = 0; O && Depth < 17; ++Depth) {
+        for (int w = 0; w < NumWorlds; ++w) if (Worlds[w] == O) return w;
+        O = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(O) + 0x20);
+    }
+    return -1;
+}
+
+// Objects inside the given worlds that carry a GC keep flag. Release = clear Async on the eligible ones (game thread).
+static int MpStuckAsyncScan(void* const* Worlds, int NumWorlds, bool Release, void** OutObj, int* OutWorld, int Max,
+                            int* OutLeftAlone) {
+    int Found = 0;
+    *OutLeftAlone = 0;
+    __try {
+        SDK::TUObjectArray* Arr = SDK::UObject::GObjects.operator->();
+        const int Count = Arr ? Arr->NumElements : 0;
+        for (int i = 0; i < Count; ++i) {
+            SDK::FUObjectItem* Chunk = Arr->Objects[i / SDK::TUObjectArray::ElementsPerChunk];
+            if (!Chunk) continue;
+            SDK::FUObjectItem* Item = &Chunk[i % SDK::TUObjectArray::ElementsPerChunk];
+            void* Obj = Item->Object;
+            if (!Obj) continue;
+            volatile LONG* Flags = reinterpret_cast<volatile LONG*>(reinterpret_cast<uintptr_t>(Item) + 0x08);
+            const LONG F = *Flags;
+            if (!(F & 0x4C000000)) continue;                  // no RootSet / AsyncLoading / Async
+            const int W = MpWorldIndexInOuterChain(Obj, Worlds, NumWorlds);
+            if (W < 0) continue;
+            const bool Eligible = (F & 0x20000000) && !(F & 0x40000000) && (F & 0x04000000) && !(F & 0x08000000);
+            if (!Eligible) { ++*OutLeftAlone; continue; }
+            if (Release) InterlockedAnd(Flags, ~static_cast<LONG>(0x04000000));
+            if (Found < Max) { OutObj[Found] = Obj; OutWorld[Found] = W; }
+            ++Found;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return Found;
+}
+
+static void MpReleaseZombieKeepFlags(void* const* Worlds, int NumWorlds, const char* Reason) {
+    static int s_reportOnly = -1;
+    if (s_reportOnly < 0) {
+        s_reportOnly = MpExeRelativeFlagPresent(L"KEEP_STUCK_ASYNC_FLAGS.flag") ? 1 : 0;
+        MpLog(std::string("[ZombieWorld] stuck Async keep-flag release ") + (s_reportOnly
+            ? "OFF (KEEP_STUCK_ASYNC_FLAGS.flag; report only)"
+            : "ON: leftover worlds are freed by the next GC instead of being reused by LoadMap"));
+    }
+    // A world released before this LoadMap that is still here after it survived the full purge: another holder.
+    static void* s_survivorWarned[16] = {};
+    if (strcmp(Reason, "world-change") == 0) {
+        for (int w = 0; w < NumWorlds; ++w) {
+            if (!MpZombieKeepFlagReleased(Worlds[w])) continue;
+            bool Warned = false;
+            for (void* P : s_survivorWarned) if (P == Worlds[w]) Warned = true;
+            if (Warned) continue;
+            for (void*& P : s_survivorWarned) if (!P) { P = Worlds[w]; break; }
+            MpLog("[ZombieWorld] " + MpPtr(Worlds[w]) + " " + SafeObjectNameForDiagnostic(Worlds[w])
+                + " survived LoadMap's full purge after its keep flag was released: something else holds it"
+                  " (ZOMBIE_REF_SCAN.flag lists candidates)");
+        }
+    }
+    void* Obj[16] = {};
+    int WorldOf[16] = {};
+    int LeftAlone = 0;
+    const int N = MpStuckAsyncScan(Worlds, NumWorlds, !s_reportOnly, Obj, WorldOf, 16, &LeftAlone);
+    static int s_lastLeftAlone = -1;
+    if (N == 0 && (LeftAlone == 0 || LeftAlone == s_lastLeftAlone)) return;
+    s_lastLeftAlone = LeftAlone;
+    std::string List;
+    for (int i = 0; i < N && i < 16; ++i) {
+        List += " | " + MpObjectAndClassName(Obj[i]) + " in " + SafeObjectNameForDiagnostic(Worlds[WorldOf[i]]);
+        if (!s_reportOnly && !MpZombieKeepFlagReleased(Worlds[WorldOf[i]])) {
+            s_ZombieKeepReleased[s_ZombieKeepReleasedNext] = Worlds[WorldOf[i]];
+            s_ZombieKeepReleasedNext = (s_ZombieKeepReleasedNext + 1) % 16;
+        }
+    }
+    MpLog(std::string("[ZombieWorld] reason=") + Reason + (s_reportOnly ? " FOUND (not released)" : " RELEASED")
+        + " stuck Async keep flag on " + std::to_string(N) + " pending-kill object(s) in " + std::to_string(NumWorlds)
+        + " leftover world(s); keep-flag holders left alone (AsyncLoading/RootSet/live): " + std::to_string(LeftAlone)
+        + List);
+}
+
+// Live objects of the current world that carry Async/AsyncLoading at +10 s / +60 s: shows whether the input component
+// is born with the stale flag (who sets it) and predicts which world would have leaked.
+static int MpLiveAsyncScan(void* World, void** OutObj, int Max, int* OutAsyncLoading) {
+    int Found = 0;
+    *OutAsyncLoading = 0;
+    __try {
+        SDK::TUObjectArray* Arr = SDK::UObject::GObjects.operator->();
+        const int Count = Arr ? Arr->NumElements : 0;
+        for (int i = 0; i < Count; ++i) {
+            SDK::FUObjectItem* Chunk = Arr->Objects[i / SDK::TUObjectArray::ElementsPerChunk];
+            if (!Chunk) continue;
+            SDK::FUObjectItem* Item = &Chunk[i % SDK::TUObjectArray::ElementsPerChunk];
+            void* Obj = Item->Object;
+            if (!Obj) continue;
+            const int32_t F = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Item) + 0x08);
+            if (!(F & 0x0C000000)) continue;
+            if (MpWorldIndexInOuterChain(Obj, &World, 1) < 0) continue;
+            if (F & 0x08000000) ++*OutAsyncLoading;
+            if (F & 0x04000000) { if (Found < Max) OutObj[Found] = Obj; ++Found; }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return Found;
+}
+
+static void MpAsyncFlagCensus(const char* Reason) {
+    void* World = *reinterpret_cast<void**>(Globals::BaseAddress + 0x06FC7F58);
+    if (!World) return;
+    void* Obj[8] = {};
+    int AsyncLoading = 0;
+    const int N = MpLiveAsyncScan(World, Obj, 8, &AsyncLoading);
+    std::string List;
+    for (int i = 0; i < N && i < 8; ++i) {
+        uint32_t Of = 0; int32_t It = 0; void* Ou = nullptr; void* Lv = nullptr;
+        MpReadWorldStateSafe(Obj[i], &Of, &It, &Ou, &Lv);
+        List += " | " + MpObjectAndClassName(Obj[i]) + " outer=" + MpObjectAndClassName(Ou) + " [" + MpObjectStateFlags(Of, It) + "]";
+    }
+    MpLog(std::string("[AsyncFlagCensus] reason=") + Reason + " world=" + SafeObjectNameForDiagnostic(World)
+        + " async=" + std::to_string(N) + " asyncloading=" + std::to_string(AsyncLoading) + List);
+}
+
+// Client (from ProcessEventClientHook, every 250 ms): a census on every GWorld change and 10 s / 60 s after it.
+static void MpWorldCensusTick() {
+    static int s_disabled = -1;
+    if (s_disabled < 0) {
+        s_disabled = MpExeRelativeFlagPresent(L"NO_WORLD_CENSUS.flag") ? 1 : 0;
+        MpLog(std::string("[WorldCensus] ") + (s_disabled ? "OFF (NO_WORLD_CENSUS.flag)" : "ON: every UWorld at each world change, +10 s and +60 s (client)"));
+    }
+    if (s_disabled) return;
+    static void* s_world = nullptr;
+    static uint64_t s_changedAtMs = 0;
+    static int s_stage = 0;   // 0 = idle, 1 = +10 s pending, 2 = +60 s pending
+    void* World = *reinterpret_cast<void**>(Globals::BaseAddress + 0x06FC7F58);
+    const uint64_t Now = GetTickCount64();
+    if (World != s_world) {
+        s_world = World;
+        s_changedAtMs = Now;
+        s_stage = 1;
+        MpWorldCensus("world-change");
+        return;
+    }
+    if (s_stage == 1 && Now - s_changedAtMs >= 10000) { s_stage = 2; MpWorldCensus("arrival+10s"); MpAsyncFlagCensus("arrival+10s"); }
+    else if (s_stage == 2 && Now - s_changedAtMs >= 60000) { s_stage = 0; MpWorldCensus("arrival+60s"); MpAsyncFlagCensus("arrival+60s"); }
+}
 // A natural OnInputModeChanged can arrive before the new map's LocalPlayer/PC/Pawn chain has
 // remained stable long enough for compatibility calls. Remember that edge and replay the input
 // activation only after the existing travel-settle gate passes; never advance the cinematic from
 // the timeout-only path.
 static bool s_ArchonInputActivationPending = false;
 static bool s_NaturalInputModeChangedObserved = false;
+// [1.14.7 FIX 2026-10-10, 38_ §21] The game's own latest OnInputModeChanged value for the current
+// possession (-1 none yet, 0 input taken away, 1 control handed to the player) and when it arrived.
+// Events raised from inside TriggerArchonInputActivation (EnableCharacterInput fires the same event)
+// are ours and are not recorded. On a hunt the first natural edge is false - the arrival cinematic
+// taking input - and true only arrives when the cinematic ends; the airship screen does the same.
+static int s_LastNaturalGameInput = -1;
+static uint64_t s_LastNaturalGameInputMs = 0;
+static int s_ArchonInputActivationDepth = 0;
 static bool s_ProgressionHudRefreshPending = false;
 static uint32_t s_ProgressionHudRefreshAttempts = 0;
 static uint64_t s_ProgressionHudRefreshNotBeforeMs = 0;
@@ -4751,6 +6808,406 @@ static uint64_t s_ClientRolePumpStableSinceMs = 0;
 static constexpr uint64_t kClientRolePumpTravelSettleMs = 3000;
 static constexpr uint64_t kClientRolePumpStableChainMs = 750;
 
+// [2026-10-10 1.14.7 CPU] ExpectedPlayerCount roster sync for ONE object (the world's GameMode or GameState).
+// Same checks, compare-then-write and one-time log text as the GObjects walk it replaces (see the roster block in
+// GameEngineTickHook); a null, unregistered, CDO or wrong-class pointer writes nothing.
+static void MpSyncExpectedPlayerField(SDK::UObject* Obj, SDK::UClass* Cls, uintptr_t Offset, const char* Tag,
+    const char* OffsetText, bool& Logged, int32_t Value) {
+    if (!Obj || !Cls || !IsRegisteredLiveObject(Obj) || Obj->IsDefaultObject()
+        || !Obj->Class || !IsRegisteredLiveObject(Obj->Class) || !Obj->IsA(Cls)) {
+        return;
+    }
+    int32_t* Field = reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Obj) + Offset);
+    if (!IsReadablePointer(Field, sizeof(int32_t))) return;
+    const int32_t Before = *Field;
+    if (Before == Value) return;
+    *Field = Value;
+    if (!Logged) {
+        Logged = true;
+        MpLog(std::string("[ExpectedPlayerCount@") + Tag + "] synchronized  instance=" + MpPtr(Obj)
+            + " class=" + Obj->Class->GetName()
+            + " before=" + std::to_string(Before)
+            + " after=" + std::to_string(Value)
+            + " offset=" + OffsetText);
+    }
+}
+
+// [2026-10-10 1.14.7 CPU] Read-only, one-shot cross-check for the world-pointer roster sync: walks GObjects ONCE and
+// logs how many non-CDO AArchonGameMode / AArchonGameState instances exist and whether each is the world's
+// AuthorityGameMode (+0x118) / GameState (+0x120). The fast path is accepted only once hub, Training and hunt logs
+// show gameModes=1 gameStates=1 with match=1 each. Called from the game thread (the tick hook) only.
+static void MpExpectedPlayerWorldCensus(const char* When) {
+    if (!SDK::UObject::GObjects) return;
+    SDK::UWorld* World = SDK::UWorld::GetWorld();
+    void* WorldGM = nullptr;
+    void* WorldGS = nullptr;
+    if (World && IsReadablePointer(World, 0x128)) {
+        WorldGM = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(World) + 0x118);
+        WorldGS = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(World) + 0x120);
+    }
+    int GameModes = 0, GameStates = 0, GameModeMatch = 0, GameStateMatch = 0;
+    std::string Detail;
+    const int Count = SDK::UObject::GObjects->Num();
+    for (int i = 0; i < Count; i++) {
+        SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+        if (!Obj || Obj->IsDefaultObject()) continue;
+        const bool IsGM = Obj->IsA(SDK::AArchonGameMode::StaticClass());
+        const bool IsGS = !IsGM && Obj->IsA(SDK::AArchonGameState::StaticClass());
+        if (!IsGM && !IsGS) continue;
+        const bool Match = IsGM ? (Obj == WorldGM) : (Obj == WorldGS);
+        if (IsGM) { ++GameModes; if (Match) ++GameModeMatch; }
+        else { ++GameStates; if (Match) ++GameStateMatch; }
+        if (GameModes + GameStates <= 8) {
+            Detail += std::string(" ") + (IsGM ? "GM" : "GS") + "=" + MpPtr(Obj) + "/"
+                + (Obj->Class ? Obj->Class->GetName() : std::string("?")) + (Match ? "(world)" : "(NOT world)");
+        }
+    }
+    MpLog(std::string("[ExpectedPlayerCount] census ") + When
+        + " world=" + MpPtr(World) + " worldGM=" + MpPtr(WorldGM) + " worldGS=" + MpPtr(WorldGS)
+        + " gameModes=" + std::to_string(GameModes) + " match=" + std::to_string(GameModeMatch)
+        + " gameStates=" + std::to_string(GameStates) + " match=" + std::to_string(GameStateMatch)
+        + " objects=" + std::to_string(Count) + Detail);
+}
+
+// [2026-10-10 1.14.7] Blueprint TickFilterHelper answered as a dedicated server - OPT-IN, default OFF.
+// UArchonGameplayStatics::TickFilterHelper (native 0x019480B0, .pdata entry, 208 bytes; its only caller is the exec thunk
+// 0x0229DB70, so only the Blueprint VM reaches it) decides whether a Blueprint "tick" branch runs: rcx=Actor, dl=Where
+// (ECityExecFilter: IslandOnly 0, CityOnly 1, Both 2), r8b=Whom (ERemoteExecFilter: LocalOnly 0, RemoteOnly 1,
+// LocalOrRemote 2, ServerOnly 3, LocalOrServer 4, All 5); al = result. Decoded on the 1.14.7 exe (same logic as 1.12
+// 0x01823000): WherePasses = Where==Both || ((Where==CityOnly) == world-is-city); Whom 0 and 4 pass only for an
+// AutonomousProxy (Role +0xF0 == 2), 1 only for a non-autonomous actor (Authority included), 2 and 5 always, and 3
+// (ServerOnly) NEVER - the client build has no NetMode branch. Every pawn on our servers is ROLE_Authority, so ServerOnly
+// and LocalOrServer branches never run there and RemoteOnly/LocalOrRemote branches always do.
+// What is proven: the native logic above. What is NOT proven: which Blueprint sites (TickStamina, TickBleedout, the
+// 0.5 s UpdateLastValidPlayerTransform edge-recovery timer, ...) sit behind which filter on 1.14.7 - the bytecode is
+// Oodle-compressed in the pak - and the "dedicated-server answer" table below is a semantic reading of the enum names
+// (an official UE_SERVER native cannot be checked in this binary). The census shows where the answers differ, not which
+// one is right.
+// Two independent opt-in modes; the hook is installed ONLY when one of the flags is present at InitServerHooks, and
+// only on DeployServer instances (AuthMode GlobalGameserver) with the no-local-player patch applied. The P2P host
+// (HuntCapability) is excluded. With neither flag: no hook, no behaviour change, the manual TickStamina stays.
+//   TICK_FILTER_CENSUS.flag  - diagnostic only. The game's answer is returned unchanged. Calls are counted per Blueprint
+//                              call site (exec-thunk hook: FFrame.Node = calling script function, script offset of the
+//                              first parameter) with the game answer next to the dedicated-server answer, logged once a
+//                              minute as [TickFilterCensus]; each calling function's Script bytes are dumped once for an
+//                              offline Kismet review; [EdgeRecoveryProbe] reads the edge-recovery fields every 10 s.
+//   SERVER_TICK_FILTER.flag  - fix. Only for ROLE_Authority actors that IsA BP_PlayerCharacter_C (the combat anim BP passes
+//                              the pawn as Actor too): ServerOnly / LocalOrServer / All -> WherePasses, LocalOnly /
+//                              RemoteOnly / LocalOrRemote -> false. Every other actor (behemoths, pets, NPCs, any
+//                              Blueprint the partial SDK dump does not show) gets the game's answer. While it is active
+//                              the manual per-connection TickStamina is skipped (the character's own tick runs it; both
+//                              would evaluate stamina twice per frame). SUBTRACTIVE TOO: RemoteOnly/LocalOrRemote branches
+//                              that run on our servers today stop - review the census "stop" rows before enabling.
+// Both flags together: fix answers plus the census. The hook takes no lock, writes no log and allocates nothing outside
+// census mode; it forwards to the game once DLL detach has begun. All FFrame/UFunction reads are SEH-guarded in
+// MpTickFilterReadFrame.
+using TickFilterHelperFn = bool(__fastcall*)(void* Actor, uint8_t Where, uint8_t Whom);
+using TickFilterExecFn = void(__fastcall*)(void* Context, void* Stack, void* Result);
+static TickFilterHelperFn OrigTickFilterHelper = nullptr;
+static TickFilterExecFn OrigTickFilterExec = nullptr;
+static std::atomic<bool> g_ServerTickFilterActive{ false };   // SERVER_TICK_FILTER.flag and the filter hook enabled
+static std::atomic<bool> g_TickFilterCensus{ false };         // TICK_FILTER_CENSUS.flag and the filter hook enabled
+static std::atomic<UClass*> g_TickFilterPlayerClass{ nullptr };   // BP_PlayerCharacter_C, cached on the game thread
+
+// Per-thread call-site context, set by the exec-thunk hook (census only) for the duration of one native call.
+thread_local void* t_TfSiteNode = nullptr;
+thread_local int32_t t_TfSiteOffset = -1;
+thread_local bool t_TfSiteValid = false;
+thread_local int32_t t_TfSiteNodeIndex = -1;   // the Node's GUObjectArray slot (UObject::Index @ 0x0C) at capture time
+
+// SEH-guarded FFrame read: Node +0x10 (calling UFunction), Code +0x20; UStruct::Script data +0x60 / count +0x68 (CANDIDATE
+// offsets, UE4.26 layout; the thunk itself uses +0x18/+0x20/+0x80). Offset = Code - Script.Data when Code lies inside the
+// script, else -1 (which also exposes a wrong Script offset in the census). OutIndex = the Node's UObject::Index (+0x0C),
+// recorded so the once-a-minute log can tell a still-live function from a freed or reused address. No C++ objects here (__try).
+__declspec(noinline) static bool MpTickFilterReadFrame(const void* Frame, void** OutNode, int32_t* OutOffset, int32_t* OutIndex) {
+    __try {
+        const uint8_t* F = static_cast<const uint8_t*>(Frame);
+        void* Node = *reinterpret_cast<void* const*>(F + 0x10);
+        const uint8_t* Code = *reinterpret_cast<const uint8_t* const*>(F + 0x20);
+        int32_t Offset = -1;
+        int32_t Index = -1;
+        if (Node) Index = *reinterpret_cast<const int32_t*>(static_cast<const uint8_t*>(Node) + 0x0C);
+        if (Node && Code) {
+            const uint8_t* N = static_cast<const uint8_t*>(Node);
+            const uint8_t* Script = *reinterpret_cast<const uint8_t* const*>(N + 0x60);
+            const int32_t Num = *reinterpret_cast<const int32_t*>(N + 0x68);
+            if (Script && Num > 0 && Code >= Script && Code <= Script + Num) Offset = static_cast<int32_t>(Code - Script);
+        }
+        *OutNode = Node;
+        *OutOffset = Offset;
+        *OutIndex = Index;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// SEH-guarded read of a UFunction's Script array (+0x60 data, +0x68 count). Copies at most Cap bytes into Out.
+__declspec(noinline) static int32_t MpTickFilterReadScript(const void* Node, uint8_t* Out, int32_t Cap, const void** OutData) {
+    __try {
+        const uint8_t* N = static_cast<const uint8_t*>(Node);
+        const uint8_t* Script = *reinterpret_cast<const uint8_t* const*>(N + 0x60);
+        const int32_t Num = *reinterpret_cast<const int32_t*>(N + 0x68);
+        *OutData = Script;
+        if (!Script || Num <= 0) return 0;
+        if (!Out) return Num;
+        const int32_t Copy = Num < Cap ? Num : Cap;
+        memcpy(Out, Script, static_cast<size_t>(Copy));
+        return Copy;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+struct MpTickFilterSiteRow {
+    void* Node; int32_t NodeIndex; int32_t Offset; uint8_t Where; uint8_t Whom;
+    uint64_t Calls, GamePass, ServerPass, Stop, Start, NoServerAnswer, OffThread, Total;
+};
+static MpTickFilterSiteRow g_TfSites[64] = {};
+static int g_TfSiteCount = 0;
+static uint64_t g_TfOverflow = 0;
+static volatile LONG64 g_TfFrameFaults = 0;
+static SRWLOCK g_TfLock = SRWLOCK_INIT;
+
+// The dedicated-server answer, or -1 when the hook gives the game's answer (not an authority player character, Whom out
+// of range, or the player class not cached yet). Reads only +0xF0 (the byte the native reads) and the object's class chain.
+static int MpTickFilterServerAnswer(void* Actor, uint8_t Where, uint8_t Whom) {
+    if (!Actor || Whom > 5) return -1;
+    if (reinterpret_cast<const uint8_t*>(Actor)[0xF0] != 3 /*ROLE_Authority*/) return -1;
+    UClass* PlayerClass = g_TickFilterPlayerClass.load(std::memory_order_acquire);
+    if (!PlayerClass || !reinterpret_cast<UObject*>(Actor)->IsA(PlayerClass)) return -1;
+    const bool WherePasses = OrigTickFilterHelper(Actor, Where, 5 /*All: Whom always passes, so this is the Where test*/);
+    switch (Whom) {
+    case 3: case 4: case 5: return WherePasses ? 1 : 0;   // ServerOnly, LocalOrServer, All
+    default: return 0;                                     // LocalOnly, RemoteOnly, LocalOrRemote: no local player here
+    }
+}
+
+static void MpTickFilterCount(uint8_t Where, uint8_t Whom, bool Game, int Server) {
+    void* Node = t_TfSiteValid ? t_TfSiteNode : nullptr;
+    const int32_t NodeIndex = t_TfSiteValid ? t_TfSiteNodeIndex : -1;
+    const int32_t Offset = t_TfSiteValid ? t_TfSiteOffset : -1;
+    const bool OffThread = GetCurrentThreadId() != GameTickThreadId;
+    const bool Effective = Server >= 0 ? Server == 1 : Game;   // what SERVER_TICK_FILTER.flag would answer
+    AcquireSRWLockExclusive(&g_TfLock);
+    MpTickFilterSiteRow* Row = nullptr;
+    for (int i = 0; i < g_TfSiteCount; ++i) {
+        MpTickFilterSiteRow& R = g_TfSites[i];
+        if (R.Node == Node && R.NodeIndex == NodeIndex && R.Offset == Offset && R.Where == Where && R.Whom == Whom) { Row = &R; break; }
+    }
+    if (!Row && g_TfSiteCount < static_cast<int>(sizeof(g_TfSites) / sizeof(g_TfSites[0]))) {
+        Row = &g_TfSites[g_TfSiteCount++];
+        *Row = MpTickFilterSiteRow{};
+        Row->Node = Node; Row->NodeIndex = NodeIndex; Row->Offset = Offset; Row->Where = Where; Row->Whom = Whom;
+    }
+    if (Row) {
+        ++Row->Calls; ++Row->Total;
+        if (Game) ++Row->GamePass;
+        if (Effective) ++Row->ServerPass;
+        if (Game && !Effective) ++Row->Stop;
+        if (!Game && Effective) ++Row->Start;
+        if (Server < 0) ++Row->NoServerAnswer;
+        if (OffThread) ++Row->OffThread;
+    } else {
+        ++g_TfOverflow;
+    }
+    ReleaseSRWLockExclusive(&g_TfLock);
+}
+
+static bool __fastcall TickFilterHelperDetour(void* Actor, uint8_t Where, uint8_t Whom) {
+    if (MpProcessDetaching()) return OrigTickFilterHelper(Actor, Where, Whom);
+    const bool Fix = g_ServerTickFilterActive.load(std::memory_order_relaxed);
+    if (!g_TickFilterCensus.load(std::memory_order_relaxed)) {
+        if (!Fix) return OrigTickFilterHelper(Actor, Where, Whom);
+        const int Server = MpTickFilterServerAnswer(Actor, Where, Whom);
+        return Server >= 0 ? Server == 1 : OrigTickFilterHelper(Actor, Where, Whom);
+    }
+    const bool Game = OrigTickFilterHelper(Actor, Where, Whom);
+    const int Server = MpTickFilterServerAnswer(Actor, Where, Whom);
+    MpTickFilterCount(Where, Whom, Game, Server);
+    return (Fix && Server >= 0) ? Server == 1 : Game;
+}
+
+// Census only: records the calling script function and offset for the filter call made inside this thunk.
+static void __fastcall TickFilterExecDetour(void* Context, void* Stack, void* Result) {
+    void* PrevNode = t_TfSiteNode;
+    const int32_t PrevOffset = t_TfSiteOffset;
+    const bool PrevValid = t_TfSiteValid;
+    const int32_t PrevIndex = t_TfSiteNodeIndex;
+    void* Node = nullptr;
+    int32_t Offset = -1;
+    int32_t Index = -1;
+    if (!MpProcessDetaching() && Stack && MpTickFilterReadFrame(Stack, &Node, &Offset, &Index)) {
+        t_TfSiteNode = Node; t_TfSiteOffset = Offset; t_TfSiteNodeIndex = Index; t_TfSiteValid = true;
+    } else {
+        t_TfSiteNode = nullptr; t_TfSiteOffset = -1; t_TfSiteNodeIndex = -1; t_TfSiteValid = false;
+        if (Stack && !MpProcessDetaching()) InterlockedIncrement64(&g_TfFrameFaults);
+    }
+    OrigTickFilterExec(Context, Stack, Result);
+    t_TfSiteNode = PrevNode; t_TfSiteOffset = PrevOffset; t_TfSiteNodeIndex = PrevIndex; t_TfSiteValid = PrevValid;
+}
+
+static bool MpTickFilterHookActive() {
+    return g_ServerTickFilterActive.load(std::memory_order_relaxed) || g_TickFilterCensus.load(std::memory_order_relaxed);
+}
+
+// Game thread: the BP class only exists once the map has loaded, so it is cached from the first connection pawn that the
+// existing per-connection loop has already matched with IsA(ABP_PlayerCharacter_C::StaticClass()). Until then the fix
+// answers like the game and the manual TickStamina keeps running.
+static void MpTickFilterCachePlayerClass(UClass* PlayerClass) {
+    if (!PlayerClass || !MpTickFilterHookActive() || g_TickFilterPlayerClass.load(std::memory_order_relaxed)) return;
+    g_TickFilterPlayerClass.store(PlayerClass, std::memory_order_release);
+    MpLog("[TickFilter] BP_PlayerCharacter_C class cached=" + MpPtr(PlayerClass)
+        + (g_ServerTickFilterActive.load(std::memory_order_relaxed)
+            ? std::string("; dedicated-server answers now active for player characters")
+            : std::string("; census now reports the dedicated-server answer for player characters")));
+}
+
+static const char* MpTickFilterWhomName(uint8_t Whom) {
+    static const char* const Names[6] = { "LocalOnly", "RemoteOnly", "LocalOrRemote", "ServerOnly", "LocalOrServer", "All" };
+    return Whom < 6 ? Names[Whom] : "?";
+}
+static const char* MpTickFilterWhereName(uint8_t Where) {
+    static const char* const Names[3] = { "IslandOnly", "CityOnly", "Both" };
+    return Where < 3 ? Names[Where] : "?";
+}
+
+// Census only, game thread: dumps a calling function's Script bytes once to <exe dir>\tickfilter_script_port<N>_<k>.bin.
+// In-memory Kismet holds raw object pointers where the pak has import indices; the logged base and name let an offline
+// reader relate them.
+// Keyed by the function's full name, not its address: a freed function's address can be reused by another one.
+// The caller has already checked that Node is still the live UFunction it recorded (MpTickFilterNodeStillLive).
+static void MpTickFilterDumpScriptOnce(void* Node, const std::string& Name) {
+    static std::string s_dumped[32];
+    static int s_count = 0;
+    for (int i = 0; i < s_count; ++i) if (s_dumped[i] == Name) return;
+    if (s_count >= 32) return;
+    s_dumped[s_count++] = Name;
+    const void* Data = nullptr;
+    const int32_t Num = MpTickFilterReadScript(Node, nullptr, 0, &Data);
+    if (Num <= 0 || Num > (8 << 20)) {
+        MpLog("[TickFilterCensus] script dump skipped fn=" + Name + " num=" + std::to_string(Num) + " (unreadable/empty/too big)");
+        return;
+    }
+    std::vector<uint8_t> Bytes(static_cast<size_t>(Num));
+    const int32_t Got = MpTickFilterReadScript(Node, Bytes.data(), Num, &Data);
+    if (Got != Num) {
+        MpLog("[TickFilterCensus] script dump failed fn=" + Name + " got=" + std::to_string(Got) + " of " + std::to_string(Num));
+        return;
+    }
+    char Path[MAX_PATH];
+    sprintf_s(Path, "%stickfilter_script_port%d_%d.bin", MpLogDir(), Globals::Port, s_count);
+    std::ofstream File(Path, std::ios::binary | std::ios::trunc);
+    if (File.is_open()) File.write(reinterpret_cast<const char*>(Bytes.data()), Num);
+    MpLog("[TickFilterCensus] script dump fn=" + Name + " node=" + MpPtr(Node) + " script=" + MpPtr(const_cast<void*>(Data))
+        + " bytes=" + std::to_string(Num) + " file=" + Path + (File.good() ? "" : " (WRITE FAILED)"));
+}
+
+// [2026-10-10 1.14.7] Census only, game thread (GC runs on this thread, so the answer holds until the caller returns): is
+// the Node recorded up to 60 s ago still the same live UFunction? It may have been garbage-collected since (a streamed
+// sublevel or an unloaded Blueprint class) and its memory reused, and GetFullName walks Class/Outer/FName unguarded.
+// Requires the GObjects round trip, the same slot index as at capture, and a live class that IsA UFunction.
+static bool MpTickFilterNodeStillLive(void* Node, int32_t NodeIndex) {
+    if (!Node || NodeIndex < 0 || !IsReadablePointer(Node, 0x70) || !IsRegisteredLiveObject(Node)) return false;
+    UObject* Obj = reinterpret_cast<UObject*>(Node);
+    if (Obj->Index != NodeIndex || !Obj->Class || !IsRegisteredLiveObject(Obj->Class)) return false;
+    return Obj->IsA(UFunction::StaticClass());
+}
+
+// Census only, game thread, once a minute: one line per call site with calls in the window, then the window resets.
+// "stop" = the game passes, the dedicated-server answer would not (branches that run on our servers today and would stop
+// under SERVER_TICK_FILTER.flag); "start" = the reverse (branches that never run today).
+static void MpTickFilterCensusTick() {
+    if (!g_TickFilterCensus.load(std::memory_order_relaxed)) return;
+    static ULONGLONG s_windowStart = 0;
+    const ULONGLONG Now = GetTickCount64();
+    if (s_windowStart == 0) { s_windowStart = Now; return; }
+    if (Now - s_windowStart < 60000) return;
+    const double Seconds = static_cast<double>(Now - s_windowStart) / 1000.0;
+    s_windowStart = Now;
+
+    MpTickFilterSiteRow Rows[64];
+    int Count = 0;
+    uint64_t Overflow = 0;
+    AcquireSRWLockExclusive(&g_TfLock);
+    Count = g_TfSiteCount;
+    for (int i = 0; i < Count; ++i) {
+        Rows[i] = g_TfSites[i];
+        MpTickFilterSiteRow& R = g_TfSites[i];
+        R.Calls = R.GamePass = R.ServerPass = R.Stop = R.Start = R.NoServerAnswer = R.OffThread = 0;
+    }
+    Overflow = g_TfOverflow;
+    ReleaseSRWLockExclusive(&g_TfLock);
+    const uint64_t FrameFaults = static_cast<uint64_t>(InterlockedCompareExchange64(
+        reinterpret_cast<volatile LONG64*>(&g_TfFrameFaults), 0, 0));
+
+    uint64_t Calls = 0, Stop = 0, Start = 0;
+    int Active = 0;
+    for (int i = 0; i < Count; ++i) {
+        const MpTickFilterSiteRow& R = Rows[i];
+        if (R.Calls == 0) continue;
+        ++Active; Calls += R.Calls; Stop += R.Stop; Start += R.Start;
+        std::string Fn = "(no frame)";
+        bool Live = false;
+        if (R.Node) {
+            Live = MpTickFilterNodeStillLive(R.Node, R.NodeIndex);
+            Fn = Live ? reinterpret_cast<UObject*>(R.Node)->GetFullName() : std::string("(stale)");
+        }
+        char Line[256];
+        sprintf_s(Line, " off=%d where=%s whom=%s calls=%llu game=%llu server=%llu stop=%llu start=%llu noServerAnswer=%llu offThread=%llu total=%llu",
+            R.Offset, MpTickFilterWhereName(R.Where), MpTickFilterWhomName(R.Whom),
+            static_cast<unsigned long long>(R.Calls), static_cast<unsigned long long>(R.GamePass),
+            static_cast<unsigned long long>(R.ServerPass), static_cast<unsigned long long>(R.Stop),
+            static_cast<unsigned long long>(R.Start), static_cast<unsigned long long>(R.NoServerAnswer),
+            static_cast<unsigned long long>(R.OffThread), static_cast<unsigned long long>(R.Total));
+        MpLog("[TickFilterCensus] site fn=" + Fn + Line);
+        if (Live) MpTickFilterDumpScriptOnce(R.Node, Fn);
+    }
+    char Summary[256];
+    sprintf_s(Summary, "[TickFilterCensus] %.1fs: sites=%d (known %d) calls=%llu stop=%llu start=%llu overflow=%llu frameFaults=%llu playerClass=%s mode=%s",
+        Seconds, Active, Count, static_cast<unsigned long long>(Calls), static_cast<unsigned long long>(Stop),
+        static_cast<unsigned long long>(Start), static_cast<unsigned long long>(Overflow),
+        static_cast<unsigned long long>(FrameFaults),
+        g_TickFilterPlayerClass.load(std::memory_order_relaxed) ? "cached" : "not-yet",
+        g_ServerTickFilterActive.load(std::memory_order_relaxed) ? "server-answers" : "game-answers");
+    MpLog(Summary);
+}
+
+// Read-only, either tick-filter flag, game thread, every 10 s per connected player pawn: does the server ever run the edge
+// recovery recorder? EdgeRecoveryTransformTimer (+0x1910, FTimerHandle, 0 = never set), LastValidPlayerTransform translation
+// (+0x1880 + 0x10), BleedOutTImer (+0xE68) - BP_PlayerCharacter_C offsets, identical in the 1.12 and 1.14.7 SDKs.
+// Expected with the game's answers: edgeTimer=0 and a stale lastValid. Unreadable fields are logged as such, not skipped.
+static void MpEdgeRecoveryProbe(AActor* Pawn, int32_t ConnIndex) {
+    const uintptr_t P = reinterpret_cast<uintptr_t>(Pawn);
+    std::string Line = "[EdgeRecoveryProbe] conn=" + std::to_string(ConnIndex) + " pawn=" + MpPtr(Pawn);
+    char Buf[160];
+    if (IsReadablePointer(reinterpret_cast<void*>(P + 0x1910), 8)) {
+        sprintf_s(Buf, " edgeTimer=0x%llX", static_cast<unsigned long long>(*reinterpret_cast<uint64_t*>(P + 0x1910)));
+        Line += Buf;
+    } else Line += " edgeTimer=unreadable";
+    bool HaveLast = false;
+    float Last[3] = {};
+    if (IsReadablePointer(reinterpret_cast<void*>(P + 0x1890), 16)) {
+        memcpy(Last, reinterpret_cast<const void*>(P + 0x1890), sizeof(Last));
+        HaveLast = true;
+        sprintf_s(Buf, " lastValid=(%.0f,%.0f,%.0f)", Last[0], Last[1], Last[2]);
+        Line += Buf;
+    } else Line += " lastValid=unreadable";
+    const FVector Loc = Pawn->K2_GetActorLocation();
+    sprintf_s(Buf, " pawnLoc=(%.0f,%.0f,%.0f)", Loc.X, Loc.Y, Loc.Z);
+    Line += Buf;
+    if (HaveLast) {
+        const float dx = Loc.X - Last[0], dy = Loc.Y - Last[1], dz = Loc.Z - Last[2];
+        sprintf_s(Buf, " dist=%.0f", std::sqrt(dx * dx + dy * dy + dz * dz));
+        Line += Buf;
+    }
+    if (IsReadablePointer(reinterpret_cast<void*>(P + 0xE68), 8)) {
+        sprintf_s(Buf, " bleedTimer=0x%llX", static_cast<unsigned long long>(*reinterpret_cast<uint64_t*>(P + 0xE68)));
+        Line += Buf;
+    } else Line += " bleedTimer=unreadable";
+    MpLog(Line);
+}
+
 // [1.14.7 FIX 2026-10-04] The engine pointer, captured from the tick hook itself.
 //
 // The manual net tick has always called 0x00A82CF0 with Networking::NetDriver as the first argument:
@@ -4762,7 +7219,70 @@ static constexpr uint64_t kClientRolePumpStableChainMs = 750;
 //     ManualTickDispatchSEH code=0xC0000005 params=0x0,0x88 regs{rax=0x0 ...}
 // 0x88 is UNetDriver::ServerConnection, which Networking::Listen deliberately nulls - i.e. the code was
 // following a client-style path off a garbage base. Calling it with the real engine is the correct fix.
+// [2026-10-11 1.14.7 O0] Replication-graph sizes for [PerfDetail], every 2 s, game thread, read-only. Offsets verified on
+// 1.14.7 (see MpDriveReplicationGraph and the relevance-settings layout block): NetDriver+0x6E8 graph (its +0x30 must
+// be the driver), graph Connections {Data +0x38, Num +0x40}, GlobalActorReplicationInfoMap Num +0xC0+0x08, each
+// connection manager's actor-info map Num +0x30+0x08, NetDriver ClientConnections {Data +0x90, Num +0x98} and each
+// UNetConnection's OpenChannels.Num +0x78. Every read goes through the SEH helpers; nothing is written.
+static void MpPerfSampleGraphCounts() {
+    if (!Globals::AmServer || !Networking::NetDriver || !MpPerfDetailEnabled()) return;
+    static uint64_t s_lastMs = 0;
+    const uint64_t Now = GetTickCount64();
+    if (s_lastMs != 0 && Now - s_lastMs < 2000) return;
+    s_lastMs = Now;
+    const uintptr_t Driver = reinterpret_cast<uintptr_t>(Networking::NetDriver);
+    const uintptr_t Graph = SafeReadPtr(Driver, 0x6E8);
+    if (!Graph || SafeReadPtr(Graph, 0x30) != Driver) return;
+    const int32_t Conns = SafeReadI32At(Graph, 0x40);
+    const uintptr_t ConnData = SafeReadPtr(Graph, 0x38);
+    int32_t InfoSum = 0, InfoMax = 0;
+    for (int32_t i = 0; ConnData && i < Conns && i < 1024; ++i) {
+        const uintptr_t Mgr = SafeReadPtr(ConnData, static_cast<uintptr_t>(i) * sizeof(void*));
+        if (!Mgr) continue;
+        const int32_t N = SafeReadI32At(Mgr, 0x38);
+        if (N < 0 || N > 1000000) continue;
+        InfoSum += N;
+        if (N > InfoMax) InfoMax = N;
+    }
+    const int32_t Clients = SafeReadI32At(Driver, 0x98);
+    const uintptr_t ClientData = SafeReadPtr(Driver, 0x90);
+    int32_t ChSum = 0, ChMax = 0;
+    for (int32_t i = 0; ClientData && i < Clients && i < 1024; ++i) {
+        const uintptr_t Conn = SafeReadPtr(ClientData, static_cast<uintptr_t>(i) * sizeof(void*));
+        if (!Conn) continue;
+        const int32_t N = SafeReadI32At(Conn, 0x78);
+        if (N < 0 || N > 1000000) continue;
+        ChSum += N;
+        if (N > ChMax) ChMax = N;
+    }
+    g_perfGraphConns.store(Conns, std::memory_order_relaxed);
+    g_perfGraphGlobalActors.store(SafeReadI32At(Graph, 0xC8), std::memory_order_relaxed);
+    g_perfGraphActorInfoSum.store(InfoSum, std::memory_order_relaxed);
+    g_perfGraphActorInfoMax.store(InfoMax, std::memory_order_relaxed);
+    g_perfClientConns.store(Clients, std::memory_order_relaxed);
+    g_perfOpenChannelsSum.store(ChSum, std::memory_order_relaxed);
+    g_perfOpenChannelsMax.store(ChMax, std::memory_order_relaxed);
+    g_perfGraphSampleMs.store(Now, std::memory_order_relaxed);
+}
+
 void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender) {
+    // [2026-10-10 1.14.7 Perf] Frame interval for the [Perf] line (entry to entry, so it includes the engine's own frame
+    // wait). One QPC read and a few relaxed atomics; no logging, allocation or lock on the game thread.
+    if (Globals::AmServer) {
+        LARGE_INTEGER PerfEntry{};
+        QueryPerformanceCounter(&PerfEntry);
+        MpPerfFrameSample(PerfEntry.QuadPart);
+        // [2026-10-11 1.14.7 O3] New pointer-check epoch for this frame (see MpReadableThisFrame).
+        if (g_MpReadableCacheMode < 0) {
+            g_MpReadableCacheMode = MpExeRelativeFlagPresent(L"NO_FRAME_POINTER_CACHE.flag") ? 0 : 1;
+            MpLog(std::string("[FramePointerCache] ")
+                + (g_MpReadableCacheMode ? "ON: repeated net-driver/connection/graph pointer checks answered once per "
+                                           "frame segment (NO_FRAME_POINTER_CACHE.flag reverts)"
+                                         : "OFF (NO_FRAME_POINTER_CACHE.flag): every check calls VirtualQuery"));
+        }
+        g_MpReadableCacheThread = GetCurrentThreadId();
+        MpReadableCacheNextEpoch();
+    }
     if (GameEngine != nullptr && g_GameEnginePtr == nullptr) {
         g_GameEnginePtr = GameEngine;
     }
@@ -4801,12 +7321,12 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
     // GObjects) and it carries the only fix lever this session produced, so it may run for either flag.
     // The membership report is the heavy one (a full GObjects walk plus an IsA pass per object, several
     // times a minute) and only ever runs for the diagnostics flag.
+    const bool HubRepDiag = Globals::AmServer && MpExeRelativeFlagPresent(L"ENABLE_HUB_REP_DIAGNOSTICS.flag");
     if (Globals::AmServer
-        && (MpExeRelativeFlagPresent(L"ENABLE_HUB_REP_DIAGNOSTICS.flag")
-            || MpExeRelativeFlagPresent(L"ENABLE_BASE_ACTOR_BOOTSTRAP.flag"))) {
+        && (HubRepDiag || MpExeRelativeFlagPresent(L"ENABLE_BASE_ACTOR_BOOTSTRAP.flag"))) {
         MpRouteBaseActorsToConnections();
     }
-    if (Globals::AmServer && MpExeRelativeFlagPresent(L"ENABLE_HUB_REP_DIAGNOSTICS.flag")) {
+    if (HubRepDiag) {
         MpReportReplicationMembership();
     }
 
@@ -4827,25 +7347,43 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
 
     SanitizeNetDriverBeforeEngineTick();
 
-    // [1.14.7 FIX 2026-10-05] Capture the genuine net-id TYPE here, before BOTH the engine's own net pass
-    // and MpDriveReplicationGraph below. The engine asks the synthetic object for its type DURING
-    // ServerReplicateActors, so capturing anywhere later in the frame leaves the first serialization of
-    // every join answering FName None. The drive is what asks for the type, so it must run after this.
-    MpCaptureGenuineNetIdType();
-
+    // [2026-10-10 1.14.7 Perf] Time the native engine tick for the [Perf] line; the call itself is unchanged.
+    LARGE_INTEGER PerfEngine0{};
+    if (Globals::AmServer) {
+        MpReadableCacheNextEpoch();   // [2026-10-11 O3] the engine tick (and its GC) is its own pointer-check epoch
+        QueryPerformanceCounter(&PerfEngine0);
+    }
     reinterpret_cast<void(*)(UGameEngine*, float, char)>(OrigGameEngineTick)(GameEngine, DeltaTime, CanRender);
+    if (Globals::AmServer) {
+        LARGE_INTEGER PerfEngine1{};
+        QueryPerformanceCounter(&PerfEngine1);
+        if (PerfEngine1.QuadPart > PerfEngine0.QuadPart) {
+            g_perfEngineCalls.fetch_add(1, std::memory_order_relaxed);
+            g_perfEngineTicksSum.fetch_add(static_cast<uint64_t>(PerfEngine1.QuadPart - PerfEngine0.QuadPart), std::memory_order_relaxed);
+            if (MpPerfDetailEnabled()) MpPerfPhaseAdd(g_perfPhaseEngine, PerfEngine0.QuadPart, PerfEngine1.QuadPart);
+        }
+        MpReadableCacheNextEpoch();   // [2026-10-11 O3] nothing remembered from inside the engine tick survives it
+    }
 
     // [1.14.7 REPLICATION-GRAPH DRIVE] The engine's own TickFlush never dispatches to
     // UNetDriver::ReplicationDriver on this build, so drive the Archon graph here, once per frame,
     // immediately after the engine tick has finished its own net pass. See MpDriveReplicationGraph.
-    //
-    // [1.14.7 FIX 2026-10-08] Suppress the hub phantom FIRST. The phantom's pawn is spawned and possessed
-    // inside the engine tick above; this drive is the only thing that gathers actors and opens channels on
-    // this build, so suppression has to run between the two, every frame. It used to run later in this
-    // hook on a 1s throttle, and the 8 October run measured the result: a client that joined before the
-    // phantom pawn existed received it (client census archonCharacters=2).
-    MpSuppressPhantomReplication();
+    if (Globals::AmServer) {
+        DropStalePlayerControllerChannelQuarantine();
+    }
+    // [2026-10-11 1.14.7 O0] Timed for [PerfDetail]; the call itself is unchanged.
+    const bool PerfDetail = Globals::AmServer && MpPerfDetailEnabled();
+    const int64_t PerfGraph0 = PerfDetail ? MpQpcNow() : 0;
     MpDriveReplicationGraph(DeltaTime);
+    if (PerfDetail) {
+        MpPerfPhaseAdd(g_perfPhaseGraph, PerfGraph0, MpQpcNow());
+        MpPerfSampleGraphCounts();
+    }
+
+    // [1.14.7 FIX 2026-10-10] Resume progression components parked before the configuration loaded.
+    MpProgressionWaitPoll();
+    MpArrivalTriggerServerProbe();   // read-only diagnostic, 40 s after each login
+    MpHuntPassServerStateTick();     // read-only diagnostic, every 10 s, logs changes only
 
     // [2026-07-20] Server-side skeletal pose/socket fix (FORCE_SERVER_MESH_POSE.flag). Server-only; the
     // helper self-throttles + no-ops unless the flag is present. See its definition above.
@@ -4914,7 +7452,11 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
     // [Group B cleanup 2026-07-13] Timed server LoadManager/lifecycle GObjects-dump block removed
     // (DumpLifecycleState + DumpLoadManagerViaGObjects — obsolete Phase-0 readiness scanners, gated off).
 
-    if (GetAsyncKeyState(VK_F7)) {
+    // [2026-10-10 1.14.7 CPU] F7 GObjects dump: client-only. GetAsyncKeyState reads the shared desktop key state, so
+    // F7 pressed in ANY window made every local hub/hunt walk all ~208k objects and then busy-wait on its game thread
+    // until the key was released (no tick, no net, no graph drive). This hook is installed only by InitServerHooks,
+    // so on today's builds the handler never runs at all.
+    if (!Globals::AmServer && GetAsyncKeyState(VK_F7)) {
         for (int i = 0; i < SDK::UObject::GObjects->Num(); i++)
         {
             SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
@@ -4947,15 +7489,21 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
         // A launch string with two `uid:huntId` entries must therefore remain at 2 until both
         // initial party members arrive. Persistent hubs carry NO_EXPECTED_PLAYERS and remain 0.
         //
-        // Verified per SDK/Archon_classes.hpp:
-        //   AArchonGameMode::ExpectedPlayerCount   at +0x0498  (line 16035)
-        //   AArchonGameState::ExpectedPlayerCount  at +0x02E8  (line 7784, Net-replicated)
+        // Verified per SDK/Archon_classes.hpp (static_asserted in Assertions.inl):
+        //   AArchonGameMode::ExpectedPlayerCount   at +0x0498  (Archon_classes.hpp:16653)
+        //   AArchonGameState::ExpectedPlayerCount  at +0x02E8  (Archon_classes.hpp:18683, Net-replicated)
         // Ramsgate/Dojo use AArchonGameMode_City and AArchonGameMode_Island, both of which
         // inherit from AArchonGameMode, so IsA(AArchonGameMode::StaticClass()) covers them.
         //
-        // Rewritten every frame (cheap, ~one-time GObjects walk cost) as belt-and-braces against
-        // InitGame or replication restoring the native default of 1. We keep the existing
-        // UArchonLoadManager::LoadFailed compatibility hook unchanged.
+        // Rewritten every frame as belt-and-braces against InitGame or replication restoring the native
+        // default of 1. We keep the existing UArchonLoadManager::LoadFailed compatibility hook unchanged.
+        // [2026-10-10 1.14.7 CPU] The objects now come from the world itself: GWorld->AuthorityGameMode (+0x118)
+        // and GWorld->GameState (+0x120), the only GameMode the engine consults and the only GameState it
+        // replicates. The previous lookup walked every GObjects entry (~208k on Ramsgate) with two IsA calls each
+        // on EVERY frame (the old comment called that "cheap, ~one-time"; it was neither). Same values, same
+        // fields, same compare-then-write, same one-time log text. A frame with no readable world writes nothing
+        // and the next frame writes. MpExpectedPlayerWorldCensus logs a one-shot cross-check (10 s after listen
+        // and at the first K2_PostLogin). LEGACY_EXPECTED_PLAYER_WALK.flag (read once) restores the full walk.
         // [A/B 2026-07-16] DISABLE_EXPECTED_PLAYER_ZERO.flag — when present next to the game .exe,
         // skip synchronization so the native session/load-manager state is left intact for an
         // A/B. Cached once (this runs every tick). Default OFF (absent flag = roster sync).
@@ -4969,11 +7517,45 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
                                          : "absent -> roster sync ENABLED (default)")
                 + " launchRosterCount=" + std::to_string(s_launchExpectedPlayers));
         }
+        static int s_legacyExpectedWalk = -1;
+        if (s_legacyExpectedWalk < 0) {
+            s_legacyExpectedWalk = MpExeRelativeFlagPresent(L"LEGACY_EXPECTED_PLAYER_WALK.flag") ? 1 : 0;
+            MpLog(std::string("[ExpectedPlayerCount] lookup = ")
+                + (s_legacyExpectedWalk ? "full GObjects walk every frame (LEGACY_EXPECTED_PLAYER_WALK.flag present)"
+                                        : "world pointers GWorld+0x118 / +0x120 (default)"));
+        }
 
-        if (s_disableExpectedZero == 0 && SDK::UObject::GObjects) {
-            static bool s_loggedGameMode  = false;
-            static bool s_loggedGameState = false;
+        static bool s_loggedGameMode  = false;
+        static bool s_loggedGameState = false;
+        if (s_disableExpectedZero == 0 && s_legacyExpectedWalk == 0) {
+            SDK::UWorld* World = SDK::UWorld::GetWorld();   // Offsets::GWorld 0x06FC7F58
+            if (World && IsReadablePointer(World, 0x128)) {
+                const uintptr_t W = reinterpret_cast<uintptr_t>(World);
+                MpSyncExpectedPlayerField(*reinterpret_cast<SDK::UObject**>(W + 0x118), SDK::AArchonGameMode::StaticClass(),
+                    0x0498, "GameMode", "+0x0498", s_loggedGameMode, s_launchExpectedPlayers);
+                MpSyncExpectedPlayerField(*reinterpret_cast<SDK::UObject**>(W + 0x120), SDK::AArchonGameState::StaticClass(),
+                    0x02E8, "GameState", "+0x02E8", s_loggedGameState, s_launchExpectedPlayers);
+            }
+        }
+        // One-shot read-only census (both lookups): 10 s after the first listening frame, and once after the
+        // first K2_PostLogin (g_postLoginTimeMs is set by the server ProcessEvent hook).
+        {
+            static uint64_t s_censusListenMs = 0;
+            static bool s_censusListenDone = false;
+            static bool s_censusLoginDone = false;
+            const uint64_t NowMs = GetTickCount64();
+            if (s_censusListenMs == 0) s_censusListenMs = NowMs;
+            if (!s_censusListenDone && NowMs - s_censusListenMs >= 10000) {
+                s_censusListenDone = true;
+                MpExpectedPlayerWorldCensus("listen+10s");
+            }
+            if (!s_censusLoginDone && g_postLoginTimeMs.load(std::memory_order_relaxed) != 0) {
+                s_censusLoginDone = true;
+                MpExpectedPlayerWorldCensus("first-postlogin");
+            }
+        }
 
+        if (s_disableExpectedZero == 0 && s_legacyExpectedWalk == 1 && SDK::UObject::GObjects) {
             const int Count = SDK::UObject::GObjects->Num();
             for (int i = 0; i < Count; i++) {
                 SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
@@ -5025,7 +7607,7 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
         int32_t preConnectionMax = -1;
 
         if (Networking::NetDriver &&
-            IsReadablePointer(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x98), sizeof(int32_t) * 2)) {
+            MpReadableThisFrame(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x98), sizeof(int32_t) * 2)) {
             preConnectionCount = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x98);
             preConnectionMax = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x9C);
         }
@@ -5038,8 +7620,12 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
         // Publish the remote connection count for the empty-instance watchdog (see g_wdConnCount).
         if (preConnectionCount >= 0) {
             g_wdConnCount.store(preConnectionCount, std::memory_order_relaxed);
-            g_wdConnStampMs.store(GetTickCount64(), std::memory_order_relaxed);
-            if (preConnectionCount > 0) g_wdHadRemoteClient.store(true, std::memory_order_relaxed);
+            const uint64_t ConnNowMs = GetTickCount64();
+            g_wdConnStampMs.store(ConnNowMs, std::memory_order_relaxed);
+            if (preConnectionCount > 0) {
+                g_wdHadRemoteClient.store(true, std::memory_order_relaxed);
+                g_wdLastRemoteConnMs.store(ConnNowMs, std::memory_order_relaxed);   // [2026-10-10 RAM] trim re-arm
+            }
         }
         {
             static int32_t s_lastConnCount = -2;   // -2 = uninitialized (distinct from -1 = unreadable)
@@ -5052,7 +7638,10 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
                 // [2026-07-16] Snapshot game-mode/session/state at every join/leave edge so the
                 // P1-leave -> P2-enable transition (and how the one-expected-player init gates P2)
                 // is visible in the log.
-                LogArchonLifecycle(("ConnEdge " + std::to_string(s_lastConnCount) + "->" + std::to_string(preConnectionCount)).c_str());
+                // [2026-10-11 O2] World-pointer lookup now (LogArchonLifecycle); off with PRODUCTION_LOG_PROFILE.flag.
+                if (!MpProductionLogProfile()) {
+                    LogArchonLifecycle(("ConnEdge " + std::to_string(s_lastConnCount) + "->" + std::to_string(preConnectionCount)).c_str());
+                }
                 s_lastConnCount = preConnectionCount;
             }
         }
@@ -5060,18 +7649,6 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
         // [1.14.7 2026-10-05] Self-throttled to one line per 2s and only while a client connection
         // exists; runs on both hub ports but logs nothing until someone joins.
         MpSendPathDiag();
-
-        // [1.14.7 2026-10-08] MpSuppressPhantomReplication now runs right after the engine tick, before the
-        // graph drive (see the call above MpDriveReplicationGraph), so a newly spawned phantom pawn never
-        // reaches a gather.
-
-        // [1.14.7 FIX 2026-10-05] The genuine net-id type is captured at the TOP of this hook, before both
-        // the engine tick and the graph drive (see the call above OrigGameEngineTick), never here.
-
-        // [1.14.7 2026-10-05] The full contract dump CALLS UNKNOWN VIRTUAL SLOTS on a live engine object,
-        // so it is opt-in now (NETID_CONTRACT_PROBE.flag in the exe directory) rather than running during
-        // normal gameplay. Its job is done: the measured contract is implemented in MpSynthNetId* below.
-        MpNetIdContractProbe();
 
         // [2026-07-16] MatchState-change trace: catch GameMode MatchState transitions between
         // connection edges (e.g. WaitingToStart -> InProgress, and whatever flips at P1-leave to
@@ -5093,7 +7670,14 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
             if (!gmOk && (nowMs - s_lastFindMs) > 1000) {
                 s_lastFindMs = nowMs;
                 s_gm = nullptr;
-                if (SDK::UObject::GObjects) {
+                // [2026-10-11 1.14.7 O2] The world's AuthorityGameMode (+0x118) instead of a ~208k-object walk once a
+                // second while it is missing (boot, map change). LEGACY_LIFECYCLE_WALK.flag keeps the walk.
+                if (!MpLegacyLifecycleWalk()) {
+                    SDK::UObject* WorldGm = nullptr;
+                    SDK::UObject* WorldGs = nullptr;
+                    MpWorldGameModeAndState(WorldGm, WorldGs);
+                    s_gm = reinterpret_cast<AArchonGameMode*>(WorldGm);
+                } else if (SDK::UObject::GObjects) {
                     const int n = SDK::UObject::GObjects->Num();
                     for (int i = 0; i < n; i++) {
                         SDK::UObject* o = SDK::UObject::GObjects->GetByIndex(i);
@@ -5110,7 +7694,7 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
                     std::string ms = reinterpret_cast<SDK::FName*>(reinterpret_cast<uintptr_t>(s_gm) + 0x02C0)->ToString();
                     MpLog("[MatchStateChange] tick=" + std::to_string(tickCounter) + " -> " + ms
                         + " (idx " + std::to_string(s_lastMatchIdx) + "->" + std::to_string(idx) + ")");
-                    LogArchonLifecycle(("MatchState=" + ms).c_str());
+                    if (!MpProductionLogProfile()) LogArchonLifecycle(("MatchState=" + ms).c_str());   // [2026-10-11 O2/O3]
                     s_lastMatchIdx = idx;
                 }
             }
@@ -5172,8 +7756,11 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
             // "reentrancy guard added" had no observable effect. It is cleared on every path, so the call is
             // wrapped in an explicit block rather than folded into the condition.
             s_inManualTick = true;
+            const int64_t PerfDispatch0 = PerfDetail ? MpQpcNow() : 0;   // [2026-10-11 O0] timed for [PerfDetail]
             const bool TickOk = SafeManualTickDispatch(Networking::NetDriver,
                 ManualTickZeroDeltaTime() ? 0.0f : DeltaTime);
+            if (PerfDetail) MpPerfPhaseAdd(g_perfPhaseDispatch, PerfDispatch0, MpQpcNow());
+            MpReadableCacheNextEpoch();   // [2026-10-11 O3] the dispatch ran game code: fresh pointer checks after it
             s_inManualTick = false;
             if (!TickOk) {
                 ReportManualNetTickFailure(false, tickCounter);
@@ -5216,12 +7803,19 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
                 + " skipped TickFlush after sanitizing unsafe NetDriver state");
             tickFlushOk = false;
         }
-        else if (!SafeManualTickFlush(Networking::NetDriver, DeltaTime)) {
-            ReportManualNetTickFailure(true, tickCounter);
-            tickFlushOk = false;
-        }
         else {
-            ReportManualNetTickRecovery(true, tickCounter);
+            // [2026-10-11 1.14.7 O0] Timed for [PerfDetail]; same call, same failure/recovery reporting.
+            const int64_t PerfFlush0 = PerfDetail ? MpQpcNow() : 0;
+            const bool FlushOk = SafeManualTickFlush(Networking::NetDriver, DeltaTime);
+            if (PerfDetail) MpPerfPhaseAdd(g_perfPhaseFlush, PerfFlush0, MpQpcNow());
+            MpReadableCacheNextEpoch();   // [2026-10-11 O3]
+            if (!FlushOk) {
+                ReportManualNetTickFailure(true, tickCounter);
+                tickFlushOk = false;
+            }
+            else {
+                ReportManualNetTickRecovery(true, tickCounter);
+            }
         }
 
         if (traceNetTick) {
@@ -5252,7 +7846,8 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
     // the engine creates the GameNetDriver during map load. Skip the manual path and announce READY
     // only once UWorld::NetDriver (UWorld+0x38) actually exists; the harness independently confirms
     // the port is bound, so this never announces a listener that is not there.
-    if (Globals::DoListen && MpExeRelativeFlagPresent(L"MAP_URL_LISTEN.flag")) {
+    // [2026-10-11] Never on a player-hosted server (MpMapUrlListenEnabled): it listens manually below.
+    if (Globals::DoListen && MpMapUrlListenEnabled()) {
         Globals::DoListen = false;
         Globals::WaitingForEngineListener = true;
         MpLog("[GameEngineTick] manual Listen skipped; waiting for the ENGINE listener (?listen map URL)");
@@ -5310,7 +7905,7 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
         else {
             for (int32_t Index = 0; Index < ClientConnectionCount; ++Index) {
                 UNetConnection* Connection = ClientConnectionData[Index];
-                if (!IsReadablePointer(Connection, 0x140)) {
+                if (!MpReadableThisFrame(Connection, 0x140)) {   // [2026-10-11 O3] once per frame segment
                     continue;
                 }
 
@@ -5354,14 +7949,37 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
                 }
             }
 
+            // [2026-10-10 1.14.7] Tick-filter opt-in modes (TICK_FILTER_CENSUS.flag / SERVER_TICK_FILTER.flag): one
+            // [EdgeRecoveryProbe] round every 10 s. Nothing here runs when neither flag installed the hook.
+            bool EdgeProbeRound = false;
+            if (MpTickFilterHookActive()) {
+                static ULONGLONG s_edgeProbeLast = 0;
+                const ULONGLONG NowMs = GetTickCount64();
+                if (NowMs - s_edgeProbeLast >= 10000) { s_edgeProbeLast = NowMs; EdgeProbeRound = true; }
+            }
             for (int32_t Index = 0; Index < ClientConnectionCount; ++Index) {
                 UNetConnection* Conn = ClientConnectionData[Index];
-                if (!IsReadablePointer(Conn, 0x140)) {
+                if (!MpReadableThisFrame(Conn, 0x140)) {   // [2026-10-11 O3] once per frame segment
                     continue;
                 }
 
                 if (Conn->PlayerController && Conn->PlayerController->Pawn && Conn->PlayerController->Pawn->IsA(ABP_PlayerCharacter_C::StaticClass())) {
-                    ((ABP_PlayerCharacter_C*)Conn->PlayerController->Pawn)->TickStamina(ECityExecFilter::Both, ERemoteExecFilter::All);
+                    // [2026-10-10 1.14.7] With SERVER_TICK_FILTER.flag the character's own tick runs TickStamina once per
+                    // actor tick (its ServerOnly/LocalOrServer branch now passes); calling it here as well would evaluate
+                    // stamina twice per frame. The manual call stays until the player class is cached (the fix answers
+                    // like the game before that), and always without the flag.
+                    MpTickFilterCachePlayerClass(ABP_PlayerCharacter_C::StaticClass());
+                    if (!(g_ServerTickFilterActive.load(std::memory_order_relaxed)
+                          && g_TickFilterPlayerClass.load(std::memory_order_relaxed))) {
+                        ((ABP_PlayerCharacter_C*)Conn->PlayerController->Pawn)->TickStamina(ECityExecFilter::Both, ERemoteExecFilter::All);
+                    } else {
+                        static bool s_staminaSkipLogged = false;
+                        if (!s_staminaSkipLogged) {
+                            s_staminaSkipLogged = true;
+                            MpLog("[TickFilter] manual TickStamina skipped (SERVER_TICK_FILTER.flag): the character's own tick runs it");
+                        }
+                    }
+                    if (EdgeProbeRound) MpEdgeRecoveryProbe(Conn->PlayerController->Pawn, Index);
                     // [2026-07-17 co-op smoothness] Measured: player pawns replicate ~10Hz (period 3) vs the
                     // behemoth ~30Hz. Raise the pawn's NetUpdateFrequency (+0x108) / MinNetUpdateFrequency
                     // (+0x10C) so the graph gives it period 1 (~30Hz, capped by NetServerMaxTickRate). Every
@@ -5376,6 +7994,7 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
                 }
             }
         }
+        MpTickFilterCensusTick();   // TICK_FILTER_CENSUS.flag only; once a minute
     }
 }
 
@@ -5454,8 +8073,11 @@ void ArchonLoadingScreenFadeInHook(void* LoadingScreen, uint8_t FadeMode) {
 
 struct RawPointerArray { void** Data; int32_t Num; int32_t Max; };
 
+// [2026-10-11 1.14.7 O3] Runs three times a frame on a server (the engine's TickDispatch hook, before the manual dispatch
+// and before the manual flush); the NetDriver and per-connection pointer checks now go through MpReadableThisFrame, so
+// each pointer costs one VirtualQuery per frame segment instead of one per call. Same checks, same repairs.
 static bool SanitizeNetDriverClientConnections(void* NetDriver, const char* Tag) {
-    if (!NetDriver || !IsReadablePointer(NetDriver, 0xA0)) {
+    if (!NetDriver || !MpReadableThisFrame(NetDriver, 0xA0)) {
         MpLog(std::string("[") + Tag + "] invalid NetDriver=" + MpPtr(NetDriver));
         return false;
     }
@@ -5463,7 +8085,7 @@ static bool SanitizeNetDriverClientConnections(void* NetDriver, const char* Tag)
     RawPointerArray* ClientConnections = reinterpret_cast<RawPointerArray*>(
         reinterpret_cast<uintptr_t>(NetDriver) + 0x90);
 
-    if (!IsReadablePointer(ClientConnections, sizeof(RawPointerArray))) {
+    if (!MpReadableThisFrame(ClientConnections, sizeof(RawPointerArray))) {
         MpLog(std::string("[") + Tag + "] unreadable ClientConnections metadata NetDriver=" + MpPtr(NetDriver));
         return false;
     }
@@ -5482,7 +8104,7 @@ static bool SanitizeNetDriverClientConnections(void* NetDriver, const char* Tag)
     int32_t WriteIndex = 0;
     for (int32_t ReadIndex = 0; ReadIndex < ClientConnections->Num; ++ReadIndex) {
         void* Connection = ClientConnections->Data[ReadIndex];
-        if (!IsReadablePointer(Connection, 0x138)) {
+        if (!MpReadableThisFrame(Connection, 0x138)) {
             MpLog(std::string("[") + Tag + "] dropping invalid connection"
                 + " index=" + std::to_string(ReadIndex)
                 + " ptr=" + MpPtr(Connection));
@@ -5507,7 +8129,7 @@ static bool SanitizeNetDriverClientConnections(void* NetDriver, const char* Tag)
     RawPointerArray* PendingCleanup = reinterpret_cast<RawPointerArray*>(
         reinterpret_cast<uintptr_t>(NetDriver) + 0xF0);
 
-    if (!IsReadablePointer(PendingCleanup, sizeof(RawPointerArray))) {
+    if (!MpReadableThisFrame(PendingCleanup, sizeof(RawPointerArray))) {
         MpLog(std::string("[") + Tag + "] unreadable NetDriver+0xF0 cleanup metadata NetDriver=" + MpPtr(NetDriver));
         return false;
     }
@@ -5538,7 +8160,8 @@ void NetDriverTickDispatchInnerHook(void* NetDriver, float DeltaTime) {
     {
         static std::atomic<int> s_calls{ 0 };
         const int n = s_calls.fetch_add(1, std::memory_order_relaxed);
-        if (n < 3 || (n % 600) == 0) {
+        // [2026-10-11 O3] The periodic heartbeat (every 600th call) is off with PRODUCTION_LOG_PROFILE.flag.
+        if (n < 3 || ((n % 600) == 0 && !MpProductionLogProfile())) {
             MpLog("[TickDispatchInner] call #" + std::to_string(n + 1) + " role="
                 + (Globals::AmServer ? "server" : "client") + " driver=" + MpPtr(NetDriver));
         }
@@ -5663,6 +8286,136 @@ void* OrigProcessRequest = nullptr;
 
 static bool MpRewriteRequestUrl(void* Request);
 static void MpProbeCharacterRequestAssociation(void* Request);
+static bool MpSplitUrl(const std::wstring& Url, std::wstring& OutHost, std::wstring& OutTail);
+static std::string MpGrantTraceCallChain();   // [GrantTrace]: native call chain with .pdata function starts
+
+// [1.14.7 2026-10-10] RtlGenRandom (advapi32!SystemFunction036) is the CSPRNG behind the grant id below. advapi32 is in
+// this project's default link set (the vcxproj adds no AdditionalDependencies and bcrypt.lib is not linked), and the
+// declaration is spelled out here instead of pulling <ntsecapi.h> (LSA types) in next to the UE SDK.
+extern "C" BOOLEAN NTAPI SystemFunction036(PVOID RandomBuffer, ULONG RandomBufferLength);
+
+// [1.14.7 2026-10-10] FMemory::Free for engine buffers handed back to this DLL (the FString GetHeader copies out).
+// GMalloc is DAT_146e1eb58 (RVA 0x06E1EB58): FMemory::Realloc (0x02564AB0, see EngineRealloc) dispatches its vtable
+// +0x20, and every inlined FString destructor in 1.14.7 frees through +0x30 on the same object (FUN_142564b60:
+// "if (!GMalloc) init; GMalloc->vt[0x30](GMalloc, Data)"). A buffer we received was allocated through that GMalloc,
+// so a null GMalloc means there is nothing of ours to free.
+static void MpEngineFree(void* Ptr) {
+    if (!Ptr || !Globals::BaseAddress) return;
+    void* Malloc = *reinterpret_cast<void**>(Globals::BaseAddress + 0x06E1EB58);
+    if (!Malloc || !IsReadablePointer(Malloc, sizeof(void*))) return;
+    void** Vtable = *reinterpret_cast<void***>(Malloc);
+    if (!Vtable || !IsReadablePointer(Vtable, 7 * sizeof(void*))) return;
+    reinterpret_cast<void(*)(void*, void*)>(Vtable[6])(Malloc, Ptr);
+}
+
+// [1.14.7 2026-10-10] The path of a dedicated-server XP grant, "/progression/<account>/<track>/<amount>", or empty for
+// any other URL. Scheme, host and query are ignored. MpRewriteRequestUrl has already run, so an allowlisted host now
+// reads "/__origin/<original-host>/progression/..."; the backend strips that prefix before routing (app.ts), and so
+// does this. Exactly three non-empty segments, the last all digits - anything else gets no grant id, which the backend
+// answers with 400 (fail-closed).
+// Plain arrays, no function-local std::wstring statics: their lazy construction faulted once on a curl worker thread
+// (see the g_UrlObs* note below), and this runs on whatever thread issues the request.
+static std::wstring MpProgressionGrantPath(const std::wstring& Url) {
+    std::wstring Host;
+    std::wstring Tail;
+    if (!MpSplitUrl(Url, Host, Tail)) return L"";
+    std::wstring Path = Tail.substr(0, Tail.find_first_of(L"?#"));
+    constexpr wchar_t kOrigin[] = L"/__origin/";
+    constexpr size_t kOriginLen = (sizeof(kOrigin) / sizeof(wchar_t)) - 1;
+    if (Path.compare(0, kOriginLen, kOrigin) == 0) {
+        const size_t HostEnd = Path.find(L'/', kOriginLen);
+        if (HostEnd == std::wstring::npos || HostEnd == kOriginLen) return L"";
+        Path = Path.substr(HostEnd);
+    }
+    constexpr wchar_t kPrefix[] = L"/progression/";
+    constexpr size_t kPrefixLen = (sizeof(kPrefix) / sizeof(wchar_t)) - 1;
+    if (Path.compare(0, kPrefixLen, kPrefix) != 0) return L"";
+    const size_t First = kPrefixLen;
+    const size_t Slash1 = Path.find(L'/', First);
+    if (Slash1 == std::wstring::npos || Slash1 == First) return L"";
+    const size_t Slash2 = Path.find(L'/', Slash1 + 1);
+    if (Slash2 == std::wstring::npos || Slash2 == Slash1 + 1) return L"";
+    const std::wstring Amount = Path.substr(Slash2 + 1);
+    if (Amount.empty() || Amount.size() > 9) return L"";
+    for (wchar_t C : Amount) {
+        if (C < L'0' || C > L'9') return L"";
+    }
+    return Path;
+}
+
+// [1.14.7 2026-10-10] Idempotent grant id on dedicated-server XP grants. The backend accepts
+// POST /progression/{account}/{track}/{amount} only with x-mysticparadox-grant-id (^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$)
+// and applies each id once; the game sends none (no grant/idempotency string in the exe). UE's HTTP retry re-issues
+// ProcessRequest on the SAME FCurlHttpRequest, so the header is read back first: a retry keeps the id it was given on
+// the first attempt and the backend replays instead of applying the XP twice. New ids are "gs-" + 128 random bits.
+// FCurlHttpRequest vtable (1.14.7, 0x145B62FE0): [2] GetHeader 0x1432BC040 = FString* (this, FString* Out /*hidden
+// return*/, const FString* Name) - zeroes Out, looks Name up in the header map at this+0xC8 and copies the value;
+// [16] SetHeader 0x1432C59E0, ignored while the request is in flight (+0xC4 == 1).
+// The URL is read in place at this+0x70 (the FString ProcessRequest itself consumes, same guards as
+// MpRewriteRequestUrl) rather than through GetURL [0], which would hand back one more engine copy to free.
+// Logs one [ProgressionGrantReq] line per grant request (process budget 2000). Never logs the API key or other headers.
+static void MpEnsureProgressionGrantId(void* Request) {
+    if (!Request || !IsReadablePointer(Request, 0xD0)) return;
+    struct RawFString { wchar_t* Data; int32_t Num; int32_t Max; };
+    const auto* Url = reinterpret_cast<const RawFString*>(reinterpret_cast<uintptr_t>(Request) + 0x70);
+    if (!Url->Data || Url->Num < 2 || Url->Max < Url->Num || Url->Num > 32768
+        || !IsReadablePointer(Url->Data, static_cast<size_t>(Url->Num) * sizeof(wchar_t))) {
+        return;
+    }
+    const std::wstring Path = MpProgressionGrantPath(std::wstring(Url->Data, static_cast<size_t>(Url->Num - 1)));
+    if (Path.empty()) return;
+
+    static std::atomic<int> s_logBudget{ 0 };
+    const bool LogIt = s_logBudget.fetch_add(1, std::memory_order_relaxed) < 2000;
+    if (*reinterpret_cast<const int32_t*>(reinterpret_cast<uintptr_t>(Request) + 0xC4) == 1) {
+        if (LogIt) MpLog("[ProgressionGrantReq] path=" + MpNarrow(Path) + " in flight: header untouched (the native call fails it)");
+        return;
+    }
+    void** Vtable = *reinterpret_cast<void***>(Request);
+    if (!Vtable || !IsReadablePointer(Vtable, 17 * sizeof(void*))) return;
+
+    FString HeaderName(L"x-mysticparadox-grant-id");
+    RawFString Existing{};
+    using GetHeaderFn = void*(*)(void*, void*, const void*);
+    reinterpret_cast<GetHeaderFn>(Vtable[2])(Request, &Existing, &HeaderName);
+    // Any non-empty value already on the request is kept, even one this code cannot read back: replacing it on a retry
+    // would turn one grant into two ids.
+    const bool Reused = Existing.Data != nullptr && Existing.Num > 1;
+    std::wstring GrantId;
+    if (Reused) {
+        if (Existing.Num <= 256
+            && IsReadablePointer(Existing.Data, static_cast<size_t>(Existing.Num) * sizeof(wchar_t))) {
+            GrantId.assign(Existing.Data, static_cast<size_t>(Existing.Num - 1));
+        } else {
+            GrantId = L"<unreadable>";
+        }
+    }
+    MpEngineFree(Existing.Data);   // GetHeader's copy was allocated with FMemory (FUN_1409fb5f0 -> 0x02564AB0)
+
+    if (!Reused) {
+        unsigned char Bytes[16] = {};
+        if (!SystemFunction036(Bytes, static_cast<ULONG>(sizeof(Bytes)))) {
+            // Fail-closed: without an id the backend refuses the grant (400) rather than risk applying it twice.
+            if (LogIt) MpLog("[ProgressionGrantReq] path=" + MpNarrow(Path) + " RtlGenRandom FAILED err="
+                + std::to_string(GetLastError()) + ": no grant id set, the backend will refuse this grant");
+            return;
+        }
+        static const wchar_t kHexDigits[] = L"0123456789abcdef";
+        GrantId = L"gs-";
+        for (unsigned char B : Bytes) {
+            GrantId += kHexDigits[B >> 4];
+            GrantId += kHexDigits[B & 0x0F];
+        }
+        FString GrantValue(GrantId.c_str());
+        using SetHeaderFn = void(*)(void*, FString*, FString*);
+        reinterpret_cast<SetHeaderFn>(Vtable[16])(Request, &HeaderName, &GrantValue);
+    }
+    if (LogIt) {
+        MpLog("[ProgressionGrantReq] path=" + MpNarrow(Path) + " grant=" + MpNarrow(GrantId.substr(0, 128))
+            + " reused=" + (Reused ? "1" : "0") + " tid=" + std::to_string(GetCurrentThreadId())
+            + " chain=" + MpGrantTraceCallChain());
+    }
+}
 
 char ProcessRequest(void* Request) {
     // 1.14.7 Ghidra confirms ProcessRequest reads FCurlHttpRequest's FString URL
@@ -5670,6 +8423,16 @@ char ProcessRequest(void* Request) {
     // pre-dispatch boundary; +0x032C5B40 is only the one-argument in-flight
     // SetURL diagnostic and cannot accept a replacement FString.
     MpRewriteRequestUrl(Request);
+
+    // [1.14.7 2026-10-10] Dedicated-server XP grants carry an idempotent grant id (see MpEnsureProgressionGrantId).
+    // Globals::AuthMode defaults to GlobalGameserver in every process (only Init() on a server changes it), so the
+    // server role is checked as well.
+    // [2026-10-14 realms] A player host (HuntCapability: realm hubs and hunts) needs the same id: the backend refuses
+    // every XP grant without one, so a realm member's kill XP was never saved (VPS, 14 Oct 11:29).
+    if (Globals::AmServer && (Globals::AuthMode == Globals::ServerAuthMode::GlobalGameserver
+            || Globals::AuthMode == Globals::ServerAuthMode::HuntCapability)) {
+        MpEnsureProgressionGrantId(Request);
+    }
 
     // Only a DeployServer gameserver carries the global gameserver credential. The optional
     // player-hosted mode never receives it and supplies its own scoped header (P2PHooks.h).
@@ -5723,7 +8486,126 @@ char ProcessRequest(void* Request) {
 // logging caused frame lag) and so it can be disabled after rewrite is enabled.
 // Installed in BOTH client and dedicated-server init (both make backend calls).
 // ============================================================================
-static const wchar_t* kMpApiBase = L"https://" MP_PUBLIC_HOST;
+//
+// [2026-10-13 realms S1] The backend address is no longer only compiled in. The launcher can hand the game process the
+// backend to use (a community realm, a self-hosted hub) in MYSTICPARADOX_BACKEND_URL = scheme://host[:port]: http or
+// https, a DNS name, IPv4 or [IPv6] host, no path, query, fragment or user information (BackendUrl.h has the exact
+// grammar). A valid value replaces the built-in https://MP_PUBLIC_HOST as the API base used by MpBuildRedirectUrl and
+// as the chat WebSocket address further down (ws/wss matching http/https, same host; the port goes to the XMPP
+// ServerPort key, because the client appends ":" + ServerPort to ServerAddr). Absent, empty or invalid means the
+// built-in https/wss address exactly as before; an invalid value is logged - reason and length only, it may have
+// carried credentials - and ignored. A DeployServer sets no such variable, so its servers keep the built-in address.
+// Resolved once: from Init (before any hook reading it exists) and otherwise on first use, behind an Interlocked state
+// word. The results sit in file-scope POD buffers (no lazy constructors, see the g_UrlObs* note below) so any thread
+// can read them once the state is 2. The log line is written by MainThread because Init runs under the loader lock.
+static const wchar_t* const kMpBuiltInApiBase = L"https://" MP_PUBLIC_HOST;
+static const wchar_t* const kMpBuiltInXmppWsUrl = L"wss://" MP_PUBLIC_HOST;
+static constexpr uint16_t kMpBuiltInXmppPort = 443;
+static constexpr size_t kMpBackendAddressChars = 320;   // "https://" + 253-char host + ":65535" + NUL, with room to spare
+
+static wchar_t g_MpApiBase[kMpBackendAddressChars];
+static wchar_t g_MpXmppWsUrl[kMpBackendAddressChars];
+static uint16_t g_MpXmppPort = kMpBuiltInXmppPort;
+static bool g_MpBackendFromEnv = false;
+static char g_MpBackendEnvIgnored[96];                  // why MYSTICPARADOX_BACKEND_URL was ignored; empty if used or absent
+static DWORD g_MpBackendEnvLength = 0;
+static volatile LONG g_MpBackendState = 0;              // 0 = unresolved, 1 = being resolved, 2 = ready
+
+static void MpResolveBackendAddress() {
+    if (InterlockedCompareExchange(&g_MpBackendState, 1, 0) != 0) {
+        // Resolved, or being resolved by another thread: wait for the result (a few microseconds at most).
+        while (InterlockedCompareExchange(&g_MpBackendState, 2, 2) != 2) { YieldProcessor(); }
+        return;
+    }
+
+    bool FromEnv = false;
+    const char* Ignored = "";
+    DWORD EnvLength = 0;
+    std::wstring EnvApi;
+    std::wstring EnvWs;
+    uint16_t EnvPort = kMpBuiltInXmppPort;
+    try {
+        char Raw[512] = {};
+        const DWORD Length = GetEnvironmentVariableA("MYSTICPARADOX_BACKEND_URL", Raw, static_cast<DWORD>(sizeof(Raw)));
+        if (Length >= sizeof(Raw)) {
+            EnvLength = Length;                         // buffer too small: Length is the size it would need
+            Ignored = "value too long";
+        }
+        else if (Length != 0) {                         // 0 = not set (or set empty): the built-in address
+            EnvLength = Length;
+            MpBackendUrl Url;
+            const char* Why = "";
+            if (MpParseBackendUrl(std::string(Raw, Length), Url, Why)) {
+                EnvApi = MpBackendApiBase(Url);
+                EnvWs = MpBackendXmppAddress(Url);
+                EnvPort = Url.Port;
+                if (EnvApi.size() < kMpBackendAddressChars && EnvWs.size() < kMpBackendAddressChars) {
+                    FromEnv = true;
+                }
+                else {
+                    Ignored = "value too long";         // unreachable under the parser's 300-character cap
+                }
+            }
+            else {
+                Ignored = Why;
+            }
+        }
+    }
+    catch (...) {
+        FromEnv = false;
+        Ignored = "internal error while reading the value";
+    }
+
+    if (FromEnv) {
+        wmemcpy(g_MpApiBase, EnvApi.c_str(), EnvApi.size() + 1);
+        wmemcpy(g_MpXmppWsUrl, EnvWs.c_str(), EnvWs.size() + 1);
+        g_MpXmppPort = EnvPort;
+    }
+    else {
+        wcscpy_s(g_MpApiBase, kMpBackendAddressChars, kMpBuiltInApiBase);
+        wcscpy_s(g_MpXmppWsUrl, kMpBackendAddressChars, kMpBuiltInXmppWsUrl);
+        g_MpXmppPort = kMpBuiltInXmppPort;
+        strcpy_s(g_MpBackendEnvIgnored, sizeof(g_MpBackendEnvIgnored), Ignored);
+        g_MpBackendEnvLength = Ignored[0] ? EnvLength : 0;
+    }
+    g_MpBackendFromEnv = FromEnv;
+    InterlockedExchange(&g_MpBackendState, 2);          // full barrier: the buffers above are visible to readers of 2
+}
+
+static const wchar_t* MpApiBase() {
+    MpResolveBackendAddress();
+    return g_MpApiBase;
+}
+
+// The XMPP ServerAddr value: "wss://host" or "ws://host", no port and no path (the NOTE above the XMPP redirect below).
+static const wchar_t* MpXmppWsUrl() {
+    MpResolveBackendAddress();
+    return g_MpXmppWsUrl;
+}
+
+// The port the chat WebSocket connects to; written to XMPP ServerPort only when the address came from the environment.
+static uint16_t MpXmppServerPort() {
+    MpResolveBackendAddress();
+    return g_MpXmppPort;
+}
+
+static bool MpBackendFromEnvironment() {
+    MpResolveBackendAddress();
+    return g_MpBackendFromEnv;
+}
+
+// One line at startup: where the address came from and what the client will use. "ws" is the address as the client
+// assembles it (ServerAddr + ":" + ServerPort); the built-in one is wss://MP_PUBLIC_HOST:443 as before.
+static void MpLogBackendAddress() {
+    MpResolveBackendAddress();
+    std::string Line = std::string("[BackendAddress] source=") + (g_MpBackendFromEnv ? "env" : "built-in")
+        + " api=" + MpNarrow(g_MpApiBase) + " ws=" + MpNarrow(g_MpXmppWsUrl) + ":" + std::to_string(g_MpXmppPort);
+    if (g_MpBackendEnvIgnored[0]) {
+        Line += std::string(" (MYSTICPARADOX_BACKEND_URL ignored: ") + g_MpBackendEnvIgnored
+            + ", length=" + std::to_string(g_MpBackendEnvLength) + ")";
+    }
+    MpLog(Line);
+}
 
 // Case-insensitive parsed-host match against the redirect allowlist: exact apex
 // or a dot-delimited subdomain of one. Never a blind substring match.
@@ -5779,7 +8661,8 @@ static bool MpSplitUrl(const std::wstring& Url, std::wstring& OutHost, std::wstr
 
 static std::wstring MpBuildRedirectUrl(const std::wstring& Host, const std::wstring& Tail) {
     // https://paradox.mysticfox.dev/__origin/<original-host><tail>  (Tail begins with '/')
-    std::wstring Out = kMpApiBase;
+    // [2026-10-13 realms S1] The base is the built-in address unless MYSTICPARADOX_BACKEND_URL named another (above).
+    std::wstring Out = MpApiBase();
     Out += L"/__origin/";
     Out += Host;
     Out += Tail;
@@ -6223,7 +9106,11 @@ static void MpLogUrlObservation(const std::wstring& Host, const std::wstring& Ta
 // (naive concat). So ServerAddr MUST be host-only (no path) — a path gets ":443" appended AFTER
 // it (observed reject: GET /__ws/xmpp:443). With a bare host the client connects to
 // wss://paradox.mysticfox.dev:443 and requests the root path, which the gateway accepts.
-static const wchar_t* kMpXmppWsUrl = L"wss://" MP_PUBLIC_HOST;
+// [2026-10-13 realms S1] The ServerAddr written here is MpXmppWsUrl() - still wss://MP_PUBLIC_HOST (host only, no path)
+// by default, ws:// or wss:// plus the host of MYSTICPARADOX_BACKEND_URL when the launcher set it (backend-address
+// block above). Because of the concatenation the port cannot ride in that string: when the address came from the
+// environment the hook also answers XMPP ServerPort with MpXmppServerPort() (scheme default 80 / 443 or the explicit
+// port); with the built-in address ServerPort is left to the game's own config (443), as before.
 
 static bool MpXmppTraceEnabled() {
     static int Cached = -1;
@@ -6308,6 +9195,31 @@ static void MpLogXmppConfigObservation(const std::wstring& Section, const std::w
     }
 }
 
+// [2026-10-13 realms S1] True when (Section or Key) names the XMPP transport AND Key is exactly ServerPort - the port the
+// client appends to ServerAddr (only overridden when the backend address came from the environment).
+static bool MpIsXmppServerPort(const std::wstring& Section, const std::wstring& Key) {
+    return _wcsicmp(Key.c_str(), L"ServerPort") == 0
+        && (MpWContainsCI(Section, L"xmpp") || MpWContainsCI(Key, L"xmpp"));
+}
+
+// Overwrites the OUTPUT FString (Value), which the client reads AFTER the hook returns, using the proven
+// engine-allocating pattern (see EngineRealloc / GetGameDefaultMap). A shallow FString(wchar_t*) would alias freed CRT
+// storage and dangle here. False (Value untouched) when the engine allocation fails.
+static bool MpWriteEngineFString(void* Value, const std::wstring& New) {
+    struct RawFString { wchar_t* Data; int Num; int Max; };
+    RawFString* Raw = reinterpret_cast<RawFString*>(Value);
+    const int Count = static_cast<int>(New.size()) + 1; // include null terminator
+
+    if (Raw->Max < Count || Raw->Data == nullptr) {
+        Raw->Data = static_cast<wchar_t*>(EngineRealloc(Raw->Data, static_cast<size_t>(Count) * sizeof(wchar_t)));
+    }
+    if (Raw->Data == nullptr) return false;
+    wmemcpy(Raw->Data, New.c_str(), static_cast<size_t>(Count));
+    Raw->Num = Count;
+    if (Raw->Max < Count) Raw->Max = Count;
+    return true;
+}
+
 void* OrigGetConfigString = nullptr;
 
 // bool FConfigCacheIni::GetString(this, const TCHAR* Section, const TCHAR* Key, FString& Value, const FString& Filename)
@@ -6331,27 +9243,24 @@ bool GetConfigStringHook(void* This, const wchar_t* Section, const wchar_t* Key,
     }
 
     if (Redirect && IsServerAddr && Value != nullptr) {
-        // Overwrite the OUTPUT FString (Value), which the client reads AFTER this hook returns,
-        // using the proven engine-allocating pattern (see EngineRealloc / GetGameDefaultMap). A
-        // shallow FString(wchar_t*) would alias freed CRT storage and dangle here.
-        struct RawFString { wchar_t* Data; int Num; int Max; };
-        RawFString* Raw = reinterpret_cast<RawFString*>(Value);
-        const std::wstring New = kMpXmppWsUrl;
-        const int Count = static_cast<int>(New.size()) + 1; // include null terminator
-
-        if (Raw->Max < Count || Raw->Data == nullptr) {
-            Raw->Data = static_cast<wchar_t*>(EngineRealloc(Raw->Data, static_cast<size_t>(Count) * sizeof(wchar_t)));
-        }
-        if (Raw->Data != nullptr) {
-            wmemcpy(Raw->Data, New.c_str(), static_cast<size_t>(Count));
-            Raw->Num = Count;
-            if (Raw->Max < Count) Raw->Max = Count;
-
+        const std::wstring New = MpXmppWsUrl();
+        if (MpWriteEngineFString(Value, New)) {
             static int LoggedOnce = 0;
             if (!LoggedOnce) { LoggedOnce = 1; MpLog(std::string("[XmppConfig] ServerAddr -> ") + MpNarrow(New)); }
             return true; // Value now holds our owned endpoint
         }
         // Allocation failed — fall through and leave the original result untouched.
+    }
+
+    // [2026-10-13 realms S1] An address from MYSTICPARADOX_BACKEND_URL also fixes the port (the client appends
+    // ":" + ServerPort to ServerAddr). Never reached with the built-in address: ServerPort stays the game's own.
+    if (Redirect && Value != nullptr && MpBackendFromEnvironment() && MpIsXmppServerPort(Sec, K)) {
+        const std::wstring Port = std::to_wstring(static_cast<unsigned>(MpXmppServerPort()));
+        if (MpWriteEngineFString(Value, Port)) {
+            static int LoggedPortOnce = 0;
+            if (!LoggedPortOnce) { LoggedPortOnce = 1; MpLog(std::string("[XmppConfig] ServerPort -> ") + MpNarrow(Port)); }
+            return true;
+        }
     }
 
     return Found;
@@ -6464,8 +9373,166 @@ static bool IsLocalArchonControllerReadinessObject(UObject* Object) {
     }
 }
 
+// [1.14.7 DIAG 2026-10-10] Training's arrival-cinematic trigger. On every Training arrival the client's
+// CheckForPlayerStartEvent (+0x1C9BEB8) gets HasFinishedLoading=false from island_arrival_cinematic_trigger_bp
+// for ~17 s after the player already has control (9 Oct 23:57:42-58:00 with the phantom, 10 Oct 09:21:30-47
+// without it), then gameplay starts anyway - a timeout, not a load. These read-only lines record the
+// trigger's state on both sides so the missing input (replicated slayers / intro animations / atmosphere, or
+// its own async load) can be identified. Field offsets are the 1.14.7 SDK's (classes.hpp).
+static std::string MpArrivalTriggerState(UObject* Object) {
+    if (!Object || !IsReadablePointer(Object, 0x4C0)) return "unreadable";
+    auto* T = reinterpret_cast<SDK::Aisland_arrival_cinematic_trigger_bp_C*>(Object);
+    return "role=" + std::to_string(static_cast<int>(T->Role))
+        + " remoteRole=" + std::to_string(static_cast<int>(T->RemoteRole))
+        + " bReplicates=" + std::to_string(static_cast<int>(T->bReplicates))
+        + " bClientStarted=" + std::to_string(static_cast<int>(T->bClientStarted))
+        + " loadingState=" + std::to_string(static_cast<int>(T->LoadingState))
+        + " loadStart=" + std::to_string(T->LLoadStartTime)
+        + " slayers=" + std::to_string(T->SlayerActors.Num())
+        + " introRefs=" + std::to_string(T->IntroAnimSequenceRefs.Num())
+        + " localIntroRefs=" + std::to_string(T->LIntroAnimSequenceRefs.Num())
+        + " defaultIntroAnims=" + std::to_string(T->DefaultIntroAnimations.Num())
+        + " introAnims=" + std::to_string(T->IntroAnimSequences.Num())
+        + " replacements=" + std::to_string(T->ReplacementActors.Num())
+        + " supportActors=" + std::to_string(T->SupportCineActors.Num())
+        + " primaryCine=" + MpPtr(T->PrimaryCineActor)
+        + " approachSeqActor=" + MpPtr(T->IslandApproachLevelSequenceActor)
+        + " atmosphere=" + MpPtr(T->IslandAtmosphereSpawner)
+        + " cineComponent=" + MpPtr(T->dynamic_cinematic_component_bp);
+}
+
+static void* g_MpArrivalTrigger = nullptr;   // last trigger instance seen by the readiness hook
+
+static bool MpIsAGuarded(UObject* Object, UClass* Class) {
+    __try {
+        return Object->IsA(Class);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void MpProbeArrivalTrigger(UObject* Object, bool Ret, uintptr_t CallerRva) {
+    if (!Object) return;
+    // The class exists only once Training is loaded; until then a by-name lookup walks every object, so it is
+    // retried at most every 2 s (this hook runs for every loading participant). The SDK caches a found class.
+    static UClass* s_triggerClass = nullptr;
+    static uint64_t s_lastClassLookupMs = 0;
+    if (s_triggerClass && !IsRegisteredLiveObject(s_triggerClass)) s_triggerClass = nullptr;   // unloaded on travel
+    if (!s_triggerClass) {
+        const uint64_t NowLookup = GetTickCount64();
+        if (NowLookup - s_lastClassLookupMs < 2000) return;
+        s_lastClassLookupMs = NowLookup;
+        s_triggerClass = SDK::UObject::FindClassFast("island_arrival_cinematic_trigger_bp_C");
+        if (!s_triggerClass) return;
+    }
+    if (!MpIsAGuarded(Object, s_triggerClass)) return;
+    g_MpArrivalTrigger = Object;
+    static void* s_lastObject = nullptr;
+    static uint64_t s_firstFalseMs = 0;
+    static bool s_loggedTrue = false;
+    static std::atomic<int> s_budget{ 0 };
+    if (Object != s_lastObject) {   // a new map's trigger: start a fresh measurement
+        s_lastObject = Object;
+        s_firstFalseMs = 0;
+        s_loggedTrue = false;
+    }
+    const uint64_t Now = GetTickCount64();
+    if (MpProductionLogProfile()) return;   // [2026-10-11 O3] server lines off (g_MpArrivalTrigger is already recorded)
+    if (!Ret) {
+        if (s_firstFalseMs == 0) s_firstFalseMs = Now;
+        if (s_budget.fetch_add(1, std::memory_order_relaxed) < 60) {
+            MpLog(std::string("[ArrivalTrigger] ") + (Globals::AmServer ? "server" : "client")
+                + " NOT_FINISHED waitedMs=" + std::to_string(Now - s_firstFalseMs)
+                + " sinceClientRestartMs=" + std::to_string(s_LastPossessedAtMs ? Now - s_LastPossessedAtMs : 0)
+                + " caller=+" + MpHex(CallerRva) + " " + MpArrivalTriggerState(Object));
+        }
+    } else if (!s_loggedTrue) {
+        s_loggedTrue = true;
+        MpLog(std::string("[ArrivalTrigger] ") + (Globals::AmServer ? "server" : "client")
+            + " FINISHED after waitedMs=" + std::to_string(s_firstFalseMs ? Now - s_firstFalseMs : 0)
+            + " caller=+" + MpHex(CallerRva) + " " + MpArrivalTriggerState(Object));
+    }
+}
+
+// [1.14.7 FIX 2026-10-10] Release an idle Training arrival trigger early (client).
+// The 10 Oct 09:35 probe settled it: the server's trigger loads its assets 1 s after boot (loadingState=2) but
+// never gets the arriving player in SlayerActors (0 for 40 s), so the arrival cinematic never starts; the
+// client's trigger sits at slayers=0 / introRefs=0 / bClientStarted=0 / loadingState=0 and its readiness turns
+// TRUE after its own 18 s timeout with nothing changed. Returning TRUE as soon as the local possession chain
+// is stable (the same proof the controller override uses) gives the identical end state 15 s sooner. Any sign
+// of a real cinematic (a slayer, intro refs, a started client, a load, a cinematic actor) keeps the native
+// answer. KEEP_ARRIVAL_TRIGGER_WAIT.flag reverts.
+static bool MpArrivalTriggerIdleReady(UObject* Object) {
+    static int s_disabled = -1;
+    if (s_disabled < 0) {
+        s_disabled = MpExeRelativeFlagPresent(L"KEEP_ARRIVAL_TRIGGER_WAIT.flag") ? 1 : 0;
+        MpLog(std::string("[ArrivalTrigger] idle-trigger release ")
+            + (s_disabled ? "OFF (KEEP_ARRIVAL_TRIGGER_WAIT.flag present)" : "ON (default)"));
+    }
+    if (s_disabled == 1 || Globals::AmServer || !Object || !IsReadablePointer(Object, 0x4C0)) return false;
+    auto* T = reinterpret_cast<SDK::Aisland_arrival_cinematic_trigger_bp_C*>(Object);
+    if (T->SlayerActors.Num() != 0 || T->IntroAnimSequenceRefs.Num() != 0 || T->bClientStarted
+        || static_cast<int>(T->LoadingState) != 0 || T->PrimaryCineActor || T->IslandApproachLevelSequenceActor) {
+        return false;
+    }
+    MpForgetPossessionIfWorldChanged();
+    UObject* PC = s_LastPossessedPC;
+    if (!PC || !IsRegisteredLiveObject(PC)) return false;
+    UObject* StablePawn = nullptr;
+    return IsClientRolePumpPossessionStable(PC, &StablePawn);
+}
+
+// Server half of the probe above: the trigger's replicated inputs as the server holds them, every 2 s for 40 s
+// after each login (the server's own readiness checks are forced TRUE and may never ask the trigger).
+// [2026-10-11 1.14.7 O2] When the trigger was not cached, every 2 s sample for 40 s after EACH login did a by-name class
+// lookup (FindClassFast walks the object array) and then a full GObjects walk with an IsA per object - on Ramsgate,
+// which has no arrival trigger, that is ~20 full walks per joining player for nothing. Now the class lookup and the walk
+// run at most once per world (GWorld pointer); a trigger the readiness hook sees later is still picked up through
+// g_MpArrivalTrigger. Read-only diagnostic: it releases nothing (the client's release is MpArrivalTriggerIdleReady).
+// LEGACY_LIFECYCLE_WALK.flag restores the per-sample lookup; PRODUCTION_LOG_PROFILE.flag turns the probe off.
+static void MpArrivalTriggerServerProbe() {
+    if (!Globals::AmServer) return;
+    const uint64_t PostLoginMs = g_MpLastPostLoginMs.load(std::memory_order_relaxed);
+    if (PostLoginMs == 0) return;
+    const uint64_t Now = GetTickCount64();
+    if (Now - PostLoginMs > 40000) return;
+    static uint64_t s_last = 0;
+    if (Now - s_last < 2000) return;
+    s_last = Now;
+    static int s_budget = 0;
+    if (s_budget >= 60) return;
+    if (MpProductionLogProfile()) return;
+
+    void* Trigger = g_MpArrivalTrigger;
+    if (!Trigger || !IsRegisteredLiveObject(Trigger)) {
+        Trigger = nullptr;
+        static void* s_searchedWorld = nullptr;   // world whose search already came back empty
+        void* World = SDK::UWorld::GetWorld();
+        if (!MpLegacyLifecycleWalk()) {
+            if (World && World == s_searchedWorld) return;
+            s_searchedWorld = World;
+        }
+        UClass* Cls = SDK::UObject::FindClassFast("island_arrival_cinematic_trigger_bp_C");
+        if (!Cls || !UObject::GObjects) return;   // not a map with an arrival cinematic
+        const int Count = UObject::GObjects->Num();
+        for (int i = 0; i < Count; ++i) {
+            UObject* Obj = UObject::GObjects->GetByIndex(i);
+            if (!Obj || Obj->IsDefaultObject() || !MpIsAGuarded(Obj, Cls)) continue;
+            Trigger = Obj;
+            break;
+        }
+        if (!Trigger) return;
+        g_MpArrivalTrigger = Trigger;
+    }
+    ++s_budget;
+    MpLog("[ArrivalTrigger] server state sincePostLoginMs=" + std::to_string(Now - PostLoginMs)
+        + " obj=" + MpPtr(Trigger) + " " + MpArrivalTriggerState(reinterpret_cast<UObject*>(Trigger)));
+}
+
 bool HasFinishedLoadingHook(UObject* a1) {
     const bool Ret = reinterpret_cast<bool(*)(UObject*)>(OrigHasFinishedLoading)(a1);
+    MpProbeArrivalTrigger(a1, Ret, reinterpret_cast<uintptr_t>(_ReturnAddress()) >= Globals::BaseAddress
+        ? reinterpret_cast<uintptr_t>(_ReturnAddress()) - Globals::BaseAddress : 0);
     if (Ret) return true;
 
     const uintptr_t ReturnAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -6491,6 +9558,17 @@ bool HasFinishedLoadingHook(UObject* a1) {
             MpLog(std::string("[ReadinessCompat] FORCE_TRUE scope=server-legacy obj=")
                 + (a1 ? a1->GetFullName() : "(null)")
                 + " caller=+" + MpHex(CallerRva));
+        }
+        return true;
+    }
+
+    if (a1 && a1 == g_MpArrivalTrigger && MpArrivalTriggerIdleReady(a1)) {
+        static void* s_releasedTrigger = nullptr;
+        if (s_releasedTrigger != a1) {
+            s_releasedTrigger = a1;
+            MpLog("[ArrivalTrigger] client RELEASED idle trigger (no slayers replicated, possession stable) sinceClientRestartMs="
+                + std::to_string(s_LastPossessedAtMs ? GetTickCount64() - s_LastPossessedAtMs : 0)
+                + " - its own timeout is 18 s; " + MpArrivalTriggerState(a1));
         }
         return true;
     }
@@ -6870,16 +9948,18 @@ static bool GraphDriveEnabled() {
 
 static void MpDriveReplicationGraph(float DeltaTime) {
     if (!GraphDriveEnabled() || !Globals::AmServer || !Networking::NetDriver) return;
-    if (!IsReadablePointer(Networking::NetDriver, 0x6F0)) return;
+    // [2026-10-11 1.14.7 O3] The three pointer checks go through MpReadableThisFrame (same checks, one VirtualQuery
+    // per frame segment); the call and its slot are unchanged.
+    if (!MpReadableThisFrame(Networking::NetDriver, 0x6F0)) return;
 
     void* Graph = reinterpret_cast<void*>(
         SafeReadPtr(reinterpret_cast<uintptr_t>(Networking::NetDriver), 0x6E8));
-    if (!Graph || !IsReadablePointer(Graph, 0x4C8)) return;
+    if (!Graph || !MpReadableThisFrame(Graph, 0x4C8)) return;
     if (reinterpret_cast<void*>(SafeReadPtr(reinterpret_cast<uintptr_t>(Graph), 0x30))
         != reinterpret_cast<void*>(Networking::NetDriver)) return;
 
     const uintptr_t Vt = SafeReadPtr(reinterpret_cast<uintptr_t>(Graph), 0x00);
-    if (!Vt || !IsReadablePointer(reinterpret_cast<void*>(Vt + 0x2F0), 8)) return;
+    if (!Vt || !MpReadableThisFrame(reinterpret_cast<void*>(Vt + 0x2F0), 8)) return;
 
     static thread_local bool s_inDrive = false;
     if (s_inDrive) return;
@@ -7154,8 +10234,11 @@ static void* RepGraphFindGlobalActorInfo(void* Graph, void* Actor) {
 // Returns 1 when something was changed, 0 when the settings were already correct, -1 when the
 // pointer was unusable. OutDetail always reports the before/after values so a live capture proves
 // the offsets (a spatialized class reads a real NetCullDistanceSquared here, e.g. 225000000).
+// [2026-10-11 1.14.7 O3] DetailOnlyIfChanged: build OutDetail (six std::to_string calls) only when something changed - the
+// once-a-second re-assert pass logs only then. Default false keeps every registration log line as it was.
 static int RepGraphApplyGlobalSettings(void* GlobalInfo, bool ZeroCullDistance,
-                                       uint16_t MinChannelFrameTimeout, std::string* OutDetail) {
+                                       uint16_t MinChannelFrameTimeout, std::string* OutDetail,
+                                       bool DetailOnlyIfChanged = false) {
     if (!GlobalInfo || !IsReadablePointer(GlobalInfo, 0x110)) return -1;
     const uintptr_t G = reinterpret_cast<uintptr_t>(GlobalInfo);
     float* Cull = reinterpret_cast<float*>(G + kRepGraphGlobalCullDistance);
@@ -7173,13 +10256,14 @@ static int RepGraphApplyGlobalSettings(void* GlobalInfo, bool ZeroCullDistance,
     if (MinChannelFrameTimeout != 0 && TimeoutBefore != 0 && TimeoutBefore < MinChannelFrameTimeout) {
         *Timeout = MinChannelFrameTimeout;
     }
-    if (OutDetail) {
+    const int Result = (*Cull != CullBefore || *CullSq != CullSqBefore || *Timeout != TimeoutBefore) ? 1 : 0;
+    if (OutDetail && (!DetailOnlyIfChanged || Result == 1)) {
         *OutDetail = " cullDistance=" + std::to_string(CullBefore) + "->" + std::to_string(*Cull)
             + " cullDistanceSq=" + std::to_string(CullSqBefore) + "->" + std::to_string(*CullSq)
             + " actorChannelFrameTimeout=" + std::to_string(TimeoutBefore)
             + "->" + std::to_string(*Timeout);
     }
-    return (*Cull != CullBefore || *CullSq != CullSqBefore || *Timeout != TimeoutBefore) ? 1 : 0;
+    return Result;
 }
 
 // A FConnectionReplicationActorInfo is a snapshot taken the first time a connection gathers the
@@ -7491,6 +10575,18 @@ struct PlayerControllerChannelQuarantineEntry {
 
 static PlayerControllerChannelQuarantineEntry s_pcChannelQuarantine[64]{};
 static thread_local bool s_processingPcChannelQuarantine = false;
+// [2026-10-11 1.14.7 O3] Entries in use, recounted after every change to the table (changes are rare: a BLOCK or a
+// cleanup). ReplicateActorFreqHook asks IsPlayerControllerChannelQuarantined for every replicated channel, and the
+// per-frame stale sweep walks the table; with nothing quarantined (the normal state) both now cost one compare.
+static int s_pcChannelQuarantineInUse = 0;
+
+static void RecountPlayerControllerChannelQuarantine() {
+    int InUse = 0;
+    for (const auto& Entry : s_pcChannelQuarantine) {
+        if (Entry.Channel) ++InUse;
+    }
+    s_pcChannelQuarantineInUse = InUse;
+}
 
 static bool IsLiveNetConnection112(void* Ptr) {
     return Ptr
@@ -7539,7 +10635,7 @@ static int ClearConnActorInfoChannelIfMatches(void* ConnActorInfo, void* Channel
 }
 
 static bool IsPlayerControllerChannelQuarantined(void* Channel) {
-    if (!Channel) return false;
+    if (!Channel || s_pcChannelQuarantineInUse == 0) return false;   // [2026-10-11 O3] empty table: nothing to scan
     for (const auto& Entry : s_pcChannelQuarantine) {
         if (Entry.Channel == Channel) return true;
     }
@@ -7586,6 +10682,7 @@ static bool QueuePlayerControllerChannelQuarantine(
     Entry.CallerRva = CallerRva;
     Entry.QueuedAtMs = static_cast<uint64_t>(GetTickCount64());
     Entry.Source = Source;
+    RecountPlayerControllerChannelQuarantine();   // [2026-10-11 O3]
     MpLog("[PCChannelQuarantine] QUEUED channel=" + MpPtr(Channel)
         + " actor=" + MpPtr(Actor)
         + " wrongConnection=" + MpPtr(WrongConnection)
@@ -7642,6 +10739,29 @@ static int SafeCloseQuarantinedActorChannel(void* Channel) {
     }
 }
 
+// Drops an entry whose channel is no longer the binding that was quarantined: the channel object is
+// gone, or a live channel now carries a different actor or connection. Uses only SDK class checks and
+// the channel's +0x28 / +0x70 fields, no native graph layout. Returns true when the entry was dropped.
+static bool DropStalePlayerControllerChannelQuarantineEntry(PlayerControllerChannelQuarantineEntry& Entry) {
+    void* Channel = Entry.Channel;
+    void* CurrentConnection = PlayerControllerChannelConnection(Channel);
+    void* CurrentActor = PlayerControllerChannelActor(Channel);
+    const bool ChannelLive = IsLiveActorChannel112(Channel);
+    const bool Reused = ChannelLive
+        && ((Entry.WrongConnection && CurrentConnection != Entry.WrongConnection)
+            || (CurrentActor && Entry.Actor && CurrentActor != Entry.Actor));
+    if (ChannelLive && !Reused) return false;
+
+    MpLog("[PCChannelQuarantine] DROP_STALE channel=" + MpPtr(Channel)
+        + " expectedActor=" + MpPtr(Entry.Actor)
+        + " currentActor=" + MpPtr(CurrentActor)
+        + " expectedConnection=" + MpPtr(Entry.WrongConnection)
+        + " currentConnection=" + MpPtr(CurrentConnection));
+    Entry = PlayerControllerChannelQuarantineEntry{};
+    RecountPlayerControllerChannelQuarantine();   // [2026-10-11 O3]
+    return true;
+}
+
 static void ProcessPlayerControllerChannelQuarantine(void* NetDriver) {
     if (s_processingPcChannelQuarantine) return;
     s_processingPcChannelQuarantine = true;
@@ -7652,25 +10772,9 @@ static void ProcessPlayerControllerChannelQuarantine(void* NetDriver) {
 
     for (auto& Entry : s_pcChannelQuarantine) {
         if (!Entry.Channel) continue;
+        if (DropStalePlayerControllerChannelQuarantineEntry(Entry)) continue;
 
         void* Channel = Entry.Channel;
-        void* CurrentConnection = PlayerControllerChannelConnection(Channel);
-        void* CurrentActor = PlayerControllerChannelActor(Channel);
-        const bool ChannelLive = IsLiveActorChannel112(Channel);
-        const bool Reused = ChannelLive
-            && ((Entry.WrongConnection && CurrentConnection != Entry.WrongConnection)
-                || (CurrentActor && Entry.Actor && CurrentActor != Entry.Actor));
-
-        if (!ChannelLive || Reused) {
-            MpLog("[PCChannelQuarantine] DROP_STALE channel=" + MpPtr(Channel)
-                + " expectedActor=" + MpPtr(Entry.Actor)
-                + " currentActor=" + MpPtr(CurrentActor)
-                + " expectedConnection=" + MpPtr(Entry.WrongConnection)
-                + " currentConnection=" + MpPtr(CurrentConnection));
-            Entry = PlayerControllerChannelQuarantineEntry{};
-            continue;
-        }
-
         const uint8_t ChannelFlags30 = *reinterpret_cast<uint8_t*>(
             reinterpret_cast<uintptr_t>(Channel) + 0x30);
         const int CloseResult = (ChannelFlags30 & 0x02u) != 0
@@ -7691,8 +10795,23 @@ static void ProcessPlayerControllerChannelQuarantine(void* NetDriver) {
             + " actorInfoCleared=" + std::to_string(ActorInfoCleared));
         Entry = PlayerControllerChannelQuarantineEntry{};
     }
+    RecountPlayerControllerChannelQuarantine();   // [2026-10-11 O3]
 
     s_processingPcChannelQuarantine = false;
+}
+
+// [2026-10-10 1.14.7] Nothing calls ProcessPlayerControllerChannelQuarantine on this build: it ran from
+// ServerReplicateActorsHook, which is not installed (MpDriveReplicationGraph drives the graph). An entry
+// therefore stayed forever, and a channel object later allocated at the same address would be skipped by
+// ReplicateActorFreqHook or refused by the SetChannelActor guard for an unrelated actor. Called once per
+// server frame before the graph drive, this drops only such stale entries; an entry still bound to the
+// wrong connection stays blocked. Closing the channel and clearing the graph's cached actor info (the
+// rest of the cleanup) depend on native layouts not yet verified on 1.14.7, so they stay out.
+static void DropStalePlayerControllerChannelQuarantine() {
+    if (s_processingPcChannelQuarantine || s_pcChannelQuarantineInUse == 0) return;   // [2026-10-11 O3]
+    for (auto& Entry : s_pcChannelQuarantine) {
+        if (Entry.Channel) DropStalePlayerControllerChannelQuarantineEntry(Entry);
+    }
 }
 
 // [2026-07-26 ESCALATION CONTROLLER-ADOPTION ROOT FIX]
@@ -7711,19 +10830,30 @@ static void ProcessPlayerControllerChannelQuarantine(void* NetDriver) {
 // ConnManager+0x28 as UNetConnection, reuses ConnActorInfo->Channel when present, otherwise creates
 // an actor channel, calls SetChannelActor, then ReplicateActor. The cached channel therefore needs
 // the same connection invariant as a newly created channel.
+//
+// [2026-10-10 1.14.7] The target is FUN_140F2C230 (RVA 0x00F2C230), a .pdata entry reached from the
+// graph drive: Archon ServerReplicateActors 0x01C034C0 -> base 0x00F2EB60 -> 0x00F2AFF0 -> here. Its
+// decompile has the same argument order and uses: param 2 +0x5C destroy bit, *param 3 = channel (and
+// channel +0x70 == actor), param 6 +0x28 handed to CreateChannelByName 0x03F62E90, param 7 frame. It
+// returns the bit total (`mov rax, rsi` at 0x00F2C6C9). This hook runs for every actor on every
+// connection, so a PlayerController is identified with the SEH-guarded O(1) liveness check and IsA
+// before any VirtualQuery-backed validation (Harmonicrain/Undaunted measured per-actor
+// IsReadablePointer at ~19% of a two-player 1.12 game thread).
 void* OrigRepGraphReplicateSingleActor = nullptr;
 uint64_t __fastcall RepGraphReplicateSingleActorGuardHook(
     void* Graph, void* Actor, void* ConnActorInfo, void* GlobalInfo,
     void* ActorInfoMap, void* ConnManager, uint32_t Frame) {
-    const bool ConnManagerValid = ConnManager
-        && IsReadablePointer(ConnManager, 0x30)
-        && IsRegisteredLiveObject(ConnManager);
-    void* Connection = ConnManagerValid
-        ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(ConnManager) + 0x28)
-        : nullptr;
-    const bool ConnectionValid = IsLiveNetConnection112(Connection);
+    if (Actor && IsRegisteredLiveObject(Actor)
+        && reinterpret_cast<UObject*>(Actor)->IsA(SDK::APlayerController::StaticClass())
+        && IsLivePlayerController112(Actor)) {
+        const bool ConnManagerValid = ConnManager
+            && IsReadablePointer(ConnManager, 0x30)
+            && IsRegisteredLiveObject(ConnManager);
+        void* Connection = ConnManagerValid
+            ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(ConnManager) + 0x28)
+            : nullptr;
+        const bool ConnectionValid = IsLiveNetConnection112(Connection);
 
-    if (IsLivePlayerController112(Actor)) {
         void* ActorConnection = *reinterpret_cast<void**>(
             reinterpret_cast<uintptr_t>(Actor) + 0x418);
         const bool ActorConnectionValid = IsLiveNetConnection112(ActorConnection);
@@ -7941,19 +11071,39 @@ void __fastcall PlayerControllerSetChannelActorGuardHook(
 // Production invariant at the final server send boundary. Even if a future graph change regresses
 // routing, a PlayerController is never serialized onto a different NetConnection. This boundary is
 // intentionally non-mutating: changing graph lists while ServerReplicateActors is iterating them
-// caused the 2026-07-27 Escalation disconnects. Ghidra identifies the 1.14.7 target as void(this).
-// Returning early intentionally skips serialization for a quarantined controller channel.
-// REPGRAPH_DIAG.flag still enables the older per-class frequency tally below.
+// caused the 2026-07-27 Escalation disconnects. Returning early intentionally skips serialization for
+// a quarantined controller channel. REPGRAPH_DIAG.flag still enables the older per-class frequency
+// tally below.
+//
+// [2026-10-10] The target returns int64 bits written, not void: its epilogue is `mov rax, rdi` at
+// 0x03D8BDAB, and the graph's ReplicateSingleActor (0x00F2C230) adds RAX into the connection's
+// bandwidth counters (+0x198 / +0x1F8 at 0x00F2C68E / 0x00F2C699) and its own return value. The hook
+// was declared bool (July) and then void, so every blocked path handed the graph whatever RAX held.
+// It now forwards the original's value and returns 0 ("nothing written") when it blocks. Harmonicrain/
+// Undaunted fixed the same ABI in their 1.12 copy. The channel and actor are no longer checked with
+// VirtualQuery on every call: the native function dereferences both unconditionally, and
+// IsRegisteredLiveObject is an SEH-guarded O(1) round trip.
 void* OrigReplicateActorFreq = nullptr;
-void __fastcall ReplicateActorFreqHook(UActorChannel* channel) {
-    if (channel && IsPlayerControllerChannelQuarantined(channel)) {
-        return;
+// [2026-10-11 1.14.7 O0] Counts every call and sums the native return (bits written) per connection for [PerfDetail].
+// Game thread; relaxed atomics; the channel's connection (+0x28) is read like the actor (+0x70) already is.
+static int64_t MpReplicateActorCounted(UActorChannel* Channel) {
+    const int64_t Bits = reinterpret_cast<int64_t(__fastcall*)(UActorChannel*)>(OrigReplicateActorFreq)(Channel);
+    if (MpPerfDetailEnabled()) {
+        if (Bits > 0) g_perfRepActorBits.fetch_add(static_cast<uint64_t>(Bits), std::memory_order_relaxed);
+        MpRepBitsAdd(Channel ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Channel) + 0x28) : nullptr, Bits);
     }
-    if (channel && IsReadablePointer(reinterpret_cast<void*>(channel), 0x78)) {
+    return Bits;
+}
+
+int64_t __fastcall ReplicateActorFreqHook(UActorChannel* channel) {
+    if (MpPerfDetailEnabled()) g_perfRepActorCalls.fetch_add(1, std::memory_order_relaxed);   // [2026-10-11 O0]
+    if (channel && IsPlayerControllerChannelQuarantined(channel)) {
+        return 0;
+    }
+    if (channel) {
         void* actor = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(channel) + 0x70);
-        if (actor && IsReadablePointer(actor, 0x20)) {
-            if (IsRegisteredLiveObject(actor)
-                && reinterpret_cast<UObject*>(actor)->IsA(
+        if (actor && IsRegisteredLiveObject(actor)) {
+            if (reinterpret_cast<UObject*>(actor)->IsA(
                     SDK::APlayerController::StaticClass())) {
                 void* connection = *reinterpret_cast<void**>(
                     reinterpret_cast<uintptr_t>(channel) + 0x28);
@@ -8015,14 +11165,12 @@ void __fastcall ReplicateActorFreqHook(UActorChannel* channel) {
                                 ? "actor-netconnection-mismatch"
                                 : "target-identity-mismatch"));
                     }
-                    return;
+                    return 0;
                 }
             }
 
             if (!RepGraphDiag()) {
-                reinterpret_cast<void(__fastcall*)(UActorChannel*)>(
-                    OrigReplicateActorFreq)(channel);
-                return;
+                return MpReplicateActorCounted(channel);
             }
             void* cls = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(actor) + 0x10);
             if (cls && IsReadablePointer(cls, 0x20)) {
@@ -8044,7 +11192,7 @@ void __fastcall ReplicateActorFreqHook(UActorChannel* channel) {
             }
         }
     }
-    reinterpret_cast<void(__fastcall*)(UActorChannel*)>(OrigReplicateActorFreq)(channel);
+    return MpReplicateActorCounted(channel);
 }
 
 // [2026-07-19 SRA_RATE_CAP.flag] Bring the ~60Hz SRA into sync with NetServerMaxTickRate (30). VERIFIED in
@@ -8055,6 +11203,10 @@ void __fastcall ReplicateActorFreqHook(UActorChannel* channel) {
 // exceeds net rate). CRUCIAL DIFFERENCE from NATIVE_NET_TICK / MANUAL_TICK_ZERO_DT (both broke joining): it
 // NEVER touches TickDispatch, so connection handshakes/timers keep running at full frame rate and the
 // server stays joinable. Default OFF; opt-in + reversible.
+// [2026-10-11 1.14.7] DEAD ON THIS BUILD: SRA_RATE_CAP.flag has no effect. Its only reader is ServerReplicateActorsHook,
+// which InitServerHooks never installs on 1.14.7 ("ServerReplicateActors probe skipped (1.14.7 target unresolved)"); the
+// Archon graph is driven by MpDriveReplicationGraph once per frame, and nothing there reads this flag. Kept only for
+// the 1.12 hook body below. Rate changes belong to O4 (39_ section 13.3), one flag at a time, with players.
 static bool SraRateCap() {
     static int c = -1;
     if (c < 0) {
@@ -9057,6 +12209,14 @@ static bool s_AirshipHUDCompatHidden = false;
 // gate — this function does not re-check it, only the internal reentrancy guard
 // (s_ArchonInputActivated = true, set before any ProcessEvent call, same ordering as before).
 void TriggerArchonInputActivation(UObject* PC, const char* TriggerLabel, bool AllowCinematicClear) {
+    // OnInputModeChanged events raised while this runs are ours, not the game's (see
+    // s_LastNaturalGameInput). A structured exception unwinding past this frame would skip the
+    // destructor, so ClientRestart also resets the depth for each new possession.
+    struct ActivationDepthScope {
+        ActivationDepthScope() { ++s_ArchonInputActivationDepth; }
+        ~ActivationDepthScope() { --s_ArchonInputActivationDepth; }
+    } ActivationDepth;
+
     uint8_t onlineReady = SafeReadByte(reinterpret_cast<uintptr_t>(PC), 0xC69, 0xEE);
 
     if (onlineReady != 1) {
@@ -9203,10 +12363,30 @@ void TriggerArchonInputActivation(UObject* PC, const char* TriggerLabel, bool Al
     // Only do it for the natural OnInputModeChanged edge after the exact possession chain has
     // survived the travel-settle interval. The timeout fallback may restore input, but it must not
     // tell an unfinished map that its arrival/loading presentation has completed.
+    //
+    // [1.14.7 FIX 2026-10-10, 38_ §21] The natural edge must also have handed control to the player:
+    // the game's latest OnInputModeChanged must be true. On a hunt the first natural edge is the arrival
+    // cinematic taking input away (false); clearing cinematic mode then made the Blueprint show the
+    // gameplay HUD over the arrival beam ~15 s before the cinematic ended (13:52 run: HUD 1->3 inside
+    // this call at 13:52:14.926, the game's own hand-over at 13:52:30.375). The airship screen takes
+    // input the same way. Ramsgate and Training hand over with a true edge and still get the clear.
+    // FORCE_CINEMATIC_CLEAR.flag restores the old any-edge behaviour.
+    static int s_ForceCinematicClear = -1;
+    if (s_ForceCinematicClear < 0) {
+        s_ForceCinematicClear = MpExeRelativeFlagPresent(L"FORCE_CINEMATIC_CLEAR.flag") ? 1 : 0;
+        MpLog(std::string("[ArchonInputActivate] cinematic clear needs the game's control hand-over: ")
+            + (s_ForceCinematicClear ? "OFF (FORCE_CINEMATIC_CLEAR.flag present)" : "ON (default)"));
+    }
+    const bool GameGaveControl = s_LastNaturalGameInput == 1 || s_ForceCinematicClear == 1;
     UObject* StableCinematicPawn = nullptr;
+    bool StablePossession = false;
+    if (AllowCinematicClear && s_NaturalInputModeChangedObserved && GameGaveControl) {
+        StablePossession = IsClientRolePumpPossessionStable(PC, &StableCinematicPawn);
+    }
     const bool CanClearCinematic = AllowCinematicClear
         && s_NaturalInputModeChangedObserved
-        && IsClientRolePumpPossessionStable(PC, &StableCinematicPawn);
+        && GameGaveControl
+        && StablePossession;
     if (s_SetCinematicModeFn && CanClearCinematic) {
         struct {
             bool bInCinematicMode;
@@ -9224,7 +12404,8 @@ void TriggerArchonInputActivation(UObject* PC, const char* TriggerLabel, bool Al
             + TriggerLabel
             + " allow=" + std::to_string(AllowCinematicClear ? 1 : 0)
             + " naturalInputEdge=" + std::to_string(s_NaturalInputModeChangedObserved ? 1 : 0)
-            + " stablePossession=" + std::to_string(CanClearCinematic ? 1 : 0));
+            + " gameInput=" + std::to_string(s_LastNaturalGameInput)
+            + " stablePossession=" + std::to_string(StablePossession ? 1 : 0));
     }
 
     // [1.12 InputConfigCascade — 2026-07-10 — Analysis.md + move.md]
@@ -9656,6 +12837,7 @@ static void TickControllerSplitDetector() {
         }
     }
 
+    MpForgetPossessionIfWorldChanged();
     UObject* PC = s_LastPossessedPC;
     if (!PC || !IsReadablePointer(PC, 0x2A0) || !IsRegisteredLiveObject(PC)) return;
     void* Player = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(PC) + 0x298);
@@ -9726,7 +12908,9 @@ static void TickControllerSplitDetector() {
 
 static bool ValidateClientPossessionChain(UObject* PC, UObject* ExpectedPawn, UObject** OutPawn) {
     if (OutPawn) *OutPawn = nullptr;
-    if (Globals::AmServer || !PC || PC != s_LastPossessedPC) return false;
+    if (Globals::AmServer) return false;
+    MpForgetPossessionIfWorldChanged();
+    if (!PC || PC != s_LastPossessedPC) return false;
 
     __try {
         if (!IsRegisteredLiveObject(PC) || !IsReadablePointer(PC, 0x2A0)) return false;
@@ -10310,6 +13494,7 @@ static void MpSendPathDiag() {
     static uint64_t s_nextMs = 0;
     static int s_samples = 0;
     if (!Globals::AmServer || s_samples >= 90) return;
+    if (MpProductionLogProfile()) return;   // [2026-10-11 O3] read-only [SendPath] probe
     const uint64_t Now = static_cast<uint64_t>(GetTickCount64());
     if (Now < s_nextMs) return;
 
@@ -10424,449 +13609,31 @@ static void MpSendPathDiag() {
         + " world=" + MpPtr(World));
 }
 
-// [1.14.7 2026-10-05 PHANTOM REPLICATION SUPPRESSION]
-//
-// The hub runs the WindowsClient binary, and that binary's map-init code forces listen-server mode
-// (GIsClient=1, GIsServer=1), so the engine spawns a ULocalPlayer: a phantom player with no
-// NetConnection, a PlayerState and - through RestartPlayer - a character. The 1.12 module eliminated it
-// by patching the five instruction sites that write those two globals. On 1.14.7 the same patches are
-// remapped and byte-verified but CANNOT be applied: with GIsClient=0 during map init this client-oriented
-// boot never finishes Slate/UI initialisation, never reaches Listen, and the DeployServer kills the hub on
-// its 30s readiness timeout (measured; see the Move10 block in InitServerHooks). The phantom is therefore
-// tolerated on 1.14.7 - and kept harmless for its own backend calls by ENABLE_SYNTHETIC_NETID.flag.
-//
-// What it must not do is become visible. Now that the graph drive makes replication work, the phantom's
-// character reaches real clients by plain spatial relevancy (both players stand at spawn): that is the
-// unexplained second pawn in the Training Grounds, and hub-side GameState.PlayerArray = 2 against the
-// client's 1. The phantom's PlayerController has no NetConnection and its UPlayer is a ULocalPlayer; a
-// real client's has a UNetConnection. On every DeployServer instance (AuthMode GlobalGameserver: the hubs
-// and, since 8 Oct, dedicated hunts) this takes that player's controller, PlayerState and pawn out of the
-// Archon graph and marks them non-replicated. [2026-10-08 correction] The old comment said player-hosted P2P
-// hunts were excluded because "the local player IS the host and must replicate". That is not true in this
-// codebase: the Launcher's P2P host is also a separate headless -server process and the hosting player
-// joins it through a NetConnection, so its local player is a phantom too. P2P (HuntCapability) stays
-// excluded only because no 1.14.7 P2P run has measured it yet.
-//
-// The GObjects walk runs only until the phantom's controller is found; afterwards one pointer read per
-// second re-checks it, so a respawned pawn is caught without re-walking the object graph.
-static void* s_phantomPc = nullptr;
-
-// SEH-isolated (no C++ objects in this frame) removal of one actor from the Archon replication graph.
-// Returns 1 on success, -1 if the call faulted, 0 for unusable inputs.
-static int MpGraphRemoveActorRaw(void* Graph, void* Actor, void* Class) {
-    if (!Graph || !Actor) return 0;
-    __try {
-        RepGraphActorInfo112 Info{};
-        Info.Actor = reinterpret_cast<AActor*>(Actor);
-        Info.Class = Class;
-        reinterpret_cast<void(__fastcall*)(void*, RepGraphActorInfo112*)>(
-            Globals::BaseAddress + 0x01BFE4C0)(Graph, &Info);
-        return 1;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return -1;
-    }
-}
-
-// [1.14.7 2026-10-05 NET-ID CONTRACT PROBE]
-//
-// The synthetic net-id object installed by EnsureSyntheticNetId (ENABLE_SYNTHETIC_NETID.flag) crashed the
-// engine: VEH 0xC0000005 at +0x3F9AD45 with rcx = the synthetic object (0x7FFD011FB9B0 == the logged
-// netId=140724622309808) and rax = 0, i.e. the engine called a virtual slot that our vtable fills with a
-// null-returning stub and then dereferenced the result. Slots 0x00-0x20 are all MpSynthNetIdGenericStub
-// (dllmain.cpp:17608-17625); only +0x28 (IsValid) and +0x30 (ToString) have real bodies.
-//
-// Before changing that object we need the REAL contract, and it cannot come from the SDK dump: the 1.14.7 dump
-// has FUniqueNetIdRepl final : public FUniqueNetIdWrapper (Engine_structs.hpp:6146) - the wrapper - not the
-// implementation class behind PlayerState+0x258, and the slot map in use today (IsValid +0x28, ToString +0x30)
-// is 1.12-era reverse engineering. So read it off a GENUINE net-id object instead: the one the engine built for
-// a real player. For every vtable slot this logs the return value and whatever the slot writes into a scratch
-// buffer (three pointer arguments are passed, all pointing at that buffer, so a hidden out-parameter such as
-// FString writes into our memory rather than an arbitrary address). Destructor slots 0x00/0x08 are never called.
-static uint64_t MpNetIdCallSlotRaw(void* Fn, void* This, void* Scratch) {
-    __try {
-        return reinterpret_cast<uint64_t(__fastcall*)(void*, void*, void*, void*)>(
-            Fn)(This, Scratch, Scratch, Scratch);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return 0xEEEEEEEEEEEEEEEEull;
-    }
-}
-
-static std::string MpTryWideString(uintptr_t Ptr) {
-    if (!Ptr || !IsReadablePointer(reinterpret_cast<void*>(Ptr), 8)) return "";
-    // No __try here: this function returns std::string and MSVC forbids SEH in a frame that needs object
-    // unwinding (C2712). The range is validated up front instead, so every read below is inside committed
-    // memory that VirtualQuery accepted.
-    if (!IsReadablePointer(reinterpret_cast<void*>(Ptr), 64 * sizeof(wchar_t))) return "";
-    const wchar_t* W = reinterpret_cast<const wchar_t*>(Ptr);
-    std::wstring S;
-    for (int i = 0; i < 64; ++i) {
-        const wchar_t C = W[i];
-        if (C == 0) break;
-        if (C < 0x20 || C > 0x7E) return "";
-        S.push_back(C);
-    }
-    if (S.size() < 2) return "";
-    return MpNarrow(S);
-}
-
-static void MpNetIdContractProbe() {
-    if (!MpExeRelativeFlagPresent(L"NETID_CONTRACT_PROBE.flag")) return;
-    if (!Globals::AmServer || !Networking::NetDriver) return;
-    static uint64_t s_nextMs = 0;
-    static void* s_lastObj = nullptr;
-    const uint64_t Now = static_cast<uint64_t>(GetTickCount64());
-    if (Now < s_nextMs) return;
-    s_nextMs = Now + 5000;
-
-    void* Genuine = nullptr;
-    const RawPointerArray* Clients = reinterpret_cast<const RawPointerArray*>(
-        reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x90);
-    if (IsReadablePointer(Clients, sizeof(RawPointerArray))
-        && IsSanePointerArray(Clients->Data, Clients->Num, Clients->Max, 1024)) {
-        for (int i = 0; i < Clients->Num && !Genuine; ++i) {
-            void* C = Clients->Data[i];
-            if (!C || !IsReadablePointer(C, 0x420)) continue;
-            void* PC = reinterpret_cast<void*>(SafeReadPtr(reinterpret_cast<uintptr_t>(C), 0x98));
-            if (!PC) continue;
-            void* PS = reinterpret_cast<void*>(SafeReadPtr(reinterpret_cast<uintptr_t>(PC), 0x228));
-            if (!PS) continue;
-            void* Id = reinterpret_cast<void*>(SafeReadPtr(reinterpret_cast<uintptr_t>(PS), 0x258));
-            if (Id) Genuine = Id;
-        }
-    }
-    if (!Genuine || Genuine == s_lastObj) return;
-    s_lastObj = Genuine;
-
-    const uintptr_t G = reinterpret_cast<uintptr_t>(Genuine);
-    const uintptr_t Vt = SafeReadPtr(G, 0x00);
-    std::string Qwords;
-    for (int i = 0; i < 8; ++i) {
-        const uintptr_t Q = SafeReadPtr(G, static_cast<uintptr_t>(i) * 8);
-        Qwords += MpHex(Q) + " ";
-        const std::string S = MpTryWideString(Q);
-        if (!S.empty()) Qwords += "(str='" + S + "') ";
-    }
-    MpLog("[NetIdDiag] genuine=" + MpPtr(Genuine) + " vtable=" + MpPtr(reinterpret_cast<void*>(Vt))
-        + " qwords=" + Qwords);
-
-    // Every non-destructor slot, with a scratch buffer so an out-parameter cannot escape.
-    // [1.14.7 2026-10-05 CORRECTION] Stop at +0x38: the measured genuine vtable has exactly eight slots,
-    // and +0x40..+0x58 read as wide-character text (rva=0x2E002E002E), i.e. the object's data past the
-    // vtable. Calling those called data - four bogus FAULTED lines in every dump.
-    uint8_t Scratch[0x40] = {};
-    for (uintptr_t Slot = 0x10; Slot <= 0x38; Slot += 8) {
-        const uintptr_t Fn = SafeReadPtr(Vt, Slot);
-        if (!Fn) { MpLog("[NetIdDiag]   slot+" + MpHex(Slot) + " = null"); continue; }
-        memset(Scratch, 0, sizeof(Scratch));
-        const uint64_t Rax = MpNetIdCallSlotRaw(reinterpret_cast<void*>(Fn), Genuine, Scratch);
-        uint64_t Out0 = 0;
-        memcpy(&Out0, Scratch, sizeof(Out0));
-        MpLog("[NetIdDiag]   slot+" + MpHex(Slot) + " rva=" + MpAddress(reinterpret_cast<void*>(Fn))
-            + " rax=0x" + MpHex(Rax)
-            + " out0=0x" + MpHex(Out0)
-            + (Rax == 0xEEEEEEEEEEEEEEEEull ? " FAULTED" : "")
-            + " str(rax)='" + MpTryWideString(Rax) + "'"
-            + " str(out0)='" + MpTryWideString(Out0) + "'");
-    }
-}
-
-// [1.14.7 FIX 2026-10-09] PHANTOM PAWN RACE - DESTROY INSTEAD OF HIDE.
-//
-// Graph removal plus clearing bReplicates/bAlwaysRelevant keeps the phantom's controller and PlayerState off
-// clients, but not its pawn. The pawn appears about 60 s after the hub starts; a client connected at that moment
-// received it anyway (8 Oct: baseline Ramsgate 23:33:36 - the character, its armour, weapon and lantern arrived on
-// the client 15-90 ms after "[PhantomRep] suppressed pawn"; Training 23:57:56, Training openCh 39 -> 47; IslandA
-// hunt 18:10:27 with a client connected since 18:09:39). Removing an actor from the graph never closes a channel
-// that is already open, and the pawn's attached equipment actors were never suppressed at all, so the client kept
-// the second character for the rest of the visit.
-//
-// Destroying the actor is the engine's own path for exactly this: UWorld::DestroyActor -> UNetDriver::
-// NotifyActorDestroyed closes the actor's channel on every client connection (the client then destroys its copy)
-// and removes it from the replication driver. AActor::K2_DestroyActor is a reflected UFunction, so it is called by
-// name through ProcessEvent - no RVA. Everything the pawn owns (AActor::Owner, +0xE0 in the 1.14.7 SDK) goes too.
-//
-// Scope: persistent hubs (Ramsgate, Training Grounds) by default. Dedicated hunts only with
-// PHANTOM_PAWN_DESTROY_HUNTS.flag until a hunt run shows a pawn-less phantom does not disturb hunt logic.
-// KEEP_PHANTOM_PAWN.flag restores the previous hide-only behaviour everywhere.
-static int MpPhantomPawnDestroyPolicy() {   // 1 destroy, 0 hide only, -1 not decided yet (GameMode unknown)
-    static int s_keep = -1;
-    if (s_keep < 0) s_keep = MpExeRelativeFlagPresent(L"KEEP_PHANTOM_PAWN.flag") ? 1 : 0;
-    if (s_keep == 1) return 0;
-    const int Hub = g_wdIsHub.load(std::memory_order_relaxed);
-    if (Hub == 1) return 1;
-    if (Hub < 0) return -1;
-    static int s_hunts = -1;
-    if (s_hunts < 0) s_hunts = MpExeRelativeFlagPresent(L"PHANTOM_PAWN_DESTROY_HUNTS.flag") ? 1 : 0;
-    return s_hunts;
-}
-
-// [1.14.7 FIX 2026-10-09] The phantom must never be (re)started. The ProcessEvent hook forces
-// GameModeBase.PlayerCanRestart -> true for every controller (a 1.12 workaround), and that is what kept handing
-// the phantom a pawn: destroying it (above) was answered with a new BP_PlayerCharacter every second (measured
-// 9 Oct 00:53:34-38, four in a row, each one reaching the connected client ~20 ms later). True for the hub's
-// local-only controller (NetConnection +0x418 null, Player +0x298 a ULocalPlayer) wherever the pawn policy
-// destroys, so the PlayerCanRestart hook answers false for it and the phantom stays pawn-less.
-static bool MpIsPhantomThatMayNotRestart(void* Controller) {
-    if (!Globals::AmServer || Globals::AuthMode != Globals::ServerAuthMode::GlobalGameserver) return false;
-    if (MpPhantomPawnDestroyPolicy() != 1) return false;
-    if (!Controller || !IsReadablePointer(Controller, 0x420) || !IsRegisteredLiveObject(Controller)) return false;
-    const uintptr_t P = reinterpret_cast<uintptr_t>(Controller);
-    if (SafeReadPtr(P, 0x418) != 0) return false;                       // a connected (remote) player
-    void* Player = reinterpret_cast<void*>(SafeReadPtr(P, 0x298));
-    return Player && IsReadablePointer(Player, 0x30) && IsRegisteredLiveObject(Player)
-        && reinterpret_cast<SDK::UObject*>(Player)->IsA(SDK::ULocalPlayer::StaticClass());
-}
-
-static bool MpDestroyActorByName(void* Actor) {
+// [1.14.7 2026-10-10] Without the phantom local player (see InitServerHooks) a server waits in WaitingToStart until
+// the first real login starts the match. On the Training Grounds and dedicated hunts that login then misses its spawn
+// (HandleStartingNewPlayer saw WaitingToStart) and the player waits for the GameMode's 60 s retry (10 Oct: 61 s from
+// PostLogin to possession on Training and on a hunt; 1.2 s on Ramsgate). The phantom's own login used to start the match
+// at boot, so a joining player found it InProgress and spawned at once (1.4 s on the 0.2.102 hunt). Starting at boot
+// instead is wrong: Training ends a match that starts with no player (0.2.104, 00:41:30: WaitingToStart ->
+// WaitingPostMatch). So the K2_PostLogin hook calls this for the first player, before HandleStartingNewPlayer, while
+// the match is still WaitingToStart (NumPlayers is already 1 there; Training kept that match InProgress after the
+// player left). AGameMode::StartMatch is a reflected UFunction (called by name, no RVA). Once per GameMode.
+static void MpStartMatchWithoutPhantom(void* GameMode) {
+    static void* s_started = nullptr;
+    if (!GameMode || GameMode == s_started || !IsRegisteredLiveObject(GameMode)) return;
     static UFunction* s_fn = nullptr;
     static bool s_tried = false;
     if (!s_tried) {
         s_tried = true;
-        UClass* ActorClass = SDK::AActor::StaticClass();
-        s_fn = ActorClass ? ActorClass->GetFunction("Actor", "K2_DestroyActor") : nullptr;
-        MpLog(std::string("[PhantomRep] K2_DestroyActor ") + (s_fn ? "resolved" : "NOT FOUND - destroy disabled"));
+        UClass* GameModeClass = SDK::AGameMode::StaticClass();
+        s_fn = GameModeClass ? GameModeClass->GetFunction("GameMode", "StartMatch") : nullptr;
+        MpLog(std::string("[NoLocalPlayer] GameMode.StartMatch ") + (s_fn ? "resolved" : "NOT FOUND - match starts at the first login"));
     }
-    if (!s_fn || !Actor || !IsReadablePointer(Actor, 0x140) || !IsRegisteredLiveObject(Actor)) return false;
-    return SafeProcessEventRaw(reinterpret_cast<UObject*>(Actor), s_fn, nullptr);
-}
-
-// Destroys every live actor whose AActor::Owner is OwnerActor. Returns how many were destroyed.
-static int MpDestroyActorsOwnedBy(void* OwnerActor, std::string& Names) {
-    if (!OwnerActor || !SDK::UObject::GObjects) return 0;
-    SDK::UClass* ActorClass = SDK::AActor::StaticClass();
-    int Destroyed = 0;
-    const int Count = SDK::UObject::GObjects->Num();
-    for (int i = 0; i < Count; ++i) {
-        SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
-        if (!Obj || Obj == OwnerActor || Obj->IsDefaultObject() || !Obj->IsA(ActorClass)) continue;
-        if (reinterpret_cast<void*>(SafeReadPtr(reinterpret_cast<uintptr_t>(Obj), 0xE0)) != OwnerActor) continue;
-        const std::string Name = SafeObjectNameForDiagnostic(Obj);
-        if (!MpDestroyActorByName(Obj)) continue;
-        if (++Destroyed <= 10) Names += (Names.empty() ? "" : ",") + Name;
-    }
-    return Destroyed;
-}
-
-static int MpClientConnectionCount() {
-    if (!Networking::NetDriver) return -1;
-    const RawPointerArray* Clients = reinterpret_cast<const RawPointerArray*>(
-        reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x90);
-    if (!IsReadablePointer(Clients, sizeof(RawPointerArray))
-        || !IsSanePointerArray(Clients->Data, Clients->Num, Clients->Max, 1024)) return -1;
-    return Clients->Num;
-}
-
-// Returns true when the pawn was destroyed (the caller then skips hide-only suppression for it).
-static bool MpDestroyPhantomPawn(void* Pawn, const char* Reason) {
-    // Respawn guard: if the phantom keeps receiving new pawns, stop destroying instead of churning every frame.
-    static uint64_t s_windowStartMs = 0;
-    static int s_inWindow = 0;
-    static bool s_guardTripped = false;
-    const uint64_t Now = static_cast<uint64_t>(GetTickCount64());
-    if (s_guardTripped) return false;
-    if (Now - s_windowStartMs > 120000) { s_windowStartMs = Now; s_inWindow = 0; }
-    if (++s_inWindow > 4) {
-        s_guardTripped = true;
-        MpLog("[PhantomRep] pawn destroy guard tripped (more than 4 phantom pawns in 120 s); hide-only from now on");
-        return false;
-    }
-    const std::string PawnName = SafeObjectNameForDiagnostic(Pawn);
-    const int Clients = MpClientConnectionCount();
-    std::string Owned;
-    // The pawn first: its own EndPlay may already take its equipment down; the owner sweep catches the rest.
-    if (!MpDestroyActorByName(Pawn)) {
-        MpLog("[PhantomRep] pawn destroy FAILED actor=" + MpPtr(Pawn) + " class=" + PawnName + "; falling back to hide");
-        return false;
-    }
-    const int OwnedCount = MpDestroyActorsOwnedBy(Pawn, Owned);
-    MpLog("[PhantomRep] destroyed pawn actor=" + MpPtr(Pawn) + " class=" + PawnName
-        + " reason=" + Reason + " clientsConnected=" + std::to_string(Clients)
-        + " ownedDestroyed=" + std::to_string(OwnedCount) + (Owned.empty() ? "" : " {" + Owned + "}"));
-    return true;
-}
-
-static void MpSuppressPhantomReplication() {
-    if (!Globals::AmServer) return;
-    // [1.14.7 FIX 2026-10-08] Every DeployServer instance, hubs AND dedicated hunts. The old gate was
-    // g_wdIsHub == 1, which is derived from the GameMode name ("City"/"TrainingGrounds") and so also
-    // excluded dedicated hunts: on the 8 Oct ShatteredIsles_IslandA hunt (BPGM_ArchonExploration_C,
-    // watchdog hub=0) the phantom was never suppressed and the player saw a second character "Player" at
-    // the spawn (client census playerStates=2 archonCharacters=2). AuthMode is fixed in Init before any
-    // tick: DeployServer never sets MYSTICPARADOX_AUTH_MODE (GlobalGameserver); the Launcher's P2P player-host
-    // runs HuntCapability and stays untouched until a 1.14.7 P2P run decides it.
-    if (Globals::AuthMode != Globals::ServerAuthMode::GlobalGameserver) return;
-    if (!Networking::NetDriver) return;
-
-    // [1.14.7 FIX 2026-10-08] Called every frame, between the engine tick and the graph drive. Only the
-    // controller liveness check and the GObjects scan stay on a 1s throttle; once the controller is
-    // known, a frame costs two guarded pointer reads, and actors are only touched when one is new.
-    static uint64_t s_nextSlowMs = 0;
-    static uint64_t s_retryAfterMs = 0;
-    static int s_scans = 0;
-    // Keyed on (pointer, UObject InternalIndex at +0x0C) so a respawned pawn that reuses a freed address is
-    // still treated as new. Ring buffer: the oldest entry is overwritten, never "full".
-    struct DoneEntry { void* Actor; int32_t Index; };
-    static DoneEntry s_done[12] = {};
-    static int s_doneNext = 0;
-    const uint64_t Now = static_cast<uint64_t>(GetTickCount64());
-    const auto IsDone = [](void* A) {
-        const int32_t Index = SafeReadI32At(reinterpret_cast<uintptr_t>(A), 0x0C);
-        for (const DoneEntry& D : s_done) { if (D.Actor == A && D.Index == Index) return true; }
-        return false;
-    };
-
-    // [1.14.7 FIX 2026-10-09] A pawn hidden while the destroy policy was still undecided (GameMode not yet
-    // known) is destroyed as soon as the policy is known - see MpDestroyPhantomPawn.
-    static void* s_pendingPawn = nullptr;
-    static int32_t s_pendingPawnIndex = 0;
-    if (s_pendingPawn) {
-        const int Policy = MpPhantomPawnDestroyPolicy();
-        if (Policy >= 0) {
-            void* Pending = s_pendingPawn;
-            s_pendingPawn = nullptr;
-            if (Policy == 1 && IsRegisteredLiveObject(Pending)
-                && SafeReadI32At(reinterpret_cast<uintptr_t>(Pending), 0x0C) == s_pendingPawnIndex) {
-                MpDestroyPhantomPawn(Pending, "deferred");
-            }
-        }
-    }
-
-    if (Now >= s_nextSlowMs) {
-        s_nextSlowMs = Now + 1000;
-        if (s_phantomPc && !(IsReadablePointer(s_phantomPc, 0x420) && IsRegisteredLiveObject(s_phantomPc))) {
-            s_phantomPc = nullptr;
-        }
-    } else if (!s_phantomPc) {
-        return;                                                   // scans stay on the 1s cadence
-    } else {
-        const uintptr_t Pc = reinterpret_cast<uintptr_t>(s_phantomPc);
-        void* Ps = reinterpret_cast<void*>(SafeReadPtr(Pc, 0x228));
-        void* Pawn = reinterpret_cast<void*>(SafeReadPtr(Pc, 0x250));
-        const bool NothingNew = IsDone(s_phantomPc) && (!Ps || IsDone(Ps)) && (!Pawn || IsDone(Pawn));
-        if (NothingNew || Now < s_retryAfterMs) return;
-    }
-    if (!s_phantomPc) {
-        if (s_scans++ > 60 || !SDK::UObject::GObjects) return;
-        const int Count = SDK::UObject::GObjects->Num();
-        for (int i = 0; i < Count; ++i) {
-            SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
-            if (!Obj || Obj->IsDefaultObject()) continue;
-            if (!Obj->IsA(SDK::APlayerController::StaticClass())) continue;
-            const uintptr_t P = reinterpret_cast<uintptr_t>(Obj);
-            if (SafeReadPtr(P, 0x418) != 0) continue;            // a real, connected player
-            // [1.14.7 2026-10-08] A null NetConnection alone is not proof: a real client's controller is
-            // also null at +0x418 for a moment after it spawns (measured on the hunt: [PlayerControllerRoute
-            // Guard] ... netConnection=null at 15:24:15.577). The phantom is the one whose UPlayer
-            // (APlayerController::Player, +0x298) is a ULocalPlayer; a remote player's is its UNetConnection.
-            void* Player = reinterpret_cast<void*>(SafeReadPtr(P, 0x298));
-            if (!Player || !IsReadablePointer(Player, 0x30) || !IsRegisteredLiveObject(Player)
-                || !reinterpret_cast<SDK::UObject*>(Player)->IsA(SDK::ULocalPlayer::StaticClass())) {
-                continue;
-            }
-            s_phantomPc = Obj;
-            MpLog("[PhantomRep] local-only PlayerController found pc=" + MpPtr(Obj)
-                + " class=" + SafeObjectNameForDiagnostic(Obj)
-                + " playerState=" + MpPtr(reinterpret_cast<void*>(SafeReadPtr(P, 0x228)))
-                + " pawn=" + MpPtr(reinterpret_cast<void*>(SafeReadPtr(P, 0x250))));
-            break;
-        }
-        if (!s_phantomPc) return;
-    }
-
-    void* Graph = reinterpret_cast<void*>(
-        SafeReadPtr(reinterpret_cast<uintptr_t>(Networking::NetDriver), 0x6E8));
-    const uintptr_t P = reinterpret_cast<uintptr_t>(s_phantomPc);
-    void* Targets[3] = { s_phantomPc,
-                         reinterpret_cast<void*>(SafeReadPtr(P, 0x228)),
-                         reinterpret_cast<void*>(SafeReadPtr(P, 0x250)) };
-    const char* Roles[3] = { "controller", "playerState", "pawn" };
-
-    for (int t = 0; t < 3; ++t) {
-        void* A = Targets[t];
-        if (!A || IsDone(A)) continue;
-        if (!IsReadablePointer(A, 0x110) || !IsRegisteredLiveObject(A)) continue;
-
-        const uintptr_t AP = reinterpret_cast<uintptr_t>(A);
-
-        // [1.14.7 FIX 2026-10-09] The pawn is destroyed, not hidden, where the policy allows it (see
-        // MpDestroyPhantomPawn). Undecided: hide it below now and destroy it once the GameMode is known.
-        if (t == 2) {
-            const int Policy = MpPhantomPawnDestroyPolicy();
-            if (Policy == 1
-                && MpDestroyPhantomPawn(A, g_wdIsHub.load(std::memory_order_relaxed) == 1 ? "hub" : "hunt-flag")) {
-                s_done[s_doneNext] = { A, SafeReadI32At(AP, 0x0C) };
-                s_doneNext = (s_doneNext + 1) % static_cast<int>(std::size(s_done));
-                continue;
-            }
-            if (Policy < 0) {
-                s_pendingPawn = A;
-                s_pendingPawnIndex = SafeReadI32At(AP, 0x0C);
-            }
-        }
-
-        const uint8_t Flags58Before = SafeReadU8At(AP, 0x58);
-        const uint8_t Flags5BBefore = SafeReadU8At(AP, 0x5B);
-
-        // [1.14.7 FIX 2026-10-05] REMOVE BEFORE CLEARING THE FLAGS. The native removal routine chooses its
-        // node from the SAME +0x58 byte as the add routine - verified by decompiling both, not inferred:
-        //   FUN_141bfe430 (add)    : +0x58 & 8 -> global node graph+0x4A0 ; & 4 -> pending list +0x4B8 ;
-        //                            else -> FUN_140f12820(*(graph+0x498))  (spatial)
-        //   FUN_141bfe4c0 (remove) : +0x58 & 8 -> (*(graph+0x4A0))->vtable[+0x278], the global node ;
-        //                            & 4 -> the owning connection's node via FUN_141bdb8f0 ;
-        //                            else -> FUN_140f2a6d0(*(graph+0x498))  (spatial)
-        // Clearing bAlwaysRelevant first therefore always took the SPATIAL branch and left the actor a
-        // member of the global always-relevant node, so it stayed replicated; graphRemove=1 only ever meant
-        // "the call returned". Membership is now read before and after, and the flags are cleared only once
-        // the actor is verifiably out of the global node.
-        void* GlobalNode = (Graph && IsReadablePointer(Graph, 0x4A8))
-            ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Graph) + 0x4A0)
-            : nullptr;
-        const int MemberBefore = RepGraphPersistentActorListContains(GlobalNode, A) ? 1 : 0;
-
-        const int Removed = (Graph && IsReadablePointer(Graph, 0x4A8))
-            ? MpGraphRemoveActorRaw(Graph, A, reinterpret_cast<void*>(SafeReadPtr(AP, 0x10)))
-            : 0;
-
-        const int MemberAfter = RepGraphPersistentActorListContains(GlobalNode, A) ? 1 : 0;
-
-        // [1.14.7 FIX 2026-10-08] Clear the flags ONLY once the actor is verifiably out of the global node.
-        // Clearing bAlwaysRelevant while it is still a member makes every later removal take the spatial
-        // branch, stranding it in the global node for good (the original §12 defect). A null GlobalNode
-        // means membership could not be measured, which is not proof of removal either. Not marked done,
-        // so the next pass retries.
-        if (!GlobalNode || MemberAfter != 0) {
-            static std::atomic<int> s_keptLogs{ 0 };
-            if (s_keptLogs.fetch_add(1, std::memory_order_relaxed) < 8) {
-                MpLog("[PhantomRep] removal NOT verified; flags kept for retry " + std::string(Roles[t])
-                    + " actor=" + MpPtr(A) + " globalNode=" + MpPtr(GlobalNode)
-                    + " globalMemberBefore=" + std::to_string(MemberBefore)
-                    + " globalMemberAfter=" + std::to_string(MemberAfter)
-                    + " graphRemove=" + std::to_string(Removed));
-            }
-            s_retryAfterMs = Now + 1000;                          // retry at most once a second
-            continue;
-        }
-
-        const bool WroteReplicates = SafeWriteByte(AP, 0x5B,
-            static_cast<uint8_t>(Flags5BBefore & ~static_cast<uint8_t>(0x01)));     // bReplicates = 0
-        const bool WroteRelevant = SafeWriteByte(AP, 0x58,
-            static_cast<uint8_t>(Flags58Before & ~static_cast<uint8_t>(0x08)));     // bAlwaysRelevant = 0
-
-        MpLog("[PhantomRep] suppressed " + std::string(Roles[t]) + " actor=" + MpPtr(A)
-            + " class=" + SafeObjectNameForDiagnostic(A)
-            + " routingFlagIntact=" + std::to_string((Flags58Before & 0x08) != 0 ? 1 : 0)
-            + " globalMemberBefore=" + std::to_string(MemberBefore)
-            + " globalMemberAfter=" + std::to_string(MemberAfter)
-            + " flags58=" + MpHex(Flags58Before) + "->" + MpHex(SafeReadU8At(AP, 0x58))
-            + " flags5B=" + MpHex(Flags5BBefore) + "->" + MpHex(SafeReadU8At(AP, 0x5B))
-            + " graphRemove=" + std::to_string(Removed)
-            + " writeReplicates=" + std::to_string(WroteReplicates ? 1 : 0)
-            + " writeAlwaysRelevant=" + std::to_string(WroteRelevant ? 1 : 0));
-        s_done[s_doneNext] = { A, SafeReadI32At(AP, 0x0C) };
-        s_doneNext = (s_doneNext + 1) % static_cast<int>(std::size(s_done));
-    }
+    if (!s_fn) return;
+    s_started = GameMode;
+    const bool Ok = SafeProcessEventRaw(reinterpret_cast<UObject*>(GameMode), s_fn, nullptr);
+    MpLog(std::string("[NoLocalPlayer] StartMatch at the first login ") + (Ok ? "called" : "FAILED (exception)")
+        + " gm=" + MpPtr(GameMode) + " class=" + SafeObjectNameForDiagnostic(GameMode));
 }
 
 static void MpTraceClientPlayerStateGap(UObject* PC) {
@@ -10917,6 +13684,16 @@ static void MpTraceClientPlayerStateGap(UObject* PC) {
 static bool IsClientRolePumpPossessionStable(UObject* PC, UObject** OutPawn) {
     UObject* Pawn = nullptr;
     const uint64_t Now = GetTickCount64();
+    if (!Globals::AmServer) MpForgetPossessionIfWorldChanged();
+    if (!s_LastPossessedPC) {
+        // Nothing tracked (no possession yet, or its world is gone): not stable, and nothing to trace -
+        // the caller's PC may be the freed controller of the previous world.
+        s_ClientRolePumpStablePC = nullptr;
+        s_ClientRolePumpStablePawn = nullptr;
+        s_ClientRolePumpStableSinceMs = 0;
+        if (OutPawn) *OutPawn = nullptr;
+        return false;
+    }
     if (!ValidateClientPossessionChain(PC, s_LastRestartPawn, &Pawn)) {
         MpTracePossessionChainFailure(PC);
         s_ClientRolePumpStablePC = nullptr;
@@ -10941,6 +13718,74 @@ static bool IsClientRolePumpPossessionStable(UObject* PC, UObject** OutPawn) {
 
     if (OutPawn) *OutPawn = Pawn;
     return true;
+}
+
+// [1.14.7 DIAG 2026-10-10] Ramsgate NPC collision. The player walks through city NPCs (user, 10 Oct); this runtime
+// never changes collision anywhere, so the question is what the game data says. Read-only, client, after each
+// arrival: for up to 4 city NPCs (city_interactive_npc_bp - placed interaction props, skeletal meshes, no capsule)
+// every primitive component's collision mode (0 none, 1 query, 2 physics, 3 both), object type, profile and
+// response to Pawn (0 ignore, 1 overlap, 2 block), plus the local capsule's response to those object types.
+// A block needs both sides to answer 2.
+static std::string MpPrimitiveCollisionText(SDK::UPrimitiveComponent* C) {
+    return C->GetName()
+        + " enabled=" + std::to_string(static_cast<int>(C->GetCollisionEnabled()))
+        + " type=" + std::to_string(static_cast<int>(C->GetCollisionObjectType()))
+        + " profile=" + C->GetCollisionProfileName().ToString()
+        + " vsPawn=" + std::to_string(static_cast<int>(C->GetCollisionResponseToChannel(SDK::ECollisionChannel::ECC_Pawn)));
+}
+
+static void MpNpcCollisionProbe(UObject* Pawn) {
+    if (Globals::AmServer || !Pawn || !UObject::GObjects) return;
+    static void* s_pawn = nullptr;
+    static int s_attempts = 0;
+    static uint64_t s_lastTryMs = 0;
+    if (s_pawn != Pawn) { s_pawn = Pawn; s_attempts = 0; s_lastTryMs = GetTickCount64(); }
+    if (s_attempts >= 3) return;                                   // done for this arrival
+    const uint64_t Now = GetTickCount64();
+    if (Now - s_lastTryMs < 4000) return;                          // 4 s apart: NPC sublevels stream in after arrival
+    s_lastTryMs = Now;
+    ++s_attempts;
+
+    UClass* NpcClass = SDK::UObject::FindClassFast("city_interactive_npc_bp_C");
+    if (!NpcClass) { s_attempts = 3; return; }                     // not a map with city NPCs
+    UClass* PrimitiveClass = SDK::UPrimitiveComponent::StaticClass();
+    std::vector<UObject*> Npcs;
+    int Total = 0;
+    const int Count = UObject::GObjects->Num();
+    for (int i = 0; i < Count; ++i) {
+        UObject* Obj = UObject::GObjects->GetByIndex(i);
+        if (!Obj || Obj->IsDefaultObject() || !MpIsAGuarded(Obj, NpcClass)) continue;
+        ++Total;
+        if (Npcs.size() < 4) Npcs.push_back(Obj);
+    }
+    if (Total == 0) return;                                        // not streamed in yet: retry
+    s_attempts = 3;
+
+    std::set<int> NpcTypes;
+    MpLog("[NpcCollision] city NPCs in world=" + std::to_string(Total) + " (dumping " + std::to_string(Npcs.size()) + ")");
+    for (UObject* Npc : Npcs) {
+        if (!IsRegisteredLiveObject(Npc)) continue;
+        auto* Actor = reinterpret_cast<SDK::AActor*>(Npc);
+        MpLog("[NpcCollision] npc=" + Npc->GetName() + " actorCollision=" + std::to_string(Actor->GetActorEnableCollision() ? 1 : 0));
+        SDK::TArray<SDK::UActorComponent*> Comps = Actor->K2_GetComponentsByClass(SDK::TSubclassOf<SDK::UActorComponent>(PrimitiveClass));
+        for (int c = 0; c < Comps.Num(); ++c) {
+            auto* Prim = reinterpret_cast<SDK::UPrimitiveComponent*>(Comps[c]);
+            if (!Prim || !IsRegisteredLiveObject(Prim)) continue;
+            NpcTypes.insert(static_cast<int>(Prim->GetCollisionObjectType()));
+            MpLog("[NpcCollision]   " + MpPrimitiveCollisionText(Prim));
+        }
+    }
+    if (IsRegisteredLiveObject(Pawn) && Pawn->IsA(SDK::ACharacter::StaticClass())) {
+        SDK::UCapsuleComponent* Capsule = reinterpret_cast<SDK::ACharacter*>(Pawn)->CapsuleComponent;
+        if (Capsule && IsRegisteredLiveObject(Capsule)) {
+            std::string Responses;
+            for (int Type : NpcTypes) {
+                Responses += " vsType" + std::to_string(Type) + "=" + std::to_string(static_cast<int>(
+                    Capsule->GetCollisionResponseToChannel(static_cast<SDK::ECollisionChannel>(Type))));
+            }
+            MpLog("[NpcCollision] local capsule " + MpPrimitiveCollisionText(Capsule) + Responses);
+        }
+    }
 }
 
 static bool RunClientRolePumpGuarded(UObject* PC, UObject* Pawn) {
@@ -11233,30 +14078,55 @@ static void StartClientHitchSampler() {
 // pushes tens of thousands of UFunction calls through here, which showed as a 1-2 s hitch on open and close.
 // The name is now built once per UFunction and cached, keyed by address and validated by the object's
 // GUObjectArray index and FName, so a recycled address recomputes instead of returning a stale name.
+// [2026-10-10 1.14.7 CPU] Also validated by Outer (+0x20), which only makes the cache more conservative, and now
+// shared with the server ProcessEventHook (PE_FULLNAME_UNCACHED.flag reverts the server to a per-call build).
 // Entries are only ever added or rewritten in place for a different object - never erased - so the reference
 // a caller holds stays valid across the nested ProcessEvent calls its own OrigProcessEventClient makes.
-static const std::string& CachedFunctionFullName(UFunction* Function) {
-    static const std::string s_null = "null";
-    if (!Function) return s_null;
-    struct Entry { int32_t Index; int32_t NameIndex; uint32_t NameNumber; std::string Name; };
-    static thread_local std::unordered_map<const void*, Entry> s_names;
+// [2026-10-11 1.14.7 O3] The entry also carries the server hook's per-UFunction category mask (MpPeCategoryMask), computed
+// the first time the server asks and recomputed whenever the name is.
+struct MpFunctionNameCacheEntry {
+    int32_t Index; int32_t NameIndex; uint32_t NameNumber; const void* Outer; std::string Name;
+    uint64_t PeMask; bool PeMaskValid;
+};
+static MpFunctionNameCacheEntry& CachedFunctionNameEntry(UFunction* Function) {
+    static thread_local std::unordered_map<const void*, MpFunctionNameCacheEntry> s_names;
     auto It = s_names.find(Function);
     if (It != s_names.end() && It->second.Index == Function->Index
-        && It->second.NameIndex == Function->Name.ComparisonIndex && It->second.NameNumber == Function->Name.Number) {
-        return It->second.Name;
+        && It->second.NameIndex == Function->Name.ComparisonIndex && It->second.NameNumber == Function->Name.Number
+        && It->second.Outer == Function->Outer) {
+        return It->second;
     }
-    Entry& Slot = s_names[Function];
+    MpFunctionNameCacheEntry& Slot = s_names[Function];
     Slot.Index = Function->Index;
     Slot.NameIndex = Function->Name.ComparisonIndex;
     Slot.NameNumber = Function->Name.Number;
+    Slot.Outer = Function->Outer;
     Slot.Name = Function->GetFullName();
-    return Slot.Name;
+    Slot.PeMask = 0;
+    Slot.PeMaskValid = false;
+    return Slot;
+}
+
+static const std::string& CachedFunctionFullName(UFunction* Function) {
+    static const std::string s_null = "null";
+    if (!Function) return s_null;
+    return CachedFunctionNameEntry(Function).Name;
 }
 
 void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     g_clientProcessEventCount.fetch_add(1, std::memory_order_relaxed);
     if (g_clientGameThreadId.load(std::memory_order_relaxed) == 0) {
         g_clientGameThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);   // ProcessEvent runs on the game thread
+    }
+    // [2026-10-10 1.14.7] Read-only UWorld census around map changes (travel-crash probe). The engine-tick hook is
+    // server-only, so the client checks GWorld from here, at most every 250 ms.
+    {
+        static uint64_t s_worldCensusCheckMs = 0;
+        const uint64_t NowMs = GetTickCount64();
+        if (NowMs - s_worldCensusCheckMs >= 250) {
+            s_worldCensusCheckMs = NowMs;
+            MpWorldCensusTick();
+        }
     }
     // s_LastPossessedPC is now file-scope (see above) so GameEngineTickHook's timeout fallback
     // can see it too. Captured at ClientRestart so the first OnInputModeChanged callback (fires
@@ -11395,6 +14265,12 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
         || FunctionName.find(".Refresh_HUD_Widget_Visibility") != std::string::npos
         || FunctionName.find(".Show_HUD") != std::string::npos
         || FunctionName.find(".Show HUD") != std::string::npos);
+    // [1.14.7 FIX 2026-10-10, 38_ §21] Most names above are Blueprint-to-Blueprint calls that never pass
+    // through ProcessEvent (no [HUDTrace] has ever logged ShowGameplayHUD or Show_HUD). The native
+    // visibility setters dispatch OnHUDVisibilityChanged through ProcessEvent on every change
+    // (0x01DF9040 -> 0x022B4130), so that event is the reliable "someone just showed the HUD" signal.
+    const bool HudVisibilityChangedEvent = Function
+        && FunctionName.find(".OnHUDVisibilityChanged") != std::string::npos;
 
     // [1.14.7 DIAG 2026-10-08] HUD visibility trace, client only, log-only. The 8 Oct hunt showed the
     // gameplay HUD during the arrival beam and nothing recorded which call made it visible (the module's
@@ -11402,6 +14278,7 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     // that is correlation, not proof). Each HUD lifecycle / cinematic event is logged with the HUD's
     // GameplayHUDVisibility (AArchonHUD +0x361, ESlateVisibility: 0 Visible, 1 Collapsed, 2 Hidden,
     // 3 HitTestInvisible, 4 SelfHitTestInvisible), so one arrival decides who shows the HUD.
+    // Answered 10 Oct (38_ §21): the cascade's SetCinematicMode(false) on the cinematic's own false edge.
     if (Function && (AirshipHUDMayHaveBeenShown
         || FunctionName.find(".HideGameplayHUD") != std::string::npos
         || FunctionName.find(".Hide_HUD") != std::string::npos
@@ -11411,13 +14288,18 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
         || FunctionName.find(".ClientIslandGameplayStarted") != std::string::npos
         || FunctionName.find(".OnCinematicState") != std::string::npos
         || FunctionName.find(".Restore_Game_Input") != std::string::npos)) {
+        int HudVisibility = -1;
+        const bool IsHudObject = Object && IsReadablePointer(Object, 0x362)
+            && Object->IsA(SDK::AArchonHUD::StaticClass());
+        if (IsHudObject) {
+            HudVisibility = SafeReadU8At(reinterpret_cast<uintptr_t>(Object), 0x361);
+        }
+        // [2026-10-10] World actors' ReceiveGameplayStart (~190 per arrival, all visibility -1) spent the
+        // 400-line budget within two travels; only the HUD's own ReceiveGameplayStart is logged now.
+        const bool WorldActorGameplayStart = !IsHudObject
+            && FunctionName.find(".ReceiveGameplayStart") != std::string::npos;
         static std::atomic<int> s_hudTrace{ 0 };
-        if (s_hudTrace.fetch_add(1, std::memory_order_relaxed) < 400) {
-            int HudVisibility = -1;
-            if (Object && IsReadablePointer(Object, 0x362)
-                && Object->IsA(SDK::AArchonHUD::StaticClass())) {
-                HudVisibility = SafeReadU8At(reinterpret_cast<uintptr_t>(Object), 0x361);
-            }
+        if (!WorldActorGameplayStart && s_hudTrace.fetch_add(1, std::memory_order_relaxed) < 400) {
             MpLog("[HUDTrace] fn=" + FunctionName
                 + " obj=" + SafeObjectNameForDiagnostic(Object)
                 + " gameplayHUDVisibility=" + std::to_string(HudVisibility));
@@ -11590,8 +14472,8 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
                 // [1.14.7 2026-10-05] One-shot arrival census. The moment the possession chain is
                 // complete for a NEW (PC, pawn) pair, count the client's player objects once. This is the
                 // client-side acceptance reading: playerStates=1, gameStates=1 and archonCharacters=1 -
-                // a second archon character would mean the hub's phantom player leaked into replication
-                // (see MpSuppressPhantomReplication), a missing playerState/gameState means the graph
+                // a second archon character would mean an extra server-side player leaked into replication
+                // (the hub phantom did until 0.2.110), a missing playerState/gameState means the graph
                 // drive regressed. Keyed on the pair so it fires once per arrival and once per travel.
                 static void* s_censusPc = nullptr;
                 static void* s_censusPawn = nullptr;
@@ -11601,10 +14483,17 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
                     MpLog("[ArrivalCensus] possession chain complete pc=" + MpPtr(s_LastPossessedPC)
                         + " pawn=" + MpPtr(StablePawn));
                     MpCensusClientPlayerObjects();
+                    // [1.14.7 2026-10-10] Read-only economy probes at the same one-shot point (outermost ProcessEvent,
+                    // game thread): hunt pass season and component state, the fountain's configuration, and the
+                    // feature-flag dump that servers already write at their first readiness check (once per process).
+                    MpHuntPassClientProbe(s_LastPossessedPC);
+                    MpCoinTossClientProbe(s_LastPossessedPC);
+                    DumpFeatureFlags("client arrival");
                 }
                 if (!RunClientRolePumpGuarded(s_LastPossessedPC, StablePawn)) {
                     MpLog("[ClientRolePump] FAULTED after stable-possession validation - caught, skipping this pump cycle");
                 }
+                MpNpcCollisionProbe(StablePawn);   // read-only diagnostic, once per arrival (self-throttled)
             }
             else if (s_LastPossessedPC && s_LastPossessedAtMs != 0) {
                 static uint64_t s_LastTravelGuardWaitLogMs = 0;
@@ -11734,6 +14623,9 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     else if (AirshipHUDMayHaveBeenShown) {
         ReconcileAirshipGameplayHUD("hud-show-path");
     }
+    else if (HudVisibilityChangedEvent) {
+        ReconcileAirshipGameplayHUD("hud-visibility-changed");
+    }
 
     if (WeaponXpClientGrant && WeaponXpClientEventSeq >= 0 && WeaponXpClientEventSeq < 256) {
         MpLog("[WeaponXP][ClientEvent] EXIT seq=" + std::to_string(WeaponXpClientEventSeq)
@@ -11797,8 +14689,18 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
         && FunctionName == "Function BP_PlayerCharacter.BP_PlayerCharacter_C.OnInputModeChanged")
     {
         bool bGameInputEnabled = *reinterpret_cast<bool*>(Parms);
+        // [1.14.7 FIX 2026-10-10, 38_ §21] Remember the game's own latest value; events raised by our
+        // activation cascade are tagged source=runtime and do not count as the game handing over control.
+        const bool FromRuntime = s_ArchonInputActivationDepth > 0;
+        const bool CurrentChain = s_LastPossessedPC
+            && ValidateClientPossessionChain(s_LastPossessedPC, Object, nullptr);
+        if (!FromRuntime && CurrentChain) {
+            s_LastNaturalGameInput = bGameInputEnabled ? 1 : 0;
+            s_LastNaturalGameInputMs = GetTickCount64();
+        }
         MpLog(std::string("[InputModeVal] pawn=") + Object->GetFullName()
-            + " bGameInputEnabled=" + (bGameInputEnabled ? "true" : "false"));
+            + " bGameInputEnabled=" + (bGameInputEnabled ? "true" : "false")
+            + " source=" + (FromRuntime ? "runtime" : "game"));
 
         // Record the first natural OnInputModeChanged after ClientRestart. Captures prove this
         // can precede stable world rendering, so it is a trigger edge only—not proof that the
@@ -11839,7 +14741,7 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
         // — currency widgets, etc.). The trade is: possibly-gearless character
         // in Ramsgate hub, versus can't-move Slayer. We take movement.
         if (!s_ArchonInputActivated && s_LastPossessedPC && !DiagNaturalMode()) {
-            if (ValidateClientPossessionChain(s_LastPossessedPC, Object, nullptr)) {
+            if (CurrentChain) {
                 s_NaturalInputModeChangedObserved = true;
 
                 UObject* StablePawn = nullptr;
@@ -12131,6 +15033,7 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
         const bool NewPossession = Object != s_LastPossessedPC || NewPawn != s_LastRestartPawn;
         s_LastPossessedPC = Object;
         s_LastRestartPawn = NewPawn;
+        s_LastPossessedWorld = *reinterpret_cast<void**>(Globals::BaseAddress + 0x06FC7F58);
         // ClientRestart is per possession, not per process. Seamless/map travel creates a new PC
         // and pawn, so the loadout/input/PlayerRole cascade must be re-armed for that possession.
         // Duplicate ClientRestart RPCs for the same PC+pawn do not re-arm it.
@@ -12139,6 +15042,9 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
             s_ArchonInputActivated = false;
             s_ArchonInputActivationPending = false;
             s_NaturalInputModeChangedObserved = false;
+            s_LastNaturalGameInput = -1;
+            s_LastNaturalGameInputMs = 0;
+            s_ArchonInputActivationDepth = 0;
             s_ProgressionHudRefreshPending = false;
             s_ProgressionHudRefreshAttempts = 0;
             s_ProgressionHudRefreshNotBeforeMs = 0;
@@ -12210,7 +15116,8 @@ static uintptr_t SafeReadPtr(uintptr_t base, uintptr_t offset) {
 // [2026-07-23 TRIALS AIRSHIP HUD]
 // Preserve the normal Dauntless presentation contract:
 //   ArchonGameState.IsInPreMatchAirship == true  -> AArchonHUD::HideGameplayHUD
-//   transition back to false                    -> AArchonHUD::ShowGameplayHUD
+//   transition back to false                    -> AArchonHUD::ShowGameplayHUD once the game hands
+//                                                  control to the player (since 10 Oct, see below)
 //
 // We intentionally invoke the game's native reflected functions instead of touching individual
 // widgets or writing GameplayHUDVisibility directly. Party/chat and the airship Ready panel remain
@@ -12246,17 +15153,35 @@ static HudFnCallResult CallHudLifecycleFunctionGuarded(UObject* HudObject, const
     }
 }
 
+// [1.14.7 FIX 2026-10-10, 38_ §21] The airship state ending is not the player getting control. In every
+// 1.12 Escalation capture IsInPreMatchAirship went false while the airship UI was still up
+// (airshipUIActive=1), ~3.1 s before the drop and ~19.6 s before the first walking input, so the
+// immediate ShowGameplayHUD put the combat HUD over the launch and the arrival beam. The restore now
+// waits for the game's own hand-over: a natural OnInputModeChanged(true) after the airship ended that
+// stays true for kAirshipHudRestoreStableMs (the drop opens with a 6-8 ms true->false blip). If the
+// game shows the HUD first, the native call is a no-op. The timeout keeps a missed edge from leaving
+// the HUD hidden. IMMEDIATE_AIRSHIP_HUD_RESTORE.flag restores the old immediate restore.
+static uint64_t s_AirshipEndedAtMs = 0;
+static constexpr uint64_t kAirshipHudRestoreStableMs = 1000;
+static constexpr uint64_t kAirshipHudRestoreTimeoutMs = 45000;
+// Hide/Show fire OnHUDVisibilityChanged, which is itself a reconcile trigger; skip that nested call.
+// Set only around CallHudLifecycleFunctionGuarded, which catches every fault, so it always clears.
+static bool s_AirshipHUDReconcileBusy = false;
+
 static void ReconcileAirshipGameplayHUD(const char* TriggerLabel) {
     if (Globals::AmServer || !OrigProcessEventClient || !s_AirshipHUD || !s_AirshipGameState) return;
+    if (s_AirshipHUDReconcileBusy) return;
     // [2026-07-24 ROOT-CAUSE FIX] s_AirshipHUD / s_AirshipGameState are cached at OnAirshipStateUpdate
     // and belong to a specific world. A level travel destroys them while their pointers stay readable
     // (recycled memory), so the IsReadablePointer/->Class checks below would pass on a dead object and
     // the native HUD calls would fault. Confirm both are still live registered objects first; if the
     // travel destroyed them, clear the cache (a fresh airship update in the new world re-populates it)
-    // and bail without touching native code.
+    // and bail without touching native code. The hidden state died with that HUD, so forget it too.
     if (!IsRegisteredLiveObject(s_AirshipHUD) || !IsRegisteredLiveObject(s_AirshipGameState)) {
         s_AirshipHUD = nullptr;
         s_AirshipGameState = nullptr;
+        s_AirshipHUDCompatHidden = false;
+        s_AirshipEndedAtMs = 0;
         return;
     }
     if (!IsReadablePointer(s_AirshipHUD, 0x522)
@@ -12273,7 +15198,10 @@ static void ReconcileAirshipGameplayHUD(const char* TriggerLabel) {
         reinterpret_cast<uintptr_t>(s_AirshipHUD), 0x520, 0xEE);
 
     if (InPreMatchAirship == 1) {
+        s_AirshipEndedAtMs = 0;
+        s_AirshipHUDReconcileBusy = true;
         const HudFnCallResult HideResult = CallHudLifecycleFunctionGuarded(s_AirshipHUD, "ArchonHUD", "HideGameplayHUD");
+        s_AirshipHUDReconcileBusy = false;
         if (HideResult == HudFnCallResult::Faulted) {
             MpLog(std::string("[AirshipHUD] FAULTED calling HideGameplayHUD trigger=") + TriggerLabel
                 + " hud=" + MpPtr(s_AirshipHUD)
@@ -12309,7 +15237,37 @@ static void ReconcileAirshipGameplayHUD(const char* TriggerLabel) {
     }
 
     if (InPreMatchAirship == 0 && s_AirshipHUDCompatHidden) {
+        static int s_ImmediateRestore = -1;
+        if (s_ImmediateRestore < 0) {
+            s_ImmediateRestore = MpExeRelativeFlagPresent(L"IMMEDIATE_AIRSHIP_HUD_RESTORE.flag") ? 1 : 0;
+            MpLog(std::string("[AirshipHUD] restore waits for the player's control: ")
+                + (s_ImmediateRestore ? "OFF (IMMEDIATE_AIRSHIP_HUD_RESTORE.flag present)" : "ON (default)"));
+        }
+        const uint64_t Now = GetTickCount64();
+        const char* RestoreReason = "immediate";
+        if (s_ImmediateRestore != 1) {
+            if (s_AirshipEndedAtMs == 0) {
+                s_AirshipEndedAtMs = Now;
+                MpLog(std::string("[AirshipHUD] airship ended trigger=") + TriggerLabel
+                    + " airshipUIActive=" + std::to_string(AirshipUIActive)
+                    + " gameplayVisibility=" + std::to_string(VisibilityBefore)
+                    + " gameInput=" + std::to_string(s_LastNaturalGameInput)
+                    + " - combat HUD stays hidden until the game hands control to the player");
+            }
+            const bool ControlGiven = s_LastNaturalGameInput == 1
+                && s_LastNaturalGameInputMs >= s_AirshipEndedAtMs
+                && Now - s_LastNaturalGameInputMs >= kAirshipHudRestoreStableMs;
+            const bool TimedOut = Now - s_AirshipEndedAtMs >= kAirshipHudRestoreTimeoutMs;
+            if (!ControlGiven && !TimedOut) {
+                return;
+            }
+            RestoreReason = ControlGiven ? "player-control" : "timeout";
+        }
+        const uint64_t SinceAirshipEndMs = s_AirshipEndedAtMs != 0 ? Now - s_AirshipEndedAtMs : 0;
+
+        s_AirshipHUDReconcileBusy = true;
         const HudFnCallResult ShowResult = CallHudLifecycleFunctionGuarded(s_AirshipHUD, "ArchonHUD", "ShowGameplayHUD");
+        s_AirshipHUDReconcileBusy = false;
         if (ShowResult == HudFnCallResult::Faulted) {
             MpLog(std::string("[AirshipHUD] FAULTED calling ShowGameplayHUD trigger=") + TriggerLabel
                 + " hud=" + MpPtr(s_AirshipHUD)
@@ -12328,6 +15286,8 @@ static void ReconcileAirshipGameplayHUD(const char* TriggerLabel) {
         const uint8_t VisibilityAfter = SafeReadByte(
             reinterpret_cast<uintptr_t>(s_AirshipHUD), 0x361, 0xEE);
         MpLog(std::string("[AirshipHUD] RESTORE trigger=") + TriggerLabel
+            + " reason=" + RestoreReason
+            + " sinceAirshipEndMs=" + std::to_string(SinceAirshipEndMs)
             + " hud=" + MpPtr(s_AirshipHUD)
             + " gameState=" + MpPtr(s_AirshipGameState)
             + " inPreMatchAirship=0"
@@ -12335,6 +15295,7 @@ static void ReconcileAirshipGameplayHUD(const char* TriggerLabel) {
             + " gameplayVisibility=" + std::to_string(VisibilityBefore)
             + "->" + std::to_string(VisibilityAfter));
         s_AirshipHUDCompatHidden = false;
+        s_AirshipEndedAtMs = 0;
     }
 }
 
@@ -12451,6 +15412,7 @@ static void TickProgressionHudRefreshInner() {
     ++s_ProgressionHudRefreshAttempts;
     s_ProgressionHudRefreshNotBeforeMs = Now + kRetryDelayMs;
 
+    MpForgetPossessionIfWorldChanged();
     UObject* PC = s_LastPossessedPC;
     // [2026-07-24 ROOT-CAUSE FIX] PC is the cached s_LastPossessedPC; a level travel destroys it while
     // the pointer stays readable. Confirm it is still a live registered object before the native
@@ -13725,6 +16687,67 @@ static void TraceTempestDamageExit(UObject* Object, void* Parms, const TempestDa
         + " return=" + TempestDamageDataSummary(P->ReturnValue));
 }
 
+/*
+ * [2026-10-11 1.14.7 O3 ProcessEvent categories] The server hook below tests every reflected call against ~30 name
+ * substrings, plus IsEscalationFlowFunction (~50 more) and BleedoutNoteEvent's prefilter - roughly 90 std::string::find
+ * calls per ProcessEvent, tens of thousands of times a second on a populated hub. All of those tests depend only on the
+ * UFunction's full name, so each one is now evaluated ONCE per UFunction (cached with the name, CachedFunctionNameEntry)
+ * into a bit of a 64-bit mask; a call site then runs its original test only when its bit is set. The bit is computed
+ * from the very predicate the site tests (or a strict superset of it), so for any name the outcome is identical; the
+ * original test is kept behind the bit as the authority. PE_CATEGORY_CACHE_OFF.flag (read once), or the uncached-name
+ * mode (PE_FULLNAME_UNCACHED.flag), sets every bit, which is exactly the old behaviour.
+ * Flag-gated developer paths (PE_NAME_DIAG, the damage multiplier, CORE_CAPTURE, the Tempest damage trace) are untouched:
+ * they cost nothing while their flag is absent.
+ */
+enum MpPeCategory : int {
+    MpPeCat_Econ = 0,              // Prestige | Draft | BountyToken | SeasonalCoin | HuntPass ([EconTrace])
+    MpPeCat_PostEvent,             // PostEvent (headless audio absorb)
+    MpPeCat_EscalationAuthState,   // EscalationGameModeComponent.AuthOnGameStateChanged
+    MpPeCat_HandleBehemothKilled,  // PlayerExperienceComponent.HandleBehemothKilled
+    MpPeCat_GrantWeaponXp,         // PlayerExperienceComponent.GrantWeaponExperience
+    MpPeCat_GrantPlayerXp,         // PlayerExperienceComponent.GrantPlayerExperience
+    MpPeCat_PerfectDodge,          // PerfectDodge
+    MpPeCat_Bleedout,              // Bleedout | FinishingHit | NoHealth (BleedoutNoteEvent's own first test)
+    MpPeCat_K2PostLogin,           // K2_PostLogin
+    MpPeCat_PostLogin,             // PostLogin
+    MpPeCat_Possession,            // AcknowledgePossession | CheckClientPossession | AcknowledgePawn
+    MpPeCat_VendorCamera,          // vendor_interactive_bp_C.UpdateCameraForAspect
+    MpPeCat_ClientRestart,         // == ClientRestart / ClientRetryClientRestart
+    MpPeCat_MustSpectate,          // == GameModeBase.MustSpectate
+    MpPeCat_PlayerCanRestart,      // == GameModeBase.PlayerCanRestart
+    MpPeCat_TryActivateAbility,    // ServerTryActivateAbility (covers ...WithEventData)
+    MpPeCat_EscalationFlow,        // IsEscalationFlowFunction
+    MpPeCat_DroneTrace,            // SetDronePositionActor (TraceArtificerDroneEvent's own first test)
+    MpPeCat_Count
+};
+static_assert(MpPeCat_Count <= 64, "MpPeCategory must fit the 64-bit mask");
+
+static uint64_t MpPeComputeCategoryMask(const std::string& N) {
+    auto Has = [&N](const char* Token) { return N.find(Token) != std::string::npos; };
+    uint64_t Mask = 0;
+    auto Set = [&Mask](int Bit, bool On) { if (On) Mask |= (1ull << Bit); };
+    Set(MpPeCat_Econ, Has("Prestige") || Has("Draft") || Has("BountyToken") || Has("SeasonalCoin") || Has("HuntPass"));
+    Set(MpPeCat_PostEvent, Has("PostEvent"));
+    Set(MpPeCat_EscalationAuthState, Has("EscalationGameModeComponent.AuthOnGameStateChanged"));
+    Set(MpPeCat_HandleBehemothKilled, Has("PlayerExperienceComponent.HandleBehemothKilled"));
+    Set(MpPeCat_GrantWeaponXp, Has("PlayerExperienceComponent.GrantWeaponExperience"));
+    Set(MpPeCat_GrantPlayerXp, Has("PlayerExperienceComponent.GrantPlayerExperience"));
+    Set(MpPeCat_PerfectDodge, Has("PerfectDodge"));
+    Set(MpPeCat_Bleedout, Has("Bleedout") || Has("FinishingHit") || Has("NoHealth"));
+    Set(MpPeCat_K2PostLogin, Has("K2_PostLogin"));
+    Set(MpPeCat_PostLogin, Has("PostLogin"));
+    Set(MpPeCat_Possession, Has("AcknowledgePossession") || Has("CheckClientPossession") || Has("AcknowledgePawn"));
+    Set(MpPeCat_VendorCamera, Has("vendor_interactive_bp_C.UpdateCameraForAspect"));
+    Set(MpPeCat_ClientRestart, N == "Function Engine.PlayerController.ClientRestart"
+        || N == "Function Engine.PlayerController.ClientRetryClientRestart");
+    Set(MpPeCat_MustSpectate, N == "Function Engine.GameModeBase.MustSpectate");
+    Set(MpPeCat_PlayerCanRestart, N == "Function Engine.GameModeBase.PlayerCanRestart");
+    Set(MpPeCat_TryActivateAbility, Has("ServerTryActivateAbility"));
+    Set(MpPeCat_EscalationFlow, IsEscalationFlowFunction(N));
+    Set(MpPeCat_DroneTrace, Has("SetDronePositionActor"));
+    return Mask;
+}
+
 void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // [1.12.0 REENTRANCY GUARD 2026-07-10] Safety-net against runaway ProcessEvent
     // recursion. Root cause of the FTUE crash was
@@ -13745,8 +16768,12 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     static thread_local int s_processEventDepth = 0;
     static thread_local UFunction* s_peStack[64] = {};   // [T7 Step 1g] parent UFunction chain for semantic caller ID
     struct DepthGuard {
-        DepthGuard(UFunction* f)  { if (s_processEventDepth >= 0 && s_processEventDepth < 64) s_peStack[s_processEventDepth] = f; ++s_processEventDepth; }
-        ~DepthGuard() { --s_processEventDepth; }
+        DepthGuard(UFunction* f)  {
+            if (s_processEventDepth >= 0 && s_processEventDepth < 64) { s_peStack[s_processEventDepth] = f; g_MpPeChain[s_processEventDepth] = f; }
+            ++s_processEventDepth;
+            g_MpPeChainDepth = s_processEventDepth;
+        }
+        ~DepthGuard() { --s_processEventDepth; g_MpPeChainDepth = s_processEventDepth; }
     } g_depthGuard(Function);
 
     if (s_processEventDepth > 32) {
@@ -13767,7 +16794,39 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     static UFunction* OnAirshipUpdated = nullptr;
     static UFunction* OnPostMitDealtAnyDamage = nullptr;
 
-    std::string FunctionName = Function ? Function->GetFullName() : "null";
+    // [2026-10-10 1.14.7 CPU] The full name (an Outer-chain walk with FName/FString/std::string allocations at each
+    // level) used to be built on EVERY reflected call. It now comes from the client's per-UFunction cache
+    // (CachedFunctionFullName: thread_local, validated by Index/FName/Outer, same "null" text). Every use below only
+    // reads it. PE_FULLNAME_UNCACHED.flag (read once) builds it per call as before.
+    static int s_peNameCacheMode = -1;
+    if (s_peNameCacheMode < 0) {
+        s_peNameCacheMode = MpExeRelativeFlagPresent(L"PE_FULLNAME_UNCACHED.flag") ? 0 : 1;
+        MpLog(std::string("[PENameCache] server full-name cache ")
+            + (s_peNameCacheMode ? "ON" : "OFF (PE_FULLNAME_UNCACHED.flag)"));
+    }
+    std::string FunctionNameUncached;
+    MpFunctionNameCacheEntry* PeNameEntry = (s_peNameCacheMode == 1 && Function) ? &CachedFunctionNameEntry(Function) : nullptr;
+    const std::string& FunctionName = s_peNameCacheMode == 1
+        ? (PeNameEntry ? PeNameEntry->Name : CachedFunctionFullName(nullptr))
+        : (FunctionNameUncached = Function ? Function->GetFullName() : std::string("null"));
+
+    // [2026-10-11 1.14.7 O3] Per-UFunction category mask (see MpPeCategory). ~0 = every test runs (the old behaviour).
+    static int s_peCategoryMode = -1;
+    if (s_peCategoryMode < 0) {
+        s_peCategoryMode = (s_peNameCacheMode == 1 && !MpExeRelativeFlagPresent(L"PE_CATEGORY_CACHE_OFF.flag")) ? 1 : 0;
+        MpLog(std::string("[PECategoryCache] server per-UFunction name-test mask ")
+            + (s_peCategoryMode ? "ON (PE_CATEGORY_CACHE_OFF.flag reverts)"
+                                : (s_peNameCacheMode == 1 ? "OFF (PE_CATEGORY_CACHE_OFF.flag)" : "OFF (PE_FULLNAME_UNCACHED.flag)")));
+    }
+    uint64_t PeMask = ~0ull;
+    if (s_peCategoryMode == 1 && PeNameEntry) {
+        if (!PeNameEntry->PeMaskValid) {
+            PeNameEntry->PeMask = MpPeComputeCategoryMask(PeNameEntry->Name);
+            PeNameEntry->PeMaskValid = true;
+        }
+        PeMask = PeNameEntry->PeMask;
+    }
+    auto PeMay = [PeMask](int Bit) { return ((PeMask >> Bit) & 1ull) != 0; };
 
     // [1.14.7 HEADLESS AUDIO 2026-10-03] A dedicated hub must not play sound. Removing the Wwise
     // output device crashes the process (measured: EXCEPTION_ACCESS_VIOLATION writing 0x...a4, round
@@ -13805,7 +16864,38 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
         }
     }
 
-    if (s_audioPostSuppression == 1 && FunctionName.find("PostEvent") != std::string::npos) {
+    // [1.14.7 DIAG 2026-10-10] [EconTrace] - the reflected game functions behind the two economy oddities the backend
+    // monitors watch ([PrestigeMon]: the hunt server asks for 400 Cache Coins twice per kill and is refused for lack of
+    // banked season progress; [DraftMon]: every Ramsgate arrival writes the bounty draft tokens up and back down).
+    // Server role, always on, bounded: 8 lines per function name, 200 per process. ECON_TRACE_OFF.flag silences it.
+    if (Globals::AmServer && Function) {
+        static int s_econTrace = -1;
+        // [2026-10-11 O3] Also off with PRODUCTION_LOG_PROFILE.flag.
+        if (s_econTrace < 0) s_econTrace = (MpExeRelativeFlagPresent(L"ECON_TRACE_OFF.flag") || MpProductionLogProfile()) ? 0 : 1;
+        static std::atomic<int> s_econTotal{ 0 };
+        if (s_econTrace == 1 && s_econTotal.load(std::memory_order_relaxed) < 200
+            && PeMay(MpPeCat_Econ)
+            && (FunctionName.find("Prestige") != std::string::npos
+                || FunctionName.find("Draft") != std::string::npos
+                || FunctionName.find("BountyToken") != std::string::npos
+                || FunctionName.find("SeasonalCoin") != std::string::npos
+                || FunctionName.find("HuntPass") != std::string::npos)) {
+            static std::mutex s_econMutex;
+            static std::unordered_map<std::string, int> s_econPerFn;   // bounded by the number of matching names
+            int Count = 0;
+            {
+                std::lock_guard<std::mutex> Lock(s_econMutex);
+                Count = ++s_econPerFn[FunctionName];
+            }
+            if (Count <= 8) {
+                s_econTotal.fetch_add(1, std::memory_order_relaxed);
+                MpLog("[EconTrace] fn=" + FunctionName + " obj=" + (Object ? SafeObjectNameForDiagnostic(Object) : std::string("<null>"))
+                    + " n=" + std::to_string(Count));
+            }
+        }
+    }
+
+    if (s_audioPostSuppression == 1 && PeMay(MpPeCat_PostEvent) && FunctionName.find("PostEvent") != std::string::npos) {
         static std::atomic<int> s_audioPostAbsorbed{ 0 };
         const int AudioSeq = s_audioPostAbsorbed.fetch_add(1, std::memory_order_relaxed);
         if (AudioSeq < 5) {
@@ -13817,7 +16907,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     }
 
     TempestDamageDiagCall TempestDamageCall{};
-    TraceArtificerDroneEvent("Server", "ENTER", Object, FunctionName, Parms);
+    if (PeMay(MpPeCat_DroneTrace)) TraceArtificerDroneEvent("Server", "ENTER", Object, FunctionName, Parms);
 
     // [DEBUG ONLY 2026-07-26] Repro-speedup damage multiplier for local testing (e.g. reproducing
     // the 2-player escalation phase-1 stall without sitting through a doubled-health behemoth).
@@ -13907,13 +16997,14 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // into the game Blueprint. Production captures have the multiplier flag absent.
     TempestDamageCall = TraceTempestDamageEnter(Object, FunctionName, Parms);
 
-    const int EscalationFlowServerSeq = TraceEscalationFlowEnter(
-        "Server", Object, FunctionName, Parms);
+    // [2026-10-11 O3] Category-gated; [EscalationFlow][Server] lines are off with PRODUCTION_LOG_PROFILE.flag.
+    const int EscalationFlowServerSeq = (PeMay(MpPeCat_EscalationFlow) && !MpProductionLogProfile())
+        ? TraceEscalationFlowEnter("Server", Object, FunctionName, Parms) : -1;
 
     // [2026-07-25 AMP ROOT-CAUSE FIX] Observe the escalation round-finished transition so the deferred
     // pump can invoke SpawnPlayerBuffChoicesForFinishedRound, which the shipped Blueprint graph never
     // calls. Recording only - no dispatch from inside this hook. See TickEscalationBuffChoiceSpawn.
-    if (Function && Parms
+    if (Function && Parms && PeMay(MpPeCat_EscalationAuthState)
         && FunctionName.find("EscalationGameModeComponent.AuthOnGameStateChanged")
                != std::string::npos) {
         NoteEscalationStateChangeForBuffChoices(Object, Parms);
@@ -13925,12 +17016,12 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // confirms whether the parallel Slayer-level award differs. No values are changed.
     int WeaponXpServerGrantSeq = -1;
     Params::PlayerExperienceComponent_GrantWeaponExperience* WeaponXpServerGrant = nullptr;
-    if (Function && Parms
+    if (Function && Parms && PeMay(MpPeCat_HandleBehemothKilled)
         && FunctionName.find("PlayerExperienceComponent.HandleBehemothKilled") != std::string::npos
         && IsReadablePointer(Parms, sizeof(Params::PlayerExperienceComponent_HandleBehemothKilled))) {
         static std::atomic<int> s_weaponXpServerKillCount{ 0 };
         int Seq = s_weaponXpServerKillCount.fetch_add(1, std::memory_order_relaxed);
-        if (Seq < 128) {
+        if (Seq < 128 && !MpProductionLogProfile()) {   // [2026-10-11 O3] log-only block
             auto* KillParms = reinterpret_cast<Params::PlayerExperienceComponent_HandleBehemothKilled*>(Parms);
             void* Behemoth = KillParms->Behemoth;
             void* ThreatComponent = (Behemoth && IsReadablePointer(Behemoth, 0x67C))
@@ -13948,7 +17039,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
         }
     }
 
-    if (Function && Parms
+    if (Function && Parms && PeMay(MpPeCat_GrantWeaponXp) && !MpProductionLogProfile()   // [2026-10-11 O3] log-only
         && FunctionName.find("PlayerExperienceComponent.GrantWeaponExperience") != std::string::npos
         && IsReadablePointer(Parms, sizeof(Params::PlayerExperienceComponent_GrantWeaponExperience))) {
         static std::atomic<int> s_weaponXpServerGrantCount{ 0 };
@@ -13963,7 +17054,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
         }
     }
 
-    if (Function && Parms
+    if (Function && Parms && PeMay(MpPeCat_GrantPlayerXp) && !MpProductionLogProfile()   // [2026-10-11 O3] log-only
         && FunctionName.find("PlayerExperienceComponent.GrantPlayerExperience") != std::string::npos
         && IsReadablePointer(Parms, sizeof(Params::PlayerExperienceComponent_GrantPlayerExperience))) {
         static std::atomic<int> s_playerXpServerGrantCount{ 0 };
@@ -13979,7 +17070,8 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // Server-authoritative half of the Tempest perfect-dodge trace. If the passive modifier was
     // installed correctly, its OnPerfectDodge listener appears here and applies the Velocity stack.
     int TempestPerfectDodgeServerSeq = -1;
-    if (Function && FunctionName.find("PerfectDodge") != std::string::npos) {
+    if (Function && PeMay(MpPeCat_PerfectDodge) && !MpProductionLogProfile()   // [2026-10-11 O3] log-only
+        && FunctionName.find("PerfectDodge") != std::string::npos) {
         static std::atomic<int> s_tempestPerfectDodgeServerCount{ 0 };
         TempestPerfectDodgeServerSeq = s_tempestPerfectDodgeServerCount.fetch_add(1, std::memory_order_relaxed);
         if (TempestPerfectDodgeServerSeq < 64) {
@@ -13992,7 +17084,8 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // [2026-07-19] Bleedout-domain capture. ALWAYS ON — the permanent-downed bug is intermittent and
     // there is no second chance to switch a flag on after it happens. Returns immediately for the
     // ~all functions that are not bleedout-related, so the cost is a few string searches.
-    BleedoutNoteEvent(FunctionName, Object);
+    // [2026-10-11 O3] Its first test is cached per UFunction (MpPeCat_Bleedout): still always on.
+    if (PeMay(MpPeCat_Bleedout)) BleedoutNoteEvent(FunctionName, Object);
 
     // [2026-07-19 HANG DIAG] Always retain the raw innermost function/object pointers: these are two
     // cheap stores and remain useful in a production hang. The 160-byte name-ring write used to run on
@@ -14070,7 +17163,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // — removed; the catalog is now dumped by the standalone CatalogExporter injectable, not the live server DLL.)
     {
         static std::atomic<bool> s_postLoginAnchor{ false };
-        if (Function && FunctionName.find("K2_PostLogin") != std::string::npos) {
+        if (Function && PeMay(MpPeCat_K2PostLogin) && FunctionName.find("K2_PostLogin") != std::string::npos) {
             bool expected = false;
             if (s_postLoginAnchor.compare_exchange_strong(expected, true)) {
                 g_postLoginTimeMs.store(GetTickCount64(), std::memory_order_relaxed);
@@ -14083,34 +17176,41 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // server, so this reliably confirms each controller reached post-login (unlike the
     // never-installed AGameMode::PostLogin native hook). K2_PostLogin's parm0 is the new
     // APlayerController. A lifecycle snapshot is taken at each so the late-joiner boundary is visible.
-    if (Function && FunctionName.find("PostLogin") != std::string::npos) {
+    if (Function && PeMay(MpPeCat_PostLogin) && FunctionName.find("PostLogin") != std::string::npos) {
         static std::atomic<int> s_plSeq{ 0 };
         int Seq = s_plSeq.fetch_add(1, std::memory_order_relaxed);
-        std::string ObjName = (Object && IsReadablePointer(Object, 0x40)) ? Object->GetName() : std::string("?");
+        // [2026-10-11 O3] PRODUCTION_LOG_PROFILE.flag skips the [PostLoginPE] line, its name lookups and the lifecycle
+        // snapshot; the match start, AFK write, login stamp and pawn-diagnostic reset below always run.
+        const bool PostLoginLog = !MpProductionLogProfile();
+        std::string ObjName = (PostLoginLog && Object && IsReadablePointer(Object, 0x40)) ? Object->GetName() : std::string("?");
         std::string Extra;
         if (Parms && FunctionName.find("K2_PostLogin") != std::string::npos) {
             void* NewPlayer = *reinterpret_cast<void**>(Parms);
-            std::string PcName = (NewPlayer && IsReadablePointer(NewPlayer, 0x40)) ? reinterpret_cast<UObject*>(NewPlayer)->GetName() : std::string("?");
+            std::string PcName = (PostLoginLog && NewPlayer && IsReadablePointer(NewPlayer, 0x40))
+                ? reinterpret_cast<UObject*>(NewPlayer)->GetName() : std::string("?");
             Extra = " newPlayer=" + MpPtr(NewPlayer) + "/" + PcName;
+            // [1.14.7 phantom removal] Start a still-waiting match before HandleStartingNewPlayer (which runs right after
+            // K2_PostLogin) so this first player is spawned at once - see MpStartMatchWithoutPhantom.
+            if (Globals::AmServer && g_NoLocalPlayerApplied.load(std::memory_order_relaxed) && Object
+                && IsReadablePointer(Object, 0x2C8)
+                && reinterpret_cast<SDK::FName*>(reinterpret_cast<uintptr_t>(Object) + 0x02C0)->ToString() == "WaitingToStart") {
+                MpStartMatchWithoutPhantom(Object);
+            }
+            // [2026-10-10 1.14.7 AFK] Mandatory: the GS AFK timeout replicates COND_InitialOnly, so it must be set before
+            // this connection's first GameState bunch (the 1 s tick write may not have run yet; it runs on the P2P host
+            // too - corrected 11 Oct). Object (the GameMode) only classifies the role while the world has none; writes
+            // go to the world's.
+            if (Globals::AmServer) MpApplyAfkTimeout(Object, "postlogin");
+            if (Globals::AmServer) g_MpLastPostLoginMs.store(GetTickCount64(), std::memory_order_relaxed);
             // [2026-07-18] New login boundary — reset the ClientRestart/pawn-relevancy capture window so
             // this login's possession handoff is traced even if earlier logins used up the old budget.
             g_pawnDiagCount.store(0, std::memory_order_relaxed);
-
-            // [1.14.7 synthetic net id] This is the earliest server-side point where the new
-            // controller's PlayerState exists, so install the synthetic net id HERE rather than at
-            // the load manager's Begin (measured: installing at Begin is too late - the gated
-            // components had already logged "does not have a valid ID" and stopped).
-            if (Globals::AmServer && NewPlayer != nullptr
-                && MpExeRelativeFlagPresent(L"ENABLE_SYNTHETIC_NETID.flag")) {
-                const uintptr_t NewPlayerState = SafeReadPtr(reinterpret_cast<uintptr_t>(NewPlayer), 0x228);
-                if (NewPlayerState != 0) {
-                    EnsureSyntheticNetId(reinterpret_cast<void*>(NewPlayerState));
-                }
-            }
         }
-        MpLog("[PostLoginPE #" + std::to_string(Seq) + "] fn=" + FunctionName
-            + " obj=" + MpPtr(Object) + "/" + ObjName + Extra);
-        LogArchonLifecycle(("PostLoginPE#" + std::to_string(Seq)).c_str());
+        if (PostLoginLog) {
+            MpLog("[PostLoginPE #" + std::to_string(Seq) + "] fn=" + FunctionName
+                + " obj=" + MpPtr(Object) + "/" + ObjName + Extra);
+            LogArchonLifecycle(("PostLoginPE#" + std::to_string(Seq)).c_str());   // [2026-10-11 O2] world pointers
+        }
     }
 
     // [2026-07-16] Possession-ack RPC trace (routes through this installed ProcessEvent hook on the
@@ -14120,7 +17220,8 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // _Implementation runs, to see whether P2's ack arrives while P1 is connected and whether it sticks.
     void* AckCapturePc = nullptr;
     void* AckPawnBefore = nullptr;
-    if (Function &&
+    // [2026-10-11 O3] Log-only (BEFORE here, AFTER at the tail via AckCapturePc); off with PRODUCTION_LOG_PROFILE.flag.
+    if (Function && PeMay(MpPeCat_Possession) && !MpProductionLogProfile() &&
         (FunctionName.find("AcknowledgePossession") != std::string::npos
             || FunctionName.find("CheckClientPossession") != std::string::npos
             || FunctionName.find("AcknowledgePawn") != std::string::npos)) {
@@ -14191,7 +17292,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // [Group E2 cleanup 2026-07-13] [LevelVisMulti-SVR] ServerUpdateMultipleLevelsVisibility logger removed.
 
 
-    if (Function && FunctionName.find("vendor_interactive_bp_C.UpdateCameraForAspect")
+    if (Function && PeMay(MpPeCat_VendorCamera) && FunctionName.find("vendor_interactive_bp_C.UpdateCameraForAspect")
         != std::string::npos)
     {
         static std::atomic<int> s_vendorAbsorbCount{0};
@@ -14244,7 +17345,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     //   - NetDormancy = DORM_Never (0) - never dormant
     //   - NetUpdateFrequency = 60.0 - as high as gameplay ticking
     //   - NetPriority = 3.0 (AActor+0x0110) - high priority in the rep list
-    if (Function && (FunctionName == "Function Engine.PlayerController.ClientRestart"
+    if (Function && PeMay(MpPeCat_ClientRestart) && (FunctionName == "Function Engine.PlayerController.ClientRestart"
                      || FunctionName == "Function Engine.PlayerController.ClientRetryClientRestart")) {
         const int PAWN_DIAG_BUDGET = 8;   // per-login: first ClientRestart + a few retries
         int slot = g_pawnDiagCount.fetch_add(1, std::memory_order_relaxed);
@@ -14336,7 +17437,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
                 }
             }
 
-            if (slot < PAWN_DIAG_BUDGET) {
+            if (slot < PAWN_DIAG_BUDGET && !MpProductionLogProfile()) {   // [2026-10-11 O3] log-only block
                 std::string pClass = "(null-pawn)";
                 std::string pFullName = "(null-pawn)";
                 uint8_t     pReplicatesByte = 0;
@@ -14424,7 +17525,8 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // Post-orig (return valid). Parms+0 = APlayerController*, Parms+0x8 = bool ReturnValue.
     static UFunction* CachedMustSpectate = nullptr;
     if ((CachedMustSpectate && Function == CachedMustSpectate) ||
-        (!CachedMustSpectate && Function && FunctionName == "Function Engine.GameModeBase.MustSpectate")) {
+        (!CachedMustSpectate && Function && PeMay(MpPeCat_MustSpectate)
+            && FunctionName == "Function Engine.GameModeBase.MustSpectate")) {
         CachedMustSpectate = Function;
         if (Parms && IsReadablePointer(Parms, 0x10)) {
             UObject* PlayerObj = *reinterpret_cast<UObject**>(Parms);
@@ -14439,23 +17541,13 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // UObject layout: Class @ +0x10, Name @ +0x18, Outer @ +0x20.
     static UFunction* CachedPlayerCanRestart = nullptr;
     if ((CachedPlayerCanRestart && Function == CachedPlayerCanRestart) ||
-        (!CachedPlayerCanRestart && Function && FunctionName == "Function Engine.GameModeBase.PlayerCanRestart")) {
+        (!CachedPlayerCanRestart && Function && PeMay(MpPeCat_PlayerCanRestart)
+            && FunctionName == "Function Engine.GameModeBase.PlayerCanRestart")) {
         CachedPlayerCanRestart = Function;
 
         if (Parms && IsReadablePointer(Parms, 0x10)) {
             UObject* PlayerObj = *reinterpret_cast<UObject**>(Parms);
             bool     PriorRet  = *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(Parms) + 0x8);
-
-            // [1.14.7 FIX 2026-10-09] The hub's local-only phantom controller may never restart, so it never
-            // gets a pawn to leak to clients (see MpIsPhantomThatMayNotRestart). Real players are unaffected.
-            if (MpIsPhantomThatMayNotRestart(PlayerObj)) {
-                *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(Parms) + 0x8) = false;
-                static std::atomic<int> s_phantomRestartLog{ 0 };
-                if (s_phantomRestartLog.fetch_add(1, std::memory_order_relaxed) < 5)
-                    MpLog("[PhantomRep] PlayerCanRestart -> false for the local-only controller " + MpPtr(PlayerObj)
-                        + " priorRet=" + std::to_string(PriorRet ? 1 : 0));
-                return; // original not called
-            }
 
             static std::atomic<int> s_diagLogCount{0};
             const int LOG_BUDGET = 5;
@@ -14847,6 +17939,18 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
                         }
                     }
                 }
+            } else if (NetConnObj && IsReadablePointer(NetConnObj, 0xA0)) {
+                // [2026-10-10] The FORCE-VIEWTARGET write above sits inside the five-call log budget, so a
+                // long-running Ramsgate skipped it from its sixth restart on (Harmonicrain/Undaunted found
+                // the same in their 1.12 copy). Same write, without the diagnostics. ClientRestart's owner
+                // pawn relevancy fix still re-points the field at the pawn afterwards.
+                UObject* owning = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(NetConnObj) + 0x98);
+                UObject* preferView = owning;
+                if (owning && IsReadablePointer(owning, 0x258)) {
+                    UObject* pcPawn = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(owning) + 0x250);
+                    if (pcPawn) preferView = pcPawn;
+                }
+                *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(NetConnObj) + 0x90) = preferView;
             }
 
             // [Phase 0c] Gate the PlayerCanRestart force in natural mode. With the flag present, run the
@@ -14874,14 +17978,14 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
         }
     }
 
-    if (Function == ServerTryActivateAbilityWithEventData || (!ServerTryActivateAbilityWithEventData && FunctionName.contains("ServerTryActivateAbilityWithEventData"))) {
+    if (Function == ServerTryActivateAbilityWithEventData || (!ServerTryActivateAbilityWithEventData && PeMay(MpPeCat_TryActivateAbility) && FunctionName.contains("ServerTryActivateAbilityWithEventData"))) {
         ServerTryActivateAbilityWithEventData = Function;
 
         Params::AbilitySystemComponent_ServerTryActivateAbilityWithEventData* ActivateAbilityParams = (Params::AbilitySystemComponent_ServerTryActivateAbilityWithEventData*)Parms;
 
         ServerTryActivateAbilityInternal((UAbilitySystemComponent*)Object, ActivateAbilityParams->AbilityToActivate, ActivateAbilityParams->InputPressed, ActivateAbilityParams->PredictionKey, &ActivateAbilityParams->TriggerEventData);
     }
-    else if (Function == ServerTryActivateAbility || (!ServerTryActivateAbility && FunctionName.contains("ServerTryActivateAbility"))) {
+    else if (Function == ServerTryActivateAbility || (!ServerTryActivateAbility && PeMay(MpPeCat_TryActivateAbility) && FunctionName.contains("ServerTryActivateAbility"))) {
         ServerTryActivateAbility = Function;
 
         Params::AbilitySystemComponent_ServerTryActivateAbility* ActivateAbilityParams = (Params::AbilitySystemComponent_ServerTryActivateAbility*)Parms;
@@ -14926,7 +18030,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // the general OrigProcessEvent dispatch (function tail) is preserved.
     reinterpret_cast<void(*)(UObject*, UFunction*, void*)>(OrigProcessEvent)(Object, Function, Parms);
     TraceTempestDamageExit(Object, Parms, TempestDamageCall);
-    TraceArtificerDroneEvent("Server", "EXIT", Object, FunctionName, Parms);
+    if (PeMay(MpPeCat_DroneTrace)) TraceArtificerDroneEvent("Server", "EXIT", Object, FunctionName, Parms);
 
     if (WeaponXpServerGrant && WeaponXpServerGrantSeq >= 0 && WeaponXpServerGrantSeq < 256) {
         MpLog("[WeaponXP][ServerGrant] EXIT seq=" + std::to_string(WeaponXpServerGrantSeq)
@@ -14997,6 +18101,9 @@ static void ExecGetViewportSizeHook(void* ctx, void* stack, void* result) {
 
 // [Group D2 cleanup 2026-07-13] ProcessRemoteFunctionWrapperHook + OrigProcessRemoteFunctionWrapper removed ([WrapperProbe]; passthrough).
 
+static void InstallHudLegendaryWeaponGuard();   // defined after InstallInteractionCalloutClassGuards (uses CwVerifySite)
+static void InstallLoadMapProbe();              // defined after InstallHudLegendaryWeaponGuard (uses CwVerifySite)
+
 void InitClientHooks() {
     MH_STATUS InitStatus = MH_Initialize();
     MpLog(std::string("[InitClientHooks] MH_Initialize=") + MH_StatusToString(InitStatus));
@@ -15065,6 +18172,9 @@ void InitClientHooks() {
     else {
         MpLog("[InitClientHooks] ProcessEvent skipped for travel handshake bisect");
     }
+
+    InstallHudLegendaryWeaponGuard();   // [2026-10-10 1.14.7] late-join null-weapon guard, client only
+    InstallLoadMapProbe();              // [2026-10-10 1.14.7] observe-only LoadMap probe (hunt -> Ramsgate crash)
 
     // Artificer-specific native Blueprint-policy dispatcher.
     // [1.14.7]: 0x0230B750 is execCanActivateAbilityBP with 3-arg exec ABI (UObject*, FFrame&, RESULT_DECL),
@@ -15153,7 +18263,7 @@ void InitClientHooks() {
     }
 
     // [1.14.7 identity diagnostic] read-only; the client's own PlayerState is the reference for a
-    // populated net-id object (the hub's phantom has none).
+    // populated net-id object (the removed hub phantom had none).
     InstallLoadMgrBeginHook("client");
 
     // [1.14.7 EAC ROOT FIX 2026-10-04] Decompiled StartupModule (RVA 0x01474ED0):
@@ -15256,123 +18366,6 @@ bool SprintHook(uintptr_t a1, uintptr_t a2) { //char __fastcall UArchonStaminaCo
     return true;
 }
 
-// [move10] Validated boot patch helpers. Each verifies the opcode AND decodes the rip-relative
-// disp32 and requires the target to equal (BaseAddress + TargetOff) before writing — so a
-// different build whose instruction/target differs is rejected rather than silently corrupted.
-// Status (OK / ABORT + reason + observed 7 bytes) is appended to Status for deferred MpLog.
-static void Move10_PatchMovByteImm(uintptr_t Rva, uintptr_t TargetOff, uint8_t ExpectImm, uint8_t NewImm,
-                                   const char* Tag, std::string& Status) {
-    uint8_t* p = (uint8_t*)(Globals::BaseAddress + Rva);
-    const bool opcodeOk = (p[0] == 0xC6 && p[1] == 0x05);                       // MOV byte ptr [rip+disp32], imm8
-    const int32_t disp = (int32_t)((uint32_t)p[2] | ((uint32_t)p[3] << 8) | ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24));
-    const bool targetOk = ((p + 7 + disp) == (uint8_t*)(Globals::BaseAddress + TargetOff));
-    const bool immOk = (p[6] == ExpectImm);
-    if (opcodeOk && immOk && targetOk) {
-        DWORD oldP = 0;
-        if (VirtualProtect(p + 6, 1, PAGE_EXECUTE_READWRITE, &oldP)) {
-            p[6] = NewImm;
-            DWORD tmpP = 0; VirtualProtect(p + 6, 1, oldP, &tmpP);
-            FlushInstructionCache(GetCurrentProcess(), p, 7);
-            Status += std::string("\n  ") + Tag + " OK imm " + std::to_string((int)ExpectImm) + "->" + std::to_string((int)NewImm);
-        } else {
-            Status += std::string("\n  ") + Tag + " ABORT VirtualProtect-failed";
-        }
-    } else {
-        Status += std::string("\n  ") + Tag + " ABORT opcodeOk=" + std::to_string((int)opcodeOk)
-            + " immOk=" + std::to_string((int)immOk) + " targetOk=" + std::to_string((int)targetOk)
-            + " bytes=" + std::to_string((int)p[0]) + "," + std::to_string((int)p[1]) + "," + std::to_string((int)p[2])
-            + "," + std::to_string((int)p[3]) + "," + std::to_string((int)p[4]) + "," + std::to_string((int)p[5]) + "," + std::to_string((int)p[6]);
-    }
-}
-
-// Rewrites a 7-byte `44 88 25 <disp32>` (MOV byte ptr [rip+disp32], R12B) into
-// `C6 05 <disp32> 00` (MOV byte ptr [rip+disp32], 0). Same length, same next-RIP, so the
-// same disp32 keeps targeting the verified global. disp bytes move from [3..6] to [2..5].
-static void Move10_PatchMovRegToImm0(uintptr_t Rva, uintptr_t TargetOff, const char* Tag, std::string& Status) {
-    uint8_t* p = (uint8_t*)(Globals::BaseAddress + Rva);
-    const bool opcodeOk = (p[0] == 0x44 && p[1] == 0x88 && p[2] == 0x25);
-    const int32_t disp = (int32_t)((uint32_t)p[3] | ((uint32_t)p[4] << 8) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 24));
-    const bool targetOk = ((p + 7 + disp) == (uint8_t*)(Globals::BaseAddress + TargetOff));
-    if (opcodeOk && targetOk) {
-        DWORD oldP = 0;
-        if (VirtualProtect(p, 7, PAGE_EXECUTE_READWRITE, &oldP)) {
-            const uint8_t d0 = p[3], d1 = p[4], d2 = p[5], d3 = p[6];           // capture disp before overwrite
-            p[0] = 0xC6; p[1] = 0x05; p[2] = d0; p[3] = d1; p[4] = d2; p[5] = d3; p[6] = 0x00;
-            DWORD tmpP = 0; VirtualProtect(p, 7, oldP, &tmpP);
-            FlushInstructionCache(GetCurrentProcess(), p, 7);
-            Status += std::string("\n  ") + Tag + " OK rewrite MOV[..],R12B -> MOV[..],0";
-        } else {
-            Status += std::string("\n  ") + Tag + " ABORT VirtualProtect-failed";
-        }
-    } else {
-        Status += std::string("\n  ") + Tag + " ABORT opcodeOk=" + std::to_string((int)opcodeOk)
-            + " targetOk=" + std::to_string((int)targetOk)
-            + " bytes=" + std::to_string((int)p[0]) + "," + std::to_string((int)p[1]) + "," + std::to_string((int)p[2])
-            + "," + std::to_string((int)p[3]) + "," + std::to_string((int)p[4]) + "," + std::to_string((int)p[5]) + "," + std::to_string((int)p[6]);
-    }
-}
-
-// Neutralizes a 6-byte `88 05 <disp32>` (MOV byte ptr [rip+disp32], AL) by overwriting it with
-// six 0x90 NOPs, provided the decoded target equals (BaseAddress+TargetOff). Used on the LATER
-// flag-writer FUN_1409E37A0 (called from FUN_1409DFF70 at 0x1409E0089 when FUN_1409E7120 returns
-// 0) so its 0x4FD4/0x4FE1 writes cannot overwrite the trio's dedicated flags. The 0-return path
-// of FUN_1409E7120 always executes 0x934A (GIsClient=0) + 0x9351 (GIsServer=1) first, so removing
-// these stores leaves the correct dedicated values in place. Instruction is exactly 6 bytes
-// (88 05 + 4-byte disp), so NOPx6 is boundary-preserving.
-static void Move10_NopMovByteAlStore(uintptr_t Rva, uintptr_t TargetOff, const char* Tag, std::string& Status) {
-    uint8_t* p = (uint8_t*)(Globals::BaseAddress + Rva);
-    const bool opcodeOk = (p[0] == 0x88 && p[1] == 0x05);
-    const int32_t disp = (int32_t)((uint32_t)p[2] | ((uint32_t)p[3] << 8) | ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24));
-    const bool targetOk = ((p + 6 + disp) == (uint8_t*)(Globals::BaseAddress + TargetOff)); // 6-byte instruction
-    if (opcodeOk && targetOk) {
-        DWORD oldP = 0;
-        if (VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &oldP)) {
-            p[0] = 0x90; p[1] = 0x90; p[2] = 0x90; p[3] = 0x90; p[4] = 0x90; p[5] = 0x90;
-            DWORD tmpP = 0; VirtualProtect(p, 6, oldP, &tmpP);
-            FlushInstructionCache(GetCurrentProcess(), p, 6);
-            Status += std::string("\n  ") + Tag + " OK NOPx6 (was MOV[..],AL)";
-        } else {
-            Status += std::string("\n  ") + Tag + " ABORT VirtualProtect-failed";
-        }
-    } else {
-        Status += std::string("\n  ") + Tag + " ABORT opcodeOk=" + std::to_string((int)opcodeOk)
-            + " targetOk=" + std::to_string((int)targetOk)
-            + " bytes=" + std::to_string((int)p[0]) + "," + std::to_string((int)p[1]) + "," + std::to_string((int)p[2])
-            + "," + std::to_string((int)p[3]) + "," + std::to_string((int)p[4]) + "," + std::to_string((int)p[5]);
-    }
-}
-
-// [move10] Replaces a 5-byte `E8 <rel32>` (CALL) whose decoded target equals (BaseAddress+ExpectTargetOff)
-// with `B0 01 90 90 90` (MOV AL,1 ; NOP x3), forcing the call's boolean result to true. Used on the
-// listen-success gate at 0x04046888: Ghidra shows it is `CALL 0x1409D81A0`, and 0x1409D81A0 is a
-// hardcoded `XOR AL,AL; RET` (always-false) stub. The gate at 0x14404685E is `CMP GIsClient,0; JZ`,
-// so ONLY the dedicated path (GIsClient==0, which move10 now forces) reaches this always-false gate,
-// whose false result aborts LoadMap ("failed to Listen"). Forcing the result true routes the dedicated
-// path to the success continuation at 0x1440469E5; the DLL's own Networking::Listen(Port) (tick hook)
-// then performs the real listen.
-static void Move10_PatchCallToMovAl1(uintptr_t Rva, uintptr_t ExpectTargetOff, const char* Tag, std::string& Status) {
-    uint8_t* p = (uint8_t*)(Globals::BaseAddress + Rva);
-    const bool opcodeOk = (p[0] == 0xE8);                                  // CALL rel32
-    const int32_t rel = (int32_t)((uint32_t)p[1] | ((uint32_t)p[2] << 8) | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24));
-    const bool targetOk = ((p + 5 + rel) == (uint8_t*)(Globals::BaseAddress + ExpectTargetOff));
-    if (opcodeOk && targetOk) {
-        DWORD oldP = 0;
-        if (VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldP)) {
-            p[0] = 0xB0; p[1] = 0x01; p[2] = 0x90; p[3] = 0x90; p[4] = 0x90; // MOV AL,1 ; NOP ; NOP ; NOP
-            DWORD tmpP = 0; VirtualProtect(p, 5, oldP, &tmpP);
-            FlushInstructionCache(GetCurrentProcess(), p, 5);
-            Status += std::string("\n  ") + Tag + " OK CALL->MOV AL,1;NOPx3";
-        } else {
-            Status += std::string("\n  ") + Tag + " ABORT VirtualProtect-failed";
-        }
-    } else {
-        Status += std::string("\n  ") + Tag + " ABORT opcodeOk=" + std::to_string((int)opcodeOk)
-            + " targetOk=" + std::to_string((int)targetOk)
-            + " bytes=" + std::to_string((int)p[0]) + "," + std::to_string((int)p[1]) + "," + std::to_string((int)p[2])
-            + "," + std::to_string((int)p[3]) + "," + std::to_string((int)p[4]);
-    }
-}
-
 void* OrigApplyPlayerRole = nullptr;
 
 // [2026-07-22] AArchonPlayerRole owner-node routing.
@@ -15408,11 +18401,150 @@ struct PlayerRoleGraphRoute {
     bool WasFullyActive = false;
     bool PostActiveRefreshComplete = false;
 };
-static PlayerRoleGraphRoute s_playerRoleGraphRoutes[64]{};
+/*
+ * [2026-10-11 1.14.7 O1 route-table capacity] One entry per (role, connection) pair. The table had 64 entries, which an
+ * all-omnicell party of 8 fills (8 roles x 8 connections); a later pair was then silently refused (FreeSlot < 0 ->
+ * return 0), so a 9th joiner never got the PlayerRole bootstrap, the post-activation push or the cull re-assert for any
+ * role. It now holds 64 roles x 64 connections (4096 pairs, the hub's 64-player plausibility limit) with exactly the
+ * same per-pair entry and semantics. Loops visit only the used prefix (s_playerRoleRouteHigh: every entry at or above it
+ * is empty; new entries take the lowest free index, as before), and a refused pair is now logged (TABLE_FULL).
+ * The per-pair channel-churn state (s_playerRoleChannelStates) is sized the same and indexed like the route, so finding
+ * a pair's state is O(1) instead of a scan; the PR_FRANK heartbeat table stays at 64 on purpose (see its comment).
+ */
+static constexpr int kPlayerRoleRouteCapacity = 64 * 64;
+static PlayerRoleGraphRoute s_playerRoleGraphRoutes[kPlayerRoleRouteCapacity]{};
+static int s_playerRoleRouteHigh = 0;   // entries [s_playerRoleRouteHigh, capacity) are all empty
+
+struct MpPlayerRoleRouteSpan {
+    PlayerRoleGraphRoute* First;
+    PlayerRoleGraphRoute* Last;
+    PlayerRoleGraphRoute* begin() const { return First; }
+    PlayerRoleGraphRoute* end() const { return Last; }
+};
+
+// The used prefix of the route table (trailing empty entries trimmed first). Game thread.
+static MpPlayerRoleRouteSpan MpActivePlayerRoleRoutes() {
+    while (s_playerRoleRouteHigh > 0 && !s_playerRoleGraphRoutes[s_playerRoleRouteHigh - 1].Actor) --s_playerRoleRouteHigh;
+    return { s_playerRoleGraphRoutes, s_playerRoleGraphRoutes + s_playerRoleRouteHigh };
+}
+
+static int MpPlayerRoleRouteIndex(const PlayerRoleGraphRoute& Route) {
+    return static_cast<int>(&Route - s_playerRoleGraphRoutes);
+}
+
+// Lowest empty index (the old full-table scan's answer): inside the used prefix, else the first index after it; -1 = full.
+static int MpPlayerRoleRouteFreeSlot() {
+    for (int i = 0; i < s_playerRoleRouteHigh; ++i) {
+        if (!s_playerRoleGraphRoutes[i].Actor) return i;
+    }
+    return s_playerRoleRouteHigh < kPlayerRoleRouteCapacity ? s_playerRoleRouteHigh : -1;
+}
+
+// After an entry at Index was filled.
+static void MpPlayerRoleRouteNoteUsed(int Index) {
+    if (Index >= s_playerRoleRouteHigh) s_playerRoleRouteHigh = Index + 1;
+}
+
+/*
+ * [2026-10-11 1.14.7 O1/O2 role pass] A connection-count change re-routes every known role to every connection: roles x
+ * (connections + 2) calls of RoutePlayerRoleToOwningConnectionRaw, and each call re-validated EVERY table entry (actor
+ * liveness: a VirtualQuery; IsCurrentNetDriverClientConnection: three VirtualQuery calls plus a scan of the client
+ * connections). At 40 players that is ~1600 calls x 1600 entries x ~5 system calls - seconds of game thread on every join
+ * and leave. A pass (MpRolePassScope, opened by TickPlayerRolePostActivationRefresh and RoutePlayerRoleToAllConnections,
+ * game thread, nestable) answers the same questions from a snapshot taken once at its start:
+ *   - IsCurrentNetDriverClientConnection: membership in the client connections that were readable (0x140) at the start;
+ *   - MpRolePassActorSafe: IsActorSafeForReplicationLifecycle, once per distinct actor;
+ *   - the stale-entry sweep in RoutePlayerRoleToOwningConnectionRaw runs once per pass (a later sweep in the same pass
+ *     could only find entries the first one already cleared: entries added during the pass were validated with the same
+ *     answers).
+ * Nothing inside a pass ticks the engine, destroys an actor or closes a connection (it routes, reads and pushes), so the
+ * answers cannot change while it runs. Outside a pass (another thread, or no pass open) every check runs as before.
+ */
+struct MpRolePass {
+    int Depth = 0;
+    DWORD Thread = 0;
+    bool ConnsValid = false;
+    bool SweepDone = false;
+    int NumConns = 0;
+    int NumActors = 0;
+    void* Conns[1024] = {};
+    const void* Actors[256] = {};
+    bool ActorSafe[256] = {};
+};
+static MpRolePass g_rolePass;
+
+static bool MpRolePassActive() {
+    return g_rolePass.Depth > 0 && g_rolePass.Thread == GetCurrentThreadId();
+}
+
+// Returns false (and opens nothing) when another thread holds the pass, or with ROLE_PASS_SNAPSHOT_OFF.flag (read once:
+// every check then runs directly, as before 11 Oct).
+static bool MpRolePassBegin() {
+    static int s_off = -1;
+    if (s_off < 0) {
+        s_off = MpExeRelativeFlagPresent(L"ROLE_PASS_SNAPSHOT_OFF.flag") ? 1 : 0;
+        MpLog(std::string("[PlayerRoleGraphRoute] role pass snapshot ")
+            + (s_off ? "OFF (ROLE_PASS_SNAPSHOT_OFF.flag): every connection/actor check runs directly"
+                     : "ON (ROLE_PASS_SNAPSHOT_OFF.flag reverts)"));
+    }
+    if (s_off == 1) return false;
+    MpRolePass& P = g_rolePass;
+    if (P.Depth > 0 && P.Thread != GetCurrentThreadId()) return false;   // never share a pass across threads
+    if (P.Depth++ > 0) return true;                                        // nested: reuse the open snapshot
+    P.Thread = GetCurrentThreadId();
+    P.ConnsValid = false;
+    P.SweepDone = false;
+    P.NumConns = 0;
+    P.NumActors = 0;
+    if (!Networking::NetDriver || !IsReadablePointer(Networking::NetDriver, 0xA0)) return true;
+    const RawPointerArray* Connections = reinterpret_cast<const RawPointerArray*>(
+        reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x90);
+    if (!IsReadablePointer(Connections, sizeof(RawPointerArray))
+        || !IsSanePointerArray(Connections->Data, Connections->Num, Connections->Max, 1024)) {
+        return true;
+    }
+    P.ConnsValid = true;
+    for (int32_t i = 0; i < Connections->Num && P.NumConns < static_cast<int>(std::size(P.Conns)); ++i) {
+        void* Connection = Connections->Data[i];
+        if (Connection && IsReadablePointer(Connection, 0x140)) P.Conns[P.NumConns++] = Connection;
+    }
+    return true;
+}
+
+struct MpRolePassScope {
+    bool Opened;
+    MpRolePassScope() : Opened(MpRolePassBegin()) {}
+    ~MpRolePassScope() { if (Opened && g_rolePass.Depth > 0) --g_rolePass.Depth; }
+    MpRolePassScope(const MpRolePassScope&) = delete;
+    MpRolePassScope& operator=(const MpRolePassScope&) = delete;
+};
+
+// IsActorSafeForReplicationLifecycle, answered once per actor inside a pass.
+static bool MpRolePassActorSafe(void* Actor) {
+    if (!Actor || !MpRolePassActive()) return IsActorSafeForReplicationLifecycle(Actor);
+    MpRolePass& P = g_rolePass;
+    for (int i = 0; i < P.NumActors; ++i) {
+        if (P.Actors[i] == Actor) return P.ActorSafe[i];
+    }
+    const bool Safe = IsActorSafeForReplicationLifecycle(Actor);
+    if (P.NumActors < static_cast<int>(std::size(P.Actors))) {
+        P.Actors[P.NumActors] = Actor;
+        P.ActorSafe[P.NumActors] = Safe;
+        ++P.NumActors;
+    }
+    return Safe;
+}
 
 static void PurgeDisconnectedPlayerRoleCaches();
 
 static bool IsCurrentNetDriverClientConnection(void* Connection) {
+    if (MpRolePassActive()) {   // [2026-10-11 O1] same answer from the pass snapshot (see MpRolePass)
+        if (!Connection || !g_rolePass.ConnsValid) return false;
+        for (int i = 0; i < g_rolePass.NumConns; ++i) {
+            if (g_rolePass.Conns[i] == Connection) return true;
+        }
+        return false;
+    }
     if (!Connection || !Networking::NetDriver
         || !IsReadablePointer(Networking::NetDriver, 0xA0)
         || !IsReadablePointer(Connection, 0x140)) return false;
@@ -15441,9 +18573,10 @@ static int RoutePlayerRoleToOwningConnectionRaw(void* PlayerRole, void** OutConn
     if (OutNode) *OutNode = nullptr;
     if (OutBootstrapResult) *OutBootstrapResult = 0;
     __try {
-        if (!IsActorSafeForReplicationLifecycle(PlayerRole)
+        // [2026-10-11 O1/O3] Pass-memoised actor check and per-frame pointer checks (MpRolePass, MpReadableThisFrame).
+        if (!MpRolePassActorSafe(PlayerRole)
             || !Networking::NetDriver
-            || !IsReadablePointer(Networking::NetDriver, 0x6F0)) return 0;
+            || !MpReadableThisFrame(Networking::NetDriver, 0x6F0)) return 0;
 
         void* Connection = ForcedConnection;
         if (!Connection) {
@@ -15458,7 +18591,7 @@ static int RoutePlayerRoleToOwningConnectionRaw(void* PlayerRole, void** OutConn
 
         void* Graph = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x6E8);
         if (OutGraph) *OutGraph = Graph;
-        if (!Graph || !IsReadablePointer(Graph, 0x4C8)) return 0;
+        if (!Graph || !MpReadableThisFrame(Graph, 0x4C8)) return 0;
         if (*reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Graph) + 0x30)
             != reinterpret_cast<void*>(Networking::NetDriver)) return 0;
 
@@ -15472,11 +18605,15 @@ static int RoutePlayerRoleToOwningConnectionRaw(void* PlayerRole, void** OutConn
             : reinterpret_cast<void*(*)(void*, void*)>(
                 Globals::BaseAddress + 0x01BDB8F0)(Graph, Connection);
         if (OutNode) *OutNode = Node;
-        if (!Node || !IsReadablePointer(Node, 0x20)) return 0;
+        if (!Node || !MpReadableThisFrame(Node, 0x20)) return 0;
 
-        for (PlayerRoleGraphRoute& Existing : s_playerRoleGraphRoutes) {
-            if (Existing.Actor
-                && (!IsActorSafeForReplicationLifecycle(Existing.Actor)
+        // [2026-10-11 O1] The stale-entry sweep runs once per role pass (see MpRolePass); outside a pass, every call.
+        const bool InPass = MpRolePassActive();
+        const bool Sweep = !InPass || !g_rolePass.SweepDone;
+        if (InPass) g_rolePass.SweepDone = true;
+        for (PlayerRoleGraphRoute& Existing : MpActivePlayerRoleRoutes()) {
+            if (Sweep && Existing.Actor
+                && (!MpRolePassActorSafe(Existing.Actor)
                     || !IsCurrentNetDriverClientConnection(Existing.Connection))) {
                 Existing = PlayerRoleGraphRoute{};
                 continue;
@@ -15495,11 +18632,8 @@ static int RoutePlayerRoleToOwningConnectionRaw(void* PlayerRole, void** OutConn
             }
         }
 
-        int FreeSlot = -1;
-        for (int i = 0; i < static_cast<int>(std::size(s_playerRoleGraphRoutes)); ++i) {
-            if (!s_playerRoleGraphRoutes[i].Actor && FreeSlot < 0) FreeSlot = i;
-        }
-        if (FreeSlot < 0) return 0;
+        const int FreeSlot = MpPlayerRoleRouteFreeSlot();   // [2026-10-11 O1] lowest free index, as before
+        if (FreeSlot < 0) return -2;   // table full: reported (rate-limited) by the callers
 
         if (!UsesGlobalRoute) {
             // Compatibility fallback for an A/B build with the global route disabled. In the fixed
@@ -15519,6 +18653,7 @@ static int RoutePlayerRoleToOwningConnectionRaw(void* PlayerRole, void** OutConn
                 NotifyAdd)(Node, Info);
         }
         s_playerRoleGraphRoutes[FreeSlot] = { PlayerRole, Node, Connection };
+        MpPlayerRoleRouteNoteUsed(FreeSlot);
 
         // The native global node is the authoritative ongoing route. Bootstrap only the initial
         // actor-channel/NetGUID bunch and late lifecycle state; the graph keeps the channel relevant.
@@ -15532,6 +18667,20 @@ static int RoutePlayerRoleToOwningConnectionRaw(void* PlayerRole, void** OutConn
     }
 }
 
+// [2026-10-11 1.14.7 O1] A refused pair used to vanish without a trace; now it is loud (once per 10 s, with a count).
+static void MpLogPlayerRoleRouteTableFull(void* PlayerRole, void* Connection, const char* Scope) {
+    static uint64_t s_lastMs = 0;
+    static uint64_t s_refused = 0;
+    ++s_refused;
+    const uint64_t Now = GetTickCount64();
+    if (s_lastMs != 0 && Now - s_lastMs < 10000) return;
+    s_lastMs = Now;
+    MpLog("[PlayerRoleGraphRoute] TABLE_FULL role=" + MpPtr(PlayerRole) + " conn=" + MpPtr(Connection)
+        + " scope=" + Scope + " capacity=" + std::to_string(kPlayerRoleRouteCapacity)
+        + " refusedSoFar=" + std::to_string(s_refused)
+        + " - this (role, connection) pair gets NO PlayerRole bootstrap/push/cull re-assert");
+}
+
 static void RoutePlayerRoleToOwningConnection(void* PlayerRole) {
     if (!Globals::AmServer || !PlayerRole
         || MpExeRelativeFlagPresent(L"DISABLE_PLAYER_ROLE_OWNER_ROUTE.flag")) return;
@@ -15539,6 +18688,7 @@ static void RoutePlayerRoleToOwningConnection(void* PlayerRole) {
     int BootstrapResult = 0;
     const int Result = RoutePlayerRoleToOwningConnectionRaw(PlayerRole, &Connection, &Graph, &Node,
         &BootstrapResult);
+    if (Result == -2) MpLogPlayerRoleRouteTableFull(PlayerRole, Connection, "owner");   // [2026-10-11 O1]
     if (Result == 1 || Result == 2 || Result == -1) {
         MpLog("[PlayerRoleGraphRoute] role=" + MpPtr(PlayerRole)
             + " conn=" + MpPtr(Connection) + " graph=" + MpPtr(Graph) + " node=" + MpPtr(Node)
@@ -15576,14 +18726,16 @@ static void RoutePlayerRoleToOwningConnection(void* PlayerRole) {
 // DISABLE_PLAYER_ROLE_GLOBAL_ROUTE.flag restores the former per-connection node path for A/B.
 // DISABLE_PLAYER_ROLE_REMOTE_ROUTE.flag still suppresses remote connection bootstraps.
 static void RoutePlayerRoleToAllConnections(void* PlayerRole) {
-    if (!Globals::AmServer || !IsActorSafeForReplicationLifecycle(PlayerRole)) return;
+    if (!Globals::AmServer) return;
+    MpRolePassScope Pass;   // [2026-10-11 O1/O2] one snapshot for the owner + every remote connection (see MpRolePass)
+    if (!MpRolePassActorSafe(PlayerRole)) return;
 
     // Owner first, unchanged - it is the one that has always worked and it seeds the dedup table.
     RoutePlayerRoleToOwningConnection(PlayerRole);
 
     if (MpExeRelativeFlagPresent(L"DISABLE_PLAYER_ROLE_OWNER_ROUTE.flag")
         || MpExeRelativeFlagPresent(L"DISABLE_PLAYER_ROLE_REMOTE_ROUTE.flag")) return;
-    if (!Networking::NetDriver || !IsReadablePointer(Networking::NetDriver, 0xA0)) return;
+    if (!Networking::NetDriver || !MpReadableThisFrame(Networking::NetDriver, 0xA0)) return;
 
     // Re-resolve the owning connection so we can skip it; a failure here is not fatal, it just
     // means we may redo the owner (the actor+node dedup makes that a refresh, not a duplicate).
@@ -15599,12 +18751,13 @@ static void RoutePlayerRoleToAllConnections(void* PlayerRole) {
     for (int32_t i = 0; i < ClientConnections->Num; ++i) {
         void* Connection = ClientConnections->Data[i];
         if (!Connection || Connection == OwnerConnection) continue;
-        if (!IsReadablePointer(Connection, 0x140)) continue;
+        if (!MpReadableThisFrame(Connection, 0x140)) continue;
 
         void* Graph = nullptr; void* Node = nullptr;
         int BootstrapResult = 0;
         const int Result = RoutePlayerRoleToOwningConnectionRaw(PlayerRole, nullptr, &Graph, &Node,
             &BootstrapResult, Connection);
+        if (Result == -2) MpLogPlayerRoleRouteTableFull(PlayerRole, Connection, "remote");   // [2026-10-11 O1]
         if (Result == 1 || Result == -1) {   // ADDED / FAULT are worth a line; refreshes are not
             MpLog("[PlayerRoleGraphRoute] role=" + MpPtr(PlayerRole)
                 + " conn=" + MpPtr(Connection) + " graph=" + MpPtr(Graph) + " node=" + MpPtr(Node)
@@ -15764,34 +18917,32 @@ struct PlayerRoleChannelState {
     int LastChIndex = -3;      // -3 = never sampled
     int Transitions = 0;
 };
-static PlayerRoleChannelState s_playerRoleChannelStates[64]{};
+// [2026-10-11 1.14.7 O1] Diagnostic-only state, one per route entry: same capacity as the route table and stored at the
+// route's own index (a pair's route index is fixed for the route's lifetime), so the old scan over 64 states - and the
+// silent drop once 64 pairs were tracked - are gone. A state left over from a different pair at that index is reset
+// (the old table could find a pair's previous state at another index; the only difference is one extra first-sample
+// OPEN line). Off with PRODUCTION_LOG_PROFILE.flag as well as NO_PLAYER_ROLE_CHANNEL_LOG.flag.
+static PlayerRoleChannelState s_playerRoleChannelStates[kPlayerRoleRouteCapacity]{};
 
 static void TickPlayerRoleChannelChurn() {
     if (!Globals::AmServer) return;
-    if (MpExeRelativeFlagPresent(L"NO_PLAYER_ROLE_CHANNEL_LOG.flag")) return;
+    if (MpExeRelativeFlagPresent(L"NO_PLAYER_ROLE_CHANNEL_LOG.flag") || MpProductionLogProfile()) return;
 
-    for (const PlayerRoleGraphRoute& Route : s_playerRoleGraphRoutes) {
+    for (const PlayerRoleGraphRoute& Route : MpActivePlayerRoleRoutes()) {
         if (!Route.Actor || !Route.Connection) continue;
-        if (!IsActorSafeForReplicationLifecycle(Route.Actor)) continue;
+        if (!MpRolePassActorSafe(Route.Actor)) continue;
         if (!IsCurrentNetDriverClientConnection(Route.Connection)) continue;
 
         const int ChIndex = Networking::GetActorChannelIndexForConnection(
             reinterpret_cast<AActor*>(Route.Actor),
             reinterpret_cast<UNetConnection*>(Route.Connection));
 
-        PlayerRoleChannelState* Slot = nullptr;
-        PlayerRoleChannelState* Free = nullptr;
-        for (PlayerRoleChannelState& S : s_playerRoleChannelStates) {
-            if (S.Actor == Route.Actor && S.Connection == Route.Connection) { Slot = &S; break; }
-            if (!S.Actor && !Free) Free = &S;
-        }
-        if (!Slot) {
-            if (!Free) continue;
-            Free->Actor = Route.Actor;
-            Free->Connection = Route.Connection;
-            Free->LastChIndex = -3;
-            Free->Transitions = 0;
-            Slot = Free;
+        PlayerRoleChannelState* Slot = &s_playerRoleChannelStates[MpPlayerRoleRouteIndex(Route)];
+        if (Slot->Actor != Route.Actor || Slot->Connection != Route.Connection) {
+            Slot->Actor = Route.Actor;
+            Slot->Connection = Route.Connection;
+            Slot->LastChIndex = -3;
+            Slot->Transitions = 0;
         }
 
         // Only an open<->closed flip is interesting; a stable channel logs nothing.
@@ -16283,20 +19434,36 @@ struct FrankDroneServerState {
     int Transitions = 0;
     uint64_t LastLogMs = 0;
 };
+// [2026-10-11 1.14.7 O1] Deliberately kept at 64 pairs: this is a read-only diagnostic whose every tracked pair logs a
+// heartbeat each 5 s, so tracking all PR_FRANK x connection pairs of a 40-player hub would add dozens of lines a second.
+// Saturating it only stops logging for further pairs (nothing is routed or repaired here); that now logs once.
 static FrankDroneServerState s_frankDroneServerStates[64]{};
 
 // Server counterpart: scoped strictly to PR_FRANK and read-only. It records the drone's native
 // route flags, global-node membership, global replication settings, per-connection cull snapshot,
 // close frame and actor-channel transitions. This identifies a channel/relevance loss without
 // pretending that the server's Blueprint fields describe the owning client's local state.
+// [2026-10-11 1.14.7 O1/O3] The role snapshot (CaptureFrankDroneGate: two reflection-chain property searches with an
+// FName->string per field) depends only on the role, so it is taken once per role per pass instead of once per
+// (role, connection) pair. Off with PRODUCTION_LOG_PROFILE.flag.
 static void TickFrankDroneDiagnostics(void* Graph) {
-    if (!Globals::AmServer || !Graph) return;
+    if (!Globals::AmServer || !Graph || MpProductionLogProfile()) return;
 
-    for (const PlayerRoleGraphRoute& Route : s_playerRoleGraphRoutes) {
+    struct RoleSnap { void* Role; FrankDroneGateSnapshot Snap; };
+    std::vector<RoleSnap> Snaps;   // distinct roles of this pass
+    for (const PlayerRoleGraphRoute& Route : MpActivePlayerRoleRoutes()) {
         if (!Route.Actor || !Route.Connection) continue;
-        if (!IsActorSafeForReplicationLifecycle(Route.Actor)) continue;
+        if (!MpRolePassActorSafe(Route.Actor)) continue;
 
-        const FrankDroneGateSnapshot S = CaptureFrankDroneGate(Route.Actor);
+        const FrankDroneGateSnapshot* Cached = nullptr;
+        for (const RoleSnap& R : Snaps) {
+            if (R.Role == Route.Actor) { Cached = &R.Snap; break; }
+        }
+        if (!Cached) {
+            Snaps.push_back({ Route.Actor, CaptureFrankDroneGate(Route.Actor) });
+            Cached = &Snaps.back().Snap;
+        }
+        const FrankDroneGateSnapshot S = *Cached;
         if (!S.Applicable) continue;
 
         float DroneX = 0, DroneY = 0, DroneZ = 0, OwnerX = 0, OwnerY = 0, OwnerZ = 0;
@@ -16327,7 +19494,15 @@ static void TickFrankDroneDiagnostics(void* Graph) {
             Free->Connection = Route.Connection;
             Slot = Free;
         }
-        if (!Slot) continue;
+        if (!Slot) {
+            static bool s_fullLogged = false;   // [2026-10-11 O1] saturation is now visible (once)
+            if (!s_fullLogged) {
+                s_fullLogged = true;
+                MpLog("[FrankDroneDiag][Server] state table full (" + std::to_string(std::size(s_frankDroneServerStates))
+                    + " pairs); further PR_FRANK x connection pairs are not traced (diagnostic only, logged once)");
+            }
+            continue;
+        }
 
         const bool WasOpen = Slot->LastChIndex >= 0;
         const bool IsOpen = ChIndex >= 0;
@@ -16413,37 +19588,101 @@ static void TickFrankDroneDiagnostics(void* Graph) {
     }
 }
 
+/*
+ * [2026-10-11 1.14.7 O3 relevance pass on change] Parts 1 and 2 below search the graph's global actor map (a linear walk
+ * of thousands of entries) once per role and once per pawn, and every connection's actor-info map once per role, and
+ * built their log strings whether or not anything changed - every ~2 s, growing with roles x connections. They only
+ * re-assert settings that the route hook already writes at registration (ArchonRouteAddNetworkActorHook), and in every
+ * log since 26 Jul they have never had to correct anything ([PlayerRoleCullGuard] and "[PawnChannelGrace] source=tick":
+ * 0 lines in the 8776-8790 logs of 9-11 Oct). They now run when the input set changes - the graph pointer, the client
+ * connection count, the set of routed roles or the set of possessed pawns (an order-independent signature) - and at
+ * least every 15 s as a safety net. Part 3 (the read-only Artificer diagnostic) keeps its own cadence. The detail
+ * strings are built only for a line that is logged. RELEVANCE_PASS_EVERY_TICK.flag (read once) runs parts 1-2 on every
+ * call again.
+ */
 static void TickRepGraphRelevanceSettings() {
     if (!Globals::AmServer || !RepGraphRelevanceFixEnabled()) return;
-    if (!Networking::NetDriver || !IsReadablePointer(Networking::NetDriver, 0x6F0)) return;
+    if (!Networking::NetDriver || !MpReadableThisFrame(Networking::NetDriver, 0x6F0)) return;
     void* Graph = *reinterpret_cast<void**>(
         reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x6E8);
-    if (!Graph || !IsReadablePointer(Graph, 0x4C8)) return;
+    if (!Graph || !MpReadableThisFrame(Graph, 0x4C8)) return;
     if (*reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Graph) + 0x30)
         != reinterpret_cast<void*>(Networking::NetDriver)) return;
+
+    static int s_everyTick = -1;
+    if (s_everyTick < 0) {
+        s_everyTick = MpExeRelativeFlagPresent(L"RELEVANCE_PASS_EVERY_TICK.flag") ? 1 : 0;
+        MpLog(std::string("[RelevancePass] role/pawn relevance re-assert ")
+            + (s_everyTick ? "on every pass (RELEVANCE_PASS_EVERY_TICK.flag)"
+                           : "on change of graph/connections/roles/pawns, else every 15 s (default)"));
+    }
+    bool RunSettings = true;
+    if (s_everyTick == 0) {
+        // Order-independent signature of the inputs; reads only, SEH-guarded for the pawn chain.
+        uint64_t RoleSum = 0, RoleXor = 0, RoleCount = 0;
+        for (const PlayerRoleGraphRoute& Route : MpActivePlayerRoleRoutes()) {
+            if (!Route.Actor) continue;
+            const uint64_t A = reinterpret_cast<uintptr_t>(Route.Actor);
+            RoleSum += A * 0x9E3779B97F4A7C15ull;
+            RoleXor ^= (A >> 4) | (A << 60);
+            ++RoleCount;   // pairs, not distinct roles: a role reaching one more connection also counts as a change
+        }
+        uint64_t PawnSum = 0, PawnXor = 0;
+        const uintptr_t Driver = reinterpret_cast<uintptr_t>(Networking::NetDriver);
+        const int32_t ConnNum = SafeReadI32At(Driver, 0x98);
+        const uintptr_t ConnData = SafeReadPtr(Driver, 0x90);
+        for (int32_t i = 0; ConnData && i < ConnNum && i < 1024; ++i) {
+            const uintptr_t Conn = SafeReadPtr(ConnData, static_cast<uintptr_t>(i) * sizeof(void*));
+            const uintptr_t PC = Conn ? SafeReadPtr(Conn, 0x30) : 0;
+            const uintptr_t Pawn = PC ? SafeReadPtr(PC, 0x250) : 0;
+            PawnSum += static_cast<uint64_t>(Pawn) * 0xC2B2AE3D27D4EB4Full + static_cast<uint64_t>(Conn);
+            PawnXor ^= static_cast<uint64_t>(Pawn) ^ (static_cast<uint64_t>(Conn) << 1);
+        }
+        const uint64_t Signature = (RoleSum ^ (RoleXor * 31) ^ (RoleCount << 48))
+            ^ ((PawnSum ^ (PawnXor * 131)) * 0x100000001B3ull)
+            ^ (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Graph)) * 7) ^ (static_cast<uint64_t>(ConnNum) << 40);
+        static uint64_t s_lastSignature = 0;
+        static uint64_t s_lastRunMs = 0;
+        const uint64_t Now = GetTickCount64();
+        RunSettings = s_lastRunMs == 0 || Signature != s_lastSignature || Now - s_lastRunMs >= 15000;
+        if (RunSettings) {
+            s_lastSignature = Signature;
+            s_lastRunMs = Now;
+        }
+    }
+    if (!RunSettings) {
+        TickFrankDroneDiagnostics(Graph);   // part 3 only
+        return;
+    }
 
     // 1) Every AArchonPlayerRole we know about: global settings plus any stale per-connection
     //    snapshot. Keyed on the distinct actors in the route table, which is populated by
     //    ApplyPlayerRoleHook for every equipped role on the server.
-    void* SeenRoles[64]{};
+    // [2026-10-11 O1] Distinct roles up to the route capacity (was 64: roles past the 64th were re-asserted every time
+    // they appeared, i.e. once per pair).
+    static void* s_seenRoles[kPlayerRoleRouteCapacity];
     int SeenRoleCount = 0;
-    for (const PlayerRoleGraphRoute& Route : s_playerRoleGraphRoutes) {
+    for (const PlayerRoleGraphRoute& Route : MpActivePlayerRoleRoutes()) {
         if (!Route.Actor) continue;
         bool Duplicate = false;
         for (int i = 0; i < SeenRoleCount; ++i) {
-            if (SeenRoles[i] == Route.Actor) { Duplicate = true; break; }
+            if (s_seenRoles[i] == Route.Actor) { Duplicate = true; break; }
         }
         if (Duplicate) continue;
-        if (SeenRoleCount < static_cast<int>(std::size(SeenRoles))) {
-            SeenRoles[SeenRoleCount++] = Route.Actor;
+        if (SeenRoleCount < kPlayerRoleRouteCapacity) {
+            s_seenRoles[SeenRoleCount++] = Route.Actor;
         }
-        if (!IsActorSafeForReplicationLifecycle(Route.Actor)) continue;
+        if (!MpRolePassActorSafe(Route.Actor)) continue;
 
         std::string Detail;
+        void* RoleGlobalInfo = RepGraphFindGlobalActorInfo(Graph, Route.Actor);
         const int GlobalResult = RepGraphApplyGlobalSettings(
-            RepGraphFindGlobalActorInfo(Graph, Route.Actor), true,
-            kRepGraphPlayerChannelGraceFrames, &Detail);
+            RoleGlobalInfo, true, kRepGraphPlayerChannelGraceFrames, &Detail, true);
         const int Cleared = RepGraphClearConnectionCullDistance(Graph, Route.Actor);
+        if (Cleared > 0 && Detail.empty()) {
+            // Unchanged global settings: re-read them for the same "before->after" text the old line printed.
+            RepGraphApplyGlobalSettings(RoleGlobalInfo, true, kRepGraphPlayerChannelGraceFrames, &Detail);
+        }
         if (GlobalResult == 1 || Cleared > 0) {
             MpLog("[PlayerRoleCullGuard] role=" + MpPtr(Route.Actor)
                 + " itemId=" + (IsReadablePointer(Route.Actor, 0x250)
@@ -16460,23 +19699,23 @@ static void TickRepGraphRelevanceSettings() {
     //    driver's client connections (UPlayer::PlayerController @ +0x30, APlayerController::Pawn @
     //    +0x250) so this can only ever touch a real player character, never a behemoth or a
     //    level actor.
-    if (!IsReadablePointer(Networking::NetDriver, 0xA0)) return;
+    if (!MpReadableThisFrame(Networking::NetDriver, 0xA0)) return;
     const RawPointerArray* Connections = reinterpret_cast<const RawPointerArray*>(
         reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x90);
-    if (!IsReadablePointer(Connections, sizeof(RawPointerArray))) return;
+    if (!MpReadableThisFrame(Connections, sizeof(RawPointerArray))) return;
     if (!IsSanePointerArray(Connections->Data, Connections->Num, Connections->Max, 1024)) return;
     for (int32_t i = 0; i < Connections->Num; ++i) {
         void* Connection = Connections->Data[i];
-        if (!Connection || !IsReadablePointer(Connection, 0x140)) continue;
+        if (!Connection || !MpReadableThisFrame(Connection, 0x140)) continue;
         void* PC = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(Connection) + 0x30);
         if (!PC || !IsReadablePointer(PC, 0x258) || !IsRegisteredLiveObject(PC)) continue;
         void* Pawn = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(PC) + 0x250);
         if (!Pawn || !IsReadablePointer(Pawn, 0x60) || !IsRegisteredLiveObject(Pawn)) continue;
 
-        std::string Detail;
+        std::string Detail;   // [2026-10-11 O3] built only when the settings changed (the only case that logs)
         const int Result = RepGraphApplyGlobalSettings(
             RepGraphFindGlobalActorInfo(Graph, Pawn), false,
-            kRepGraphPlayerChannelGraceFrames, &Detail);
+            kRepGraphPlayerChannelGraceFrames, &Detail, true);
         if (Result == 1) {
             MpLog("[PawnChannelGrace] source=tick pawn=" + MpPtr(Pawn)
                 + " conn=" + MpPtr(Connection) + " result=" + std::to_string(Result) + Detail);
@@ -16491,6 +19730,10 @@ static void TickRepGraphRelevanceSettings() {
 static void TickPlayerRolePostActivationRefresh() {    if (!Globals::AmServer || !OrigProcessEvent
         || MpExeRelativeFlagPresent(L"DISABLE_PLAYER_ROLE_OWNER_ROUTE.flag")) return;
 
+    // [2026-10-11 1.14.7 O1/O2] One role pass for the whole once-a-second tick: the purge, the churn log, the relevance
+    // re-assert, the connection-edge re-route and the post-activation loop all answer "is this connection current / is
+    // this role alive" from one snapshot (see MpRolePass).
+    MpRolePassScope Pass;
     PurgeDisconnectedPlayerRoleCaches();
     TickPlayerRoleChannelChurn();
     TickRepGraphRelevanceSettings();
@@ -16502,10 +19745,10 @@ static void TickPlayerRolePostActivationRefresh() {    if (!Globals::AmServer ||
     // role we know about, so joining order stops mattering. Cheap: only fires when Num changes,
     // and the actor+node dedup turns the already-routed pairs into refreshes.
     if (!MpExeRelativeFlagPresent(L"DISABLE_PLAYER_ROLE_REMOTE_ROUTE.flag")
-        && Networking::NetDriver && IsReadablePointer(Networking::NetDriver, 0xA0)) {
+        && Networking::NetDriver && MpReadableThisFrame(Networking::NetDriver, 0xA0)) {
         const RawPointerArray* Connections = reinterpret_cast<const RawPointerArray*>(
             reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x90);
-        if (IsReadablePointer(Connections, sizeof(RawPointerArray))
+        if (MpReadableThisFrame(Connections, sizeof(RawPointerArray))
             && IsSanePointerArray(Connections->Data, Connections->Num, Connections->Max, 1024)) {
             static int32_t s_lastRoutedConnCount = -1;
             if (Connections->Num != s_lastRoutedConnCount) {
@@ -16515,19 +19758,20 @@ static void TickPlayerRolePostActivationRefresh() {    if (!Globals::AmServer ||
                 s_lastRoutedConnCount = Connections->Num;
                 // Snapshot the distinct actors first: RoutePlayerRoleToAllConnections writes new
                 // entries into s_playerRoleGraphRoutes, so iterating it live would be unsound.
-                void* Actors[64]{};
+                // [2026-10-11 O1] Up to the route capacity (was 64 distinct roles).
+                static void* s_edgeActors[kPlayerRoleRouteCapacity];
                 int ActorCount = 0;
-                for (const PlayerRoleGraphRoute& Entry : s_playerRoleGraphRoutes) {
+                for (const PlayerRoleGraphRoute& Entry : MpActivePlayerRoleRoutes()) {
                     if (!Entry.Actor) continue;
                     bool Seen = false;
-                    for (int i = 0; i < ActorCount; ++i) if (Actors[i] == Entry.Actor) { Seen = true; break; }
-                    if (!Seen && ActorCount < 64) Actors[ActorCount++] = Entry.Actor;
+                    for (int i = 0; i < ActorCount; ++i) if (s_edgeActors[i] == Entry.Actor) { Seen = true; break; }
+                    if (!Seen && ActorCount < kPlayerRoleRouteCapacity) s_edgeActors[ActorCount++] = Entry.Actor;
                 }
                 for (int i = 0; i < ActorCount; ++i) {
-                    if (IsActorSafeForReplicationLifecycle(Actors[i])) {
-                        RoutePlayerRoleToAllConnections(Actors[i]);
+                    if (MpRolePassActorSafe(s_edgeActors[i])) {
+                        RoutePlayerRoleToAllConnections(s_edgeActors[i]);
                     } else {
-                        PurgePlayerRoleLifetimeCaches(Actors[i], "connection-edge-invalid-actor");
+                        PurgePlayerRoleLifetimeCaches(s_edgeActors[i], "connection-edge-invalid-actor");
                     }
                 }
             }
@@ -16535,11 +19779,11 @@ static void TickPlayerRolePostActivationRefresh() {    if (!Globals::AmServer ||
     }
 
     const uint64_t Now = GetTickCount64();
-    for (PlayerRoleGraphRoute& Entry : s_playerRoleGraphRoutes) {
+    for (PlayerRoleGraphRoute& Entry : MpActivePlayerRoleRoutes()) {
         if (!Entry.Actor) continue;
-        if (!IsActorSafeForReplicationLifecycle(Entry.Actor)
+        if (!MpRolePassActorSafe(Entry.Actor)
             || !IsCurrentNetDriverClientConnection(Entry.Connection)
-            || !IsReadablePointer(Entry.Node, 0x20)) {
+            || !MpReadableThisFrame(Entry.Node, 0x20)) {
             Entry = PlayerRoleGraphRoute{};
             continue;
         }
@@ -16694,7 +19938,9 @@ struct TempestModifierEnsureEntry {
     int RepairAttempts = 0;
     bool InUse = false;
 };
-static TempestModifierEnsureEntry s_tempestModifierEnsure[16]{};
+// [2026-10-11 1.14.7 O1] 16 -> 64 (one PR_TEMPEST role per player on a 64-player hub); a full table now logs once
+// instead of on every refused role.
+static TempestModifierEnsureEntry s_tempestModifierEnsure[64]{};
 static constexpr uint64_t kTempestModifierSettleMs = 3000;
 static constexpr uint64_t kTempestModifierRetryMs = 3500;
 static constexpr int kTempestModifierMaxAttempts = 3;
@@ -16713,7 +19959,12 @@ static void NoteTempestModifierRole(void* PlayerRole) {
         if (!Entry.InUse && FreeSlot < 0) FreeSlot = i;
     }
     if (FreeSlot < 0) {
-        MpLog("[TempestModifierEnsure] tracking table full; role=" + MpPtr(PlayerRole));
+        static bool s_fullLogged = false;
+        if (!s_fullLogged) {
+            s_fullLogged = true;
+            MpLog("[TempestModifierEnsure] tracking table full (" + std::to_string(std::size(s_tempestModifierEnsure))
+                + " roles); role=" + MpPtr(PlayerRole) + " is not watched (logged once)");
+        }
         return;
     }
     s_tempestModifierEnsure[FreeSlot].PlayerRole = PlayerRole;
@@ -16904,7 +20155,8 @@ struct TempestChargeDiagEntry {
     int LastChargeMilli = INT32_MIN;   // last sampled current-charge * 1000
     uint64_t LastHeartbeatMs = 0;
 };
-static TempestChargeDiagEntry s_tempestChargeDiag[16]{};
+// [2026-10-11 1.14.7 O1] 16 -> 64. Diagnostic only (TEMPEST_CHARGE_DIAG.flag); a full table logs once.
+static TempestChargeDiagEntry s_tempestChargeDiag[64]{};
 
 static void PurgePlayerRoleLifetimeCaches(void* PlayerRole, const char* Reason) {
     if (!PlayerRole) return;
@@ -16915,7 +20167,7 @@ static void PurgePlayerRoleLifetimeCaches(void* PlayerRole, const char* Reason) 
     int ModifierCount = 0;
     int ChargeCount = 0;
 
-    for (PlayerRoleGraphRoute& Entry : s_playerRoleGraphRoutes) {
+    for (PlayerRoleGraphRoute& Entry : MpActivePlayerRoleRoutes()) {   // [2026-10-11 O1] used prefix
         if (Entry.Actor == PlayerRole) {
             Entry = PlayerRoleGraphRoute{};
             ++RouteCount;
@@ -16958,10 +20210,10 @@ static void PurgePlayerRoleLifetimeCaches(void* PlayerRole, const char* Reason) 
 }
 
 static void PurgeDisconnectedPlayerRoleCaches() {
-    for (PlayerRoleGraphRoute& Route : s_playerRoleGraphRoutes) {
+    for (PlayerRoleGraphRoute& Route : MpActivePlayerRoleRoutes()) {   // [2026-10-11 O1] used prefix, pass checks
         if (!Route.Actor) continue;
 
-        if (!IsActorSafeForReplicationLifecycle(Route.Actor)) {
+        if (!MpRolePassActorSafe(Route.Actor)) {
             void* Actor = Route.Actor;
             PurgePlayerRoleLifetimeCaches(Actor, "tick-invalid-actor");
             continue;
@@ -17010,6 +20262,12 @@ static void NoteTempestChargeDiagRole(void* PlayerRole) {
                 + " state={" + PlayerRoleChargeSummary(PlayerRole) + "}");
             return;
         }
+    }
+    static bool s_fullLogged = false;   // [2026-10-11 O1]
+    if (!s_fullLogged) {
+        s_fullLogged = true;
+        MpLog("[TempestChargeDiag] tracking table full (" + std::to_string(std::size(s_tempestChargeDiag))
+            + " roles); role=" + MpPtr(PlayerRole) + " is not traced (logged once)");
     }
 }
 
@@ -18088,7 +21346,7 @@ static void InstallServerWindowSuppressionHooks() {
         + " show=" + (OrigShowWindowApi ? "ok" : "FAIL"));
 }
 
-// [move10 1.14.7] Byte-verified instruction patch helper: validate the exact expected bytes
+// [1.14.7] Byte-verified instruction patch helper: validate the exact expected bytes
 // (opcode + decoded RIP-relative target) before writing, fail closed, flush the icache.
 static bool MpPatchBytesVerified(uintptr_t Rva, const uint8_t* Expected, const uint8_t* Replacement,
                                  size_t Length, const char* Tag) {
@@ -18101,29 +21359,29 @@ static bool MpPatchBytesVerified(uintptr_t Rva, const uint8_t* Expected, const u
         if (VirtualQuery(Site, &Info, sizeof(Info)) == 0
             || Info.State != MEM_COMMIT
             || (Info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
-            MpLog(std::string("[Move10] ") + Tag + " unreadable at +" + MpHex(Rva) + " - skipped (fail closed)");
+            MpLog(std::string("[BytePatch] ") + Tag + " unreadable at +" + MpHex(Rva) + " - skipped (fail closed)");
             return false;
         }
         const uintptr_t RegionEnd = reinterpret_cast<uintptr_t>(Info.BaseAddress) + Info.RegionSize;
         if (reinterpret_cast<uintptr_t>(Site) + Length > RegionEnd) {
-            MpLog(std::string("[Move10] ") + Tag + " spans a page boundary at +" + MpHex(Rva) + " - skipped (fail closed)");
+            MpLog(std::string("[BytePatch] ") + Tag + " spans a page boundary at +" + MpHex(Rva) + " - skipped (fail closed)");
             return false;
         }
     }
     if (memcmp(Site, Expected, Length) != 0) {
-        MpLog(std::string("[Move10] ") + Tag + " byte guard FAILED at +" + MpHex(Rva) + " - skipped (fail closed)");
+        MpLog(std::string("[BytePatch] ") + Tag + " byte guard FAILED at +" + MpHex(Rva) + " - skipped (fail closed)");
         return false;
     }
     DWORD OldProtect = 0;
     if (!VirtualProtect(Site, Length, PAGE_EXECUTE_READWRITE, &OldProtect)) {
-        MpLog(std::string("[Move10] ") + Tag + " VirtualProtect failed at +" + MpHex(Rva)
+        MpLog(std::string("[BytePatch] ") + Tag + " VirtualProtect failed at +" + MpHex(Rva)
             + " err=" + std::to_string(GetLastError()));
         return false;
     }
     memcpy(Site, Replacement, Length);
     VirtualProtect(Site, Length, OldProtect, &OldProtect);
     FlushInstructionCache(GetCurrentProcess(), Site, Length);
-    MpLog(std::string("[Move10] ") + Tag + " patched at +" + MpHex(Rva));
+    MpLog(std::string("[BytePatch] ") + Tag + " patched at +" + MpHex(Rva));
     return true;
 }
 
@@ -18135,225 +21393,9 @@ static bool MpPatchBytesVerified(uintptr_t Rva, const uint8_t* Expected, const u
 //   controller+0x228 -> PlayerState       (verified in FUN_141c29400)
 //   PlayerState+0x250 -> id type, +0x258 -> shared net-id OBJECT, +0x260 -> its control block
 //   netId+0x00 -> the object's vtable
-// The phantom local player on a hub has +0x258 == null (that is the gate that stops its whole
-// player-data load); a real logged-in player does not, which is where the vtable comes from.
 // Nothing is written and no behaviour changes: the detour calls the original immediately.
 using LoadMgrBeginFn = void(*)(void*);
 static LoadMgrBeginFn OrigLoadMgrBegin = nullptr;
-
-// ============================================================================
-// [1.14.7 SYNTHETIC NET ID 2026-10-03] Give the phantom local player a valid net-id object.
-//
-// Why: the hub's forced listen-server boot spawns a phantom ULocalPlayer whose PlayerState has no
-// net-id object (verified live: PlayerState+0x258 == null). Every player-data component then logs
-// "the player state does not have a valid ID" and stops, the aggregation times out at +60s, the map
-// reload fails and the hub stops listening - so no client can ever join.
-//
-// The contract is verified from the engine's own code, not guessed:
-//   * FUN_140a7b3e0 = FUniqueNetIdRepl::ToString():
-//         if (netId == 0 || netId->vtable[0x28]() == 0) -> L"INVALID"
-//         else netId->vtable[0x30](netId, &outFString)
-//     i.e. slot 0x28 = IsValid() -> bool, slot 0x30 = ToString() -> writes an FString.
-//     This is also why every per-player URL contains the literal "INVALID".
-//   * FUN_141c29400 shows the field layout: PlayerState+0x258 = the shared net-id OBJECT,
-//     +0x260 = its control block.
-// So a static object with a vtable whose 0x28 returns true and whose 0x30 writes the configured
-// account id makes the gate pass AND makes every per-player URL carry a real account id.
-//
-// Safety: the object and its control block are static (never freed); the control block's counts are
-// initialised very high so a TSharedPtr release can never reach zero and call a destructor. The eight
-// real slots are implemented from the MEASURED contract (see below); the slots past +0x38 are inert
-// stubs that no caller may reach. Opt-in for its first test:
-// ENABLE_SYNTHETIC_NETID.flag. The account id comes from MYSTICPARADOX_PHANTOM_ACCOUNT_ID (default
-// "mystpax"), and should match the backend's GAMESERVER_NO_PLAYER_USER_ID.
-static void* MpSynthNetIdGenericStub(void*, void*, void*, void*) {
-    return nullptr;
-}
-static bool MpSynthNetIdIsValid(void*) {
-    return true;
-}
-
-static const std::wstring& MpSynthNetIdString() {
-    static std::wstring Cached;
-    if (Cached.empty()) {
-        char Buffer[128] = { 0 };
-        const DWORD Length = GetEnvironmentVariableA("MYSTICPARADOX_PHANTOM_ACCOUNT_ID", Buffer, sizeof(Buffer));
-        const std::string Value = (Length > 0 && Length < sizeof(Buffer)) ? std::string(Buffer) : std::string("mystpax");
-        Cached.assign(Value.begin(), Value.end());
-    }
-    return Cached;
-}
-
-// FString = { TCHAR* Data; int32 Num; int32 Max } - the buffer must come from the engine allocator
-// because the caller's FString will free it.
-static void* MpSynthNetIdWriteFString(void* OutFString, const std::wstring& Value) {
-    struct RawFString { wchar_t* Data; int32_t Num; int32_t Max; };
-    auto* Out = reinterpret_cast<RawFString*>(OutFString);
-    const size_t Count = Value.size() + 1;
-    wchar_t* Buffer = static_cast<wchar_t*>(EngineRealloc(nullptr, Count * sizeof(wchar_t)));
-    if (Buffer == nullptr) {
-        return OutFString;
-    }
-    memcpy(Buffer, Value.c_str(), Count * sizeof(wchar_t));
-    Out->Data = Buffer;
-    Out->Num = static_cast<int32_t>(Count);
-    Out->Max = static_cast<int32_t>(Count);
-    return OutFString;
-}
-
-// [1.14.7 2026-10-05 NET-ID CONTRACT] The synthetic vtable now implements the REAL contract, measured on a
-// genuine net-id object (the client PlayerState's +0x258) with the NETID_CONTRACT_PROBE.flag dump. That dump
-// (pid=15036, 20:12:54) shows the genuine vtable holds exactly EIGHT slots:
-//
-//   +0x10 rva +0xA631A0  FName* GetType(FName* Out)  writes the 8-byte FName into RDX and returns RDX
-//                                                    (measured 0xB3B19). THIS is the slot whose null return
-//                                                    crashed the engine at RVA +0x3F9AD45 (FUN_143F9ABD0:
-//                                                    CALL [vtable+0x28], CALL [vtable+0x10], MOV RAX,[RAX])
-//   +0x18 rva +0x9EA250  const TCHAR* GetIdString()  points at the object's own "devrepro0055"
-//   +0x20 rva +0xA631B0  int32 GetSize()             0x1A = 26 = ("devrepro0055".Len + 1) * sizeof(TCHAR)
-//   +0x28 rva +0xA69E90  bool IsValid()              1
-//   +0x30 rva +0xA84750  FString* ToString(FString* Out)
-//   +0x38 rva +0xA83F40  FString* ToDisplayString(FString* Out)  "devre...o0055" = Left(5)+"..."+Right(5)
-//   +0x40 and beyond are NOT vtable: the dump read them as wide-character text (rva=0x2E002E002E).
-//
-// Slots +0x18 and +0x20 carried the same defect class as +0x10 (a caller dereferencing a null pointer), so
-// all three are implemented together. The type FName is taken from a genuine object in THIS process - so the
-// index is valid in this process's name pool by construction - and falls back to 0, "None", which is always
-// a valid FName, until such an object exists.
-static uint64_t g_MpSynthNetIdTypeFName = 0;
-static bool g_MpSynthNetIdTypeCaptured = false;
-
-// Hidden-return-buffer convention, as measured: RCX = this, RDX = the FName destination, RAX = RDX.
-static void* MpSynthNetIdGetType(void*, void* OutFName) {
-    if (OutFName != nullptr) {
-        *reinterpret_cast<uint64_t*>(OutFName) = g_MpSynthNetIdTypeFName;
-    }
-    return OutFName;
-}
-
-// The caller only reads this pointer, and the cached string lives for the process lifetime.
-static const wchar_t* MpSynthNetIdIdString(void*) {
-    return MpSynthNetIdString().c_str();
-}
-
-// Byte size of the id including its terminator (measured 0x1A for the 12-character "devrepro0055").
-static int32_t MpSynthNetIdIdSize(void*) {
-    return static_cast<int32_t>((MpSynthNetIdString().size() + 1) * sizeof(wchar_t));
-}
-
-static void* MpSynthNetIdToString(void*, void* OutFString) {
-    return MpSynthNetIdWriteFString(OutFString, MpSynthNetIdString());
-}
-
-// Measured on the genuine object: "devrepro0055" (12 characters) came back as "devre...o0055".
-static void* MpSynthNetIdToDisplayString(void*, void* OutFString) {
-    const std::wstring& Id = MpSynthNetIdString();
-    if (Id.size() > 10) {
-        return MpSynthNetIdWriteFString(OutFString, Id.substr(0, 5) + L"..." + Id.substr(Id.size() - 5));
-    }
-    return MpSynthNetIdWriteFString(OutFString, Id);
-}
-
-static void* g_MpSynthNetIdVtable[16] = {
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),        // 0x00 destructor (static object: never called)
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),        // 0x08 deleting destructor
-    reinterpret_cast<void*>(&MpSynthNetIdGetType),            // 0x10 FName GetType(), hidden return buffer
-    reinterpret_cast<void*>(&MpSynthNetIdIdString),           // 0x18 const TCHAR* id
-    reinterpret_cast<void*>(&MpSynthNetIdIdSize),             // 0x20 int32 size incl. terminator
-    reinterpret_cast<void*>(&MpSynthNetIdIsValid),            // 0x28 IsValid
-    reinterpret_cast<void*>(&MpSynthNetIdToString),           // 0x30 ToString -> FString
-    reinterpret_cast<void*>(&MpSynthNetIdToDisplayString),    // 0x38 display string -> FString
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),        // past the measured vtable: never called
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),
-};
-
-struct MpSynthNetIdObject { void** Vtable; };
-static MpSynthNetIdObject g_MpSynthNetIdObject{ g_MpSynthNetIdVtable };
-
-// [1.14.7 2026-10-05] Take the type FName from a genuine net-id object as soon as this process has one (a
-// client's PlayerState), so the synthetic object reports the same type. Bails immediately once captured and
-// does nothing while no client is connected.
-static void MpCaptureGenuineNetIdType() {
-    if (g_MpSynthNetIdTypeCaptured || !Globals::AmServer || !Networking::NetDriver) return;
-
-    const RawPointerArray* Clients = reinterpret_cast<const RawPointerArray*>(
-        reinterpret_cast<uintptr_t>(Networking::NetDriver) + 0x90);
-    if (!IsReadablePointer(Clients, sizeof(RawPointerArray))
-        || !IsSanePointerArray(Clients->Data, Clients->Num, Clients->Max, 1024)) {
-        return;
-    }
-
-    for (int i = 0; i < Clients->Num; ++i) {
-        void* C = Clients->Data[i];
-        if (!C || !IsReadablePointer(C, 0x420)) continue;
-        void* PC = reinterpret_cast<void*>(SafeReadPtr(reinterpret_cast<uintptr_t>(C), 0x98));
-        if (!PC) continue;
-        void* PS = reinterpret_cast<void*>(SafeReadPtr(reinterpret_cast<uintptr_t>(PC), 0x228));
-        if (!PS) continue;
-        void* Id = reinterpret_cast<void*>(SafeReadPtr(reinterpret_cast<uintptr_t>(PS), 0x258));
-        if (!Id || Id == reinterpret_cast<void*>(&g_MpSynthNetIdObject)) continue;
-
-        // Read the slot through the object's vtable pointer, exactly as the probe does: *(Id+0x10) is the
-        // object's OWN data, not a function pointer. Getting this wrong means calling heap data as code.
-        const uintptr_t Vt = SafeReadPtr(reinterpret_cast<uintptr_t>(Id), 0x00);
-        if (!Vt) continue;
-        const uintptr_t Fn = SafeReadPtr(Vt, 0x10);
-        if (!Fn) continue;
-        uint8_t Scratch[0x10] = {};
-        const uint64_t Rax = MpNetIdCallSlotRaw(reinterpret_cast<void*>(Fn), Id, Scratch);
-        if (Rax == 0xEEEEEEEEEEEEEEEEull) continue;
-        uint64_t Value = 0;
-        memcpy(&Value, Scratch, sizeof(Value));
-        if (Value == 0) continue;
-
-        g_MpSynthNetIdTypeFName = Value;
-        g_MpSynthNetIdTypeCaptured = true;
-        MpLog("[SynthNetId] captured the genuine type FName=0x" + MpHex(Value) + " from netId=" + MpPtr(Id));
-        return;
-    }
-
-    // Fallback visibility: while a client is connected and no genuine id has been reachable, say so
-    // (throttled to one line per 10s). Until the capture succeeds the synthetic object answers FName None
-    // (comparison index 0) - a valid FName, so the engine cannot fault on it, but not the process-local
-    // identity type a genuine object reports.
-    static uint64_t s_nextUnresolvedLogMs = 0;
-    const uint64_t NowMs = static_cast<uint64_t>(GetTickCount64());
-    if (Clients->Num > 0 && NowMs >= s_nextUnresolvedLogMs) {
-        s_nextUnresolvedLogMs = NowMs + 10000;
-        MpLog("[SynthNetId] type unresolved: " + std::to_string(Clients->Num)
-            + " client connection(s), no genuine net id reachable yet - GetType answers FName None");
-    }
-}
-
-// TSharedPtr control block: { vtable, int32 SharedReferenceCount, int32 WeakReferenceCount }.
-static void* g_MpSynthRefVtable[2] = {
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),
-    reinterpret_cast<void*>(&MpSynthNetIdGenericStub),
-};
-struct MpSynthRefController { void** Vtable; int32_t Shared; int32_t Weak; };
-static MpSynthRefController g_MpSynthRefController{ g_MpSynthRefVtable, 0x40000000, 0x40000000 };
-
-// Install the synthetic id into a PlayerState that has none. Returns true when it wrote the fields.
-static bool EnsureSyntheticNetId(void* PlayerState) {
-    if (PlayerState == nullptr) return false;
-    uintptr_t* NetIdSlot = reinterpret_cast<uintptr_t*>(reinterpret_cast<uintptr_t>(PlayerState) + 0x258);
-    uintptr_t* ControlSlot = reinterpret_cast<uintptr_t*>(reinterpret_cast<uintptr_t>(PlayerState) + 0x260);
-    if (!IsReadablePointer(NetIdSlot, sizeof(uintptr_t)) || !IsReadablePointer(ControlSlot, sizeof(uintptr_t))) {
-        return false;
-    }
-    if (*NetIdSlot != 0) return false;                 // already has one - never overwrite
-    *NetIdSlot = reinterpret_cast<uintptr_t>(&g_MpSynthNetIdObject);
-    *ControlSlot = reinterpret_cast<uintptr_t>(&g_MpSynthRefController);
-    MpLog("[SynthNetId] installed for playerState=" + MpPtr(PlayerState)
-        + " id='" + MpNarrow(MpSynthNetIdString()) + "'");
-    return true;
-}
 
 // ============================================================================
 // [1.14.7 PROGRESSION DIAGNOSTICS 2026-10-03] The hub's player-data aggregation stalls because
@@ -18376,14 +21418,90 @@ static ProgConfigLoadedFn OrigProgConfigLoaded = nullptr;
 using ProgCompleteLoadInternalFn = void(*)(void*);
 static ProgCompleteLoadInternalFn OrigProgCompleteLoadInternal = nullptr;
 
+// ============================================================================
+// [1.14.7 FIX 2026-10-10] Wake the components that ReadFromBackend parked.
+//
+// ReadFromBackend (FUN_141a6aab0, decompiled) receives the component's interface at +0xB0 and, when the
+// configuration predicate is FALSE, appends {weak component, FName "CompleteLoadInternal"} to the game
+// instance's list at +0x550. Nothing on this build ever calls that back (no reflected UFunction carries
+// the name - see the 2026-10-05 note in ProgConfigLoadedHook), so a parked component waits until the load
+// manager gives up 60 s later. The phantom local player used to hide this: its own boot-time load fetched
+// the configuration, so a real player's predicate was already TRUE and took the direct path. Without the
+// phantom (0.2.103+) every first Training/hunt join parked and took 61 s; Ramsgate escaped
+// only because other City code re-checks the predicate.
+//
+// The ReadFromBackend hook records the parked component; MpProgressionWaitPoll re-checks the predicate from
+// the server tick and, once it is TRUE, calls the verified CompleteLoadInternal body - exactly what
+// ReadFromBackend does on its own TRUE branch. g_ProgCompleted (filled by the CompleteLoadInternal hook)
+// keeps every component to one completion.
+static thread_local int t_progPredicateResult = -1;    // last predicate answer on this thread (-1 = not asked)
+static std::mutex g_ProgWaitMutex;
+static std::vector<void*> g_ProgWaiters;               // parked UProgressionComponents
+static std::set<void*> g_ProgCompleted;                // components CompleteLoadInternal already ran for
+static std::atomic<int> g_ProgWaiterCount{ 0 };
+static ULONGLONG g_ProgWaitSince = 0;                  // when the oldest current waiter parked
+// [2026-10-11 1.14.7 O2] Components that took ReadFromBackend's WAIT branch and have not completed since - the only way a
+// component becomes "stranded" (configuration received, setup never finished: see ProgConfigLoadedHook). Unlike
+// g_ProgWaiters this list is not emptied by MpProgressionWaitPoll's resume or its 90 s give-up; an entry leaves when
+// CompleteLoadInternal runs for it or when it is no longer a live object. Guarded by g_ProgWaitMutex.
+static std::vector<void*> g_ProgStrandCandidates;
+static bool g_ProgStrandCandidatesOverflow = false;   // a candidate did not fit: fall back to the full walk
+
+static bool MpProgressionAlreadyCompleted(void* Component) {
+    std::lock_guard<std::mutex> Lock(g_ProgWaitMutex);
+    return g_ProgCompleted.count(Component) != 0;
+}
+
 static void ProgCompleteLoadInternalHook(void* This) {
     static volatile LONG logged = 0;
     if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
         MpLog("[ProgDiag] CompleteLoadInternal RUNS this=" + MpPtr(This));
     }
+    if (This) {
+        std::lock_guard<std::mutex> Lock(g_ProgWaitMutex);
+        if (g_ProgCompleted.size() > 4096) g_ProgCompleted.clear();   // bound; a hub never gets near this
+        g_ProgCompleted.insert(This);
+        g_ProgWaiters.erase(std::remove(g_ProgWaiters.begin(), g_ProgWaiters.end(), This), g_ProgWaiters.end());
+        g_ProgWaiterCount.store(static_cast<int>(g_ProgWaiters.size()), std::memory_order_relaxed);
+        g_ProgStrandCandidates.erase(std::remove(g_ProgStrandCandidates.begin(), g_ProgStrandCandidates.end(), This),
+            g_ProgStrandCandidates.end());   // [2026-10-11 O2]
+    }
     if (OrigProgCompleteLoadInternal) {
         OrigProgCompleteLoadInternal(This);
     }
+}
+
+using ProgReadFromBackendFn = void(*)(void*);
+static ProgReadFromBackendFn OrigProgReadFromBackend = nullptr;
+
+static void ProgReadFromBackendHook(void* Interface) {
+    t_progPredicateResult = -1;
+    if (OrigProgReadFromBackend) {
+        OrigProgReadFromBackend(Interface);
+    }
+    // Only the WAIT branch asks the predicate and gets FALSE; every other exit leaves -1 or 1.
+    if (t_progPredicateResult != 0 || !Interface || !Globals::AmServer) return;
+
+    void* Component = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Interface) - 0xB0);
+    size_t Waiters = 0;
+    {
+        std::lock_guard<std::mutex> Lock(g_ProgWaitMutex);
+        g_ProgCompleted.erase(Component);   // a new waiter at a recycled address is not completed
+        if (g_ProgWaiters.empty()) g_ProgWaitSince = GetTickCount64();
+        if (std::find(g_ProgWaiters.begin(), g_ProgWaiters.end(), Component) == g_ProgWaiters.end()) {
+            g_ProgWaiters.push_back(Component);
+        }
+        // [2026-10-11 O2] Also a stranding candidate for ProgConfigLoadedHook (bounded; past the bound the hook walks
+        // GObjects again, as before).
+        if (std::find(g_ProgStrandCandidates.begin(), g_ProgStrandCandidates.end(), Component) == g_ProgStrandCandidates.end()) {
+            if (g_ProgStrandCandidates.size() < 1024) g_ProgStrandCandidates.push_back(Component);
+            else g_ProgStrandCandidatesOverflow = true;
+        }
+        Waiters = g_ProgWaiters.size();
+        g_ProgWaiterCount.store(static_cast<int>(Waiters), std::memory_order_relaxed);
+    }
+    MpLog("[ProgWait] ReadFromBackend parked component=" + MpPtr(Component)
+        + " (configuration not loaded yet) waiters=" + std::to_string(Waiters));
 }
 
 static bool ProgConfigLoadedHook(void* GameInstance) {
@@ -18406,9 +21524,52 @@ static bool ProgConfigLoadedHook(void* GameInstance) {
     // Flag meanings, audit-verified (the earlier +0x3F0 reading was wrong):
     //   +0x3F0 = configuration received        +0x3F8 = finished setup        +0x414 = initialization guard
     // So the stranded state is exactly: configuration received AND setup never finished.
+    //
+    // [2026-10-11 1.14.7 O2] The search below was a full GObjects walk (~208k objects, an IsA each) on EVERY predicate
+    // call while fewer than 8 resumes had happened - in practice on every call for the process lifetime, and City code
+    // asks the predicate at every join. A component can only reach the stranded state through ReadFromBackend's WAIT
+    // branch, which ProgReadFromBackendHook records (g_ProgStrandCandidates), so only those components are examined -
+    // with the same checks, in the same order, and the same resume. The walk is kept for LEGACY_LIFECYCLE_WALK.flag and
+    // for the (theoretical) candidate-list overflow.
     if (Loaded && GameInstance && SDK::UObject::GObjects) {
         static std::atomic<int> s_resumes{ 0 };
-        if (s_resumes.load(std::memory_order_relaxed) < 8) {
+        bool UseWalk = MpLegacyLifecycleWalk();
+        std::vector<void*> Candidates;
+        if (!UseWalk && s_resumes.load(std::memory_order_relaxed) < 8) {
+            std::lock_guard<std::mutex> Lock(g_ProgWaitMutex);
+            UseWalk = g_ProgStrandCandidatesOverflow;
+            if (!UseWalk) Candidates = g_ProgStrandCandidates;
+        }
+        if (!UseWalk && !Candidates.empty() && s_resumes.load(std::memory_order_relaxed) < 8) {
+            std::vector<void*> Gone;
+            for (void* Candidate : Candidates) {
+                SDK::UObject* Obj = reinterpret_cast<SDK::UObject*>(Candidate);
+                if (!IsReadablePointer(Obj, 0x420) || !IsRegisteredLiveObject(Obj)) { Gone.push_back(Candidate); continue; }
+                if (Obj->IsDefaultObject() || !Obj->IsA(SDK::UProgressionComponent::StaticClass())) {
+                    Gone.push_back(Candidate);
+                    continue;
+                }
+                if (MpProgressionAlreadyCompleted(Obj)) continue;
+                const uintptr_t Base = reinterpret_cast<uintptr_t>(Obj);
+                const uint8_t ConfigReceived = *reinterpret_cast<const uint8_t*>(Base + 0x3F0);
+                const uint8_t FinishedSetup = *reinterpret_cast<const uint8_t*>(Base + 0x3F8);
+                if (ConfigReceived == 0 || FinishedSetup != 0) continue;   // not stranded
+                if (s_resumes.fetch_add(1, std::memory_order_relaxed) >= 8) break;
+                MpLog("[ProgResume] stranded component this=" + MpPtr(Obj)
+                    + " configReceived=" + std::to_string(static_cast<int>(ConfigReceived))
+                    + " finishedSetup=" + std::to_string(static_cast<int>(FinishedSetup))
+                    + " -> calling the verified CompleteLoadInternal body (+0x1A4DE80)");
+                reinterpret_cast<void(*)(void*)>(Globals::BaseAddress + 0x01A4DE80)(Obj);
+            }
+            if (!Gone.empty()) {
+                std::lock_guard<std::mutex> Lock(g_ProgWaitMutex);
+                for (void* G : Gone) {
+                    g_ProgStrandCandidates.erase(std::remove(g_ProgStrandCandidates.begin(), g_ProgStrandCandidates.end(), G),
+                        g_ProgStrandCandidates.end());
+                }
+            }
+        }
+        if (UseWalk && s_resumes.load(std::memory_order_relaxed) < 8) {
             const int Count = SDK::UObject::GObjects->Num();
             for (int i = 0; i < Count; ++i) {
                 SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
@@ -18418,6 +21579,10 @@ static bool ProgConfigLoadedHook(void* GameInstance) {
                 // Validate live identity before touching native state (the delegate held a WEAK reference).
                 if (!IsReadablePointer(Obj, 0x420)) continue;
                 if (!IsRegisteredLiveObject(Obj)) continue;
+
+                // [2026-10-10] FinishedSetup stays 0 after a completion, so without this the same component was
+                // resumed again at every later join (Ramsgate 10 Oct: one component three times).
+                if (MpProgressionAlreadyCompleted(Obj)) continue;
 
                 const uintptr_t Base = reinterpret_cast<uintptr_t>(Obj);
                 const uint8_t ConfigReceived = *reinterpret_cast<const uint8_t*>(Base + 0x3F0);
@@ -18497,7 +21662,80 @@ static bool ProgConfigLoadedHook(void* GameInstance) {
         MpLog("[ProgDiag] progression configuration predicate returned FALSE (gameInstance="
             + MpPtr(GameInstance) + ") - ReadFromBackend will WAIT for the config event");
     }
+    t_progPredicateResult = Loaded ? 1 : 0;
     return Loaded;
+}
+
+// [1.14.7 FIX 2026-10-10] Server tick: resume parked progression components once the configuration is loaded
+// (see the block comment above ProgCompleteLoadInternalHook). Acts when the server runs without the phantom
+// local player (every server role since 0.2.110), or with PROGRESSION_WAIT_RESUME.flag; if the byte guard ever
+// fails and a phantom exists, its own early load makes the predicate TRUE before a real player arrives, and
+// resuming its component would give it a full player-data load. The predicate is asked at most every 200 ms and only while
+// something is parked; the original is called directly, so the hook's object scan does not run here.
+static void MpProgressionWaitPoll() {
+    if (!Globals::AmServer || g_ProgWaiterCount.load(std::memory_order_relaxed) == 0) return;
+
+    static int s_enabled = -1;
+    if (s_enabled < 0 && Globals::BaseAddress) {
+        s_enabled = (g_NoLocalPlayerApplied.load(std::memory_order_relaxed)
+            || MpExeRelativeFlagPresent(L"PROGRESSION_WAIT_RESUME.flag")) ? 1 : 0;
+        MpLog(std::string("[ProgWait] resume of parked components ")
+            + (s_enabled ? "ACTIVE (no phantom local player, or PROGRESSION_WAIT_RESUME.flag)"
+                         : "inactive (the phantom's early load covers it)"));
+    }
+    if (s_enabled != 1) {
+        std::lock_guard<std::mutex> Lock(g_ProgWaitMutex);
+        g_ProgWaiters.clear();
+        g_ProgWaiterCount.store(0, std::memory_order_relaxed);
+        return;
+    }
+
+    static ULONGLONG s_lastCheck = 0;
+    const ULONGLONG Now = GetTickCount64();
+    if (Now - s_lastCheck < 200) return;
+    s_lastCheck = Now;
+
+    void* GameInstance = g_archonGameInstanceForHuntPass;
+    if (!GameInstance || !OrigProgConfigLoaded || !IsRegisteredLiveObject(GameInstance)) return;
+
+    ULONGLONG Since = 0;
+    {
+        std::lock_guard<std::mutex> Lock(g_ProgWaitMutex);
+        Since = g_ProgWaitSince;
+    }
+    if (!OrigProgConfigLoaded(GameInstance)) {
+        // The load manager gives up at 60 s and PlayerDataRecovery takes over; stop asking after that.
+        if (Since != 0 && Now - Since > 90000) {
+            std::lock_guard<std::mutex> Lock(g_ProgWaitMutex);
+            MpLog("[ProgWait] configuration still not loaded after 90 s; dropping "
+                + std::to_string(g_ProgWaiters.size()) + " parked component(s) to the load-failure recovery");
+            g_ProgWaiters.clear();
+            g_ProgWaiterCount.store(0, std::memory_order_relaxed);
+        }
+        return;
+    }
+
+    std::vector<void*> Ready;
+    {
+        std::lock_guard<std::mutex> Lock(g_ProgWaitMutex);
+        Ready.swap(g_ProgWaiters);
+        g_ProgWaiterCount.store(0, std::memory_order_relaxed);
+    }
+    for (void* Component : Ready) {
+        if (MpProgressionAlreadyCompleted(Component)) {
+            MpLog("[ProgWait] component=" + MpPtr(Component) + " already completed; nothing to resume");
+            continue;
+        }
+        SDK::UObject* Obj = reinterpret_cast<SDK::UObject*>(Component);
+        if (!IsReadablePointer(Component, 0x420) || !IsRegisteredLiveObject(Component)
+            || Obj->IsDefaultObject() || !Obj->IsA(SDK::UProgressionComponent::StaticClass())) {
+            MpLog("[ProgWait] component=" + MpPtr(Component) + " is gone or not a progression component; skipped");
+            continue;
+        }
+        MpLog("[ProgWait] configuration loaded " + std::to_string(Since ? Now - Since : 0)
+            + " ms after the first park -> CompleteLoadInternal component=" + MpPtr(Component));
+        reinterpret_cast<void(*)(void*)>(Globals::BaseAddress + 0x01A4DE80)(Component);
+    }
 }
 
 static void InstallProgressionDiagnostics() {
@@ -18512,6 +21750,305 @@ static void InstallProgressionDiagnostics() {
     MH_STATUS CompleteEnable = CompleteCreate == MH_OK ? MH_EnableHook((void*)(Globals::BaseAddress + 0x01A4DE80)) : CompleteCreate;
     MpLog(std::string("[ProgDiag] CompleteLoadInternal hook (+0x1A4DE80) create=")
         + MH_StatusToString(CompleteCreate) + " enable=" + MH_StatusToString(CompleteEnable));
+
+    // [1.14.7 FIX 2026-10-10] ReadFromBackend (entry confirmed in the 1.14.7 database): records parked components.
+    MH_STATUS ReadCreate = MH_CreateHook((void*)(Globals::BaseAddress + 0x01A6AAB0),
+        ProgReadFromBackendHook, reinterpret_cast<LPVOID*>(&OrigProgReadFromBackend));
+    MH_STATUS ReadEnable = ReadCreate == MH_OK ? MH_EnableHook((void*)(Globals::BaseAddress + 0x01A6AAB0)) : ReadCreate;
+    MpLog(std::string("[ProgWait] ReadFromBackend hook (+0x1A6AAB0) create=")
+        + MH_StatusToString(ReadCreate) + " enable=" + MH_StatusToString(ReadEnable));
+}
+
+// ============================================================================
+// [1.14.7 DIAG 2026-10-10] [GrantTrace] - which game code issues each inventory transaction.
+// FUN_140dbb560 (RVA 0x00DBB560, a function entry in the 1.14.7 database and in .pdata) builds the POST /inventory body.
+// Decompiled argument layout: arg4 = { FString source @+0x00, FString transactionId @+0x10 } (written as "source" and
+// "transactionId"); arg5 = adds, 0x50-byte entries { FName catalogId @+0x00, int32 quantity @+0x08 }; arg6 = saved
+// instances; arg7 = stacked removes, 0x38-byte entries { FName @+0x10, int32 amount @+0x18 }; arg8 = 0x40-byte entries.
+// The backend's [GrantMon] logs the same transaction by id; this side adds the native call chain (exe RVAs with their
+// function starts), which names the code behind grants such as the 4 daily draft tokens added on every arrival.
+// Server role, read-only (the original always runs), 400 lines per process; GRANT_TRACE_OFF.flag skips the hook.
+using InventoryTxnBuildFn = void*(*)(void*, void*, void*, void*, void*, void*, void*, void*);
+static InventoryTxnBuildFn OrigInventoryTxnBuild = nullptr;
+static uintptr_t ResolveFunctionStartRva(uintptr_t Rva);   // defined with the callout guards (.pdata lookup)
+
+static std::string MpGrantTraceItems(void* Array, uintptr_t Stride, uintptr_t NameOffset, uintptr_t CountOffset) {
+    if (!Array || !IsReadablePointer(Array, 0x10)) return "[]";
+    void* Data = *reinterpret_cast<void**>(Array);
+    const int32_t Num = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Array) + 0x8);
+    if (Num <= 0) return "[]";
+    if (Num > 256 || !Data || !IsReadablePointer(Data, static_cast<size_t>(Num) * Stride)) return "[?" + std::to_string(Num) + "]";
+    std::string Out = "[";
+    for (int32_t i = 0; i < Num && i < 24; ++i) {
+        const uintptr_t Entry = reinterpret_cast<uintptr_t>(Data) + static_cast<uintptr_t>(i) * Stride;
+        if (i) Out += ", ";
+        Out += reinterpret_cast<SDK::FName*>(Entry + NameOffset)->ToString()
+            + " x" + std::to_string(*reinterpret_cast<int32_t*>(Entry + CountOffset));
+    }
+    return Out + (Num > 24 ? ", ...]" : "]");
+}
+
+static int MpGrantTraceCount(void* Array) {
+    if (!Array || !IsReadablePointer(Array, 0x10)) return -1;
+    return *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Array) + 0x8);
+}
+
+static std::string MpGrantTraceCallChain() {
+    void* Frames[14] = {};
+    const USHORT Count = RtlCaptureStackBackTrace(2, 14, Frames, nullptr);   // skip this helper and the detour
+    std::string Out;
+    for (USHORT i = 0; i < Count; ++i) {
+        const uintptr_t Address = reinterpret_cast<uintptr_t>(Frames[i]);
+        const uintptr_t Rva = Address - Globals::BaseAddress;
+        const uintptr_t Start = Address > Globals::BaseAddress ? ResolveFunctionStartRva(Rva) : 0;
+        Out += Start ? (" +" + MpHex(Rva) + "(fn " + MpHex(Start) + ")") : (" " + MpAddress(Frames[i]));
+    }
+    return Out;
+}
+
+// The innermost reflected functions executing on this thread (Blueprint graphs and UFunction thunks), innermost first.
+// Native-only paths (an HTTP completion, for example) have none and print "-".
+static std::string MpGrantTraceUFunctionChain() {
+    std::string Out;
+    const int Depth = g_MpPeChainDepth < 64 ? g_MpPeChainDepth : 64;
+    int Printed = 0;
+    for (int i = Depth - 1; i >= 0 && Printed < 6; --i) {
+        SDK::UFunction* Function = g_MpPeChain[i];
+        if (!Function || !IsRegisteredLiveObject(Function)) continue;
+        std::string Name = Function->GetFullName();
+        if (Name.rfind("Function ", 0) == 0) Name = Name.substr(9);
+        Out += (Printed++ ? " <- " : "") + Name;
+    }
+    return Out.empty() ? "-" : Out;
+}
+
+static void* InventoryTxnBuildHook(void* Self, void* Out, void* Ids, void* Meta, void* Adds, void* Saves, void* Removes, void* Third) {
+    static std::atomic<int> s_budget{ 0 };
+    if (!MpProductionLogProfile()   // [2026-10-11 O3] log-only
+        && s_budget.fetch_add(1, std::memory_order_relaxed) < 400 && Meta && IsReadablePointer(Meta, 0x20)) {
+        MpLog("[GrantTrace] txn=" + CoreCapFString(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Meta) + 0x10))
+            + " source=\"" + CoreCapFString(Meta) + "\""
+            + " adds=" + MpGrantTraceItems(Adds, 0x50, 0x00, 0x08)
+            + " stackedRemoves=" + MpGrantTraceItems(Removes, 0x38, 0x10, 0x18)
+            + " saves=" + std::to_string(MpGrantTraceCount(Saves))
+            + " other=" + std::to_string(MpGrantTraceCount(Third))
+            + " ufunctions=" + MpGrantTraceUFunctionChain()
+            + " caller=" + MpGrantTraceCallChain());
+    }
+    return OrigInventoryTxnBuild(Self, Out, Ids, Meta, Adds, Saves, Removes, Third);
+}
+
+// [1.14.7 DIAG 2026-10-10] [CooldownTrace] - every UCooldownComponent::GetCooldownStartTime lookup (FUN_141a032f0, RVA
+// 0x01A032F0, a .pdata entry). Decompiled: bool (UCooldownComponent* this, const FString& Id, FDateTime& Out); it
+// returns false with "no valid backend data!" while this+0x100 (backend data loaded) is 0, else searches the
+// TArray at this+0x108 (count +0x110) of 0x18-byte { FString id, FDateTime started } entries. The daily bounty
+// (UBountyComponent_Daily::ServerInitializeBounties: "bounty cooldown not found ... using hunt pass start") and the
+// patrol bonus Blueprint (periodic_reward_bpc_C.OnRefreshCooldownStatus) both decide "new period" from it, and both
+// still fire on every arrival although the backend now stores and serves their cooldowns (38_ section 19.7). This
+// records, per lookup: the id, found or not, the date, whether the component had its data yet, and who asked.
+using CooldownStartTimeFn = uint64_t(*)(void*, void*, void*);
+static CooldownStartTimeFn OrigCooldownStartTime = nullptr;
+
+static std::string MpTicksToIso(int64_t Ticks) {
+    constexpr int64_t kUnixEpochTicks = 621355968000000000LL;   // FDateTime ticks (100 ns since 0001-01-01) at 1970
+    if (Ticks <= kUnixEpochTicks) return std::to_string(Ticks);
+    const time_t Seconds = static_cast<time_t>((Ticks - kUnixEpochTicks) / 10000000LL);
+    tm Utc{};
+    if (gmtime_s(&Utc, &Seconds) != 0) return std::to_string(Ticks);
+    char Buffer[32] = {};
+    strftime(Buffer, sizeof(Buffer), "%Y-%m-%dT%H:%M:%SZ", &Utc);
+    return Buffer;
+}
+
+static uint64_t CooldownStartTimeHook(void* Component, void* Id, void* Out) {
+    // The id FString is passed by value: the original frees its buffer before returning, so read it first.
+    static std::atomic<int> s_budget{ 0 };
+    const bool Trace = !MpProductionLogProfile()   // [2026-10-11 O3] log-only
+        && s_budget.fetch_add(1, std::memory_order_relaxed) < 300;
+    const std::string IdText = Trace ? CoreCapFString(Id) : std::string();
+    const uint64_t Ret = OrigCooldownStartTime(Component, Id, Out);
+    if (Trace) {
+        const bool Found = (Ret & 0xFF) != 0;
+        const int64_t Ticks = (Found && Out && IsReadablePointer(Out, 8)) ? *reinterpret_cast<int64_t*>(Out) : 0;
+        const bool Readable = Component && IsReadablePointer(Component, 0x118);
+        const int Loaded = Readable ? *reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(Component) + 0x100) : -1;
+        const int Entries = Readable ? *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(Component) + 0x110) : -1;
+        MpLog("[CooldownTrace] id=" + IdText + " found=" + (Found ? "1" : "0")
+            + " value=" + (Found ? MpTicksToIso(Ticks) : std::string("-"))
+            + " backendData=" + std::to_string(Loaded) + " entries=" + std::to_string(Entries)
+            + " component=" + MpPtr(Component) + "/" + (Component ? SafeObjectNameForDiagnostic(Component) : std::string("null"))
+            + " ufunctions=" + MpGrantTraceUFunctionChain()
+            + " caller=" + MpGrantTraceCallChain());
+    }
+    return Ret;
+}
+
+static void InstallCooldownTraceHook() {
+    constexpr uintptr_t kStartTimeRva = 0x01A032F0;
+    if (ResolveFunctionStartRva(kStartTimeRva) != kStartTimeRva) {
+        MpLog("[CooldownTrace] NOT installed: +" + MpHex(kStartTimeRva) + " is not a function entry in this build's .pdata");
+        return;
+    }
+    void* Target = reinterpret_cast<void*>(Globals::BaseAddress + kStartTimeRva);
+    const MH_STATUS Create = MH_CreateHook(Target, reinterpret_cast<void*>(&CooldownStartTimeHook), reinterpret_cast<LPVOID*>(&OrigCooldownStartTime));
+    const MH_STATUS Enable = Create == MH_OK ? MH_EnableHook(Target) : Create;
+    MpLog(std::string("[CooldownTrace] GetCooldownStartTime hook (+0x1A032F0) create=") + MH_StatusToString(Create)
+        + " enable=" + MH_StatusToString(Enable));
+}
+
+// [1.14.7 DIAG 2026-10-11] [KillXP] - why a Behemoth kill on a dedicated hunt grants no weapon XP and no Hunt Pass XP.
+// UPlayerExperienceComponent::HandleBehemothKilled (FUN_141a62960) runs on every kill ([WeaponXP][ServerKill]) and makes
+// two awards from FPlayerProgressionTuningData: weapon XP from BehemothXPTuningData (+0x20) and Hunt Pass XP from
+// BehemothXPTuningDataHuntPass (+0x88). Each amount is FUN_141a44ec0(&component, behemoth, tuning) (float):
+//   base = FUN_141a57f80(component, behemoth, tuning)   int; 0 when the weapon lookup below fails (silent below
+//          Warning verbosity). diff = behemoth level - player weapon level: diff > 0 -> BaseXP + bonus over
+//          min(diff, NumXPBonusLevels); |diff| > NumXPPenaltyLevels -> MinXP; else BaseXP - penalty * |diff|; then
+//          times the player's XP multiplier (FUN_142284720).
+//   + StarBonus[behemoth star level] (FUN_142239e50).
+// FUN_141a57a50(component, weapon category, out) resolves the equipped weapon's level (out+4). A positive weapon amount
+// goes to FUN_141a62540(component, base, bonus, type 9, out) (native GrantWeaponExperience); a positive Hunt Pass
+// amount to FUN_141a1bcf0(huntPassComponent, amount) -> AddProgressToSelectedTrack. In the 10 Oct repro six kills
+// reached HandleBehemothKilled and no XP request left the hunt server. These pass-through hooks log every step's value
+// so the zero is located. All five targets are .pdata entries; nothing is changed. KILL_XP_TRACE_OFF.flag disables.
+using KillXpWeaponLevelFn = uint64_t(*)(void*, uint64_t, void*);
+using KillXpBaseFn = int32_t(*)(void*, void*, void*);
+using KillXpAmountFn = float(*)(void**, void*, void*);
+using KillXpGrantWeaponFn = void(*)(void*, uint64_t, uint64_t, uint64_t, void*);
+using KillXpHuntPassAddFn = void(*)(void*, uint64_t);
+static KillXpWeaponLevelFn OrigKillXpWeaponLevel = nullptr;
+static KillXpBaseFn OrigKillXpBase = nullptr;
+static KillXpAmountFn OrigKillXpAmount = nullptr;
+static KillXpGrantWeaponFn OrigKillXpGrantWeapon = nullptr;
+static KillXpHuntPassAddFn OrigKillXpHuntPassAdd = nullptr;
+static std::atomic<int> g_KillXpBudget{ 0 };
+// FUN_141a57a50 has 30 callers (UI getters among them); it is logged only while the kill-XP base runs on this thread.
+static thread_local int g_KillXpBaseDepth = 0;
+
+static bool MpKillXpLogBudget() { return g_KillXpBudget.fetch_add(1, std::memory_order_relaxed) < 400; }
+
+// FCreatureXPTuningData { int32 BaseXP; int32 MinXP; float XPBonus; float XPPenalty; int32 NumXPBonusLevels;
+// int32 NumXPPenaltyLevels; } at the start of FBehemothXPTuningData (StarBonus TMap<int32,float> at +0x18, Num at +0x20).
+static std::string MpKillXpTuning(void* Tuning) {
+    if (!Tuning || !IsReadablePointer(Tuning, 0x28)) return "tuning=unreadable";
+    const uintptr_t T = reinterpret_cast<uintptr_t>(Tuning);
+    return "tuning{base=" + std::to_string(*reinterpret_cast<int32_t*>(T + 0x00))
+        + " min=" + std::to_string(*reinterpret_cast<int32_t*>(T + 0x04))
+        + " bonus=" + std::to_string(*reinterpret_cast<float*>(T + 0x08))
+        + " penalty=" + std::to_string(*reinterpret_cast<float*>(T + 0x0C))
+        + " bonusLevels=" + std::to_string(*reinterpret_cast<int32_t*>(T + 0x10))
+        + " penaltyLevels=" + std::to_string(*reinterpret_cast<int32_t*>(T + 0x14))
+        + " starBonusEntries=" + std::to_string(*reinterpret_cast<int32_t*>(T + 0x20)) + "}";
+}
+
+static uint64_t KillXpWeaponLevelHook(void* Component, uint64_t Category, void* Out) {
+    const uint64_t Ret = OrigKillXpWeaponLevel(Component, Category, Out);
+    if (g_KillXpBaseDepth > 0 && MpKillXpLogBudget()) {
+        std::string Fields = "out=unreadable";
+        if (Out && IsReadablePointer(Out, 0x1C)) {
+            const uintptr_t O = reinterpret_cast<uintptr_t>(Out);
+            Fields = "out{flag=" + std::to_string(*reinterpret_cast<uint8_t*>(O)) + " level=" + std::to_string(*reinterpret_cast<int32_t*>(O + 4))
+                + " q8=" + MpHex(*reinterpret_cast<uint64_t*>(O + 8)) + " q10=" + MpHex(*reinterpret_cast<uint64_t*>(O + 0x10))
+                + " i18=" + std::to_string(*reinterpret_cast<int32_t*>(O + 0x18)) + "}";
+        }
+        MpLog("[KillXP] weaponLevel category=" + std::to_string(Category & 0xFF) + " ok=" + std::to_string(Ret & 0xFF) + " " + Fields
+            + " component=" + MpPtr(Component));
+    }
+    return Ret;
+}
+
+static int32_t KillXpBaseHook(void* Component, void* Behemoth, void* Tuning) {
+    ++g_KillXpBaseDepth;
+    const int32_t Base = OrigKillXpBase(Component, Behemoth, Tuning);
+    --g_KillXpBaseDepth;
+    if (MpKillXpLogBudget()) {
+        MpLog("[KillXP] base=" + std::to_string(Base) + " behemoth=" + (Behemoth ? SafeObjectNameForDiagnostic(Behemoth) : std::string("null"))
+            + " " + MpKillXpTuning(Tuning));
+    }
+    return Base;
+}
+
+static float KillXpAmountHook(void** ComponentRef, void* Behemoth, void* Tuning) {
+    const float Amount = OrigKillXpAmount(ComponentRef, Behemoth, Tuning);
+    if (MpKillXpLogBudget()) {
+        // The caller passes &tuning+0x20 for weapon XP and &tuning+0x88 for the Hunt Pass; name it by the struct offset.
+        MpLog("[KillXP] amount=" + std::to_string(Amount) + " behemoth=" + (Behemoth ? SafeObjectNameForDiagnostic(Behemoth) : std::string("null"))
+            + " tuning=" + MpPtr(Tuning));
+    }
+    return Amount;
+}
+
+static std::string MpProbeFName(const SDK::FName& Name);   // defined with the hunt pass probes
+
+// [2026-10-11] The banking state GrantExperience (0x01A5FEA0) branches on for a capped weapon: UPlayerExperienceComponent
+// BankingExperienceConfigTable +0x1C0, BankingConfigRowName +0x1C8 (None = no bank: XP over the cap is dropped),
+// BankingLevelsUnlockedCount +0x1D0, BankingExperienceMultiplier +0x1D4. InitializeBankingUnlocks (0x01A666D0) is the only
+// server writer, from the player's Slayer's Path (BankedXP_* nodes) when the journey loads and when a node unlocks.
+static std::string MpKillXpBanking(void* Component) {
+    if (!Component || !IsReadablePointer(Component, 0x1D8)) return "banking=unreadable";
+    const uintptr_t C = reinterpret_cast<uintptr_t>(Component);
+    return "banking{table=" + MpPtr(*reinterpret_cast<void**>(C + 0x1C0))
+        + " row=" + MpProbeFName(*reinterpret_cast<const SDK::FName*>(C + 0x1C8))
+        + " levels=" + std::to_string(*reinterpret_cast<int32_t*>(C + 0x1D0))
+        + " multiplier=" + std::to_string(*reinterpret_cast<float*>(C + 0x1D4)) + "}";
+}
+
+static void KillXpGrantWeaponHook(void* Component, uint64_t Base, uint64_t Bonus, uint64_t Type, void* Out) {
+    if (MpKillXpLogBudget()) {
+        MpLog("[KillXP] GrantWeaponExperience base=" + std::to_string(static_cast<int32_t>(Base)) + " bonus=" + std::to_string(static_cast<int32_t>(Bonus))
+            + " type=" + std::to_string(Type & 0xFF) + " " + MpKillXpBanking(Component) + " component=" + MpPtr(Component));
+    }
+    OrigKillXpGrantWeapon(Component, Base, Bonus, Type, Out);
+}
+
+static void KillXpHuntPassAddHook(void* HuntPass, uint64_t Amount) {
+    if (MpKillXpLogBudget()) {
+        MpLog("[KillXP] HuntPass add amount=" + std::to_string(static_cast<int32_t>(Amount)) + " component=" + MpPtr(HuntPass));
+    }
+    OrigKillXpHuntPassAdd(HuntPass, Amount);
+}
+
+static void InstallKillXpTrace() {
+    if (MpExeRelativeFlagPresent(L"KILL_XP_TRACE_OFF.flag")) {
+        MpLog("[KillXP] off (KILL_XP_TRACE_OFF.flag present)");
+        return;
+    }
+    struct Target { uintptr_t Rva; void* Hook; void** Orig; const char* Name; };
+    const Target Targets[] = {
+        { 0x01A57A50, reinterpret_cast<void*>(&KillXpWeaponLevelHook), reinterpret_cast<void**>(&OrigKillXpWeaponLevel), "weapon level" },
+        { 0x01A57F80, reinterpret_cast<void*>(&KillXpBaseHook), reinterpret_cast<void**>(&OrigKillXpBase), "base XP" },
+        { 0x01A44EC0, reinterpret_cast<void*>(&KillXpAmountHook), reinterpret_cast<void**>(&OrigKillXpAmount), "kill XP amount" },
+        { 0x01A62540, reinterpret_cast<void*>(&KillXpGrantWeaponHook), reinterpret_cast<void**>(&OrigKillXpGrantWeapon), "GrantWeaponExperience" },
+        { 0x01A1BCF0, reinterpret_cast<void*>(&KillXpHuntPassAddHook), reinterpret_cast<void**>(&OrigKillXpHuntPassAdd), "Hunt Pass add" },
+    };
+    for (const Target& T : Targets) {
+        if (ResolveFunctionStartRva(T.Rva) != T.Rva) {
+            MpLog(std::string("[KillXP] ") + T.Name + " NOT hooked: +" + MpHex(T.Rva) + " is not a function entry in this build's .pdata");
+            continue;
+        }
+        void* Address = reinterpret_cast<void*>(Globals::BaseAddress + T.Rva);
+        const MH_STATUS Create = MH_CreateHook(Address, T.Hook, reinterpret_cast<LPVOID*>(T.Orig));
+        const MH_STATUS Enable = Create == MH_OK ? MH_EnableHook(Address) : Create;
+        MpLog(std::string("[KillXP] ") + T.Name + " hook (+" + MpHex(T.Rva) + ") create=" + MH_StatusToString(Create)
+            + " enable=" + MH_StatusToString(Enable));
+    }
+}
+
+static void InstallGrantTraceHook() {
+    if (MpExeRelativeFlagPresent(L"GRANT_TRACE_OFF.flag")) {
+        MpLog("[GrantTrace] off (GRANT_TRACE_OFF.flag present)");
+        return;
+    }
+    InstallCooldownTraceHook();
+    constexpr uintptr_t kTxnBuildRva = 0x00DBB560;
+    if (ResolveFunctionStartRva(kTxnBuildRva) != kTxnBuildRva) {
+        MpLog("[GrantTrace] NOT installed: +0x" + MpHex(kTxnBuildRva) + " is not a function entry in this build's .pdata");
+        return;
+    }
+    void* Target = reinterpret_cast<void*>(Globals::BaseAddress + kTxnBuildRva);
+    const MH_STATUS Create = MH_CreateHook(Target, reinterpret_cast<void*>(&InventoryTxnBuildHook), reinterpret_cast<LPVOID*>(&OrigInventoryTxnBuild));
+    const MH_STATUS Enable = Create == MH_OK ? MH_EnableHook(Target) : Create;
+    MpLog(std::string("[GrantTrace] inventory transaction builder hook (+0xDBB560) create=") + MH_StatusToString(Create)
+        + " enable=" + MH_StatusToString(Enable));
 }
 
 // ============================================================================
@@ -18967,6 +22504,9 @@ static void DumpFeatureFlags(const char* Tag) {
         Found++;
         // Log every blueprint feature flag (the *_bpff_C family, which is where season-style flags live) and
         // every flag whose name mentions season/hunt/pass/event, plus the first ten others for context.
+        // [2026-10-10] Also progression/network: ProgressionNetworkOptimizationsFeature (class getter 0x1424B1490) gates
+        // the hunt pass grant path FUN_140E9F090. Called once per process on servers (first readiness check) and on the
+        // client (first arrival census).
         std::string Name = Obj->GetName();
         const bool Interesting = Name.find("bpff") != std::string::npos
             || Name.find("season") != std::string::npos
@@ -18976,13 +22516,380 @@ static void DumpFeatureFlags(const char* Tag) {
             || Name.find("pass") != std::string::npos
             || Name.find("Pass") != std::string::npos
             || Name.find("event") != std::string::npos
-            || Name.find("Event") != std::string::npos;
+            || Name.find("Event") != std::string::npos
+            || Name.find("Progression") != std::string::npos
+            || Name.find("progression") != std::string::npos
+            || Name.find("Network") != std::string::npos;
         if (Interesting || Logged < 10) {
             MpLog("[FeatureFlags]   " + Name + " bEnabled=" + std::to_string(Enabled ? 1 : 0));
             if (!Interesting) Logged++;
         }
     }
     MpLog("[FeatureFlags] total=" + std::to_string(Found) + " disabled=" + std::to_string(Disabled));
+}
+
+// ============================================================================
+// [1.14.7 DIAG 2026-10-10] Hunt pass and fountain probes: [HuntPassProbe] / [CoinTossProbe] (client, arrival census)
+// and [HuntPassState] (server tick). Read-only: no field is written and no native function is called, except the
+// reflected KismetTextLibrary.Conv_TextToString that turns the season-table texts into strings (client, game thread,
+// outermost ProcessEvent). Layouts from the SDK:
+//   AArchonPlayerController::HuntPassComponent +0x730 (Archon_classes.hpp)
+//   UHuntPassComponent: MainHuntPassId +0x1B4 / SelectedHuntPassId +0x1BC (FName), MainHuntPassSeasonEndDate +0x1C8
+//     (FDateTime), RefreshCount +0x1D0, bSelectedPassActive +0x1D4, bReplicated +0x1D5, bDidAutoClaimRewardsWhenLoading
+//     +0x1D6, ActiveHuntPassData +0x1D8 = TArray<FReplicatedHuntPassData> (0x1C each: FName ID; bool bIsPrestige,
+//     bIsCompleted, bHasPremium; int32 Rank, ConfirmedRank, ConfirmedPremiumRank, RankProgress)
+//   UArchonGameInstance: +0x6D0 is SDK padding; FindActiveHuntPassRow (FUN_1418fd230) stores qword 0 of the active row's
+//     RowMap entry there, i.e. the row-name FName (see SetGameInstanceActiveSeason). HuntPassSeasonTable +0x6E0.
+//   FHuntPassSeasonDataTable (0x270): base FOnlineProgressionTrackTableData { ProgressionTrack +0x08 (FString),
+//     StartDate +0x30, EndDate +0x38 }, IsMainHuntPassSeason +0x78, SeasonTitle +0x80, HuntRewardItemId +0x118,
+//     HuntRewardItemAmount +0x128, ProgressPerGatherable +0x160, bAvailableInCurrentBuild +0x164, Assets +0x228,
+//     OverallSeasonName +0x258.
+// Note IsReadablePointer insists on 8-byte alignment, so 4-aligned fields (the FNames, the 0x1C array entries) are
+// covered by checking their 8-aligned owner over the whole range instead.
+
+// FString -> printable ASCII (quotes and non-ASCII become '?'), capped.
+static std::string MpProbeFString(const void* FStr, size_t MaxChars = 160) {
+    if (!FStr || !IsReadablePointer(FStr, 0x10)) return "<unreadable>";
+    const wchar_t* Data = *reinterpret_cast<const wchar_t* const*>(FStr);
+    const int32_t Num = *reinterpret_cast<const int32_t*>(reinterpret_cast<uintptr_t>(FStr) + 0x08);
+    const int32_t Max = *reinterpret_cast<const int32_t*>(reinterpret_cast<uintptr_t>(FStr) + 0x0C);
+    if (!Data || Num <= 0) return "";
+    if (Num > 32768 || Max < Num || !IsReadablePointer(Data, static_cast<size_t>(Num) * sizeof(wchar_t))) {
+        return "<bad fstring num=" + std::to_string(Num) + ">";
+    }
+    std::string Out;
+    for (int32_t i = 0; i < Num && Out.size() < MaxChars; ++i) {
+        const wchar_t C = Data[i];
+        if (C == L'\0') break;
+        Out += (C >= 0x20 && C < 0x7F && C != L'"') ? static_cast<char>(C) : '?';
+    }
+    return Out;
+}
+
+// FName by value. An FNameEntryId is block (bits 16..28) | offset; anything outside that range prints raw.
+static std::string MpProbeFName(const SDK::FName& Name) {
+    if (Name.ComparisonIndex == 0 && Name.Number == 0) return "None";
+    if (Name.ComparisonIndex < 0 || Name.ComparisonIndex >= 0x20000000) {
+        uint64_t Raw = 0;
+        std::memcpy(&Raw, &Name, sizeof(Raw));
+        return "<fname " + MpHex(Raw) + ">";
+    }
+    return Name.ToString();
+}
+
+// No objects with destructors in this frame (the SDK's FText/FString have none), so __try is legal (C2712).
+static bool MpConvTextToStringGuarded(const SDK::FText* Text, SDK::FString* Out) {
+    __try {
+        *Out = SDK::UKismetTextLibrary::Conv_TextToString(*Text);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// FText -> string through the reflected Conv_TextToString (FText::ToString, which also resolves localized texts; the
+// SDK's FText::ToString reads TextData+0x28, which is only right for generated texts). The caller must be on the game
+// thread at the outermost ProcessEvent (the arrival census is): the nested call re-enters the client hook at depth 2,
+// where none of the census/pump work runs. "<text>" whenever the text or the function is not usable. The returned
+// FString was allocated by the native body and is released with MpEngineFree.
+static std::string MpProbeText(const SDK::FText* Text) {
+    if (!Text || !IsReadablePointer(Text, sizeof(SDK::FText))) return "<text>";
+    const void* TextData = *reinterpret_cast<void* const*>(Text);
+    if (!TextData || !IsReadablePointer(TextData, 0x10)) return "<text>";
+    static int s_kismetReady = -1;
+    if (s_kismetReady < 0) {
+        SDK::UClass* Cls = SDK::UKismetTextLibrary::StaticClass();
+        s_kismetReady = (Cls && IsRegisteredLiveObject(Cls) && SDK::UKismetTextLibrary::GetDefaultObj()
+            && Cls->GetFunction("KismetTextLibrary", "Conv_TextToString")) ? 1 : 0;
+        if (s_kismetReady != 1) MpLog("[HuntPassProbe] KismetTextLibrary.Conv_TextToString unavailable; texts print as <text>");
+    }
+    if (s_kismetReady != 1) return "<text>";
+    SDK::FString Result;
+    if (!MpConvTextToStringGuarded(Text, &Result)) return "<text-fault>";
+    const std::string Out = MpProbeFString(&Result, 96);
+    MpEngineFree(*reinterpret_cast<void**>(&Result));
+    return Out;
+}
+
+// The game instance's season table (+0x6E0), only when it is live and its row struct really is FHuntPassSeasonDataTable.
+static SDK::UDataTable* MpHuntPassSeasonTable(SDK::UObject* GameInstance, std::string& Why) {
+    if (!GameInstance || !IsReadablePointer(GameInstance, 0x6F0)) { Why = "game instance unreadable"; return nullptr; }
+    auto* Table = reinterpret_cast<SDK::UDataTable*>(SafeReadPtr(reinterpret_cast<uintptr_t>(GameInstance), 0x6E0));
+    if (!Table || !IsReadablePointer(Table, sizeof(SDK::UDataTable)) || !IsRegisteredLiveObject(Table)
+        || !MpIsAGuarded(Table, SDK::UDataTable::StaticClass())) {
+        Why = "no live table at +0x6E0";
+        return nullptr;
+    }
+    SDK::UScriptStruct* RowStruct = Table->RowStruct;
+    if (!RowStruct || !IsReadablePointer(RowStruct, 0x60) || !IsRegisteredLiveObject(RowStruct)
+        || RowStruct->GetName() != "HuntPassSeasonDataTable"
+        || RowStruct->Size < static_cast<int32_t>(sizeof(SDK::FHuntPassSeasonDataTable))) {
+        Why = "row struct is not HuntPassSeasonDataTable";
+        return nullptr;
+    }
+    const int32_t Rows = Table->RowMap.Num();
+    if (Rows < 0 || Rows > 2000) {
+        Why = "implausible row count " + std::to_string(Rows);
+        return nullptr;
+    }
+    return Table;
+}
+
+struct MpHuntPassView {
+    bool Ok = false;
+    std::string Main;
+    std::string Selected;
+    std::string MainEnd;
+    uint32_t RefreshCount = 0;
+    int SelectedActive = -1;
+    int Replicated = -1;
+    int AutoClaimed = -1;
+    int32_t ActiveCount = -1;
+    std::string Passes;             // every ActiveHuntPassData entry
+    std::string SelectedProgress;   // rank/confirmed/progress of the entry whose ID is SelectedHuntPassId
+};
+
+static MpHuntPassView MpReadHuntPassComponent(SDK::UObject* Component) {
+    MpHuntPassView V;
+    if (!Component || !IsReadablePointer(Component, 0x1E8) || !IsRegisteredLiveObject(Component)
+        || !MpIsAGuarded(Component, SDK::UHuntPassComponent::StaticClass())) {
+        return V;
+    }
+    const auto* HP = reinterpret_cast<const SDK::UHuntPassComponent*>(Component);
+    int64_t EndTicks = 0;
+    std::memcpy(&EndTicks, &HP->MainHuntPassSeasonEndDate, sizeof(EndTicks));
+    V.Main = MpProbeFName(HP->MainHuntPassId);
+    V.Selected = MpProbeFName(HP->SelectedHuntPassId);
+    V.MainEnd = EndTicks ? MpTicksToIso(EndTicks) : std::string("0");
+    V.RefreshCount = HP->RefreshCount;
+    V.SelectedActive = *reinterpret_cast<const uint8_t*>(&HP->bSelectedPassActive);
+    V.Replicated = *reinterpret_cast<const uint8_t*>(&HP->bReplicated);
+    V.AutoClaimed = *reinterpret_cast<const uint8_t*>(&HP->bDidAutoClaimRewardsWhenLoading);
+
+    const uintptr_t C = reinterpret_cast<uintptr_t>(Component);
+    const uintptr_t Data = *reinterpret_cast<const uintptr_t*>(C + 0x1D8);
+    const int32_t Num = *reinterpret_cast<const int32_t*>(C + 0x1E0);
+    const int32_t Max = *reinterpret_cast<const int32_t*>(C + 0x1E4);
+    constexpr size_t kStride = sizeof(SDK::FReplicatedHuntPassData);   // 0x1C
+    V.ActiveCount = Num;
+    if (Num < 0 || Num > 256 || Max < Num
+        || (Num > 0 && (!Data || !IsReadablePointer(reinterpret_cast<void*>(Data), static_cast<size_t>(Num) * kStride)))) {
+        V.Passes = "<unreadable num=" + std::to_string(Num) + ">";
+    } else {
+        for (int32_t i = 0; i < Num && i < 64; ++i) {
+            const auto* E = reinterpret_cast<const SDK::FReplicatedHuntPassData*>(Data + static_cast<size_t>(i) * kStride);
+            const std::string Progress = std::to_string(E->Rank) + "/" + std::to_string(E->ConfirmedRank)
+                + "/" + std::to_string(E->RankProgress);
+            V.Passes += std::string(i ? "; " : "") + MpProbeFName(E->ID)
+                + " prestige=" + std::to_string(*reinterpret_cast<const uint8_t*>(&E->bIsPrestige))
+                + " completed=" + std::to_string(*reinterpret_cast<const uint8_t*>(&E->bIsCompleted))
+                + " premium=" + std::to_string(*reinterpret_cast<const uint8_t*>(&E->bHasPremium))
+                + " rank=" + std::to_string(E->Rank) + " confirmed=" + std::to_string(E->ConfirmedRank)
+                + " premiumConfirmed=" + std::to_string(E->ConfirmedPremiumRank)
+                + " progress=" + std::to_string(E->RankProgress);
+            if (V.SelectedProgress.empty() && E->ID == HP->SelectedHuntPassId) V.SelectedProgress = Progress;
+        }
+        if (Num > 64) V.Passes += "; ...";
+    }
+    if (V.SelectedProgress.empty()) V.SelectedProgress = "-";
+    V.Ok = true;
+    return V;
+}
+
+static void MpDumpHuntPassSeasonRows(SDK::UDataTable* Table, uint64_t ActiveRaw) {
+    MpLog("[HuntPassProbe] season table " + SafeObjectNameForDiagnostic(Table) + " rows="
+        + std::to_string(Table->RowMap.Num()) + " (once per process; ACTIVE = gameInstance+0x6D0)");
+    int Logged = 0;
+    for (auto& Pair : Table->RowMap) {
+        if (Logged++ >= 400) break;
+        uint64_t KeyRaw = 0;
+        std::memcpy(&KeyRaw, &Pair.Key(), sizeof(KeyRaw));
+        std::string Line = "[HuntPassProbe] row=" + MpProbeFName(Pair.Key())
+            + ((ActiveRaw != 0 && KeyRaw == ActiveRaw) ? " ACTIVE" : "");
+        const uint8_t* Row = Pair.Value();
+        if (!Row || !IsReadablePointer(Row, sizeof(SDK::FHuntPassSeasonDataTable))) {
+            MpLog(Line + " rowData=" + MpPtr(Row) + " unreadable");
+            continue;
+        }
+        const auto* R = reinterpret_cast<const SDK::FHuntPassSeasonDataTable*>(Row);
+        int64_t StartTicks = 0;
+        int64_t EndTicks = 0;
+        std::memcpy(&StartTicks, &R->StartDate, sizeof(StartTicks));
+        std::memcpy(&EndTicks, &R->EndDate, sizeof(EndTicks));
+        Line += " main=" + std::to_string(*reinterpret_cast<const uint8_t*>(&R->IsMainHuntPassSeason))
+            + " availableInBuild=" + std::to_string(*reinterpret_cast<const uint8_t*>(&R->bAvailableInCurrentBuild))
+            + " track=" + MpProbeFString(&R->ProgressionTrack, 64)
+            + " start=" + MpTicksToIso(StartTicks) + " end=" + MpTicksToIso(EndTicks)
+            + " title=\"" + MpProbeText(&R->SeasonTitle) + "\""
+            + " overall=\"" + MpProbeText(&R->OverallSeasonName) + "\""
+            + " assets=" + (R->Assets ? "1" : "0")
+            + " perGatherable=" + std::to_string(R->ProgressPerGatherable)
+            + " huntReward=" + MpProbeFString(&R->HuntRewardItemId, 64) + " x" + std::to_string(R->HuntRewardItemAmount);
+        MpLog(Line);
+    }
+}
+
+// Client, once per arrival (bounded): the game instance's active season, the local hunt pass component, and once per
+// process every row of the season table.
+static void MpHuntPassClientProbe(UObject* PC) {
+    if (Globals::AmServer) return;
+    static int s_runs = 0;
+    if (++s_runs > 64) return;
+
+    SDK::UObject* GameInstance = nullptr;
+    SDK::UWorld* World = SDK::UWorld::GetWorld();
+    if (World && IsReadablePointer(World, 0x188) && IsRegisteredLiveObject(World)) {
+        SDK::UObject* Candidate = World->OwningGameInstance;
+        if (Candidate && IsReadablePointer(Candidate, 0x6F0) && IsRegisteredLiveObject(Candidate)
+            && MpIsAGuarded(Candidate, SDK::UArchonGameInstance::StaticClass())) {
+            GameInstance = Candidate;
+        }
+    }
+    uint64_t ActiveRaw = 0;
+    if (GameInstance) {
+        std::memcpy(&ActiveRaw, reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(GameInstance) + 0x6D0), sizeof(ActiveRaw));
+    }
+    std::string Why;
+    SDK::UDataTable* Table = GameInstance ? MpHuntPassSeasonTable(GameInstance, Why) : nullptr;
+    if (!GameInstance) Why = "no live UArchonGameInstance";
+    // +0x6D0 is only named when it equals one of the table's row keys, which also proves it is a valid FName.
+    std::string ActiveName = ActiveRaw ? "<not a row key>" : "None";
+    if (Table && ActiveRaw) {
+        for (auto& Pair : Table->RowMap) {
+            uint64_t KeyRaw = 0;
+            std::memcpy(&KeyRaw, &Pair.Key(), sizeof(KeyRaw));
+            if (KeyRaw == ActiveRaw) {
+                ActiveName = MpProbeFName(Pair.Key());
+                break;
+            }
+        }
+    }
+    MpLog("[HuntPassProbe] arrival run=" + std::to_string(s_runs) + " pc=" + MpPtr(PC)
+        + " gameInstance=" + MpPtr(GameInstance) + " activeSeason=" + ActiveName + " raw=" + MpHex(ActiveRaw)
+        + " seasonTable=" + MpPtr(Table)
+        + (Table ? " rows=" + std::to_string(Table->RowMap.Num()) : " (" + Why + ")"));
+
+    SDK::UObject* Component = nullptr;
+    if (PC && IsReadablePointer(PC, 0x738) && IsRegisteredLiveObject(PC)
+        && MpIsAGuarded(PC, SDK::AArchonPlayerController::StaticClass())) {
+        Component = reinterpret_cast<SDK::AArchonPlayerController*>(PC)->HuntPassComponent;
+    }
+    const MpHuntPassView V = MpReadHuntPassComponent(Component);
+    if (!V.Ok) {
+        MpLog("[HuntPassProbe] component=" + MpPtr(Component) + " unavailable (no live UHuntPassComponent at pc+0x730)");
+    } else {
+        MpLog("[HuntPassProbe] component=" + MpPtr(Component) + " main=" + V.Main + " selected=" + V.Selected
+            + " mainSeasonEnd=" + V.MainEnd + " refreshCount=" + std::to_string(V.RefreshCount)
+            + " selectedActive=" + std::to_string(V.SelectedActive) + " replicated=" + std::to_string(V.Replicated)
+            + " autoClaimed=" + std::to_string(V.AutoClaimed) + " active=" + std::to_string(V.ActiveCount)
+            + " passes=[" + V.Passes + "]");
+    }
+
+    static bool s_rowsDumped = false;
+    if (!s_rowsDumped && Table) {
+        s_rowsDumped = true;
+        MpDumpHuntPassSeasonRows(Table, ActiveRaw);
+    }
+}
+
+// Server, from GameEngineTickHook: every connected player's hunt pass component, at most every 10 s, one line per
+// controller whose values changed since its last line.
+static void MpHuntPassServerStateTick() {
+    if (!Globals::AmServer || !Globals::Listening || !Networking::NetDriver) return;
+    if (MpProductionLogProfile()) return;   // [2026-10-11 O3] read-only [HuntPassState] trace
+    static uint64_t s_lastMs = 0;
+    const uint64_t Now = GetTickCount64();
+    if (s_lastMs != 0 && Now - s_lastMs < 10000) return;
+    s_lastMs = Now;
+
+    const uintptr_t Driver = reinterpret_cast<uintptr_t>(Networking::NetDriver);
+    if (!IsReadablePointer(Networking::NetDriver, 0xA0)) return;
+    auto** Connections = *reinterpret_cast<SDK::UNetConnection***>(Driver + 0x90);
+    const int32_t Count = *reinterpret_cast<int32_t*>(Driver + 0x98);
+    const int32_t Max = *reinterpret_cast<int32_t*>(Driver + 0x9C);
+    if (!IsSanePointerArray(Connections, Count, Max, 1024)) return;
+
+    static std::unordered_map<void*, std::string> s_lastState;   // game thread only
+    std::unordered_map<void*, std::string> Seen;
+    for (int32_t i = 0; i < Count; ++i) {
+        SDK::UNetConnection* Conn = Connections[i];
+        if (!Conn || !IsReadablePointer(Conn, 0x140)) continue;
+        SDK::APlayerController* PC = Conn->PlayerController;
+        if (!PC || !IsReadablePointer(PC, 0x738) || !IsRegisteredLiveObject(PC)
+            || !MpIsAGuarded(PC, SDK::AArchonPlayerController::StaticClass())) {
+            continue;
+        }
+        const MpHuntPassView V = MpReadHuntPassComponent(reinterpret_cast<SDK::AArchonPlayerController*>(PC)->HuntPassComponent);
+        if (!V.Ok) continue;
+        const std::string State = "main=" + V.Main + " selected=" + V.Selected + " active=" + std::to_string(V.ActiveCount)
+            + " sel(rank/confirmed/progress)=" + V.SelectedProgress
+            + " selectedActive=" + std::to_string(V.SelectedActive) + " refreshCount=" + std::to_string(V.RefreshCount)
+            + " mainSeasonEnd=" + V.MainEnd;
+        Seen[PC] = State;
+        const auto It = s_lastState.find(PC);
+        if (It != s_lastState.end() && It->second == State) continue;
+        MpLog("[HuntPassState] pc=" + MpPtr(PC) + "/" + SafeObjectNameForDiagnostic(PC) + " " + State
+            + " passes=[" + V.Passes + "]");
+    }
+    s_lastState.swap(Seen);   // controllers that left are forgotten, so a reused address logs again
+}
+
+// Client, at the arrival census until both are found (at most 6 arrivals): the fountain stinger's DailyBonusItemId
+// (UCoinTossStinger +0x360 FString, on the native and the cointoss_stringer_bpw_C default objects) and the live
+// UArchonActivitiesProgressionComponent: DailyBundleStoreQueryTag +0x150, DebugDailyBundleStoreQueryTag +0x160 (FString)
+// and the bytes at +0x220/+0x221, which lie inside the SDK's unnamed Pad_210[0x6B8] (no field names available).
+static void MpCoinTossClientProbe(UObject* PC) {
+    if (Globals::AmServer || !UObject::GObjects) return;
+    static bool s_done = false;
+    static int s_attempts = 0;
+    if (s_done || s_attempts >= 6) return;
+    ++s_attempts;
+
+    std::string Line = "[CoinTossProbe] attempt=" + std::to_string(s_attempts);
+    SDK::UObject* NativeCdo = SDK::UCoinTossStinger::GetDefaultObj();
+    if (NativeCdo && IsReadablePointer(NativeCdo, 0x370) && IsRegisteredLiveObject(NativeCdo)) {
+        Line += " nativeDefault.DailyBonusItemId=\""
+            + MpProbeFString(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(NativeCdo) + 0x360)) + "\"";
+    } else {
+        Line += " nativeDefault=unavailable";
+    }
+    bool StingerFound = false;
+    SDK::UClass* StingerClass = SDK::UObject::FindClassFast("cointoss_stringer_bpw_C");
+    if (StingerClass && IsReadablePointer(StingerClass, 0x120) && IsRegisteredLiveObject(StingerClass)) {
+        SDK::UObject* Cdo = StingerClass->ClassDefaultObject;
+        if (Cdo && IsReadablePointer(Cdo, 0x370) && IsRegisteredLiveObject(Cdo)
+            && MpIsAGuarded(Cdo, SDK::UCoinTossStinger::StaticClass())) {
+            StingerFound = true;
+            Line += " " + SafeObjectNameForDiagnostic(Cdo) + ".DailyBonusItemId=\""
+                + MpProbeFString(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Cdo) + 0x360)) + "\"";
+        } else {
+            Line += " cointoss_stringer_bpw_C default object unavailable";
+        }
+    } else {
+        Line += " cointoss_stringer_bpw_C not loaded";
+    }
+
+    int Found = 0;
+    SDK::UClass* ActivitiesClass = SDK::UArchonActivitiesProgressionComponent::StaticClass();
+    if (ActivitiesClass) {
+        const int Count = UObject::GObjects->Num();
+        for (int i = 0; i < Count && Found < 3; ++i) {
+            UObject* Obj = UObject::GObjects->GetByIndex(i);
+            if (!Obj || Obj->IsDefaultObject() || !MpIsAGuarded(Obj, ActivitiesClass)) continue;
+            if (!IsReadablePointer(Obj, 0x228)) continue;
+            ++Found;
+            const uintptr_t A = reinterpret_cast<uintptr_t>(Obj);
+            Line += " | activities=" + MpPtr(Obj) + " outer=" + SafeObjectNameForDiagnostic(Obj->Outer)
+                + (Obj->Outer == PC ? " (local pc)" : "")
+                + " DailyBundleStoreQueryTag=\"" + MpProbeFString(reinterpret_cast<void*>(A + 0x150)) + "\""
+                + " DebugDailyBundleStoreQueryTag=\"" + MpProbeFString(reinterpret_cast<void*>(A + 0x160)) + "\""
+                + " byte220=" + std::to_string(SafeReadU8At(A, 0x220))
+                + " byte221=" + std::to_string(SafeReadU8At(A, 0x221));
+        }
+    }
+    if (Found == 0) Line += " | no live UArchonActivitiesProgressionComponent";
+    MpLog(Line);
+    s_done = StingerFound && Found > 0;
 }
 
 // [1.14.7 HUNT PASS QUERY CALL 2026-10-03] Route 2 from section BC/BD: the progression configuration is
@@ -19483,6 +23390,30 @@ static const char* CwVerifySite(const CwSite& S) {
     return nullptr;
 }
 
+// [2026-10-10 1.14.7 RAM] Byte guard for the backup OOM pool release (MpReleaseBackupOomPool). Not a hook: it proves the
+// pool global (+0x6DACBD0) and size (0x2000000) through SetupMemoryPools' own bytes, and that the only reader,
+// OnOutOfMemory, still null-checks the pool before freeing it. Returns nullptr when both match, else a reason.
+static const char* MpVerifyBackupOomPoolSites() {
+    // 0x02525890: sub rsp,28; mov ecx,0x2000000; call 0x02661D90 (VirtualAlloc thunk); mov [rip+0x0488732B],rax
+    static const uint8_t kSetupPools[21] = { 0x48, 0x83, 0xEC, 0x28, 0xB9, 0x00, 0x00, 0x00, 0x02, 0xE8, 0xF2, 0xC4,
+                                             0x13, 0x00, 0x48, 0x89, 0x05, 0x2B, 0x73, 0x88, 0x04 };
+    const CwSite Setup{ "FGenericPlatformMemory::SetupMemoryPools", 0x02525890, kSetupPools, sizeof(kSetupPools), 0, 0,
+                        nullptr, nullptr };
+    if (const char* Why = CwVerifySite(Setup)) return Why;
+    // 0x02529C00 OnOutOfMemory: at +0x57 mov rcx,[rip+0x04882F72] (0x02529C5E + 0x04882F72 = the pool global 0x06DACBD0);
+    // at +0x68 test rcx,rcx; je 0x02529D5B (a null pool is skipped).
+    constexpr uintptr_t kOomRva = 0x02529C00;
+    if (ResolveFunctionStartRva(kOomRva) != kOomRva) return "oom-handler-not-pdata-entry";
+    const uint8_t* Oom = reinterpret_cast<const uint8_t*>(Globals::BaseAddress + kOomRva);
+    if (!IsReadablePointer(Oom, 0x80)) return "oom-handler-unreadable";
+    static const uint8_t kLoad[7] = { 0x48, 0x8B, 0x0D, 0x72, 0x2F, 0x88, 0x04 };
+    static const uint8_t kTest[5] = { 0x48, 0x85, 0xC9, 0x0F, 0x84 };
+    if (memcmp(Oom + 0x57, kLoad, sizeof(kLoad)) != 0 || memcmp(Oom + 0x68, kTest, sizeof(kTest)) != 0) {
+        return "oom-handler-mismatch";
+    }
+    return nullptr;
+}
+
 static void CwLogInstalled(const CwSite& S, MH_STATUS Create, MH_STATUS Enable) {
     MpLog(std::string("[CalloutGuard] install site=") + S.Name + " rva=+" + MpHex(S.Rva)
         + " entry=pdata bytes=match super=" + (S.SuperCallOffset ? ("+" + MpHex(S.SuperRva) + "(decoded)") : std::string("none"))
@@ -19585,6 +23516,239 @@ static void InstallInteractionCalloutClassGuards() {
         if (C == MH_OK && E != MH_OK) MH_RemoveHook(Target);
         CwLogInstalled(S, C, E);
     }
+}
+
+// [2026-10-10 1.14.7] Late-join legendary HUD guard (client only). UHUDLegendaryAbilityWidget's construct function
+// 0x01F7AA00 (NativeConstruct by its vtable slot - CANDIDATE name) calls the HandleWeaponEquipped native 0x01F6D4F0
+// directly at 0x01F7AED2 with Pawn->Weapon (+0x5F0, getter 0x018CE900) unchecked. When the controller's Inventory
+// (PC+0x9B8) has replicated but no weapon is equipped yet, 0x01F6D6BE reads InWeapon->ItemId.Num (+0x248) -> AV. The
+// other callers are null-safe: the exec thunk 0x023D1180 (ProcessEvent / delegate path; the equip broadcast never passes
+// null) and HandleLoadoutChanged 0x01F6D480 (tests the weapon; its exec 0x023D1160 is a frameless leaf that tail-jumps
+// there). The same construct has already bound the handler to AArchonCharacter::OnWeaponEquipped (+0x5F8), which the
+// equip function 0x018D71B0 broadcasts with the non-null primary weapon, so skipping the null call loses nothing (the
+// client chain that equips the weapon after a late join is untraced: until a live run shows a skip line followed by the
+// icon appearing, a skip may leave the default icon until HandleLoadoutChanged runs - never worse than stock, which
+// faults). STATIC PROOF ONLY: no 1.14.7 dump at exe+0x1F6D6BE yet; live late-join A/B pending. The friend's 1.12 fix
+// guards the matching native (1.12 0x01DF77C0, matched by shape: vtable +0x2A0 call, weapon in rdx; tools/rva-port-audit.py
+// pairs it by prologue alone with 1.12 0x019E8E80, unverified). A hook on the native body covers all three callers; the crashing call is
+// native-to-native and never reaches ProcessEvent. Servers build no HUD (no local player since 0.2.111) and never install
+// it. DISABLE_HUD_LEGENDARY_GUARD.flag reverts.
+static constexpr uintptr_t kHudLegendaryWeaponEquippedRva = 0x01F6D4F0;
+static const uint8_t kHudLegendaryWeaponEquippedBytes[] = { 0x40,0x55,0x53,0x56,0x57,0x41,0x54,0x48,0x8D,0xAC,0x24,0xB0,
+                                                            0xFE,0xFF,0xFF,0x48,0x81,0xEC,0x50,0x02,0x00,0x00 };
+using HudLegendaryWeaponEquippedFn = void(__fastcall*)(void* Widget, void* InWeapon);
+static HudLegendaryWeaponEquippedFn OrigHudLegendaryWeaponEquipped = nullptr;
+
+static void __fastcall HudLegendaryWeaponEquippedDetour(void* Widget, void* InWeapon) {
+    // No logging and no CRT once DLL_PROCESS_DETACH has begun (0.2.96 exit crash, 38_ §18.2); a null weapon is still skipped.
+    if (MpProcessDetaching()) {
+        if (InWeapon) OrigHudLegendaryWeaponEquipped(Widget, InWeapon);
+        return;
+    }
+    if (!InWeapon) {
+        static std::atomic<uint32_t> s_skips{ 0 };
+        const uint32_t N = s_skips.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (N <= 8 || (N & (N - 1)) == 0) {
+            MpLog("[HudLegendaryGuard] HandleWeaponEquipped(InWeapon=null) skipped widget=" + MpPtr(Widget)
+                + " n=" + std::to_string(N) + " (re-runs from Character.OnWeaponEquipped when the weapon is equipped)");
+        }
+        return;
+    }
+    OrigHudLegendaryWeaponEquipped(Widget, InWeapon);
+}
+
+static void InstallHudLegendaryWeaponGuard() {
+    if (Globals::AmServer) return;
+    if (MpExeRelativeFlagPresent(L"DISABLE_HUD_LEGENDARY_GUARD.flag")) {
+        MpLog("[HudLegendaryGuard] DISABLE_HUD_LEGENDARY_GUARD.flag present -> not installed");
+        return;
+    }
+    const CwSite S{ "HUDLegendaryAbilityWidget::HandleWeaponEquipped", kHudLegendaryWeaponEquippedRva,
+        kHudLegendaryWeaponEquippedBytes, sizeof(kHudLegendaryWeaponEquippedBytes), 0, 0,
+        reinterpret_cast<void*>(&HudLegendaryWeaponEquippedDetour), reinterpret_cast<void**>(&OrigHudLegendaryWeaponEquipped) };
+    if (const char* Why = CwVerifySite(S)) {
+        MpLog(std::string("[HudLegendaryGuard] NOT installed rva=+") + MpHex(S.Rva) + " reason=" + Why
+            + " (late-join null-weapon HUD crash left unguarded)");
+        return;
+    }
+    void* Target = reinterpret_cast<void*>(Globals::BaseAddress + S.Rva);
+    const MH_STATUS C = MH_CreateHook(Target, S.Detour, S.Orig);
+    const MH_STATUS E = C == MH_OK ? MH_EnableHook(Target) : C;
+    if (C == MH_OK && E != MH_OK) MH_RemoveHook(Target);
+    MpLog(std::string("[HudLegendaryGuard] install rva=+") + MpHex(S.Rva) + " entry=pdata bytes=match create="
+        + MH_StatusToString(C) + " enable=" + MH_StatusToString(E));
+}
+
+// [2026-10-10 1.14.7 travel-crash probe, client only, observe-only] UEngine::LoadMap = 0x04271370 (named by its own
+// strings: "LoadMap: %s", "Failed to load package '%s'", "Took %f seconds after InitializeForWorld(%s)"; .pdata primary
+// entry). ABI from its only engine caller (UArchon LoadMap wrapper 0x01909C10, call at 0x01909EA6): rcx = engine,
+// rdx = FWorldContext&, r8 = FURL* (by-value copy; Map FString at +0x28), r9 = UPendingNetGame*, [rsp+0x28] = FString&
+// Error; returns bool. The hunt -> Ramsgate crash faults inside it (0x04272D28, the new world's PersistentLevel is null
+// before LoadPackagesFully); this logs the destination, the old world and every UWorld in memory at entry, and the
+// result and duration at exit, so the next crash shows what LoadMap found. NO_LOADMAP_PROBE.flag disables it.
+static constexpr uintptr_t kEngineLoadMapRva = 0x04271370;
+static const uint8_t kEngineLoadMapBytes[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x20,                  // mov [rsp+0x20], rbx
+    0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55,      // push rbp / rsi / rdi / r12 / r13
+    0x41, 0x56, 0x41, 0x57,                        // push r14 / r15
+    0x48, 0x8D, 0xAC, 0x24, 0x00, 0xFE, 0xFF, 0xFF,// lea rbp, [rsp-0x200]
+    0x48, 0x81, 0xEC, 0x00, 0x03, 0x00, 0x00,      // sub rsp, 0x300
+};
+using EngineLoadMapFn = bool(__fastcall*)(void* Engine, void* WorldContext, void* Url, void* Pending, void* Error);
+static EngineLoadMapFn OrigEngineLoadMap = nullptr;
+
+static std::string MpFStringAt(const void* Base, uintptr_t Offset) {
+    if (!Base || !IsReadablePointer(Base, Offset + 0x10)) return "?";
+    const wchar_t* Data = *reinterpret_cast<wchar_t* const*>(reinterpret_cast<uintptr_t>(Base) + Offset);
+    const int32_t Num = *reinterpret_cast<const int32_t*>(reinterpret_cast<uintptr_t>(Base) + Offset + 8);
+    if (!Data || Num <= 1 || Num > 1024 || !IsReadablePointer(Data, static_cast<size_t>(Num) * sizeof(wchar_t))) return "";
+    std::string Out;
+    for (int32_t i = 0; i < Num - 1; ++i) Out.push_back(Data[i] < 128 ? static_cast<char>(Data[i]) : '?');
+    return Out;
+}
+
+static void* MpWorldContextWorld(void* WorldContext) {
+    return (WorldContext && IsReadablePointer(WorldContext, 0x288))
+        ? *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(WorldContext) + 0x280) : nullptr;
+}
+
+static bool __fastcall EngineLoadMapDetour(void* Engine, void* WorldContext, void* Url, void* Pending, void* Error) {
+    if (MpProcessDetaching()) return OrigEngineLoadMap(Engine, WorldContext, Url, Pending, Error);
+    void* OldWorld = MpWorldContextWorld(WorldContext);
+    const std::string Map = MpFStringAt(Url, 0x28);
+    MpLog("[LoadMap] enter map=" + Map + " pending=" + MpPtr(Pending) + " context=" + MpPtr(WorldContext)
+        + " oldWorld=" + MpPtr(OldWorld) + "/" + (OldWorld ? SafeObjectNameForDiagnostic(OldWorld) : std::string("none")));
+    MpWorldCensus("loadmap-enter");
+
+    // The census above has just released the stuck Async keep flag of every leftover world (MpReleaseZombieKeepFlags,
+    // 0.2.125), so LoadMap's full purge frees them before its FindPackage. The guard below is the opt-in last resort for
+    // a leftover held by something else.
+    // [2026-10-10 1.14.7 safety net] If the destination map's previous UWorld is still in memory as a pending-kill
+    // leftover, LoadMap's FindPackage would reuse it and crash on its null PersistentLevel (21:14:50). Fail this travel
+    // before LoadMap touches anything instead: the engine then handles it as a load failure (UPendingNetGame::
+    // LoadMapCompleted -> BrowseToDefaultMap), i.e. back to the login screen rather than a crash. Only pending-kill
+    // worlds count, never a world that is merely still loading. OPT-IN (ENABLE_ZOMBIE_LOADMAP_GUARD.flag) until the
+    // holder is known: if it keeps the leftover alive after the login screen too, every later Ramsgate travel would
+    // be refused, a login loop worse than the crash.
+    static int s_zombieGuard = -1;
+    if (s_zombieGuard < 0) {
+        s_zombieGuard = MpExeRelativeFlagPresent(L"ENABLE_ZOMBIE_LOADMAP_GUARD.flag") ? 1 : 0;
+        MpLog(std::string("[LoadMap] leftover-world guard ") + (s_zombieGuard ? "ON (ENABLE_ZOMBIE_LOADMAP_GUARD.flag)" : "OFF (default; diagnostics only)"));
+    }
+    if (s_zombieGuard && !Map.empty()) {
+        std::string Short = Map.substr(Map.find_last_of('/') == std::string::npos ? 0 : Map.find_last_of('/') + 1);
+        if (Short.find('.') != std::string::npos) Short = Short.substr(0, Short.find('.'));
+        MpWorldCensusEntry Worlds[64]{};
+        int Objects = 0;
+        int Found = MpWorldCensusScan(Worlds, 64, &Objects);
+        if (Found < 0) Found = -Found - 1;
+        for (int i = 0; i < Found; ++i) {
+            if (Worlds[i].World == OldWorld || !(Worlds[i].ItemFlags & 0x20000000)) continue;
+            if (SafeObjectNameForDiagnostic(Worlds[i].World) != Short) continue;
+            if (MpZombieKeepFlagReleased(Worlds[i].World)) continue;   // LoadMap's own full purge frees it (0.2.125)
+            MpLog("[LoadMap] REFUSED map=" + Map + ": its previous world " + MpPtr(Worlds[i].World)
+                + " is a pending-kill leftover (level=" + (Worlds[i].Level ? MpPtr(Worlds[i].Level) : std::string("NULL"))
+                + "); failing this travel instead of reusing it and crashing (ENABLE_ZOMBIE_LOADMAP_GUARD.flag)");
+            MpReportZombieWorld(Worlds[i].World, "loadmap-refused");
+            return false;
+        }
+    }
+    const uint64_t T0 = GetTickCount64();
+    const bool Ok = OrigEngineLoadMap(Engine, WorldContext, Url, Pending, Error);
+    void* NewWorld = MpWorldContextWorld(WorldContext);
+    MpLog(std::string("[LoadMap] exit ok=") + (Ok ? "1" : "0") + " ms=" + std::to_string(GetTickCount64() - T0)
+        + " world=" + MpPtr(NewWorld) + "/" + (NewWorld ? SafeObjectNameForDiagnostic(NewWorld) : std::string("none"))
+        + (Ok ? "" : " error=" + MpFStringAt(Error, 0)));
+    return Ok;
+}
+
+static void InstallLoadMapProbe() {
+    if (Globals::AmServer) return;
+    if (MpExeRelativeFlagPresent(L"NO_LOADMAP_PROBE.flag")) {
+        MpLog("[LoadMap] NO_LOADMAP_PROBE.flag present -> probe not installed");
+        return;
+    }
+    const CwSite S{ "UEngine::LoadMap", kEngineLoadMapRva, kEngineLoadMapBytes, sizeof(kEngineLoadMapBytes), 0, 0,
+        reinterpret_cast<void*>(&EngineLoadMapDetour), reinterpret_cast<void**>(&OrigEngineLoadMap) };
+    if (const char* Why = CwVerifySite(S)) {
+        MpLog(std::string("[LoadMap] probe NOT installed rva=+") + MpHex(S.Rva) + " reason=" + Why);
+        return;
+    }
+    void* Target = reinterpret_cast<void*>(Globals::BaseAddress + S.Rva);
+    const MH_STATUS C = MH_CreateHook(Target, S.Detour, S.Orig);
+    const MH_STATUS E = C == MH_OK ? MH_EnableHook(Target) : C;
+    if (C == MH_OK && E != MH_OK) MH_RemoveHook(Target);
+    MpLog(std::string("[LoadMap] probe install rva=+") + MpHex(S.Rva) + " entry=pdata bytes=match create="
+        + MH_StatusToString(C) + " enable=" + MH_StatusToString(E));
+}
+
+// [2026-10-10 1.14.7] Installs the opt-in TickFilterHelper hook (see TickFilterHelperDetour). Called at the end of
+// InitServerHooks, after the no-local-player patch has set g_NoLocalPlayerApplied. Both flags are read once here.
+static const uint8_t kTickFilterHelperBytes[] = { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,
+                                                  0x41,0x0F,0xB6,0xD8,0x0F,0xB6,0xF2 };
+static const uint8_t kTickFilterExecBytes[] = { 0x40,0x53,0x56,0x57,0x48,0x83,0xEC,0x20,0x33,0xFF,0x49,0x8B,0xF0 };
+
+static void InstallServerTickFilter() {
+    if (!Globals::AmServer) return;
+    const bool Fix = MpExeRelativeFlagPresent(L"SERVER_TICK_FILTER.flag");
+    const bool Census = MpExeRelativeFlagPresent(L"TICK_FILTER_CENSUS.flag");
+    if (!Fix && !Census) {
+        MpLog("[TickFilter] OFF (default): neither SERVER_TICK_FILTER.flag nor TICK_FILTER_CENSUS.flag present; no hook, "
+              "the game answers, manual TickStamina unchanged");
+        return;
+    }
+    if (Globals::AuthMode != Globals::ServerAuthMode::GlobalGameserver) {
+        MpLog("[TickFilter] not installed: not a DeployServer instance (AuthMode is not GlobalGameserver); flags ignored, "
+              "manual TickStamina unchanged");
+        return;
+    }
+    if (!g_NoLocalPlayerApplied.load(std::memory_order_relaxed)) {
+        MpLog("[TickFilter] not installed: the no-local-player patch is not applied (a local player could own an authority "
+              "pawn); flags ignored, manual TickStamina unchanged");
+        return;
+    }
+    const CwSite Filter{ "UArchonGameplayStatics::TickFilterHelper", 0x019480B0, kTickFilterHelperBytes,
+        sizeof(kTickFilterHelperBytes), 0, 0, reinterpret_cast<void*>(&TickFilterHelperDetour),
+        reinterpret_cast<void**>(&OrigTickFilterHelper) };
+    if (const char* Why = CwVerifySite(Filter)) {
+        MpLog(std::string("[TickFilter] NOT installed: filter rva=+") + MpHex(Filter.Rva) + " reason=" + Why
+            + "; the game answers, manual TickStamina unchanged");
+        return;
+    }
+    g_TickFilterCensus.store(Census, std::memory_order_relaxed);   // read by the hook from its first call
+    void* FilterTarget = reinterpret_cast<void*>(Globals::BaseAddress + Filter.Rva);
+    const MH_STATUS FC = MH_CreateHook(FilterTarget, Filter.Detour, Filter.Orig);
+    const MH_STATUS FE = FC == MH_OK ? MH_EnableHook(FilterTarget) : FC;
+    if (FE != MH_OK) {
+        if (FC == MH_OK) MH_RemoveHook(FilterTarget);
+        g_TickFilterCensus.store(false, std::memory_order_relaxed);
+        MpLog(std::string("[TickFilter] NOT installed: filter create=") + MH_StatusToString(FC) + " enable="
+            + MH_StatusToString(FE) + "; the game answers, manual TickStamina unchanged");
+        return;
+    }
+    g_ServerTickFilterActive.store(Fix, std::memory_order_relaxed);
+
+    std::string ExecStatus = "not hooked (census off)";
+    if (Census) {
+        const CwSite Exec{ "execTickFilterHelper", 0x0229DB70, kTickFilterExecBytes, sizeof(kTickFilterExecBytes), 0, 0,
+            reinterpret_cast<void*>(&TickFilterExecDetour), reinterpret_cast<void**>(&OrigTickFilterExec) };
+        if (const char* Why = CwVerifySite(Exec)) {
+            ExecStatus = std::string("NOT hooked reason=") + Why + " (census rows carry no call site)";
+        } else {
+            void* ExecTarget = reinterpret_cast<void*>(Globals::BaseAddress + Exec.Rva);
+            const MH_STATUS EC = MH_CreateHook(ExecTarget, Exec.Detour, Exec.Orig);
+            const MH_STATUS EE = EC == MH_OK ? MH_EnableHook(ExecTarget) : EC;
+            if (EC == MH_OK && EE != MH_OK) MH_RemoveHook(ExecTarget);
+            ExecStatus = std::string("create=") + MH_StatusToString(EC) + " enable=" + MH_StatusToString(EE)
+                + (EE == MH_OK ? "" : " (census rows carry no call site)");
+        }
+    }
+    const char* Mode = Fix && Census ? "SERVER ANSWERS for BP_PlayerCharacter_C + census (SERVER_TICK_FILTER.flag + TICK_FILTER_CENSUS.flag)"
+                     : Fix ? "SERVER ANSWERS for BP_PlayerCharacter_C (SERVER_TICK_FILTER.flag); manual TickStamina skipped once the class is cached"
+                           : "CENSUS ONLY (TICK_FILTER_CENSUS.flag): the game's answer is returned unchanged";
+    MpLog(std::string("[TickFilter] mode=") + Mode + "; filter rva=+" + MpHex(Filter.Rva)
+        + " entry=pdata bytes=match create=" + MH_StatusToString(FC) + " enable=" + MH_StatusToString(FE)
+        + "; exec rva=+" + MpHex(static_cast<uintptr_t>(0x0229DB70)) + " " + ExecStatus);
 }
 
 // [1.14.7 FIX 2026-10-08] Bound the engine crash handler's wait on server roles. After a game-thread crash the
@@ -19935,50 +24099,6 @@ static void LoadMgrBeginHook(void* This) {
     g_lastLoadManager = This;
     LogPlayerIdentityChain("Begin", This);
 
-    // [1.14.7 phantom-load skip 2026-10-03] A manager whose owner has NO net-id object can never
-    // complete its player-data load. Verified at runtime on the live hub:
-    //     [IdentityDiag] Begin ... playerState=player_state_bp_C_... netId=null netIdControl=null
-    // and every gated component then logs "the player state does not have a valid ID" and stops
-    // (see Progress/34 section L). The aggregation times out at +60s, the map reload fails
-    // ("LoadMap: failed to Listen") and the hub stops listening, so a client can never join.
-    //
-    // Begin is also what registers the failure callback (the delegate whose callback is
-    // FUN_141cb0010 / LoadFailed), so skipping it for that owner starts no loads and arms no
-    // failure timer: the hub is not torn down by a load that could never succeed. Real players
-    // (netId != null) take the normal path untouched. DISABLE_PHANTOM_LOAD_SKIP.flag reverts it.
-    // [2026-10-03] Measured result: skipping Begin for the net-id-less owner does stop the
-    // +60s LoadFailed ("LoadMap: failed to Listen" disappears and the hub no longer tears down
-    // that way), BUT the hub then fails through a different path - the character request logs
-    // "OnSetHttpRequestComplete Response failed, Null Response, Timeout?", followed by a
-    // "WorldContext requested with invalid context object" loop, and the hub still stops
-    // listening. Neither behaviour serves a client, so this stays OPT-IN for further work:
-    // create ENABLE_PHANTOM_LOAD_SKIP.flag next to the game executable to try it.
-    if (Globals::AmServer && MpExeRelativeFlagPresent(L"ENABLE_PHANTOM_LOAD_SKIP.flag")) {
-        const uintptr_t Mgr = reinterpret_cast<uintptr_t>(This);
-        const uintptr_t Controller = SafeReadPtr(Mgr, 0x20);
-        const uintptr_t PlayerState = Controller ? SafeReadPtr(Controller, 0x228) : 0;
-        const uintptr_t NetId = PlayerState ? SafeReadPtr(PlayerState, 0x258) : 0;
-        if (PlayerState == 0 || NetId == 0) {
-            static volatile LONG skipped = 0;
-            if (InterlockedCompareExchange(&skipped, 1, 0) == 0) {
-                MpLog("[PhantomLoadSkip] Begin skipped: owner has no valid net id (playerState="
-                    + MpPtr((void*)PlayerState) + " netId=0x0) - this load can never complete");
-            }
-            return;
-        }
-    }
-
-    // [1.14.7 synthetic net id] opt-in first test: give the net-id-less owner a valid object before
-    // the loads start, so the gate passes and the per-player URLs carry a real account id.
-    if (Globals::AmServer && MpExeRelativeFlagPresent(L"ENABLE_SYNTHETIC_NETID.flag")) {
-        const uintptr_t Mgr = reinterpret_cast<uintptr_t>(This);
-        const uintptr_t Controller = SafeReadPtr(Mgr, 0x20);
-        const uintptr_t PlayerState = Controller ? SafeReadPtr(Controller, 0x228) : 0;
-        if (PlayerState != 0) {
-            EnsureSyntheticNetId(reinterpret_cast<void*>(PlayerState));
-        }
-    }
-
     if (OrigLoadMgrBegin) {
         OrigLoadMgrBegin(This);
     }
@@ -20019,9 +24139,12 @@ static void InstallServerHeadlessSetup() {
     else if (Globals::AuthMode == Globals::ServerAuthMode::Invalid) authModeStr = "Invalid";
 
     const bool hasNullRhi = std::string(GetCommandLineA()).contains("-nullrhi");
+    // [2026-10-11 1.14.7] Watchdog= shows the empty-server watchdog switch Init chose (on for every full-argument launch,
+    // the player host's included; off only in the manual-test launch).
     MpLog(std::string("[InitRole] AmServer=") + (Globals::AmServer ? "1" : "0")
         + " AuthMode=" + authModeStr
         + " NullRHI=" + (hasNullRhi ? "1" : "0")
+        + " Watchdog=" + (EnableWatchdog ? "1" : "0")
         + P2PHooks::DescribeRole());
 
     // ========================================================================
@@ -20058,6 +24181,50 @@ static void InstallServerHeadlessSetup() {
     StartServerWindowHider();
 }
 
+// [2026-10-10 1.14.7 RAM] No Chromium/CEF on any server role (DeployServer hubs and dedicated hunts, the player host).
+// RVA 0x00F357D0 = FWebBrowserWidgetModule::StartupModule: .pdata entry 0x00F357D0, the only reference is slot 1 of
+// the module vtable 0x05162920 (wide name "WebBrowserWidget" at 0x05162960); tools/rva-port-audit.py: <- 1.12
+// 0x00EF8990 VERIFIED (identical prologue). It makes a UWebBrowserAssetManager, loads the WebBrowser module and calls
+// IWebBrowserModule::Get().GetSingleton() (FWebBrowserModule vtable +0x48 = 0x045AA2E0), whose first call constructs
+// FWebBrowserSingleton (0x045B3C10): CefInitialize plus an UnrealCEFSubProcess.exe gpu-process child (10 Oct: one per
+// hub, ~111 MB private each), then sets the default materials (vcalls +0x80 / +0x88). The engine module ignores
+// -nocef. A server shows no web pages; the module's ShutdownModule is an empty `ret`, its destructor never reads the
+// asset manager (+8) and FWebBrowserModule::ShutdownModule is null-safe, so skipping leaves the module loaded and
+// inert. A later client-UI GetSingleton call (login/purchase flow, UArchonWebBrowserWindow) would still create CEF
+// lazily, as today. Installed from DllMain (winmm proxy -> LoadLibraryW), before PreInit starts plugin modules;
+// clients never run InitServerHooks. Replaces the old player-host-only copy in p2p/PlayerHost.cpp.
+// KEEP_WEB_BROWSER.flag leaves the module startup alone. Wrong bytes / not a .pdata entry: no hook, CEF starts.
+static void MpWebBrowserWidgetStartupSkip(void*) {
+    MpLog("[RenderData] skipped WebBrowserWidget module startup; Chromium/CEF not started on this server");
+}
+
+// mov rax,rsp; push rsi; sub rsp,70h; cmp qword ptr [rcx+8],0 (WebBrowserAssetMgr); mov rsi,rcx; jne rel32
+static const uint8_t kWebBrowserWidgetStartupBytes[] = {
+    0x48, 0x8B, 0xC4, 0x56, 0x48, 0x83, 0xEC, 0x70, 0x48, 0x83, 0x79, 0x08, 0x00, 0x48, 0x8B, 0xF1, 0x0F, 0x85 };
+
+static void InstallServerWebBrowserSkip() {
+    if (!Globals::AmServer) return;
+    if (MpExeRelativeFlagPresent(L"KEEP_WEB_BROWSER.flag")) {
+        MpLog("[RenderData] WebBrowserWidget startup skip DISABLED by KEEP_WEB_BROWSER.flag; Chromium/CEF will start");
+        return;
+    }
+    const CwSite Site{ "WebBrowserWidget::StartupModule", 0x00F357D0,
+        kWebBrowserWidgetStartupBytes, sizeof(kWebBrowserWidgetStartupBytes), 0, 0,
+        reinterpret_cast<void*>(&MpWebBrowserWidgetStartupSkip), nullptr };
+    if (const char* Why = CwVerifySite(Site)) {
+        MpLog(std::string("[RenderData] WebBrowserWidget startup skip NOT installed: ") + Why
+            + " target=+" + MpHex(Site.Rva) + "; Chromium/CEF left enabled");
+        return;
+    }
+    void* const Target = reinterpret_cast<void*>(Globals::BaseAddress + Site.Rva);
+    const MH_STATUS Create = MH_CreateHook(Target, Site.Detour, nullptr);
+    const MH_STATUS Enable = (Create == MH_OK) ? MH_EnableHook(Target) : Create;
+    if (Create == MH_OK && Enable != MH_OK) MH_RemoveHook(Target);
+    MpLog(std::string("[RenderData] WebBrowserWidget startup skip ") + (Enable == MH_OK ? "installed" : "NOT installed")
+        + " create=" + MH_StatusToString(Create) + " enable=" + MH_StatusToString(Enable) + " target=+" + MpHex(Site.Rva)
+        + " entry=pdata bytes=match" + (Enable == MH_OK ? "" : "; Chromium/CEF left enabled"));
+}
+
 void InitServerHooks() {
     InitLog("[InitServerHooks] Entry - MH_Initialize");
     MH_Initialize();
@@ -20069,6 +24236,8 @@ void InitServerHooks() {
     InstallEngineCommandLineHook();
 
     InstallServerHeadlessSetup();
+    // Every server role: no Chromium/CEF (see InstallServerWebBrowserSkip).
+    InstallServerWebBrowserSkip();
     // The optional player-hosted mode's server hooks (P2PHooks.h; nothing without the module).
     P2PHooks::InstallServerHooks();
 
@@ -20260,6 +24429,11 @@ void InitServerHooks() {
 
     // [1.14.7] +0x03F90E20 has no verified function boundary/ABI; skip the old read-only probe.
     MpLog("[InitServerHooks] ServerReplicateActors probe skipped (1.14.7 target unresolved)");
+    // [2026-10-11 1.14.7] Say so when the dead A/B flag is present, so nobody reads a capture as "rate capped".
+    if (MpExeRelativeFlagPresent(L"SRA_RATE_CAP.flag")) {
+        MpLog("[SraRateCap] SRA_RATE_CAP.flag present but has NO EFFECT on 1.14.7 (its hook is not installed; "
+              "MpDriveReplicationGraph drives the graph every frame)");
+    }
 
     // [1.14.7 2026-10-05] UArchonReplicationGraph::ServerReplicateActors (vtable +0x2F8, RVA
     // 0x01C034C0), pass-through counter only. Its decompiled body is the deferred owner-only route plus
@@ -20299,8 +24473,38 @@ void InitServerHooks() {
         + " enable=" + MH_StatusToString(RoleRouteRemoveEnable)
         + " target=+" + MpHex(0x01BFE4C0));
 
-    // [1.14.7] Old +0x00F27260 RepGraph pre-channel target lacks a verified function body/ABI.
-    MpLog("[InitServerHooks] PlayerController pre-channel guard skipped (1.14.7 target unresolved)");
+    // [2026-10-10 1.14.7] PlayerController pre-channel guard on UReplicationGraph::ReplicateSingleActor
+    // (0x00F2C230; ABI and call path in the comment above RepGraphReplicateSingleActorGuardHook). The old
+    // +0x00F27260 guess was never installed. Fail closed: the hook goes in only when the target is a .pdata
+    // entry with the expected prologue; otherwise the SetChannelActor and ReplicateActor guards below
+    // still enforce the invariant.
+    {
+        static const uint8_t PreChannelExpect[] = {
+            0x40, 0x55,                                // push rbp
+            0x53, 0x56, 0x57,                          // push rbx / rsi / rdi
+            0x41, 0x55, 0x41, 0x56,                    // push r13 / r14
+            0x48, 0x8D, 0x6C, 0x24, 0xE9,              // lea rbp, [rsp-0x17]
+            0x48, 0x81, 0xEC, 0xD8, 0x00, 0x00, 0x00,  // sub rsp, 0xD8
+        };
+        const CwSite PreChannelSite{ "ReplicateSingleActor", 0x00F2C230,
+            PreChannelExpect, sizeof(PreChannelExpect), 0, 0,
+            reinterpret_cast<void*>(&RepGraphReplicateSingleActorGuardHook),
+            &OrigRepGraphReplicateSingleActor };
+        if (const char* Reason = CwVerifySite(PreChannelSite)) {
+            MpLog(std::string("[InitServerHooks] PlayerController pre-channel guard NOT installed: ")
+                + Reason + " target=+" + MpHex(PreChannelSite.Rva));
+        } else {
+            MH_STATUS PreChannelCreate = MH_CreateHook(
+                reinterpret_cast<void*>(Globals::BaseAddress + PreChannelSite.Rva),
+                PreChannelSite.Detour, PreChannelSite.Orig);
+            MH_STATUS PreChannelEnable = MH_EnableHook(
+                reinterpret_cast<void*>(Globals::BaseAddress + PreChannelSite.Rva));
+            MpLog(std::string("[InitServerHooks] PlayerController pre-channel guard create=")
+                + MH_StatusToString(PreChannelCreate)
+                + " enable=" + MH_StatusToString(PreChannelEnable)
+                + " target=+" + MpHex(PreChannelSite.Rva) + " entry=pdata bytes=match");
+        }
+    }
 
     // Universal PlayerController binding invariant. This catches native SetChannelActor callers
     // outside the RepGraph helper and blocks a wrong-connection initial bunch before serialization.
@@ -20446,6 +24650,11 @@ void InitServerHooks() {
     // whether CompleteLoadInternal ever runs (see the block comment near the definitions).
     InstallProgressionDiagnostics();
 
+    // [1.14.7 diag 2026-10-10] read-only; names the game code behind every inventory transaction ([GrantTrace]).
+    InstallGrantTraceHook();
+    // [1.14.7 diag 2026-10-11] read-only; follows a Behemoth kill's weapon and Hunt Pass XP to the zero ([KillXP]).
+    InstallKillXpTrace();
+
     // [1.14.7 headless audio] a dedicated hub must not play sound (see the block comment).
     InstallHeadlessAudioHook();
 
@@ -20575,171 +24784,44 @@ void InitServerHooks() {
     VirtualProtect((void*)(Globals::BaseAddress + 0x79A815), 0x1, oldProtect, &oldProtect);
 #endif
 
-    // [move10 — 2026-07-11] Phantom local-player suppression (VERIFIED root cause).
-    //
-    // Root cause (verified via Ghidra + logs, cross-checked twice):
-    //   During map init — BEFORE the first GameEngineTick — the world-setup function at
-    //   0x1409E7120 unconditionally executes:
-    //       0x009E934A  MOV byte[GIsClient(0x146B53259)], 1
-    //       0x009E9351  MOV byte[GIsServer(0x146B5325A)], 1
-    //   i.e. it forces LISTEN-SERVER mode (both flags = 1). GIsClient=1 makes the engine
-    //   spawn a ULocalPlayer, which fires OnLocalPlayerReady + a phantom K2_PostLogin with
-    //   NO network connection (connCount=0). That phantom PlayerState has no valid
-    //   UniqueId (APlayerState::UniqueId @ +0x250, confirmed in SDK Engine_classes.hpp),
-    //   so every per-player backend call it makes resolves to userId "INVALID", and
-    //   UProgressionComponent::ReadFromBackend logs "player state does not have a valid ID".
-    //
-    // Timing proof: phantom K2_PostLogin @ 00:23:28.921 precedes first GameEngineTick @
-    // 00:23:29.174 by 253ms — so the per-tick GIsServer=1/GIsClient=0 reassert below in
-    // GameEngineTickHook runs TOO LATE to prevent the phantom. The fix must land before
-    // map init, hence here in InitServerHooks (server-gated: this function is only called
-    // from Init() when AmServer, else InitClientHooks() runs — real clients keep GIsClient=1).
-    //
-    // REPRO 1 (06:56 IST) RESULT: single-site 0x934A alone was insufficient — phantom still
-    // fired (OnLocalPlayerReady + K2_PostLogin on player_controller_city_bp_C before tick 2).
-    // Either the conditional block at 0x009E94F8 ran and 0x9507 re-set GIsClient=1, or the
-    // patch never applied (the [move10] status was invisible because InitLog is a no-op).
-    //
-    // Deterministic fix: force dedicated flags (GIsServer=1, GIsClient=0) on BOTH branches out
-    // of 0x1409E7120 so no boot-time ULocalPlayer is ever created regardless of branch taken:
-    //       0x009E934A  GIsClient 1 -> 0        (unconditional path; imm flip)
-    //       0x009E94FB  GIsServer 0 -> 1        (Branch B; imm flip)
-    //       0x009E9507  GIsClient R12B(=1) -> 0 (Branch B; 7-byte reg->imm rewrite)
-    //   (0x009E9351 GIsServer=1 is already correct and left alone.)
-    //
-    // CROSS-REF UPDATE: FUN_1409DFF70 calls FUN_1409E7120 (trio) at 0x1409E0071, then — only if
-    // it returns 0 (its success path, which always runs 0x934A+0x9351 first) — calls the LATER
-    // writer FUN_1409E37A0 at 0x1409E0089, whose 0x4FD4/0x4FE1 (MOV [flag],AL) would overwrite
-    // the flags. Ghidra shows exactly 3 writers per global; the trio covers the E7120 pair, so we
-    // NOP the two E37A0 stores. After all 5 patches EVERY static writer yields GIsClient=0 /
-    // GIsServer=1, so this repro is conclusive: if the phantom persists it is NOT flag-gated.
-    //       0x009E4FD4  GIsClient store (MOV [..],AL) -> NOPx6
-    //       0x009E4FE1  GIsServer store (MOV [..],AL) -> NOPx6
-    // Server-gated: InitServerHooks is only called from Init() when AmServer; clients run
-    // InitClientHooks() and keep GIsClient=1. Each write is validated (opcode + decoded target)
-    // and fails loud. Status is recorded now and emitted from MainThread via MpLog (InitLog no-op).
-    // These six Move10 instruction patches still use 1.12 RVAs/globals. Their byte guards
-    // fail closed, but the sites have not been remapped for 1.14.7; do not attempt them.
-    // ========================================================================
-    // [move10 — 1.14.7 REMAP 2026-10-03] Phantom local-player suppression for CL 647472.
-    //
-    // Same verified root cause as the 1.12 patch set, remapped to this binary with Ghidra:
-    //   During map init (before the first GameEngineTick) the world-setup code forces
-    //   LISTEN-SERVER mode by writing BOTH GIsClient=1 and GIsServer=1. GIsClient=1 makes the
-    //   engine spawn a ULocalPlayer, which fires a phantom K2_PostLogin with no network
-    //   connection. That phantom PlayerState has no valid UniqueId (APlayerState::UniqueId
-    //   +0x250), so every per-player backend call it makes resolves to userId "INVALID":
-    //     UProgressionComponent::ReadFromBackend() - the player state does not have a valid ID
-    //     GET  /loadout/INVALID//all   GET /inventory/INVALID/   PUT /cooldown/batch/INVALID
-    //     POST /pjm/INVALID            -> UArchonLoadManager::LoadFailed after 66s
-    //     -> LoadMap: failed to Listen(...) -> Failed to load default map
-    //   (Reproduced on the current build with no client connected at all.)
-    //
-    // Ghidra evidence for the 1.14.7 sites (writers of GIsClient 0x06E1EAD9 / GIsServer 0x06E1EADA):
-    //   FUN_1409f7170 (the "trio", unconditional path + branch B):
-    //     0x9F9433  MOV byte [GIsClient],1        C6 05 <disp32> 01   <- forces client mode
-    //     0x9F943F  MOV byte [GIsServer],1        C6 05 <disp32> 01   (already correct)
-    //     0x9F95F2  MOV byte [GIsServer],0        C6 05 <disp32> 00   <- branch B client mode
-    //     0x9F95FE  MOV byte [GIsClient],R12B     44 88 25 <disp32>   (R12B=1)
-    //   FUN_1409f36a0 (the later derived writer, would overwrite both):
-    //     0x9F4F19  MOV byte [GIsClient],AL       88 05 <disp32>
-    //     0x9F4F25  MOV byte [GIsServer],AL       88 05 <disp32>
-    //
-    // Patches (server-gated: InitServerHooks only runs when AmServer; clients keep GIsClient=1):
-    //   * 0x9F9433 imm 1 -> 0        (GIsClient stays 0)
-    //   * 0x9F95F2 imm 0 -> 1        (GIsServer stays 1)
-    //   * 0x9F95FE reg store -> C6 05 <disp32> 00 (same 7-byte length)
-    //   * 0x9F4F19 / 0x9F4F25 -> NOPx6 so the derived writer cannot undo the two above
-    // Every site is byte-verified (opcode + decoded RIP-relative target) before writing and
-    // fails closed with a loud log; DISABLE_MOVE10.flag skips the whole set for A/B.
-    {
-        const uintptr_t GIsClientRva = 0x06E1EAD9;
-        const uintptr_t GIsServerRva = 0x06E1EADA;
-
-        auto RipDisp = [](uintptr_t SiteRva, uintptr_t TargetRva, size_t InstrLen) -> int32_t {
-            return static_cast<int32_t>(static_cast<int64_t>(TargetRva) - static_cast<int64_t>(SiteRva + InstrLen));
-        };
-        auto DispBytes = [](int32_t Disp, uint8_t* Out) {
-            Out[0] = static_cast<uint8_t>(Disp & 0xFF);
-            Out[1] = static_cast<uint8_t>((Disp >> 8) & 0xFF);
-            Out[2] = static_cast<uint8_t>((Disp >> 16) & 0xFF);
-            Out[3] = static_cast<uint8_t>((Disp >> 24) & 0xFF);
-        };
-
-        int Patched = 0;
-        int GuardFailed = 0;
-
-        // [2026-10-03] These five 1.14.7 sites are remapped and byte-verified, but applying them
-        // BREAKS the boot of this WindowsClient build: with GIsClient forced to 0 during map init
-        // the engine never finishes Slate/UI initialisation, never reaches Listen, and the
-        // DeployServer kills the hub on its 30s readiness timeout (observed: log stops at
-        // "FSlateFontInfo was constructed with a null UFont", no map load, SIGTERM at +29s).
-        // The phantom ULocalPlayer is therefore REQUIRED by this build's client-oriented boot.
-        // The patches are kept for future work but are opt-in only: create
-        // ENABLE_MOVE10_1147.flag next to the game executable to apply them.
-        if (!MpExeRelativeFlagPresent(L"ENABLE_MOVE10_1147.flag")) {
-            MpLog("[Move10] 1.14.7 remap present but NOT applied (opt-in; ENABLE_MOVE10_1147.flag absent). "
-                  "Applying it stops the client-build boot before Listen - see dllmain.cpp notes.");
-            Globals::Move10Status = "remapped but opt-in (ENABLE_MOVE10_1147.flag absent)";
-        }
-        else {
-            // 1) GIsClient immediate store: force 0 instead of 1.
-            {
-                const uintptr_t Site = 0x9F9433;
-                int32_t Disp = RipDisp(Site, GIsClientRva, 7);
-                uint8_t Exp[7] = { 0xC6, 0x05, 0, 0, 0, 0, 0x01 };
-                uint8_t Rep[7] = { 0xC6, 0x05, 0, 0, 0, 0, 0x00 };
-                DispBytes(Disp, Exp + 2); DispBytes(Disp, Rep + 2);
-                if (MpPatchBytesVerified(Site, Exp, Rep, 7, "GIsClient imm 1->0")) ++Patched; else ++GuardFailed;
-            }
-            // 2) GIsServer immediate store (branch B): force 1 instead of 0.
-            {
-                const uintptr_t Site = 0x9F95F2;
-                int32_t Disp = RipDisp(Site, GIsServerRva, 7);
-                uint8_t Exp[7] = { 0xC6, 0x05, 0, 0, 0, 0, 0x00 };
-                uint8_t Rep[7] = { 0xC6, 0x05, 0, 0, 0, 0, 0x01 };
-                DispBytes(Disp, Exp + 2); DispBytes(Disp, Rep + 2);
-                if (MpPatchBytesVerified(Site, Exp, Rep, 7, "GIsServer imm 0->1")) ++Patched; else ++GuardFailed;
-            }
-            // 3) GIsClient register store (branch B, R12B=1): rewrite to an immediate 0 store.
-            {
-                const uintptr_t Site = 0x9F95FE;
-                int32_t Disp = RipDisp(Site, GIsClientRva, 7);
-                uint8_t Exp[7] = { 0x44, 0x88, 0x25, 0, 0, 0, 0 };
-                uint8_t Rep[7] = { 0xC6, 0x05, 0, 0, 0, 0, 0x00 };
-                DispBytes(Disp, Exp + 3); DispBytes(Disp, Rep + 2);
-                if (MpPatchBytesVerified(Site, Exp, Rep, 7, "GIsClient reg->imm 0")) ++Patched; else ++GuardFailed;
-            }
-            // 4) Derived writer GIsClient store -> NOPx6.
-            {
-                const uintptr_t Site = 0x9F4F19;
-                int32_t Disp = RipDisp(Site, GIsClientRva, 6);
-                uint8_t Exp[6] = { 0x88, 0x05, 0, 0, 0, 0 };
-                uint8_t Rep[6] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
-                DispBytes(Disp, Exp + 2);
-                if (MpPatchBytesVerified(Site, Exp, Rep, 6, "derived GIsClient store NOP")) ++Patched; else ++GuardFailed;
-            }
-            // 5) Derived writer GIsServer store -> NOPx6.
-            {
-                const uintptr_t Site = 0x9F4F25;
-                int32_t Disp = RipDisp(Site, GIsServerRva, 6);
-                uint8_t Exp[6] = { 0x88, 0x05, 0, 0, 0, 0 };
-                uint8_t Rep[6] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
-                DispBytes(Disp, Exp + 2);
-                if (MpPatchBytesVerified(Site, Exp, Rep, 6, "derived GIsServer store NOP")) ++Patched; else ++GuardFailed;
-            }
-
-            Globals::Move10Status = "1.14.7 remap: " + std::to_string(Patched) + "/5 patched"
-                + (GuardFailed ? (", " + std::to_string(GuardFailed) + " byte-guard FAILED") : "");
-            MpLog("[Move10] " + Globals::Move10Status);
-        }
+    // [1.14.7 2026-10-10 PHANTOM REMOVAL] No game viewport or local player on any server role. The phantom was the local
+    // player UGameEngine::Init (0x03E07010) creates because this -server boot of the client build runs with GIsClient=1
+    // (early boot writes it at 0x9F9433). Init tests GIsClient at 0x03E07349 and, when it is 0, jumps at 0x03E07353 over
+    // the block that creates the game viewport client (RSI); right after, 0x03E07457 tests RSI and jumps to 0x03E0770D,
+    // past the window and first-player setup - the engine's own dedicated-server path. Making that jump unconditional
+    // keeps GIsClient=1 for the rest of the boot (forcing GIsClient=0 instead stalled the Slate/UI setup and the LoadMap
+    // listen gate at 0x04272A80), so no viewport, no window and no local player exist and the first LoadMap spawns no
+    // PlayerController; the first real login starts the match (MpStartMatchWithoutPhantom). Opt-in in 0.2.103-0.2.108,
+    // the DeployServer default in 0.2.109, every server role (P2P player hosts too) since 0.2.110, which also removed
+    // the phantom workarounds - so a failed byte guard is loud: nothing suppresses a phantom any more. 38_ 19.3-19.4.
+    if (Globals::AuthMode != Globals::ServerAuthMode::Invalid) {
+        static const uint8_t Expected[6] = { 0x0F, 0x84, 0xD3, 0x00, 0x00, 0x00 };     // jz 0x03E0742C
+        static const uint8_t Replacement[6] = { 0xE9, 0xD4, 0x00, 0x00, 0x00, 0x90 };  // jmp 0x03E0742C; nop
+        const bool Ok = MpPatchBytesVerified(0x03E07353, Expected, Replacement, 6,
+            "UGameEngine::Init viewport/local-player block skip");
+        g_NoLocalPlayerApplied.store(Ok, std::memory_order_relaxed);
+        MpLog(std::string("[NoLocalPlayer] ") + (Ok
+            ? "APPLIED: this server boots without a game viewport or local player; the first login starts the match"
+            : "NOT APPLIED (byte guard failed - see the line above): this server WILL have a phantom local player, and "
+              "no phantom suppression exists any more - check the game build"));
     }
+
+    // [2026-10-10 1.14.7] Opt-in Blueprint tick filter (SERVER_TICK_FILTER.flag / TICK_FILTER_CENSUS.flag; default: no
+    // hook). Must follow the block above: it requires g_NoLocalPlayerApplied.
+    InstallServerTickFilter();
 
     InitLog("[InitServerHooks] Hooks and patches installed, returning");
 }
 
 void Init() {
     InitLog("[Init] Entry");
+    // [2026-10-10 1.14.7 CPU] Resolve the exe directory for the flag-file cache once and decide the cache mode
+    // (UNCACHED_FLAG_FILES.flag) before anything reads a flag; no lock is held here (see MpExeRelativeFlagPresent).
+    MpResolveExeDirW();
+    MpDecideFlagCacheMode();
+    // [2026-10-13 realms S1] Decide the backend address (MYSTICPARADOX_BACKEND_URL or the built-in one) before any hook
+    // that builds a backend URL is installed; MainThread logs the result (no logging under the loader lock).
+    MpResolveBackendAddress();
 
     Globals::AmServer = std::string(GetCommandLineA()).contains("-server");
     Globals::BaseAddress = (uintptr_t)GetModuleHandleA(nullptr);
@@ -20802,7 +24884,11 @@ void Init() {
 
             InitLog(std::string("[Init] Parsed DeployServer args: Port=") + std::to_string(Globals::Port));
 
-            if (Globals::Port >= 8776) {
+            // [2026-10-11 1.14.7 P2P host] Also by AuthMode: a player-hosted (HuntCapability) server is disposable on
+            // any port. (Checked while doing this: EnableWatchdog is constant-initialised to true and only the manual
+            // test branch below clears it, so every launch with this full argument list - the player host's included,
+            // whatever its port - already had the watchdog; this condition states the intent, it changes nothing.)
+            if (Globals::Port >= 8776 || Globals::AuthMode == Globals::ServerAuthMode::HuntCapability) {
                 // [2026-07-18 stale-hunt ROOT FIX] This previously forced EnableWatchdog=FALSE for ALL
                 // deploy ports (>=8776), which silently disabled BOTH empty-server reapers: the tick
                 // watchdog's `if(EnableWatchdog)` block never ran (so GameModeEmptyState() never published

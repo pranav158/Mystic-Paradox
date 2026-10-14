@@ -55,4 +55,17 @@ namespace P2PHooks {
     void RequestHeader(std::wstring& Name, std::wstring& Value);
     // Every server ProcessEvent (after the shared handling).
     void ObserveServerEvent(const std::string& FunctionName, void* Parms);
+
+    // --- Launcher-declared hosted role (module mode only; any thread after ReadLaunch) ---
+    // The stub answers the defaults (false / 0 / -1), so a build without the module behaves exactly as before.
+
+    // True when the launcher started this process as a persistent hub (MYSTICPARADOX_HOSTED_ROLE=HUB, valid
+    // bootstrap). Absent or HUNT = false: the process is a disposable hunt server whatever map it loads.
+    bool HostedRoleIsHub();
+    // The hub's player cap from MYSTICPARADOX_MAX_PLAYERS (1..64), only for a HUB role. 0 = none: the core keeps its
+    // HUB_MAX_PLAYERS.txt / default.
+    int MaxPlayersOverride();
+    // The hub's idle-kick timeout from MYSTICPARADOX_HUB_AFK_SECONDS (0..7200, 0 = never kick), only for a HUB role.
+    // -1 = none: the core keeps its HUB_AFK_TIMEOUT_SECONDS.txt / default.
+    int HubAfkSecondsOverride();
 }

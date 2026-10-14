@@ -17,8 +17,11 @@ param(
 
 $bt = [char]96
 $srcDir = Join-Path $Root 'ParadoxRuntime'
-# The optional player-hosted module (p2p\*.cpp) holds RVAs too when it is present.
-$files  = @((Join-Path $srcDir 'dllmain.cpp'), (Join-Path $srcDir 'Networking.cpp')) + @(Get-ChildItem -LiteralPath (Join-Path $srcDir 'p2p') -Filter *.cpp -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) |
+# The optional player-hosted module (p2p\*.cpp) and its anti-cheat module (anticheat\*.cpp, the Hunt Guard evidence
+# producer since 9 October) hold RVAs too when they are present.
+$files  = @((Join-Path $srcDir 'dllmain.cpp'), (Join-Path $srcDir 'Networking.cpp')) +
+    @(Get-ChildItem -LiteralPath (Join-Path $srcDir 'p2p') -Filter *.cpp -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) +
+    @(Get-ChildItem -LiteralPath (Join-Path $srcDir 'anticheat') -Filter *.cpp -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) |
     Where-Object { Test-Path -LiteralPath $_ }
 
 $verified = @{}

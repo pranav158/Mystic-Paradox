@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The ICE co-op transport module (ABI 3), loaded by the launcher. -->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{21BBC5A2-8FCA-461F-86FB-DC38A56BFD59}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>ParadoxTransport</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)build\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)build\obj\ParadoxTransport\$(Configuration)\</IntDir>
+    <TargetName>ParadoxTransport</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <PreprocessorDefinitions>PARADOX_TRANSPORT_EXPORTS;JUICE_STATIC;WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)third_party\libjuice-1.7.4\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Release'">MultiThreaded</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>ws2_32.lib;bcrypt.lib;crypt32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\admission_client.cpp" />
+    <ClCompile Include="src\admission_ticket.cpp" />
+    <ClCompile Include="src\control_codec.cpp" />
+    <ClCompile Include="src\guard_event_pipe.cpp" />
+    <ClCompile Include="src\ice_link.cpp" />
+    <ClCompile Include="src\ice_session.cpp" />
+    <ClCompile Include="src\ice_transport.cpp" />
+    <ClCompile Include="src\message_transport.cpp" />
+    <ClCompile Include="src\pair_crypto.cpp" />
+    <ClCompile Include="src\paradox_transport_api.cpp" />
+    <ClCompile Include="src\transport_app.cpp" />
+    <ClCompile Include="src\transport_module.cpp" />
+    <ClCompile Include="src\udp_bridge.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\admission_client.hpp" />
+    <ClInclude Include="src\admission_ticket.hpp" />
+    <ClInclude Include="src\control_codec.hpp" />
+    <ClInclude Include="src\guard_event_pipe.hpp" />
+    <ClInclude Include="src\ice_link.hpp" />
+    <ClInclude Include="src\ice_session.hpp" />
+    <ClInclude Include="src\ice_transport.hpp" />
+    <ClInclude Include="src\message_transport.hpp" />
+    <ClInclude Include="src\pair_crypto.hpp" />
+    <ClInclude Include="src\paradox_transport_api.hpp" />
+    <ClInclude Include="src\session_types.hpp" />
+    <ClInclude Include="src\transport_app.hpp" />
+    <ClInclude Include="src\transport_module.hpp" />
+    <ClInclude Include="src\udp_bridge.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="libjuice.vcxproj">
+      <Project>{3589DF96-FF7E-42F0-B518-8BCFD3F8B38D}</Project>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

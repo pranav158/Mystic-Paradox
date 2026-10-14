@@ -393,6 +393,7 @@ CatalogExporter/
   ProgressionExporter.cpp  — RunProgressionExport()
   CombatExporter.cpp       — RunCombatExport()
   SkinsExporter.cpp        — RunSkinsExport()
+  MasteryExporter.cpp      — RunMasteryExport() (EXPORT_MASTERY, added 2026-10-13)
   ExportFlags.md           — this document
 ```
 
@@ -454,3 +455,44 @@ open the relevant UI and re-inject, do not assume the table does not exist.
 
 Read-only: no `ProcessEvent`, no hooks, no writes into game memory. Safe against a live process.
 Runs last in the dispatch order so a fault here cannot cost you the targeted exports.
+
+### EXPORT_MASTERY (mastery_card_table + achievements_table - objective ids)
+
+Writes `Items_Analysis/mastery_1_14_7/mastery_objectives.json` (`MasteryExporter.cpp`) in exactly the shape of
+`ParadoxBackend/game-data/mastery_objectives.json`, so a fresh export can be copied there:
+
+```json
+{ "schema": 1, "source": "...", "objectiveIds": ["...sorted, unique..."],
+  "cards": [{ "cardId": "MasteryCard_Behemoth_Charrogg", "track": "MasteryTrack_Behemoth",
+              "objectives": [{ "id": "MasteryObjective_Behemoth_Charrogg_Kill", "target": 1, "type": "KillBehemoth" }],
+              "type": "Behemoth", "gameObjectId": "...",
+              "baseXpObjectiveId": "MasteryObjective_Behemoth_Charrogg_XP",
+              "prestigeXpObjectiveId": "MasteryObjective_Behemoth_Charrogg_PrestigeXP" }],
+  "achievements": [{ "id": "Release_BrokenBehemoth",
+                     "objectives": [{ "id": "AchievementObjective_BrokenBehemoth_Kill", "target": 1, "type": "KillBehemoth" }] }] }
+```
+
+**Why this mode exists.** The game server reports mastery and achievement progress to the backend as objective ids
+(`POST /progression/:userId`, `objectives[].objective_id`). Both tables carry every id the game can send, so the backend
+can accept exactly those instead of any string with the right prefix. `objectiveIds` holds every
+`UniqueOnlineObjectiveId` of both tables **plus the cards' XP-bar ids** (`BaseXPBarOnlineObjectiveId`,
+`PrestigeXPBarOnlineObjectiveId`): the game reports those as objectives too (45 of the 663 ids stored on 13 Oct were XP-bar
+ids). `CompoundObjectiveId` values (grouping ids such as `..._Breaks`) are kept only as per-objective `compoundId`
+metadata; none has been seen reported.
+
+**Source.** Found by **row-struct match** across every loaded DataTable (like `EXPORT_SLAYERS_PATH`):
+`Archon.MasteryCardTableData` (258 rows on 1.14.7) and `Archon.AchievementTableData` (46 rows). A card's `track` is its
+reward track other than the shared `MasteryTrack_PlayerLevel`. `target` is `Objective.Amount`; `type` is the
+`ObjectiveData_*` class without its prefix; `rank` / `progressTrack` appear on the *ProgressTo*-style objectives, where
+`Amount` is 1 and the rank to reach is `ProgressRank`. Rows are written sorted by row name.
+
+> **No display strings, on purpose.** `DisplayName` / `MasteryPopupText` are `FText`; `ToString()` on an `FText` crashes the
+> process (see `EXPORT_SLAYERS_PATH`). Everything emitted is `FName`, `FString`, POD or a class name, each name read behind SEH.
+
+> **Load requirement.** Only loaded tables are seen. If `catalog_export_status.txt` says `no tables found with
+> RowStruct=MasteryCardTableData` or `...AchievementTableData`, open the Mastery board (and the achievements list) once and
+> inject again. This mode has **not been injected yet**: the 1.14.7 file in `game-data/` was extracted statically from the
+> paks (`mastery_card_table` in `Archon_25-WindowsClient.pak`, `achievements_table` in `Archon_24-WindowsClient.pak`); a
+> live run should produce the same `objectiveIds` (258 cards, 46 achievements, 1,828 ids).
+
+Read-only: no `ProcessEvent`, no hooks, no writes into game memory.

@@ -10,6 +10,7 @@
  *   EXPORT_SKINS_RESOLVE_STRINGTABLE=0
  *   EXPORT_WEAPON_SLOTS=0
  *   EXPORT_CELLS=0
+ *   EXPORT_MASTERY=0
  *
  * *** EXPORT_SKINS_RESOLVE_STRINGTABLE WARNING: CLIENT-ONLY. This mode calls a live engine
  * function (UKismetStringTableLibrary::GetTableEntrySourceString) via ProcessEvent from the
@@ -76,6 +77,12 @@ struct ExportFlags {
     // UStoreItemViewModel objects plus StoreItemTable image rows after the Reward Cache UI is open.
     // Pure SDK-layout/GObjects reads: no hooks, no ProcessEvent and no game-memory writes.
     bool ExportStoreRuntime = false;
+    // [2026-10-13] Mastery objective ids. Reads every loaded MasteryCardTableData row (mastery_card_table) and
+    // AchievementTableData row (achievements_table): the objective ids the game server reports to the backend,
+    // each card's track and the completion targets. Pure GObjects/RowMap read (FName, FString, POD; no FText, no
+    // ProcessEvent), same safety class as EXPORT_SLAYERS_PATH. LOAD REQUIREMENT: open the Mastery board once so
+    // the tables are loaded. Output: Items_Analysis\mastery_1_14_7\mastery_objectives.json (MasteryExporter.cpp).
+    bool ExportMastery = false;
 };
 
 inline std::wstring FindFlagsFile() {
@@ -134,6 +141,7 @@ inline ExportFlags LoadExportFlags() {
     flags.ExportDropTables = parsed.count("EXPORT_DROP_TABLES") ? parsed["EXPORT_DROP_TABLES"] : false;
     flags.ExportCurrencyNames = parsed.count("EXPORT_CURRENCY_NAMES") ? parsed["EXPORT_CURRENCY_NAMES"] : false;
     flags.ExportStoreRuntime = parsed.count("EXPORT_STORE_RUNTIME") ? parsed["EXPORT_STORE_RUNTIME"] : false;
+    flags.ExportMastery = parsed.count("EXPORT_MASTERY") ? parsed["EXPORT_MASTERY"] : false;
 
     return flags;
 }

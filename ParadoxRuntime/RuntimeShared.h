@@ -24,6 +24,10 @@ namespace Globals {
 
 // Flushed per-port diagnostic log next to the game executable (mysticparadox_dll_port<N>.log).
 void MpLog(const std::string& Msg);
+// The same file without the timestamp/pid prefix, for the given port (Networking.cpp's NetLog).
+void MpLogRawPort(int Port, const std::string& Msg);
+// PRODUCTION_LOG_PROFILE.flag on a server: per-event diagnostic traces are skipped (list in dllmain.cpp).
+bool MpProductionLogProfile();
 std::string MpPtr(const void* Ptr);
 // Reads an environment variable of at most Maximum characters without control characters.
 bool MpReadEnvironment(const char* Name, std::string& Value, size_t Maximum);

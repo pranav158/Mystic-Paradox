@@ -51,6 +51,7 @@ extern int RunTableInventoryExport();
 extern int RunDropTableExport();
 extern int RunCurrencyExport();
 extern int RunStoreRuntimeExport();
+extern int RunMasteryExport();
 
 // ---- output location -------------------------------------------------------
 // See ExportPaths.hpp: <root>\Items_Analysis when ExportPaths.local.h names a root, else .\Items_Analysis.
@@ -655,7 +656,7 @@ static void WriteManifest(const std::wstring& outDir, const ExportFlags& flags,
                            int catalogGeneral, int catalogEquipment, int liveWeaponSlots,
                            int progressionRows, int combatRows, int skinsRows,
                            int slayersPathNodes, int huntRows, int tableInventoryRows,
-                           int storeRuntimeRows) {
+                           int storeRuntimeRows, int masteryRows) {
     std::ofstream f(outDir + L"\\export_manifest_1_14_7.json", std::ios::trunc);   // the 1.12 run's is export_manifest.json
     if (!f) return;
 
@@ -681,7 +682,8 @@ static void WriteManifest(const std::wstring& outDir, const ExportFlags& flags,
     f << "    \"EXPORT_WEAPON_SLOTS\": " << (flags.ExportWeaponSlots ? "true" : "false") << ",\n";
     f << "    \"EXPORT_HUNTS\": " << (flags.ExportHunts ? "true" : "false") << ",\n";
     f << "    \"EXPORT_TABLE_INVENTORY\": " << (flags.ExportTableInventory ? "true" : "false") << ",\n";
-    f << "    \"EXPORT_STORE_RUNTIME\": " << (flags.ExportStoreRuntime ? "true" : "false") << "\n";
+    f << "    \"EXPORT_STORE_RUNTIME\": " << (flags.ExportStoreRuntime ? "true" : "false") << ",\n";
+    f << "    \"EXPORT_MASTERY\": " << (flags.ExportMastery ? "true" : "false") << "\n";
     f << "  },\n";
     f << "  \"results\": {\n";
     f << "    \"catalogGeneralItems\": " << catalogGeneral << ",\n";
@@ -693,7 +695,8 @@ static void WriteManifest(const std::wstring& outDir, const ExportFlags& flags,
     f << "    \"slayersPathNodes\": " << slayersPathNodes << ",\n";
     f << "    \"huntRows\": " << huntRows << ",\n";
     f << "    \"tableInventoryRows\": " << tableInventoryRows << ",\n";
-    f << "    \"storeRuntimeRows\": " << storeRuntimeRows << "\n";
+    f << "    \"storeRuntimeRows\": " << storeRuntimeRows << ",\n";
+    f << "    \"masteryRows\": " << masteryRows << "\n";
     f << "  }\n";
     f << "}\n";
 }
@@ -737,7 +740,7 @@ static DWORD WINAPI ExporterThread(LPVOID) {
     }
     if (!cat) { Status("TIMEOUT: catalog never appeared. Reach the main menu/Ramsgate, then re-inject."); return 0; }
 
-    int gen = 0, eq = 0, weaponSlots = 0, progRows = 0, combatRows = 0, skinsRows = 0, slayersRows = 0, huntRows = 0, tableInventoryRows = 0, dropTableRows = 0, currencyRows = 0, storeRuntimeRows = 0;
+    int gen = 0, eq = 0, weaponSlots = 0, progRows = 0, combatRows = 0, skinsRows = 0, slayersRows = 0, huntRows = 0, tableInventoryRows = 0, dropTableRows = 0, currencyRows = 0, storeRuntimeRows = 0, masteryRows = 0;
 
     if (flags.ExportCatalog) {
         gen = DumpGeneralCatalog(outDir);
@@ -824,6 +827,14 @@ static DWORD WINAPI ExporterThread(LPVOID) {
         Status("EXPORT_STORE_RUNTIME=0, skipping store runtime capture");
     }
 
+    // Mastery objective ids (2026-10-13): mastery_card_table + achievements_table - the objective ids the game
+    // reports, each card's track and the completion targets. Pure read-only; see MasteryExporter.cpp.
+    if (flags.ExportMastery) {
+        masteryRows = RunMasteryExport();
+    } else {
+        Status("EXPORT_MASTERY=0, skipping mastery/achievement objective export");
+    }
+
     // Runs last: the census is a discovery aid for the NEXT injection, so it should not delay the
     // targeted exports above if something faults.
     if (flags.ExportTableInventory) {
@@ -832,14 +843,15 @@ static DWORD WINAPI ExporterThread(LPVOID) {
         Status("EXPORT_TABLE_INVENTORY=0, skipping DataTable census");
     }
 
-    WriteManifest(outDir, flags, gen, eq, weaponSlots, progRows, combatRows, skinsRows, slayersRows, huntRows, tableInventoryRows, storeRuntimeRows);
+    WriteManifest(outDir, flags, gen, eq, weaponSlots, progRows, combatRows, skinsRows, slayersRows, huntRows, tableInventoryRows, storeRuntimeRows, masteryRows);
 
     Status("ALL DONE general=" + std::to_string(gen) + " equipment=" + std::to_string(eq) +
            " progression=" + std::to_string(progRows) + " combat=" + std::to_string(combatRows) +
            " skins=" + std::to_string(skinsRows) + " slayers=" + std::to_string(slayersRows) +
            " hunts=" + std::to_string(huntRows) + " tables=" + std::to_string(tableInventoryRows) +
            " dropTables=" + std::to_string(dropTableRows) + " currencyNames=" + std::to_string(currencyRows) +
-           " storeRuntime=" + std::to_string(storeRuntimeRows));
+           " storeRuntime=" + std::to_string(storeRuntimeRows) +
+           " mastery=" + std::to_string(masteryRows));
     MessageBeep(MB_OK);
     return 0;
 }

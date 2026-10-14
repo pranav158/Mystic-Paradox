@@ -24,3 +24,6 @@ bool P2PHooks::TickShutdown() { return false; }
 void P2PHooks::OnListenFailed() {}
 void P2PHooks::RequestHeader(std::wstring&, std::wstring&) {}
 void P2PHooks::ObserveServerEvent(const std::string&, void*) {}
+bool P2PHooks::HostedRoleIsHub() { return false; }
+int P2PHooks::MaxPlayersOverride() { return 0; }
+int P2PHooks::HubAfkSecondsOverride() { return -1; }

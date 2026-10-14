@@ -1,0 +1,7 @@
+# Pinned to the toolchain this crate is built with on the owner's PC: rustc 1.96.0-nightly (2d76d9bc7, 2026-03-09), host
+# x86_64-pc-windows-msvc. rustup installs it on the first build in this folder. To build with the locally installed nightly
+# instead, set RUSTUP_TOOLCHAIN=nightly for one command. See README.md "Build".
+[toolchain]
+channel = "nightly-2026-03-09"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
