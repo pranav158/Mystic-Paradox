@@ -1,0 +1,176 @@
+/*
+ * Copyright (C) 2026 MysticFox / Pranav Karande (pranav158/Mystic-Paradox)
+ * Licensed under the GNU Affero General Public License v3.0.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
+ */
+
+/* [2026-10-14] Terms of Use, Privacy Policy, consent and account deletion: the document viewer, the acceptance checks,
+   the deactivation banner. Built on the modal, auth and banner styles; colours come from the tokens. */
+
+/* ---- The document viewer --------------------------------------------------------------------------------- */
+
+.legal-doc {
+  max-height: min(56vh, 480px);
+  overflow-y: auto;
+  padding: 2px 6px 2px 0;
+  color: var(--ink-2);
+  font-size: 13.5px;
+  line-height: 1.62;
+  scrollbar-gutter: stable;
+}
+
+.legal-doc:focus-visible {
+  outline: 2px solid var(--aether-hi);
+  outline-offset: 3px;
+  border-radius: 8px;
+}
+
+.legal-doc p {
+  margin: 0 0 10px;
+}
+
+.legal-doc a {
+  color: var(--aether-hi);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+}
+
+.legal-doc code {
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ink);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12.5px;
+}
+
+.legal-doc strong {
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.legal-doc-title {
+  margin: 0 0 12px;
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-size: 15px;
+  letter-spacing: 0.04em;
+}
+
+.legal-doc-heading {
+  margin: 18px 0 8px;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.legal-doc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding-left: 20px;
+}
+
+.legal-doc-list li::marker {
+  color: var(--aether-hi);
+}
+
+/* ---- Acceptance checks (registration and the consent gate) --------------------------------------------- */
+
+.legal-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 2px;
+}
+
+.legal-check {
+  align-items: flex-start;
+  line-height: 1.5;
+}
+
+.legal-check input {
+  margin-top: 2px;
+}
+
+.legal-check .link {
+  padding: 0;
+  font-size: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.legal-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin: 10px 0 0;
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+
+.legal-links .link {
+  font-size: 12.5px;
+}
+
+/* ---- Deactivated account banner (Home and Account) ------------------------------------------------------ */
+
+.deactivation-banner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 0 0 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--bad-line);
+  border-radius: var(--r-lg);
+  background: var(--bad-a);
+  color: #ffd3da;
+  animation: rise var(--t-med) var(--ease-out) both;
+}
+
+.deactivation-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.deactivation-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  color: #ffe1e6;
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.deactivation-title svg {
+  width: 17px;
+  height: 17px;
+  flex: none;
+  margin-top: 1px;
+  color: var(--bad);
+}
+
+.deactivation-note {
+  margin: 0;
+  color: #ffd3da;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+@media (max-width: 720px) {
+  .deactivation-banner {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

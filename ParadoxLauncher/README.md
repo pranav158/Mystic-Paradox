@@ -156,5 +156,3 @@ Report vulnerabilities according to [SECURITY.md](../SECURITY.md).
 
 Licensed under GNU Affero General Public License v3.0 only. See [LICENSE](../LICENSE),
 [NOTICE.md](../NOTICE.md), and [ADDITIONAL_TERMS.md](../ADDITIONAL_TERMS.md).
-
-Based on **Undaunted** by gwog :3 (https://github.com/SyST3MDeV/Undaunted).

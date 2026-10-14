@@ -3,13 +3,14 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 use tauri::AppHandle;
 
 use crate::commands::auth::{current_access_token, fetch_policy_cached, invalidate_access_token};
-use crate::install::{paths, verify};
+use crate::install::verify;
 use crate::launch::process;
+use crate::servers::{self, ServerTarget};
 
 // "stable" manifests/downloads stay unauthenticated server-side; "beta"/"dev" now require a
 // signed-in tester (see requireTesterForNonStableChannel in ParadoxBackend's
@@ -100,7 +101,10 @@ pub(crate) fn runtime_install_lock() -> &'static std::sync::Arc<tokio::sync::Mut
 /// install the stable runtime before Home/Play switches them back to beta/dev.
 pub fn start_runtime_prefetch(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        if paths::load_saved_exe_path(&app).is_none() {
+        // [2026-10-13 realms S1] Only the selected server's own folder, and never a local server's: its runtime files
+        // are the realm's own, so the feed is not used for it.
+        let target = servers::active_target(&app);
+        if !target.uses_official_feed() || target.exe_path.is_none() {
             return;
         }
         let policy_app = app.clone();
@@ -150,6 +154,21 @@ pub struct RuntimeUpdateStatus {
     pub current_sha256: Option<String>,
     pub latest_sha256: Option<String>,
     pub size: Option<usize>,
+    /// [2026-10-13 realms S1] False for a local server: its runtime files are the realm's own, the launcher does not
+    /// fetch, check or write ours there, and every other field is empty.
+    pub feed_managed: bool,
+}
+
+/// The answer for a server whose files our feed does not manage.
+fn unmanaged_status() -> RuntimeUpdateStatus {
+    RuntimeUpdateStatus {
+        available: false,
+        version: None,
+        current_sha256: None,
+        latest_sha256: None,
+        size: None,
+        feed_managed: false,
+    }
 }
 
 struct InstalledRuntimeState {
@@ -255,15 +274,6 @@ async fn fetch_manifest(channel: &str, token: Option<&str>) -> Result<ManifestFe
         })
 }
 
-fn install_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let exe = paths::load_saved_exe_path(app)
-        .ok_or_else(|| "Locate your Dauntless installation first.".to_string())?;
-    if !exe.is_file() {
-        return Err("Your Dauntless installation is missing.".to_string());
-    }
-    paths::game_dir(&exe)
-}
-
 fn verify_manifest(manifest: &RuntimeManifest, bytes: &[u8]) -> Result<(), String> {
     if manifest.target_changelist != TARGET_CHANGELIST
         || manifest.size != bytes.len()
@@ -301,6 +311,12 @@ pub async fn check_runtime_update(
     app: AppHandle,
     channel: String,
 ) -> Result<RuntimeUpdateStatus, String> {
+    // [2026-10-13 realms S1] The selected server is resolved once, before any network work, so the folder checked is
+    // the folder of the server that was selected when the check began.
+    let target = servers::active_target(&app);
+    if !target.uses_official_feed() {
+        return Ok(unmanaged_status());
+    }
     let (manifest, _token) = fetch_channel_manifest(&app, &channel).await?;
     let Some(manifest) = manifest else {
         return Ok(RuntimeUpdateStatus {
@@ -309,9 +325,10 @@ pub async fn check_runtime_update(
             current_sha256: None,
             latest_sha256: None,
             size: None,
+            feed_managed: true,
         });
     };
-    let directory = install_dir(&app)?;
+    let directory = target.install_dir()?;
     let installed = installed_runtime_state(&directory, &manifest)?;
     Ok(RuntimeUpdateStatus {
         available: !installed.all_current,
@@ -319,6 +336,7 @@ pub async fn check_runtime_update(
         current_sha256: installed.current_hash,
         latest_sha256: Some(manifest.sha256),
         size: Some(manifest.size),
+        feed_managed: true,
     })
 }
 
@@ -327,6 +345,24 @@ pub async fn install_runtime_update(
     app: AppHandle,
     channel: String,
 ) -> Result<RuntimeUpdateStatus, String> {
+    // [2026-10-13 realms S1] Resolve the selected server once. A local server's folder is never written by our feed.
+    let target = servers::active_target(&app);
+    if !target.uses_official_feed() {
+        return Ok(unmanaged_status());
+    }
+    install_runtime_update_for(app, channel, target).await
+}
+
+/// The signed runtime install for one resolved server (Play passes the target it resolved at its start, so the
+/// folder updated is the folder launched even if the selection changes meanwhile).
+pub(crate) async fn install_runtime_update_for(
+    app: AppHandle,
+    channel: String,
+    target: ServerTarget,
+) -> Result<RuntimeUpdateStatus, String> {
+    if !target.uses_official_feed() {
+        return Ok(unmanaged_status());
+    }
     // Startup prefetch, Home/Locate, manual Repair and Play all converge here. Serialize them so
     // two callers can never race the shared .new/.bak atomic replacement files.
     let _install_guard = runtime_install_lock().lock().await;
@@ -334,7 +370,7 @@ pub async fn install_runtime_update(
     let Some(manifest) = manifest else {
         return Err("No runtime update is published for this channel.".to_string());
     };
-    let directory = install_dir(&app)?;
+    let directory = target.install_dir()?;
     let current_path = directory.join(RUNTIME_DLL_NAME);
     let installed = installed_runtime_state(&directory, &manifest)?;
 
@@ -348,6 +384,7 @@ pub async fn install_runtime_update(
             current_sha256: installed.current_hash,
             latest_sha256: Some(manifest.sha256),
             size: Some(manifest.size),
+            feed_managed: true,
         });
     }
 
@@ -373,6 +410,7 @@ pub async fn install_runtime_update(
             current_sha256: installed.current_hash,
             latest_sha256: Some(manifest.sha256),
             size: Some(manifest.size),
+            feed_managed: true,
         });
     }
 
@@ -430,6 +468,7 @@ pub async fn install_runtime_update(
         current_sha256: Some(manifest.sha256.clone()),
         latest_sha256: Some(manifest.sha256),
         size: Some(manifest.size),
+        feed_managed: true,
     })
 }
 
@@ -549,6 +588,7 @@ async fn install_extra_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn digest(bytes: &[u8]) -> String {

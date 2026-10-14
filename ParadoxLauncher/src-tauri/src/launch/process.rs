@@ -4,6 +4,10 @@ use std::sync::{Mutex, OnceLock};
 
 const GAME_EXE_NAME: &str = "Dauntless-Win64-Shipping.exe";
 static CLIENT_GAME_PID: AtomicU32 = AtomicU32::new(0);
+/// [2026-10-13 realms S5] The auth scope (`auth/scope.rs` key: `official`, or a local server's id) the running client
+/// was launched under. Sign-out, Guard and the log upload decide by it, so one server's session ending never ends a
+/// game that belongs to another.
+static CLIENT_SCOPE: Mutex<Option<String>> = Mutex::new(None);
 /// Emitted with the exit code when the launcher's own game client exits.
 pub const GAME_EXITED_EVENT: &str = "game-exited";
 
@@ -43,6 +47,31 @@ pub fn game_process_id() -> Option<u32> {
     match CLIENT_GAME_PID.load(Ordering::Acquire) {
         0 => None,
         pid => Some(pid),
+    }
+}
+
+fn set_client_scope(scope: Option<String>) {
+    *CLIENT_SCOPE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = scope;
+}
+
+/// The scope key of the running client, `None` while no client of this launcher runs.
+pub fn running_client_scope() -> Option<String> {
+    game_process_id()?;
+    CLIENT_SCOPE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Forgets the client `pid` (it exited, or never started), and the scope it ran under.
+fn clear_client(pid: u32) {
+    if CLIENT_GAME_PID
+        .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        set_client_scope(None);
     }
 }
 
@@ -172,21 +201,48 @@ pub struct LaunchIdentity {
     pub display_name: String,
 }
 
+/// What the launcher decided for this Play before the spawn: the centrally authorised runtime profile, and the
+/// address of a local server's backend (`None` for the official and Paradox-realm servers).
+pub struct LaunchSettings<'a> {
+    pub runtime_profile: &'a str,
+    pub backend_url: Option<&'a str>,
+    /// The auth scope key the game is launched under (`AuthScope::key`).
+    pub scope_key: &'a str,
+}
+
+/// [2026-10-13 realms S1] The address the runtime uses instead of its built-in one. Only the launcher sets it, and
+/// only for a local server; an inherited value is always dropped so a stray variable cannot point the official
+/// game at another backend.
+const BACKEND_URL_ENV: &str = "MYSTICPARADOX_BACKEND_URL";
+
 fn is_sanitized_runtime_env_name(name: &str) -> bool {
     [
         "MYSTICPARADOX_RUNTIME_PROFILE",
         "MYSTICPARADOX_ALLOW_DAMAGE_DEBUG",
         "MYSTICPARADOX_DEBUG_DAMAGE_MULTIPLIER",
+        BACKEND_URL_ENV,
     ]
     .iter()
     .any(|blocked| name.eq_ignore_ascii_case(blocked))
 }
 
-fn build_game_environment(runtime_profile: &str) -> Result<Vec<u16>, String> {
+/// `backend_url` is `Some` only for a local server (`ServerTarget::backend_url`); official and Paradox-realm servers
+/// pass `None` and get the same environment as before the server list existed.
+fn build_game_environment(
+    runtime_profile: &str,
+    backend_url: Option<&str>,
+) -> Result<Vec<u16>, String> {
     use std::os::windows::ffi::OsStrExt;
 
     if runtime_profile != "production" && runtime_profile != "development" {
         return Err("Invalid centrally authorized runtime profile.".to_string());
+    }
+    // Re-validated here as well: whatever reaches the game's environment is exactly the canonical
+    // `scheme://host[:port]` form, never free text.
+    if let Some(url) = backend_url {
+        if crate::servers::normalize_backend_url(url).as_deref() != Ok(url) {
+            return Err("Invalid server address.".to_string());
+        }
     }
 
     // Build a private Unicode environment block instead of mutating the launcher's process-wide
@@ -210,6 +266,13 @@ fn build_game_environment(runtime_profile: &str) -> Result<Vec<u16>, String> {
     let mut profile_encoded = profile.encode_utf16().collect::<Vec<_>>();
     profile_encoded.push(0);
     entries.push(("mysticparadox_runtime_profile".to_string(), profile_encoded));
+    if let Some(url) = backend_url {
+        let mut encoded = format!("{BACKEND_URL_ENV}={url}")
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        encoded.push(0);
+        entries.push((BACKEND_URL_ENV.to_lowercase(), encoded));
+    }
     entries.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut block = Vec::new();
@@ -218,6 +281,29 @@ fn build_game_environment(runtime_profile: &str) -> Result<Vec<u16>, String> {
     }
     block.push(0);
     Ok(block)
+}
+
+/// [2026-10-15] Sets the game's three fullscreen keys to borderless in its settings file (`launch/game_settings.rs`).
+/// A failure never stops Play: it is written to the session's launcher log and the game starts in whatever mode the
+/// file already holds.
+fn prepare_borderless_display(session_dir: &Path) {
+    let result = match super::game_settings::settings_path() {
+        Some(path) => super::game_settings::set_borderless_fullscreen(&path).map(|changed| {
+            if changed {
+                "borderless display: settings file updated".to_string()
+            } else {
+                "borderless display: settings file already borderless".to_string()
+            }
+        }),
+        None => Err("LOCALAPPDATA is not set".to_string()),
+    };
+    match result {
+        Ok(line) => super::logs::append_launcher_log(session_dir, &line),
+        Err(error) => super::logs::append_launcher_log(
+            session_dir,
+            &format!("warning: borderless display not set, launching anyway: {error}"),
+        ),
+    }
 }
 
 /// Phase 2 (in-process redirect): the game is launched with NO proxy env vars. The injected
@@ -231,7 +317,7 @@ pub fn spawn_game(
     exe_path: &Path,
     exchange_code: &str,
     identity: &LaunchIdentity,
-    runtime_profile: &str,
+    settings: &LaunchSettings,
     session_dir: &Path,
     mut metadata: super::logs::SessionMetadata,
 ) -> Result<(), String> {
@@ -319,14 +405,22 @@ pub fn spawn_game(
         .collect();
     // A rejected environment returns here. Release per-Play resources through the same path every
     // other spawn failure uses, so a failed Play attempt leaves nothing running behind it.
-    let mut environment = match build_game_environment(runtime_profile) {
-        Ok(value) => value,
-        Err(error) => {
-            release_play_resources();
-            logs::append_launcher_log(session_dir, &format!("game environment rejected: {error}"));
-            return Err(error);
-        }
-    };
+    let mut environment =
+        match build_game_environment(settings.runtime_profile, settings.backend_url) {
+            Ok(value) => value,
+            Err(error) => {
+                release_play_resources();
+                logs::append_launcher_log(
+                    session_dir,
+                    &format!("game environment rejected: {error}"),
+                );
+                return Err(error);
+            }
+        };
+
+    // [2026-10-15] Borderless launch: the game reads its display mode from its settings file when it starts, so the
+    // mode is set here, before the process exists. Non-fatal: a failure is logged and the game starts anyway.
+    prepare_borderless_display(session_dir);
 
     unsafe {
         // Obtain a handle to the shell (Explorer) process to reparent under.
@@ -448,6 +542,8 @@ pub fn spawn_game(
             &format!("process created (pid {})", pi.dwProcessId),
         );
         set_active_session_log_dir(Some(session_dir));
+        // The scope first: a reader that sees the pid must find the scope it belongs to.
+        set_client_scope(Some(settings.scope_key.to_string()));
         CLIENT_GAME_PID.store(pi.dwProcessId, Ordering::Release);
 
         // Wait briefly to catch immediate crashes (missing DLL, wrong working dir, etc.).
@@ -457,12 +553,7 @@ pub fn spawn_game(
             GetExitCodeProcess(pi.hProcess, &mut code);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-            let _ = CLIENT_GAME_PID.compare_exchange(
-                pi.dwProcessId,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            clear_client(pi.dwProcessId);
             release_play_resources();
             logs::append_launcher_log(session_dir, &format!("exited immediately (code {code})"));
             set_active_session_log_dir(None);
@@ -499,12 +590,9 @@ pub fn spawn_game(
             WaitForSingleObject(h_process, INFINITE);
             GetExitCodeProcess(h_process, &mut code);
             CloseHandle(h_process);
-            let _ = CLIENT_GAME_PID.compare_exchange(
-                process_id,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            clear_client(process_id);
+            // [2026-10-14 realms] A realm game's presence loop sends its leave now (it never blocks this exit path).
+            crate::servers::realm_presence::client_exited();
             release_play_resources();
             logs::append_launcher_log(&session_dir_owned, &format!("exited (code {code})"));
             set_active_session_log_dir(None);
@@ -565,11 +653,74 @@ mod tests {
         ));
         assert!(!is_sanitized_runtime_env_name("SystemRoot"));
 
-        let environment = build_game_environment("production").unwrap();
+        let environment = build_game_environment("production", None).unwrap();
         let flattened = String::from_utf16_lossy(&environment).replace('\0', "\n");
         assert!(flattened
             .lines()
             .any(|line| line == "MYSTICPARADOX_RUNTIME_PROFILE=production"));
-        assert!(build_game_environment("local-debug").is_err());
+        assert!(build_game_environment("local-debug", None).is_err());
+    }
+
+    fn environment_lines(environment: &[u16]) -> Vec<String> {
+        String::from_utf16_lossy(environment)
+            .split('\0')
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    // [2026-10-13 realms S1] The address variable is set by the launcher for a local server and by nothing else.
+    #[test]
+    fn backend_url_reaches_the_game_only_for_a_local_server() {
+        let name = "MYSTICPARADOX_BACKEND_URL";
+        assert!(is_sanitized_runtime_env_name(name));
+        assert!(is_sanitized_runtime_env_name("mysticparadox_backend_url"));
+
+        // Official and Paradox realm: nothing new, even when the launcher's own environment carries a value.
+        std::env::set_var(name, "https://inherited.example.com");
+        let official = environment_lines(&build_game_environment("production", None).unwrap());
+        std::env::remove_var(name);
+        assert!(
+            !official
+                .iter()
+                .any(|line| line.to_uppercase().starts_with(name)),
+            "an inherited value must not reach the game"
+        );
+        assert!(official
+            .iter()
+            .any(|line| line == "MYSTICPARADOX_RUNTIME_PROFILE=production"));
+
+        // Local: exactly one entry, the canonical address, and the rest of the block is the official one.
+        let local = environment_lines(
+            &build_game_environment("production", Some("https://realm.example.com:8443")).unwrap(),
+        );
+        let entries: Vec<&String> = local
+            .iter()
+            .filter(|line| line.to_uppercase().starts_with(name))
+            .collect();
+        assert_eq!(
+            entries,
+            [&"MYSTICPARADOX_BACKEND_URL=https://realm.example.com:8443".to_string()]
+        );
+        let mut without = local.clone();
+        without.retain(|line| !line.to_uppercase().starts_with(name));
+        let mut expected = official.clone();
+        expected.sort();
+        without.sort();
+        assert_eq!(without, expected);
+
+        // Free text is refused, not passed on.
+        for bad in [
+            "https://realm.example.com/path",
+            "http://realm.example.com",
+            "https://realm.example.com\nEVIL=1",
+            "realm.example.com",
+            "",
+        ] {
+            assert!(
+                build_game_environment("production", Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 }

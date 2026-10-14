@@ -34,10 +34,13 @@ export function TextField({ label, error, hint, hintTone = "muted", rightAdornme
   );
 }
 
-/** Show/Hide toggle for password fields. */
+/**
+ * Show/Hide toggle for password fields. [2026-10-14] It is reached with the Tab key (it was skipped before), and its name
+ * says what pressing it does, so the name always contains the visible word ("Show" or "Hide").
+ */
 export function RevealToggle({ shown, onToggle }: { shown: boolean; onToggle: () => void }) {
   return (
-    <button type="button" className="btn btn-ghost" onClick={onToggle} tabIndex={-1} aria-pressed={shown}>
+    <button type="button" className="btn btn-ghost" onClick={onToggle} aria-label={shown ? "Hide password" : "Show password"}>
       {shown ? "Hide" : "Show"}
     </button>
   );

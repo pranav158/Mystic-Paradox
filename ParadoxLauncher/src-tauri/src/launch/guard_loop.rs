@@ -68,12 +68,27 @@ pub fn clear() {
     guard::clear();
 }
 
+/// The client Guard may report: only a game launched under the official scope. A local server's game belongs to a
+/// network that is not ours, so no Guard session or heartbeat (module lists, hashes) about it ever leaves the PC.
+fn guarded_client(running: Option<u32>, scope_key: Option<&str>) -> Option<u32> {
+    running.filter(|_| scope_key == Some(crate::servers::OFFICIAL_ID))
+}
+
 fn protected_processes() -> [(&'static str, Option<u32>); 2] {
     #[cfg(mystic_p2p)]
     let host = crate::p2p::guarded_host_process_id();
     #[cfg(not(mystic_p2p))]
     let host = None;
-    [("client", process::game_process_id()), ("host", host)]
+    [
+        (
+            "client",
+            guarded_client(
+                process::game_process_id(),
+                process::running_client_scope().as_deref(),
+            ),
+        ),
+        ("host", host),
+    ]
 }
 
 /// 20, 40, 80, 160, then 300 s.
@@ -183,6 +198,15 @@ mod tests {
         assert_eq!(failure_interval(4), Duration::from_secs(160));
         assert_eq!(failure_interval(5), Duration::from_secs(300));
         assert_eq!(failure_interval(50), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn guard_never_reports_a_local_servers_game() {
+        // The official scope's key is `official`; a local server's key is its own id.
+        assert_eq!(guarded_client(Some(4242), Some("official")), Some(4242));
+        assert_eq!(guarded_client(Some(4242), Some("s-aaaaaaaaaaaa")), None);
+        assert_eq!(guarded_client(Some(4242), None), None);
+        assert_eq!(guarded_client(None, Some("official")), None);
     }
 
     #[test]

@@ -12,7 +12,9 @@
   --ink: #eef3fb;
   --ink-2: #b9c5d8;
   --ink-3: #8191a8;
-  --ink-4: #5b6a80;
+  /* [2026-10-14] Was #5b6a80 (3.2:1 on the darkest glass, under WCAG AA 4.5:1 for text: input placeholders and the auth
+     divider). Now 4.7:1 on that glass and 5.3:1 on the page. */
+  --ink-4: #76859f;
 
   --aether: #5ba3ff;
   --aether-hi: #8cc6ff;

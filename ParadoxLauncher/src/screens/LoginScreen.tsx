@@ -5,6 +5,10 @@ import { Button } from "../components/Button";
 import { Banner } from "../components/Banner";
 import { AuthCard, AuthLayout } from "../components/AuthLayout";
 import { DiscordIcon } from "../components/icons";
+import { ServerSwitcher, switcherReturnsFocusTo } from "../components/ServerSwitcher";
+import { LegalLinks, useLegalViewer } from "../components/LegalDocument";
+import { useServer } from "../servers/ServerContext";
+import { serverNaming } from "../servers/serverNames";
 
 interface LoginScreenProps {
   onCreateAccount: () => void;
@@ -12,6 +16,14 @@ interface LoginScreenProps {
 
 export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
   const { login, startDiscordLogin, authError } = useAuth();
+  // [2026-10-13 realms S5] Sign-in goes to the selected server's own backend. Discord belongs to the official account
+  // system, so a local server (which has its own accounts) offers email and password only.
+  const { selected, officialNetwork } = useServer();
+  // [2026-10-14] A server chosen on the switcher brings this card back after its restore, and the switcher takes the focus
+  // back (ServerSwitcher.tsx). Then the email field must not autofocus and take it.
+  const [focusOnSwitcher] = useState(() => switcherReturnsFocusTo(selected?.id));
+  const serverName = selected && !officialNetwork ? serverNaming(selected).primary : null;
+  const legal = useLegalViewer();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -58,7 +70,13 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
 
   return (
     <AuthLayout>
-      <AuthCard title="Welcome back, Slayer" subtitle="Sign in to return to the Shattered Isles.">
+      <AuthCard
+        title={serverName ? `Sign in to ${serverName}` : "Welcome back, Slayer"}
+        subtitle={serverName
+          ? "Use your account on this server. It is not your Mystic Paradox account, and Mystic Paradox never sees it."
+          : "Sign in to return to the Shattered Isles."}
+      >
+        <ServerSwitcher />
         <form onSubmit={handleSubmit} className="auth-form" noValidate>
           {displayedError && <Banner>{displayedError}</Banner>}
 
@@ -70,7 +88,7 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             disabled={submitting}
-            autoFocus
+            autoFocus={!focusOnSwitcher}
           />
 
           <TextField
@@ -87,18 +105,25 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
             Sign in
           </Button>
 
-          <div className="divider">or</div>
+          {officialNetwork && (
+            <>
+              <div className="divider">or</div>
 
-          <Button variant="discord" size="lg" block loading={discordSubmitting} loadingLabel="Opening Discord…" onClick={handleDiscord}>
-            <DiscordIcon />Continue with Discord
-          </Button>
+              <Button variant="discord" size="lg" block loading={discordSubmitting} loadingLabel="Opening Discord…" onClick={handleDiscord}>
+                <DiscordIcon />Continue with Discord
+              </Button>
+            </>
+          )}
 
           <p className="auth-foot">
-            New to Mystic Paradox?
+            {serverName ? "New to this server?" : "New to Mystic Paradox?"}
             <button type="button" className="link" onClick={onCreateAccount}>Create an account</button>
           </p>
         </form>
+        {/* [2026-10-14] The documents, one click away on the sign-in screen as well as at registration. */}
+        <LegalLinks onOpen={legal.open} />
       </AuthCard>
+      {legal.dialog}
     </AuthLayout>
   );
 }

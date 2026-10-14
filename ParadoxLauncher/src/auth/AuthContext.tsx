@@ -3,11 +3,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { LauncherApiError } from "../api/client";
 import type { LauncherAccount, LauncherErrorCode } from "../api/types";
+import type { ConsentInput } from "../api/tauri";
+import { useServer } from "../servers/ServerContext";
 
-type AuthStatus = "checking" | "restoreFailed" | "signedOut" | "awaitingDiscord" | "awaitingUsername" | "pendingApproval" | "signedIn";
+// "needsServerConsent": the selected server is a local one whose warning has not been accepted. Nothing is sent to it
+// (no session restore, no sign-in) until the player accepts.
+type AuthStatus = "checking" | "restoreFailed" | "signedOut" | "awaitingDiscord" | "awaitingUsername" | "pendingApproval" | "signedIn" | "needsServerConsent";
 
 interface AuthContextValue {
   status: AuthStatus;
+  /** The server this session (or this sign-in form) belongs to: sign-in follows the selected server. */
+  serverId: string | undefined;
   account: LauncherAccount | null;
   authError: string | null;
   accountCheckedAt: number | null;
@@ -15,7 +21,8 @@ interface AuthContextValue {
   accountRefreshError: string | null;
   refreshAccount: () => Promise<LauncherAccount | null>;
   login: (email: string, password: string) => Promise<void>;
-  register: (displayName: string, email: string, password: string) => Promise<void>;
+  /** `consent` is the Terms of Use and Privacy Policy acceptance; the official server requires it, a local server never gets it. */
+  register: (displayName: string, email: string, password: string, consent?: ConsentInput) => Promise<void>;
   logout: () => Promise<void>;
   startDiscordLogin: () => Promise<void>;
   setUsername: (username: string) => Promise<void>;
@@ -32,6 +39,12 @@ export function useAuth(): AuthContextValue {
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
+  // [2026-10-13 realms S5] Sign-in, the saved session and every account call belong to the SELECTED server. Each call
+  // names the server it is for, and the launcher refuses it if its own selection differs, so a form typed for one
+  // server can never be sent to another.
+  const { ready: serversReady, serverId, needsAck, officialNetwork } = useServer();
+  const officialRef = useRef(officialNetwork);
+  officialRef.current = officialNetwork;
   const [status, setStatus] = useState<AuthStatus>("checking");
   const [account, setAccount] = useState<LauncherAccount | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -40,7 +53,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     refreshing: false,
     error: null,
   });
-  const restoreStartedRef = useRef(false);
+  const restoredForRef = useRef<string | null>(null);
   const operationRef = useRef(0);
   const accountRefreshInFlightRef = useRef(false);
   const accountLastCheckedRef = useRef(0);
@@ -60,9 +73,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const operation = ++operationRef.current;
     setStatus("checking");
     setAuthError(null);
+    // A restore starts from nothing: it may be for another server, whose screens must not show this account.
+    setAccount(null);
+    setAccountSync({ checkedAt: null, refreshing: false, error: null });
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        const restored = await invoke<LauncherAccount | null>("native_restore_session");
+        const restored = await invoke<LauncherAccount | null>("native_restore_session", { serverId });
         if (operation !== operationRef.current) return;
         if (restored) applyAccount(restored);
         else setStatus("signedOut");
@@ -80,7 +96,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return;
       }
     }
-  }, [applyAccount]);
+  }, [applyAccount, serverId]);
 
   const signedInAccountId = status === "signedIn" ? account?.userId ?? null : null;
   const refreshAccount = useCallback(async (): Promise<LauncherAccount | null> => {
@@ -91,7 +107,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       // Reads the account with the cached access token; it no longer rotates the refresh token
       // every two minutes. Rust still refreshes (and signs out) when the token is rejected.
-      const refreshed = await invoke<LauncherAccount>("native_refresh_account");
+      const refreshed = await invoke<LauncherAccount>("native_refresh_account", { serverId });
       if (operation !== operationRef.current) return null;
       applyAccount(refreshed);
       return refreshed;
@@ -114,7 +130,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setAccountSync((current) => current.refreshing ? { ...current, refreshing: false } : current);
       }
     }
-  }, [applyAccount, signedInAccountId]);
+  }, [applyAccount, signedInAccountId, serverId]);
 
   useEffect(() => {
     if (!signedInAccountId) return;
@@ -132,15 +148,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, [signedInAccountId, refreshAccount]);
 
+  // A different server (or a local server whose warning was just accepted) is a different session: whatever this one
+  // was doing is cancelled, and the saved session of the server now in use is looked for. A local server whose
+  // warning is not accepted is not contacted at all.
+  const restoreKey = !serversReady ? null : needsAck ? `${serverId ?? ""}:warning` : `${serverId ?? ""}`;
   useEffect(() => {
-    if (restoreStartedRef.current) return;
-    restoreStartedRef.current = true;
+    if (restoreKey === null || restoredForRef.current === restoreKey) return;
+    restoredForRef.current = restoreKey;
+    if (needsAck) {
+      ++operationRef.current;
+      discordPendingRef.current = false;
+      setAccount(null);
+      setAuthError(null);
+      setAccountSync({ checkedAt: null, refreshing: false, error: null });
+      setStatus("needsServerConsent");
+      return;
+    }
     void restoreSavedSession();
-  }, [restoreSavedSession]);
+  }, [restoreKey, needsAck, restoreSavedSession]);
 
   useEffect(() => {
+    // Discord belongs to the official account system: a return from the browser while a local server is selected is
+    // not applied to it.
     const unlistenPromise = listen<string>("discord-auth-complete", async (event) => {
-      if (!discordPendingRef.current) return;
+      if (!discordPendingRef.current || !officialRef.current) return;
       discordPendingRef.current = false;
       const operation = ++operationRef.current;
       setStatus("checking");
@@ -159,7 +190,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const unlistenPromise = listen<string>("discord-auth-error", (event) => {
-      if (!discordPendingRef.current) return;
+      if (!discordPendingRef.current || !officialRef.current) return;
       discordPendingRef.current = false;
       ++operationRef.current;
       setAuthError(describeAuthError(new LauncherApiError(event.payload as LauncherErrorCode, "Discord sign-in didn't complete.")));
@@ -172,36 +203,40 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     discordPendingRef.current = false;
     const operation = ++operationRef.current;
     setAuthError(null);
-    const next = await invoke<LauncherAccount>("native_login", { email, password });
+    const next = await invoke<LauncherAccount>("native_login", { serverId, email, password });
     if (operation === operationRef.current) applyAccount(next);
-  }, [applyAccount]);
+  }, [applyAccount, serverId]);
 
-  const register = useCallback(async (displayName: string, email: string, password: string) => {
+  const register = useCallback(async (displayName: string, email: string, password: string, consent?: ConsentInput) => {
     discordPendingRef.current = false;
     const operation = ++operationRef.current;
     setAuthError(null);
-    const pending = await invoke<LauncherAccount>("native_register", { displayName, email, password });
+    // The consent key is sent only when the player accepted (official servers); a local server's call is unchanged.
+    const args = consent
+      ? { serverId, displayName, email, password, consent }
+      : { serverId, displayName, email, password };
+    const pending = await invoke<LauncherAccount>("native_register", args);
     if (operation !== operationRef.current) return;
     const checkedAt = Date.now();
     accountLastCheckedRef.current = checkedAt;
     setAccount(pending);
     setAccountSync({ checkedAt, refreshing: false, error: null });
     setStatus("pendingApproval");
-  }, []);
+  }, [serverId]);
 
   const setUsername = useCallback(async (username: string) => {
     const operation = ++operationRef.current;
-    const next = await invoke<LauncherAccount>("native_set_username", { username });
+    const next = await invoke<LauncherAccount>("native_set_username", { serverId, username });
     if (operation === operationRef.current) applyAccount(next);
-  }, [applyAccount]);
+  }, [applyAccount, serverId]);
 
   const logout = useCallback(async () => {
     discordPendingRef.current = false;
     const operation = ++operationRef.current;
     try {
-      await invoke("native_logout");
+      await invoke("native_logout", { serverId });
     } catch {
-      await invoke("native_forget_session").catch(() => {});
+      await invoke("native_forget_session", { serverId }).catch(() => {});
     } finally {
       if (operation === operationRef.current) {
         setAccount(null);
@@ -210,7 +245,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setStatus("signedOut");
       }
     }
-  }, []);
+  }, [serverId]);
 
   const startDiscordLogin = useCallback(async () => {
     discordPendingRef.current = true;
@@ -231,17 +266,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const forgetSavedSession = useCallback(async () => {
     discordPendingRef.current = false;
     const operation = ++operationRef.current;
-    await invoke("native_forget_session").catch(() => {});
+    await invoke("native_forget_session", { serverId }).catch(() => {});
     if (operation !== operationRef.current) return;
     setAccount(null);
     setAuthError(null);
     setAccountSync({ checkedAt: null, refreshing: false, error: null });
     setStatus("signedOut");
-  }, []);
+  }, [serverId]);
 
   const value = useMemo<AuthContextValue>(
     () => ({
       status,
+      serverId,
       account,
       authError,
       accountCheckedAt: accountSync.checkedAt,
@@ -256,7 +292,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       retrySavedSession: restoreSavedSession,
       forgetSavedSession,
     }),
-    [status, account, authError, accountSync, refreshAccount, login, register, logout, startDiscordLogin, setUsername, restoreSavedSession, forgetSavedSession],
+    [status, serverId, account, authError, accountSync, refreshAccount, login, register, logout, startDiscordLogin, setUsername, restoreSavedSession, forgetSavedSession],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

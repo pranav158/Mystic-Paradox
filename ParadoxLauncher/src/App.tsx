@@ -1,9 +1,13 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { AuthProvider, useAuth } from "./auth/AuthContext";
+import { AccountRulesProvider, useAccountRules } from "./auth/AccountRules";
 import { PolicyProvider } from "./policy/PolicyContext";
+import { ServerProvider, useServer } from "./servers/ServerContext";
+import { RealmTrustProvider } from "./servers/RealmTrust";
 import { LoginScreen } from "./screens/LoginScreen";
 import { RegisterScreen } from "./screens/RegisterScreen";
 import { SetUsernameScreen } from "./screens/SetUsernameScreen";
+import { ConsentScreen, ConsentUnavailableScreen } from "./screens/ConsentScreen";
 import { DashboardShell } from "./screens/DashboardShell";
 import { Button } from "./components/Button";
 import { TitleBar } from "./components/TitleBar";
@@ -58,10 +62,40 @@ function StatusScreen({ title, children, busy = false }: { title: string; childr
   );
 }
 
+// [2026-10-13 realms S5] A local server is selected and its warning has not been accepted: nothing is sent to it. The
+// warning popup opens on its own; this screen is what stays behind it after a Cancel.
+function ServerConsentScreen() {
+  const { selected, select, openWarning } = useServer();
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <StatusScreen title="Local server">
+      <p className="auth-sub">
+        {selected?.name ?? "This server"} is a local server. Nothing is sent to it until you have read and accepted its warning.
+      </p>
+      {error && <p className="field-error" role="alert">{error}</p>}
+      <div className="status-actions">
+        <Button onClick={() => selected && openWarning(selected.id)}>Read the warning</Button>
+        <Button
+          variant="secondary"
+          onClick={() => {
+            setError(null);
+            select("official").catch((err) => setError(typeof err === "string" ? err : "Couldn't switch servers."));
+          }}
+        >
+          Use the official server
+        </Button>
+      </div>
+    </StatusScreen>
+  );
+}
+
 function AppShell() {
   const { status, authError, retrySavedSession, forgetSavedSession } = useAuth();
+  // [2026-10-14] Terms of Use and Privacy Policy: a Mystic Paradox account must accept the current ones before the dashboard.
+  const rules = useAccountRules();
   const [showRegister, setShowRegister] = useState(false);
   const [launcherUpdate, setLauncherUpdate] = useState<LauncherUpdate | null>(null);
+  const { selected, officialNetwork } = useServer();
 
   useEffect(() => {
     // Check for a launcher self-update on app start, whatever the auth state, then every 30 minutes.
@@ -88,10 +122,12 @@ function AppShell() {
   const toast = launcherUpdate ? <UpdateToast update={launcherUpdate} /> : null;
 
   let screen;
-  if (status === "checking") {
+  if (status === "needsServerConsent") {
+    screen = <ServerConsentScreen />;
+  } else if (status === "checking") {
     screen = (
       <StatusScreen title="Restoring your session" busy>
-        <p className="auth-sub">Contacting the Mystic Paradox account server…</p>
+        <p className="auth-sub">{officialNetwork ? "Contacting the Mystic Paradox account server…" : `Contacting ${selected?.name ?? "the server"}…`}</p>
       </StatusScreen>
     );
   } else if (status === "awaitingDiscord") {
@@ -103,7 +139,7 @@ function AppShell() {
   } else if (status === "restoreFailed") {
     screen = (
       <StatusScreen title="Your session is still saved">
-        <p className="auth-sub">{authError ?? "The launcher couldn't contact the account server yet."}</p>
+        <p className="auth-sub">{authError ?? (officialNetwork ? "The launcher couldn't contact the account server yet." : `The launcher couldn't contact ${selected?.name ?? "the server"} yet.`)}</p>
         <div className="status-actions">
           <Button onClick={() => void retrySavedSession()}>Retry</Button>
           <Button variant="secondary" onClick={() => void forgetSavedSession()}>Sign in again</Button>
@@ -116,13 +152,25 @@ function AppShell() {
     screen = (
       <StatusScreen title="Request received">
         <p className="auth-sub">
-          Your username is reserved. An administrator approves closed-test accounts; once yours is approved, sign in to play.
+          {officialNetwork
+            ? "Your username is reserved. An administrator approves closed-test accounts; once yours is approved, sign in to play."
+            : `Your username is reserved. The host of ${selected?.name ?? "this server"} may need to approve new accounts; once yours is approved, sign in to play.`}
         </p>
         <div className="status-actions single">
           <Button block variant="secondary" onClick={() => void forgetSavedSession()}>Back to sign in</Button>
         </div>
       </StatusScreen>
     );
+  } else if (status === "signedIn" && rules.gate === "checking") {
+    screen = (
+      <StatusScreen title="Checking your account" busy>
+        <p className="auth-sub">Reading the Terms of Use status of your account…</p>
+      </StatusScreen>
+    );
+  } else if (status === "signedIn" && rules.gate === "failed") {
+    screen = <ConsentUnavailableScreen />;
+  } else if (status === "signedIn" && rules.gate === "accept") {
+    screen = <ConsentScreen />;
   } else if (status === "signedIn") {
     screen = <DashboardShell />;
   } else {
@@ -141,11 +189,18 @@ function AppShell() {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <PolicyProvider>
-        <AppShell />
-        <TitleBar />
-      </PolicyProvider>
-    </AuthProvider>
+    <ServerProvider>
+      {/* [2026-10-14 realms] The realm host confirmation, its ownership warning and the realm notices (under ServerProvider). */}
+      <RealmTrustProvider>
+        <AuthProvider>
+          <AccountRulesProvider>
+            <PolicyProvider>
+              <AppShell />
+              <TitleBar />
+            </PolicyProvider>
+          </AccountRulesProvider>
+        </AuthProvider>
+      </RealmTrustProvider>
+    </ServerProvider>
   );
 }

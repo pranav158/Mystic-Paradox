@@ -17,10 +17,13 @@ export function usePolicy(): PolicyContextValue {
 }
 
 export function PolicyProvider({ children }: { children: ReactNode }) {
-  const { status, account } = useAuth();
+  const { status, account, serverId } = useAuth();
   const [policy, setPolicy] = useState<LauncherPolicy | null>(null);
   const mountedRef = useRef(true);
-  const accountKey = status === "signedIn" ? account?.userId ?? null : null;
+  // The policy belongs to one account on one server: another server's account never sees it.
+  const accountKey = status === "signedIn" && account?.userId ? `${serverId ?? ""}:${account.userId}` : null;
+  const serverIdRef = useRef(serverId);
+  serverIdRef.current = serverId;
   const identityRef = useRef({ key: accountKey, generation: 0 });
   if (identityRef.current.key !== accountKey) {
     identityRef.current = { key: accountKey, generation: identityRef.current.generation + 1 };
@@ -37,7 +40,7 @@ export function PolicyProvider({ children }: { children: ReactNode }) {
     const identity = identityRef.current;
     if (!identity.key) return Promise.resolve(null);
     if (pendingRef.current?.generation === identity.generation) return pendingRef.current.promise;
-    const promise = getPolicy().then((next) => {
+    const promise = getPolicy(serverIdRef.current).then((next) => {
       if (!mountedRef.current || identityRef.current !== identity) return null;
       setPolicy(next);
       setPolicyGeneration(identity.generation);

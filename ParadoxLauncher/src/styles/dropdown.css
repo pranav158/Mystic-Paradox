@@ -1,0 +1,210 @@
+/*
+ * Copyright (C) 2026 MysticFox / Pranav Karande (pranav158/Mystic-Paradox)
+ * Licensed under the GNU Affero General Public License v3.0.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
+ */
+
+/* [2026-10-14] The launcher's dropdown (src/components/Dropdown.tsx), in place of native selects. The closed control looks like
+   .input; the list is a fixed-position portal on the body, in the glass style. */
+
+.dropdown {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 10px 0 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: rgba(4, 9, 16, 0.55);
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color var(--t-med), box-shadow var(--t-med), background-color var(--t-med);
+}
+
+.dropdown:hover:not(.is-disabled) {
+  border-color: var(--line-3);
+}
+
+.dropdown.is-open {
+  border-color: var(--aether);
+  background: rgba(4, 9, 16, 0.78);
+  box-shadow: 0 0 0 4px rgba(91, 163, 255, 0.16);
+}
+
+.dropdown.is-disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.dropdown-value {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.dropdown-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.dropdown-main {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dropdown-detail {
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dropdown-placeholder {
+  color: var(--ink-4);
+}
+
+.dropdown-chevron {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--ink-3);
+  transition: transform var(--t-med) var(--ease-out), color var(--t-med);
+}
+
+.dropdown.is-open .dropdown-chevron {
+  color: var(--aether-hi);
+  transform: rotate(180deg);
+}
+
+/* Tags: the same colour recipe as the .chip tones; "local" is the local-server red. */
+.dropdown-tag {
+  --tone: var(--aether);
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--tone) 32%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--tone) 13%, transparent);
+  color: color-mix(in srgb, var(--tone) 55%, white);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.dropdown-tag.tone-official { --tone: var(--ok); }
+.dropdown-tag.tone-realm { --tone: var(--aether); }
+.dropdown-tag.tone-local { --tone: var(--bad); }
+
+.dropdown-menu {
+  position: fixed;
+  z-index: 200;
+  box-sizing: border-box;
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line-3);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(18, 29, 47, 0.97), rgba(8, 14, 25, 0.98));
+  box-shadow: inset 0 1px 0 var(--sheen), var(--shadow-pop);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  transform-origin: top left;
+  animation: dropdown-in var(--t-med) var(--ease-out) both;
+  --dropdown-from: -4px;
+}
+
+.dropdown-menu[data-placement="up"] {
+  transform-origin: bottom left;
+  --dropdown-from: 4px;
+}
+
+@keyframes dropdown-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--dropdown-from)) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.dropdown-option {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  border-radius: 10px;
+  color: var(--ink-2);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.dropdown-option[data-active="true"] {
+  background: var(--aether-a10);
+  color: var(--ink);
+}
+
+.dropdown-option.is-selected {
+  color: var(--ink);
+}
+
+.dropdown-option.is-action {
+  margin-top: 6px;
+  color: var(--aether-hi);
+  font-weight: 600;
+}
+
+/* The action row sits under a hairline, in the gap above it. */
+.dropdown-option.is-action::before {
+  content: "";
+  position: absolute;
+  top: -4px;
+  right: 8px;
+  left: 8px;
+  height: 1px;
+  background: var(--line-2);
+}
+
+.dropdown-check {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin-left: auto;
+  color: var(--aether-hi);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dropdown-menu {
+    animation: none;
+  }
+}
+
+[data-motion="reduced"] .dropdown-menu {
+  animation: none;
+}

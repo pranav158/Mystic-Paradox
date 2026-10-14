@@ -5,6 +5,8 @@ import { sanitizeError } from "../../lib/sanitize";
 import { buildName, shortHash } from "../../lib/sessions";
 import { AlertIcon, FolderIcon, LibraryIcon, RuntimeIcon, ShieldIcon } from "../../components/icons";
 import { ArtBackdrop, heroArt } from "../../components/ArtBackdrop";
+import { useServer } from "../../servers/ServerContext";
+import { statusNaming } from "../../servers/serverNames";
 
 type Feedback = { kind: "ok" | "bad"; message: string } | null;
 
@@ -14,6 +16,8 @@ function at(index: number, extra?: Record<string, string>): CSSProperties {
 
 export function LibraryTab() {
   const { refreshPolicy } = usePolicy();
+  // [2026-10-14] A realm is named by its realm name here too (servers/serverNames.ts).
+  const { selected } = useServer();
   const [install, setInstall] = useState<InstallStatus | null>(null);
   const [runtime, setRuntime] = useState<RuntimeUpdateStatus | null>(null);
   const [runtimeChannel, setRuntimeChannel] = useState<string | null>(null);
@@ -59,9 +63,12 @@ export function LibraryTab() {
   }, [refresh]);
 
   const located = install?.located === true;
+  // [2026-10-13 realms S1] A local server's runtime files are the realm's own: no signed manifest, nothing to repair.
+  const runtimeManaged = install?.runtimeManaged !== false;
+  const otherServer = install?.serverKind && install.serverKind !== "official" ? statusNaming(install, selected)?.primary ?? null : null;
   useEffect(() => {
-    if (located) void refreshRuntime();
-  }, [located, refreshRuntime]);
+    if (located && runtimeManaged) void refreshRuntime();
+  }, [located, runtimeManaged, refreshRuntime]);
 
   const handleRepair = useCallback(async () => {
     setBusy("repair");
@@ -108,14 +115,16 @@ export function LibraryTab() {
   const target = install?.targetChangelist ?? null;
   const targetName = buildName(target);
   const targetLabel = target ? `${targetName ? `Dauntless ${targetName} · ` : ""}CL ${target}` : "—";
-  const runtimeLabel = runtimeError
+  const runtimeLabel = !runtimeManaged
+    ? "This server uses its own runtime files. The launcher does not check or update them."
+    : runtimeError
     ? "Couldn't reach the update server. Play verifies the runtime anyway."
     : !runtime
       ? "Checking the signed manifest…"
       : runtime.version
         ? `Version ${runtime.version}${runtimeChannel ? ` on the ${runtimeChannel} channel` : ""}`
         : `No release is published on the ${runtimeChannel ?? "current"} channel.`;
-  const runtimeChip = runtimeError || !runtime
+  const runtimeChip = !runtimeManaged || runtimeError || !runtime
     ? null
     : !runtime.version
       ? { tone: "warn", label: "Not published" }
@@ -138,7 +147,7 @@ export function LibraryTab() {
             <section className="glass glow game-tile reveal" style={at(1, { "--art": `url("${heroArt}")` })}>
               <div className="game-tile-art" aria-hidden="true" />
               <div>
-                <p className="eyebrow">Installed</p>
+                <p className="eyebrow">{otherServer ? `Installed · ${otherServer}` : "Installed"}</p>
                 <h2 className="game-tile-title">Dauntless</h2>
                 <div className="game-tile-meta">
                   {target && <span className="chip">{targetLabel}</span>}
@@ -189,11 +198,13 @@ export function LibraryTab() {
                       <p className="section-desc">{runtimeLabel}</p>
                     </div>
                   </div>
-                  <div className="section-actions">
-                    <button type="button" onClick={handleRepair} disabled={busy != null} className={`btn ${hasError ? "btn-primary" : "btn-secondary"}`}>
-                      {busy === "repair" ? <><span className="spinner" aria-hidden="true" />Verifying…</> : hasError ? "Repair runtime" : "Verify runtime"}
-                    </button>
-                  </div>
+                  {runtimeManaged && (
+                    <div className="section-actions">
+                      <button type="button" onClick={handleRepair} disabled={busy != null} className={`btn ${hasError ? "btn-primary" : "btn-secondary"}`}>
+                        {busy === "repair" ? <><span className="spinner" aria-hidden="true" />Verifying…</> : hasError ? "Repair runtime" : "Verify runtime"}
+                      </button>
+                    </div>
+                  )}
                 </div>
                 {runtime?.currentSha256 && (
                   <dl className="kv">
@@ -208,7 +219,7 @@ export function LibraryTab() {
                   </dl>
                 )}
                 {feedback && <p className={`feedback ${feedback.kind}`} role={feedback.kind === "bad" ? "alert" : "status"}>{feedback.message}</p>}
-                <p className="note with-icon"><ShieldIcon />Every runtime file is signed. Play re-checks the game and runtime hashes with the server before it starts.</p>
+                {runtimeManaged && <p className="note with-icon"><ShieldIcon />Every runtime file is signed. Play re-checks the game and runtime hashes with the server before it starts.</p>}
               </div>
             </section>
           </>

@@ -5,4 +5,8 @@
 @import "./styles/shell.css";
 @import "./styles/home.css";
 @import "./styles/pages.css";
+@import "./styles/servers.css";
+@import "./styles/dropdown.css";
+@import "./styles/modal.css";
 @import "./styles/auth.css";
+@import "./styles/legal.css";

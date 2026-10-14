@@ -54,12 +54,39 @@ export function SettingsIcon(props: IconProps) {
   );
 }
 
+/** Servers: two stacked machines. */
+export function ServersIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <rect x="3.5" y="4" width="17" height="6.5" rx="1.6" />
+      <rect x="3.5" y="13.5" width="17" height="6.5" rx="1.6" />
+      <path d="M7 7.25h.01" strokeWidth="2.4" />
+      <path d="M7 16.75h.01" strokeWidth="2.4" />
+      <path d="M11 7.25h6" />
+      <path d="M11 16.75h6" />
+    </Icon>
+  );
+}
+
 export function AboutIcon(props: IconProps) {
   return (
     <Icon {...props}>
       <circle cx="12" cy="12" r="9" />
       <path d="M12 11v5.5" />
       <path d="M12 7.6h.01" strokeWidth="2.4" />
+    </Icon>
+  );
+}
+
+/** [2026-10-14] Host realm: a keep with a flag, for hosting a realm on this PC. */
+export function HostRealmIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M5 20.5V10h3V7.5h8V10h3v10.5" />
+      <path d="M3.5 20.5h17" />
+      <path d="M9.5 20.5v-4a2.5 2.5 0 0 1 5 0v4" />
+      <path d="M12 7.5V3.5" />
+      <path d="M12 3.5h3.2l-.9 1.2.9 1.2H12" />
     </Icon>
   );
 }
@@ -110,6 +137,15 @@ export function ChevronLeftIcon(props: IconProps) {
   return (
     <Icon {...props}>
       <path d="m15 18-6-6 6-6" />
+    </Icon>
+  );
+}
+
+// [2026-10-14] The dropdown's chevron (components/Dropdown.tsx).
+export function ChevronDownIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="m6 9 6 6 6-6" />
     </Icon>
   );
 }

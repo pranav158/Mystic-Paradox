@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { launcherApi } from "../api/client";
+import { checkUsername } from "../api/tauri";
+import { useServer } from "../servers/ServerContext";
 import { TextField } from "./TextField";
 
 const USERNAME_PATTERN = /^[A-Za-z0-9]+$/;
@@ -18,6 +19,8 @@ export function usernameFormatError(username: string): string | null {
 
 /** Username input with the shared format rules and a best-effort availability probe on blur. */
 export function useUsernameField() {
+  // The availability check is answered by the selected server's own backend (a local server's names are its own).
+  const { serverId } = useServer();
   const [value, setValue] = useState("");
   const [check, setCheck] = useState<UsernameCheck>({ state: "idle" });
 
@@ -29,7 +32,7 @@ export function useUsernameField() {
     }
     setCheck({ state: "checking" });
     try {
-      const result = await launcherApi.checkUsername(username);
+      const result = await checkUsername(username, serverId);
       setCheck(result.available ? { state: "available" } : { state: "unavailable", reason: result.reason ?? "That username is taken." });
     } catch {
       setCheck({ state: "idle" });

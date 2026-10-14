@@ -116,6 +116,9 @@ pub struct SessionMetadata {
     pub display_name: String,
     pub game_exe_path: String,
     pub channel: String,
+    /// [2026-10-13 realms S5] The auth scope the game was launched under (`AuthScope::key`): `official`, or a local
+    /// server's id. Session history is per scope, and a local server's logs are never uploaded to our backend.
+    pub auth_scope: String,
     pub exit_code: Option<u32>,
     pub exited_at: Option<String>,
 }

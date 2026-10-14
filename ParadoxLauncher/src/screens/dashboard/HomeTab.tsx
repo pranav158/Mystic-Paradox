@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { useAuth } from "../../auth/AuthContext";
+import { useAccountRules } from "../../auth/AccountRules";
 import { usePolicy } from "../../policy/PolicyContext";
 import { useServices } from "../../services/ServicesContext";
 import {
@@ -10,15 +11,24 @@ import {
   isGameRunning,
   onGameExited,
   pickInstallPath,
+  REALM_HOST_KEY_REQUIRED,
+  REALM_OWNER_CHANGED,
   secureLaunch,
   type InstallStatus,
   type RuntimeUpdateStatus,
 } from "../../api/tauri";
 import { sanitizeError } from "../../lib/sanitize";
+import { deactivationMessage, isDeactivationRefusal } from "../../lib/accountDeletion";
 import { buildName, describeExit, formatClock, formatDuration, formatWhen, type SessionSummary } from "../../lib/sessions";
 import { AccountIcon, AlertIcon, BuildIcon, CheckIcon, HistoryIcon, PlayIcon, RuntimeIcon } from "../../components/icons";
 import { AetherMark } from "../../components/AetherMark";
 import { ArtBackdrop } from "../../components/ArtBackdrop";
+import { Banner } from "../../components/Banner";
+import { DeactivationBanner } from "../../components/DeactivationBanner";
+import { LocalServerBadge } from "../../components/LocalServerWarning";
+import { useServer } from "../../servers/ServerContext";
+import { statusNaming } from "../../servers/serverNames";
+import { useRealmTrust } from "../../servers/RealmTrust";
 
 function gameRootPath(exePath: string): string {
   return exePath
@@ -62,7 +72,7 @@ type RuntimeView =
   | { state: "unavailable" };
 
 // The manifest check is a network call; reuse a recent answer when Home remounts on tab switches.
-let runtimeCache: { channel: string; at: number; status: RuntimeUpdateStatus } | null = null;
+let runtimeCache: { channel: string; serverId: string; at: number; status: RuntimeUpdateStatus } | null = null;
 const RUNTIME_CACHE_MS = 120_000;
 
 interface HomeTabProps {
@@ -74,6 +84,11 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   const { account, accountCheckedAt, accountRefreshing, accountRefreshError } = useAuth();
   const { policy, refreshPolicy } = usePolicy();
   const services = useServices();
+  const { openWarning, selected } = useServer();
+  const realmTrust = useRealmTrust();
+  // [2026-10-14] A deactivated account (a deletion was requested) cannot start the game: Play says why instead.
+  const rules = useAccountRules();
+  const [restoreError, setRestoreError] = useState<string | null>(null);
   const [install, setInstall] = useState<InstallStatus | null>(null);
   const [phase, setPhase] = useState<PlayPhase>({ status: "idle" });
   const [runtime, setRuntime] = useState<RuntimeView>({ state: "idle" });
@@ -127,12 +142,17 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   // Real runtime state from the signed manifest for this account's channel.
   const channel = policy?.channel;
   const located = install?.located === true;
+  // [2026-10-13 realms S1] The status describes the selected server. A local server's runtime files are the realm's
+  // own, so there is no signed manifest to check for them; the cached answer belongs to one server.
+  const serverId = install?.serverId ?? "official";
+  const serverKind = install?.serverKind ?? "official";
+  const runtimeManaged = install?.runtimeManaged !== false;
   useEffect(() => {
-    if (!channel || !located) {
+    if (!channel || !located || !runtimeManaged) {
       setRuntime({ state: "idle" });
       return;
     }
-    if (runtimeCache && runtimeCache.channel === channel && Date.now() - runtimeCache.at < RUNTIME_CACHE_MS) {
+    if (runtimeCache && runtimeCache.channel === channel && runtimeCache.serverId === serverId && Date.now() - runtimeCache.at < RUNTIME_CACHE_MS) {
       setRuntime({ state: "known", status: runtimeCache.status });
       return;
     }
@@ -140,12 +160,12 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     setRuntime({ state: "checking" });
     checkRuntimeUpdate(channel)
       .then((status) => {
-        runtimeCache = { channel, at: Date.now(), status };
+        runtimeCache = { channel, serverId, at: Date.now(), status };
         if (!cancelled) setRuntime({ state: "known", status });
       })
       .catch(() => { if (!cancelled) setRuntime({ state: "unavailable" }); });
     return () => { cancelled = true; };
-  }, [channel, located, runtimeNonce]);
+  }, [channel, located, runtimeManaged, serverId, runtimeNonce]);
 
   const invalidateRuntime = useCallback(() => {
     runtimeCache = null;
@@ -220,6 +240,7 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
 
   const handlePlay = useCallback(async () => {
     if (!install || !account || playLockRef.current || (phase.status !== "idle" && phase.status !== "error")) return;
+    if (rules.deactivatedUntil !== null || rules.deletionChecking) return;
     playLockRef.current = true;
     setPhase({ status: "requestingSession" });
 
@@ -228,22 +249,52 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
       const freshPolicy = await refreshPolicy();
       if (!freshPolicy) throw new Error("Couldn't verify your account access. Check your connection and try again.");
       if (!mountedRef.current) return;
+      // [2026-10-14 realms] A realm is entered only with the host the player agreed to: they are asked first when there is none.
+      if (selected && !(await realmTrust.ensureHost(selected))) {
+        if (mountedRef.current) setPhase({ status: "idle" });
+        return;
+      }
       // Rust repairs/verifies signed runtime, validates the executable and entitlement, then requests the ticket.
       setPhase({ status: "launching" });
-      await secureLaunch(freshPolicy.channel);
+      try {
+        await secureLaunch(freshPolicy.channel);
+      } catch (err) {
+        // [2026-10-14 realms] The realm's name now belongs to another host: the player decides before anything starts. Trusting
+        // the new host carries on with this Play; cancelling keeps the old host and starts nothing.
+        if (err !== REALM_OWNER_CHANGED || !selected) throw err;
+        if (!(await realmTrust.trustNewHost(selected))) {
+          if (mountedRef.current) setPhase({ status: "idle" });
+          return;
+        }
+        await secureLaunch(freshPolicy.channel);
+      }
       if (mountedRef.current) {
         setPhase({ status: "running" });
         setSessionsNonce((value) => value + 1);
         invalidateRuntime();
       }
     } catch (err) {
+      // [2026-10-14] A refusal for a deactivated account: the sentence names the day, and the banner is read again.
+      const deactivated = isDeactivationRefusal(err);
+      if (deactivated) void rules.reloadDeletion().catch(() => {});
       if (mountedRef.current) {
-        setPhase({ status: "error", message: sanitizeError(typeof err === "string" ? err : err instanceof Error ? err.message : undefined) || "Couldn't launch Dauntless." });
+        // [2026-10-14 realms] The host check's token reads as a sentence (the host is confirmed before the next Play).
+        const text = err === REALM_HOST_KEY_REQUIRED ? "Confirm this realm's host before you play." : typeof err === "string" ? err : err instanceof Error ? err.message : undefined;
+        setPhase({ status: "error", message: sanitizeError(text) || "Couldn't launch Dauntless." });
       }
     } finally {
       playLockRef.current = false;
     }
-  }, [install, account, phase.status, refreshPolicy, invalidateRuntime]);
+  }, [install, account, phase.status, refreshPolicy, invalidateRuntime, selected, realmTrust, rules]);
+
+  const restoreFromHome = useCallback(async () => {
+    setRestoreError(null);
+    try {
+      await rules.restoreAccount();
+    } catch (err) {
+      setRestoreError(typeof err === "string" ? err : err instanceof Error ? err.message : "Couldn't restore the account.");
+    }
+  }, [rules]);
 
   const handleCheckStatus = useCallback(async () => {
     if (playLockRef.current) return;
@@ -273,7 +324,13 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   const fatalInstallError = hasError && !runtimeRepairRequired;
   const gameRunning = phase.status === "running";
   const ready = located && !fatalInstallError;
-  const canPlay = ready && (install?.exeSha256 != null || runtimeRepairRequired) && (phase.status === "idle" || phase.status === "error");
+  // Play can be off for a whole server (a local server whose warning has not been accepted).
+  // [2026-10-14] While the account is deactivated Play says the deletion day; while its state is being read, Play waits.
+  const accountBlock = rules.deactivatedUntil !== null
+    ? deactivationMessage(rules.deactivatedUntil)
+    : rules.deletionChecking ? "Checking your account…" : null;
+  const playBlocked = ready ? install?.playBlockedReason ?? accountBlock : null;
+  const canPlay = ready && !playBlocked && (install?.exeSha256 != null || runtimeRepairRequired) && (phase.status === "idle" || phase.status === "error");
   const canRepair = located && runtimeRepairRequired && !gameRunning && (phase.status === "idle" || phase.status === "error");
   const busy = phase.status !== "idle" && phase.status !== "error" && phase.status !== "running";
   const liveSession = gameRunning && sessions?.[0] && !sessions[0].exitedAt ? sessions[0] : null;
@@ -281,7 +338,7 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   const statusTitle = gameRunning
     ? "Dauntless is running"
     : ready
-      ? runtimeRepairRequired ? "Runtime will be repaired" : "Ready to launch"
+      ? playBlocked ? "Play isn't available yet" : runtimeRepairRequired ? "Runtime will be repaired" : "Ready to launch"
       : located
         ? "Installation needs attention"
         : "Select your game folder";
@@ -289,10 +346,14 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     ? liveSession
       ? `Started at ${formatClock(Date.parse(liveSession.startedAt))}. Play returns when the game closes.`
       : "Play returns when the game closes."
+    : ready && playBlocked
+      ? playBlocked
     : ready && runtimeRepairRequired
       ? "The signed runtime is downloaded and verified when you press Play."
       : ready
-        ? "Game folder found. Files and the signed runtime are verified with the server on Play."
+        ? runtimeManaged
+          ? "Game folder found. Files and the signed runtime are verified with the server on Play."
+          : "Game folder found. This server's own backend checks your files when you press Play."
         : located && hasError
           ? sanitizeError(install?.error)
           : "Point the launcher at your Dauntless folder to get started.";
@@ -303,9 +364,11 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
       ? progressLabel ?? "Please wait…"
       : canPlay
         ? "Play"
-        : canRepair
-          ? "Repair"
-          : "Locate game";
+        : playBlocked
+          ? "Unavailable"
+          : canRepair
+            ? "Repair"
+            : "Locate game";
   const buttonAction = gameRunning ? handleCheckStatus : canPlay ? handlePlay : canRepair ? handleRepair : handleLocate;
   const playVariant = busy ? " is-busy" : gameRunning ? " is-running" : canPlay ? "" : " is-secondary";
 
@@ -346,7 +409,10 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   let runtimeValue = "Needs setup";
   let runtimeNote = "Select your game folder";
   let runtimeTone: "" | " good" | " warn" | " busy" = "";
-  if (located && runtimeRepairRequired) {
+  if (located && !runtimeManaged) {
+    runtimeValue = "Realm's own files";
+    runtimeNote = "Not updated by the launcher";
+  } else if (located && runtimeRepairRequired) {
     runtimeValue = "Repair needed";
     runtimeNote = "Fixed automatically on Play";
     runtimeTone = " warn";
@@ -374,6 +440,12 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     ? "Your Slayer is out in the Shattered Isles. The launcher keeps watch until the game closes."
     : "Ramsgate is waiting. Prepare your Slayer and return to the Shattered Isles.";
   const nonStableChannel = channel && channel !== "stable" ? channel : null;
+  // [2026-10-14] Which server Play uses: the kind in words, then its name (the official server is "Mystic Paradox"). A
+  // realm is named by its realm name; the player's own name for it is a smaller line under that, only when it differs.
+  const serverKindLabel = serverKind === "paradox_realm" ? "Paradox realm" : serverKind === "local" ? "Local server" : "Official server";
+  const playNaming = statusNaming(install, selected);
+  const playServerName = serverKind === "official" ? "Mystic Paradox" : playNaming?.primary || null;
+  const playServerDetail = serverKind === "official" ? null : playNaming?.secondary ?? null;
 
   return (
     <div className="home">
@@ -393,6 +465,32 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
         )}
       </header>
 
+      {/* [2026-10-14] The account is deactivated and waits for its deletion: restore it, or the deletion day stands. */}
+      {rules.deactivatedUntil !== null && (
+        <div className="home-notice">
+          <DeactivationBanner
+            scheduledFor={rules.deactivatedUntil}
+            restoring={rules.deletionBusy}
+            error={restoreError}
+            onRestore={() => void restoreFromHome()}
+          />
+        </div>
+      )}
+
+      {/* [2026-10-14 realms] A realm this player is in ended for them (the host went offline, or they were removed or banned). */}
+      {realmTrust.notice && (
+        <div className="home-notice">
+          <Banner
+            tone={realmTrust.notice.reason === "HOST_OFFLINE" ? "muted" : "danger"}
+            onDismiss={realmTrust.dismissNotice}
+          >
+            {/* [2026-10-14] A realm is named by its realm name, first, so the player knows which realm it was. */}
+            {realmTrust.notice.realm && <strong>{realmTrust.notice.realm}: </strong>}
+            {realmTrust.notice.message}
+          </Banner>
+        </div>
+      )}
+
       <div className="home-body">
         <div className="home-primary">
           <section className="glass glow launch reveal" style={at(3)} aria-label="Installation and launch status">
@@ -400,7 +498,7 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
             <div className="launch-copy">
               <h2 className="launch-title" aria-live="polite">
                 <span key={busy ? progressLabel : statusTitle} className="swap">{busy ? progressLabel : statusTitle}</span>
-                {ready && !busy && !gameRunning && !runtimeRepairRequired && (
+                {ready && !busy && !gameRunning && !runtimeRepairRequired && !playBlocked && (
                   <span className="badge-ok" aria-label="Verified"><CheckIcon /></span>
                 )}
               </h2>
@@ -412,8 +510,19 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
               {phase.status === "error" && <p className="launch-error" role="alert">{phase.message}</p>}
             </div>
             <div className="launch-actions">
+              {/* [2026-10-14] The server Play will use, named in words (kind and name), so it is never a surprise. */}
+              <div className="play-server" data-kind={serverKind}>
+                <div className="play-server-head">
+                  <span className="play-server-kind">{serverKindLabel}</span>
+                  {serverKind === "local" && (
+                    <LocalServerBadge onOpen={() => openWarning(serverId)}>LOCAL SERVER WARNING</LocalServerBadge>
+                  )}
+                </div>
+                {playServerName && <p className="play-server-name" title={playServerName}>{playServerName}</p>}
+                {playServerDetail && <p className="play-server-detail" title={playServerDetail}>{playServerDetail}</p>}
+              </div>
               <div className={`play-wrap${canPlay && !gameRunning && !busy ? " is-ready" : ""}`}>
-                <button type="button" onClick={buttonAction} disabled={busy} className={`play${playVariant}`}>
+                <button type="button" onClick={buttonAction} disabled={busy || (playBlocked != null && !gameRunning)} className={`play${playVariant}`}>
                   {busy ? <span className="spinner" aria-hidden="true" /> : gameRunning ? <span className="dot pulse" aria-hidden="true" /> : canPlay ? <PlayIcon /> : null}
                   <span key={buttonText} className="swap">{buttonText}</span>
                 </button>

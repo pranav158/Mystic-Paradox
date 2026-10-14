@@ -1,22 +1,34 @@
 import { useCallback, useEffect, useRef, useState, type ComponentType, type CSSProperties, type SVGProps } from "react";
-import { AboutIcon, ChevronLeftIcon, ChevronRightIcon, HomeIcon, LibraryIcon, RefreshIcon, SettingsIcon } from "../components/icons";
+import { AboutIcon, ChevronLeftIcon, ChevronRightIcon, HomeIcon, HostRealmIcon, LibraryIcon, RefreshIcon, ServersIcon, SettingsIcon } from "../components/icons";
 import { AetherMark } from "../components/AetherMark";
 import { useAuth } from "../auth/AuthContext";
+import { useServer } from "../servers/ServerContext";
+import { serverNaming } from "../servers/serverNames";
 import { ServicesProvider, useServices, type ServiceHealth } from "../services/ServicesContext";
 import { setUiPrefs, useMediaQuery, useUiPrefs } from "../lib/prefs";
 import { prefersReducedMotion, withViewTransition } from "../lib/platform";
 import { buildName, formatClock } from "../lib/sessions";
+import { OPTIONAL_PANELS } from "../lib/optionalPanels";
 import { HomeTab } from "./dashboard/HomeTab";
 import { LibraryTab } from "./dashboard/LibraryTab";
+import { ServersTab } from "./dashboard/ServersTab";
+import { HostRealmTab } from "./dashboard/HostRealmTab";
 import { AccountTab } from "./dashboard/AccountTab";
 import { SettingsTab } from "./dashboard/SettingsTab";
 import { AboutTab } from "./dashboard/AboutTab";
 
-export type Tab = "home" | "library" | "account" | "settings" | "about";
+export type Tab = "home" | "library" | "servers" | "host" | "account" | "settings" | "about";
 
-const NAV_ITEMS: { id: Tab; label: string; icon: ComponentType<SVGProps<SVGSVGElement>> }[] = [
+type NavItem = { id: Tab; label: string; icon: ComponentType<SVGProps<SVGSVGElement>> };
+
+// [2026-10-14] "Host realm" exists only when a build ships an optional module's panel (src/p2p/*Panel.tsx). A public build
+// has no such tab, so no nav item and no route to it.
+const HOST_NAV_ITEM: NavItem = { id: "host", label: "Host realm", icon: HostRealmIcon };
+const NAV_ITEMS: NavItem[] = [
   { id: "home", label: "Home", icon: HomeIcon },
   { id: "library", label: "Library", icon: LibraryIcon },
+  { id: "servers", label: "Servers & realms", icon: ServersIcon },
+  ...(OPTIONAL_PANELS.length > 0 ? [HOST_NAV_ITEM] : []),
   { id: "settings", label: "Settings", icon: SettingsIcon },
   { id: "about", label: "About", icon: AboutIcon },
 ];
@@ -28,22 +40,37 @@ const SERVICE_TITLE: Record<ServiceHealth, string> = {
   unreachable: "Connection lost",
 };
 
-const SERVICE_DETAIL: Record<ServiceHealth, string> = {
-  checking: "Contacting Mystic Paradox…",
-  online: "Backend healthy",
-  degraded: "Backend reports an issue",
-  unreachable: "Can't reach the service",
-};
+// [2026-10-13 realms S5] The card shows the SELECTED server's backend, so a local server is named instead of "Mystic Paradox".
+function serviceDetail(health: ServiceHealth, serverName: string | null): string {
+  const name = serverName ?? "Mystic Paradox";
+  switch (health) {
+    case "checking": return `Contacting ${name}…`;
+    case "online": return serverName ? `${serverName} backend healthy` : "Backend healthy";
+    case "degraded": return serverName ? `${serverName} reports an issue` : "Backend reports an issue";
+    default: return serverName ? `Can't reach ${serverName}` : "Can't reach the service";
+  }
+}
 
 function ServicesCard() {
   const { health, checkedAt, refreshing, supportedChangelist, refresh } = useServices();
+  const { selected } = useServer();
+  // Only a server other than the built-in official one is named (a realm by its realm name, servers/serverNames.ts).
+  const serverName = selected && selected.kind !== "official" ? serverNaming(selected).primary : null;
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!open) return;
+    // [2026-10-14] Escape closes the panel and returns focus to its trigger, so keyboard focus is not left in the hidden panel.
     const close = (event: PointerEvent | KeyboardEvent) => {
-      if (event instanceof KeyboardEvent ? event.key === "Escape" : !wrapRef.current?.contains(event.target as Node)) setOpen(false);
+      if (event instanceof KeyboardEvent) {
+        if (event.key !== "Escape") return;
+        setOpen(false);
+        triggerRef.current?.focus();
+        return;
+      }
+      if (!wrapRef.current?.contains(event.target as Node)) setOpen(false);
     };
     window.addEventListener("pointerdown", close);
     window.addEventListener("keydown", close);
@@ -53,7 +80,8 @@ function ServicesCard() {
     };
   }, [open]);
 
-  const detail = refreshing ? "Refreshing…" : checkedAt ? `${SERVICE_DETAIL[health]} · ${formatClock(checkedAt)}` : SERVICE_DETAIL[health];
+  const healthDetail = serviceDetail(health, serverName);
+  const detail = refreshing ? "Refreshing…" : checkedAt ? `${healthDetail} · ${formatClock(checkedAt)}` : healthDetail;
   const supportedBuild = supportedChangelist ? `${buildName(supportedChangelist) ?? "CL"} · ${supportedChangelist}` : "Unknown";
 
   return (
@@ -66,6 +94,7 @@ function ServicesCard() {
           </button>
         </div>
         <dl className="pop-rows">
+          {serverName && (<><dt>Server</dt><dd className="truncate" title={serverName}>{serverName}</dd></>)}
           <dt>Backend</dt>
           <dd>{SERVICE_TITLE[health].replace("Services ", "")}</dd>
           <dt>Accepted build</dt>
@@ -75,6 +104,7 @@ function ServicesCard() {
         </dl>
       </div>
       <button
+        ref={triggerRef}
         type="button"
         className="services"
         aria-expanded={open}
@@ -114,6 +144,8 @@ function Shell() {
   switch (tab) {
     case "home": page = <HomeTab onOpenAccount={() => navigate("account")} onNavigate={navigate} />; break;
     case "library": page = <LibraryTab />; break;
+    case "servers": page = <ServersTab />; break;
+    case "host": page = <HostRealmTab />; break;
     case "account": page = <AccountTab />; break;
     case "settings": page = <SettingsTab />; break;
     default: page = <AboutTab />;
@@ -186,7 +218,7 @@ function Shell() {
 function initialTab(): Tab {
   if (!import.meta.env.DEV) return "home";
   const requested = new URLSearchParams(window.location.search).get("tab");
-  return requested === "library" || requested === "account" || requested === "settings" || requested === "about" ? requested : "home";
+  return NAV_ITEMS.find((item) => item.id === requested)?.id ?? "home";
 }
 
 // With View Transitions the page cross-fade is the entry animation; otherwise a CSS rise.

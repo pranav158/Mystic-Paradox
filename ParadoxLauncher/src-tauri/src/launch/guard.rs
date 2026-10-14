@@ -53,9 +53,8 @@ pub(crate) struct GuardPayload {
     issued_at: String,
     expires_at: String,
     pub(crate) artifacts: Vec<GuardArtifact>,
-    // Integrity-check policy, read only with the anti-cheat module (anticheat/guard_checks.rs).
-    #[cfg(mystic_anticheat)]
-    pub(crate) executable_memory_policy: crate::anticheat::guard_checks::ExecutableMemoryPolicy,
+    // Integrity-check policy (launch/guard_checks.rs). Every signed manifest carries it.
+    pub(crate) executable_memory_policy: crate::launch::guard_checks::ExecutableMemoryPolicy,
 }
 
 #[derive(Clone, Deserialize)]
@@ -65,9 +64,8 @@ pub(crate) struct GuardArtifact {
     size: u64,
     pub(crate) sha256: String,
     required: bool,
-    #[cfg(mystic_anticheat)]
     #[serde(default)]
-    pub(crate) protected_regions: Vec<crate::anticheat::guard_checks::ProtectedRegion>,
+    pub(crate) protected_regions: Vec<crate::launch::guard_checks::ProtectedRegion>,
 }
 
 #[derive(Serialize, Clone)]
@@ -80,6 +78,9 @@ pub struct GuardSignals {
     private_executable_bytes: usize,
     writable_executable_bytes: usize,
     unexpected_module_count: usize,
+    /// Publisher of the unexpected modules, at most 32 entries, sorted (`launch/guard_checks.rs`). Always sent: an
+    /// empty list when nothing is unexpected. It is not part of the signed heartbeat material.
+    unexpected_modules: Vec<crate::launch::guard_checks::UnexpectedModule>,
     protected_page_mismatch_count: usize,
     debugger_present: bool,
 }
@@ -224,15 +225,9 @@ fn verify_envelope(
     Ok(payload)
 }
 
-/// The integrity-check policy the anti-cheat module reads from the manifest (anticheat/guard_checks.rs).
-#[cfg(mystic_anticheat)]
+/// The integrity-check policy the manifest carries (launch/guard_checks.rs): its bounds and hash format.
 fn integrity_policy_is_valid(payload: &GuardPayload) -> bool {
-    crate::anticheat::guard_checks::policy_is_valid(&payload.executable_memory_policy)
-}
-
-#[cfg(not(mystic_anticheat))]
-fn integrity_policy_is_valid(_payload: &GuardPayload) -> bool {
-    true
+    crate::launch::guard_checks::policy_is_valid(&payload.executable_memory_policy)
 }
 
 fn validate_manifest_window(
@@ -477,6 +472,22 @@ pub(crate) fn installed_artifacts_by_role(
     Ok(names)
 }
 
+/// Whether the current signed Guard manifest of `channel` lists any file under `role` (installed or not). The ICE
+/// transport's manifest has no TRANSPORT_RUNTIME (p2p/mod.rs).
+#[cfg(mystic_p2p)]
+pub(crate) fn manifest_lists_role(
+    app: &AppHandle,
+    channel: &str,
+    access_token: &str,
+    role: &str,
+) -> Result<bool, String> {
+    let payload = cached_manifest(app, channel, access_token)?;
+    Ok(payload
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.role == role))
+}
+
 fn wide_string(value: &[u16]) -> String {
     let end = value.iter().position(|v| *v == 0).unwrap_or(value.len());
     String::from_utf16_lossy(&value[..end])
@@ -491,8 +502,7 @@ fn filetime_to_iso(value: FILETIME) -> String {
     )
 }
 
-/// A module loaded in the protected process (Toolhelp snapshot). Guard Lite reads only path and size.
-#[cfg_attr(not(mystic_anticheat), allow(dead_code))]
+/// A module loaded in the protected process (Toolhelp snapshot).
 pub(crate) struct LoadedModule {
     pub(crate) path: String,
     pub(crate) name: String,
@@ -500,18 +510,18 @@ pub(crate) struct LoadedModule {
     pub(crate) size: u32,
 }
 
-/// Integrity findings of a heartbeat. The anti-cheat module measures them (anticheat/guard_checks.rs, when built in)
-/// while the co-op switch is on; otherwise Guard runs as Guard Lite, an observer (signed manifest and artifacts,
-/// process identity, loaded-module digest, debugger flag) that reports these as zero.
+/// Integrity measurements of a heartbeat (launch/guard_checks.rs): private executable memory, the loaded-module
+/// allowlist with the publishers of the unexpected modules, and the protected code pages. Measured on every build
+/// while the game runs; the launcher reports them and never ends the game.
 #[derive(Default)]
 pub(crate) struct IntegritySignals {
     pub(crate) private_executable_bytes: usize,
     pub(crate) writable_executable_bytes: usize,
     pub(crate) unexpected_module_count: usize,
+    pub(crate) unexpected_modules: Vec<crate::launch::guard_checks::UnexpectedModule>,
     pub(crate) protected_page_mismatch_count: usize,
 }
 
-#[cfg(mystic_anticheat)]
 fn integrity_signals(
     process: HANDLE,
     process_id: u32,
@@ -519,25 +529,8 @@ fn integrity_signals(
     game_dir: &Path,
     modules: &[LoadedModule],
 ) -> IntegritySignals {
-    // Guard Lite while co-op is off: the heavy checks belong to co-op play only.
-    if !crate::p2p::coop_active() {
-        return IntegritySignals::default();
-    }
     // SAFETY: collect_signals passes its open process handle and that process's module snapshot.
-    unsafe {
-        crate::anticheat::guard_checks::collect(process, process_id, payload, game_dir, modules)
-    }
-}
-
-#[cfg(not(mystic_anticheat))]
-fn integrity_signals(
-    _process: HANDLE,
-    _process_id: u32,
-    _payload: &GuardPayload,
-    _game_dir: &Path,
-    _modules: &[LoadedModule],
-) -> IntegritySignals {
-    IntegritySignals::default()
+    unsafe { crate::launch::guard_checks::collect(process, process_id, payload, game_dir, modules) }
 }
 
 fn collect_signals(
@@ -596,6 +589,7 @@ fn collect_signals(
             private_executable_bytes: integrity.private_executable_bytes,
             writable_executable_bytes: integrity.writable_executable_bytes,
             unexpected_module_count: integrity.unexpected_module_count,
+            unexpected_modules: integrity.unexpected_modules,
             protected_page_mismatch_count: integrity.protected_page_mismatch_count,
             debugger_present: debugger != 0,
         })
@@ -1018,6 +1012,43 @@ mod tests {
         );
         assert!(validate_manifest_window("not-a-time", "2026-09-10T00:00:00Z", now).is_err());
         assert!(validate_manifest_window("2026-09-08T00:00:00Z", "not-a-time", now).is_err());
+    }
+
+    #[test]
+    fn heartbeat_signals_always_carry_the_unexpected_module_list() {
+        let mut signals = GuardSignals {
+            game_process_id: 4,
+            game_started_at: "2026-10-14T00:00:00.000Z".into(),
+            module_count: 1,
+            module_set_digest: "00".repeat(32),
+            private_executable_bytes: 0,
+            writable_executable_bytes: 0,
+            unexpected_module_count: 1,
+            unexpected_modules: Vec::new(),
+            protected_page_mismatch_count: 0,
+            debugger_present: false,
+        };
+        let json = serde_json::to_value(&signals).expect("serializes");
+        assert_eq!(json["unexpectedModules"], serde_json::json!([]));
+        assert_eq!(json["unexpectedModuleCount"], 1);
+        signals
+            .unexpected_modules
+            .push(crate::launch::guard_checks::UnexpectedModule {
+                file_name: "overlay.dll".into(),
+                signer: "unsigned".into(),
+                sha256: "ab".repeat(32),
+                size: 9,
+            });
+        let json = serde_json::to_value(&signals).expect("serializes");
+        assert_eq!(
+            json["unexpectedModules"],
+            serde_json::json!([{
+                "fileName": "overlay.dll",
+                "signer": "unsigned",
+                "sha256": "ab".repeat(32),
+                "size": 9
+            }])
+        );
     }
 
     #[test]

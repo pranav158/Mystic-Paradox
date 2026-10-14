@@ -3,8 +3,10 @@ use std::fs;
 use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 
+use crate::auth::scope;
 use crate::commands::auth::{api_base_url, http_client, safe_api_error, send_authorized};
 use crate::launch::logs;
+use crate::servers;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,13 +44,21 @@ struct StoredSessionMetadata {
     started_at: String,
     account_id: String,
     channel: String,
+    /// Sessions written before the server list have none: they were the official scope's.
+    #[serde(default = "official_scope_key")]
+    auth_scope: String,
     exit_code: Option<u32>,
     exited_at: Option<String>,
 }
 
-/// The newest Play sessions of one account on this PC, read from each session folder's
-/// metadata.json (written once the game process starts). Attempts that failed before spawn have
-/// no metadata and are not listed. Other accounts' sessions on a shared PC are never returned.
+fn official_scope_key() -> String {
+    servers::OFFICIAL_ID.to_string()
+}
+
+/// The newest Play sessions of one account of the SELECTED server's scope on this PC, read from each session
+/// folder's metadata.json (written once the game process starts). Attempts that failed before spawn have
+/// no metadata and are not listed. Other accounts' sessions on a shared PC, and sessions of another server's
+/// scope, are never returned.
 #[tauri::command]
 pub async fn native_recent_sessions(
     app: AppHandle,
@@ -57,8 +67,10 @@ pub async fn native_recent_sessions(
 ) -> Result<Vec<SessionSummary>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = logs::sessions_root(&app)?;
+        let scope = scope::scope_for(&servers::store::load(&app), None)?;
         Ok(read_recent_sessions(
             &root,
+            scope.key(),
             &account_id,
             limit.unwrap_or(5).clamp(1, 20) as usize,
         ))
@@ -69,6 +81,7 @@ pub async fn native_recent_sessions(
 
 fn read_recent_sessions(
     root: &std::path::Path,
+    scope_key: &str,
     account_id: &str,
     limit: usize,
 ) -> Vec<SessionSummary> {
@@ -80,7 +93,7 @@ fn read_recent_sessions(
         .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
         .filter_map(|entry| fs::read(entry.path().join("metadata.json")).ok())
         .filter_map(|bytes| serde_json::from_slice::<StoredSessionMetadata>(&bytes).ok())
-        .filter(|metadata| metadata.account_id == account_id)
+        .filter(|metadata| metadata.account_id == account_id && metadata.auth_scope == scope_key)
         .map(|metadata| SessionSummary {
             id: metadata.launch_session_id,
             started_at: metadata.started_at,
@@ -108,6 +121,7 @@ mod tests {
         let write = |id: &str, account: &str, started: &str| {
             let dir = root.join(id);
             fs::create_dir_all(&dir).unwrap();
+            // Written before the server list existed: no `authScope`, so the official scope's.
             let metadata = serde_json::json!({
                 "launchSessionId": id, "startedAt": started, "accountId": account, "displayName": "x",
                 "gameExePath": "x", "channel": "stable", "exitCode": 0, "exitedAt": started
@@ -120,12 +134,65 @@ mod tests {
         write("d", "me", "2026-10-02T10:00:00.000Z");
         fs::create_dir_all(root.join("no-metadata")).unwrap();
 
-        let ids: Vec<String> = read_recent_sessions(&root, "me", 2)
+        let ids: Vec<String> = read_recent_sessions(&root, "official", "me", 2)
             .into_iter()
             .map(|s| s.id)
             .collect();
         assert_eq!(ids, vec!["b".to_string(), "d".to_string()]);
-        assert!(read_recent_sessions(&root.join("missing"), "me", 5).is_empty());
+        assert!(read_recent_sessions(&root.join("missing"), "official", "me", 5).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn recent_sessions_never_cross_server_scopes() {
+        let root = std::env::temp_dir().join(format!(
+            "mysticparadox-sessions-scope-test-{}",
+            std::process::id()
+        ));
+        let write = |id: &str, scope: Option<&str>, started: &str| {
+            let dir = root.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let mut metadata = serde_json::json!({
+                "launchSessionId": id, "startedAt": started, "accountId": "me", "displayName": "x",
+                "gameExePath": "x", "channel": "stable", "exitCode": 0, "exitedAt": started
+            });
+            if let Some(scope) = scope {
+                metadata["authScope"] = scope.into();
+            }
+            fs::write(dir.join("metadata.json"), metadata.to_string()).unwrap();
+        };
+        write("old", None, "2026-10-01T10:00:00.000Z");
+        write("official", Some("official"), "2026-10-02T10:00:00.000Z");
+        write(
+            "local-a",
+            Some("s-aaaaaaaaaaaa"),
+            "2026-10-03T10:00:00.000Z",
+        );
+        write(
+            "local-b",
+            Some("s-bbbbbbbbbbbb"),
+            "2026-10-04T10:00:00.000Z",
+        );
+        let ids = |scope: &str| -> Vec<String> {
+            read_recent_sessions(&root, scope, "me", 10)
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        };
+        assert_eq!(
+            ids("official"),
+            vec!["official".to_string(), "old".to_string()]
+        );
+        assert_eq!(ids("s-aaaaaaaaaaaa"), vec!["local-a".to_string()]);
+        assert_eq!(ids("s-bbbbbbbbbbbb"), vec!["local-b".to_string()]);
+        // Only the official network's sessions may be uploaded to it.
+        assert!(is_uploadable_scope(&read_scope(&root.join("old"))));
+        assert!(is_uploadable_scope(&read_scope(&root.join("official"))));
+        assert!(!is_uploadable_scope(&read_scope(&root.join("local-a"))));
+        assert!(
+            !is_uploadable_scope(&read_scope(&root.join("no-such-folder"))),
+            "an unreadable session is not uploaded"
+        );
         fs::remove_dir_all(&root).ok();
     }
 }
@@ -161,12 +228,34 @@ fn uploadable_files(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
+/// The scope a session folder was launched under (`official` for sessions older than the server list); `None` when
+/// its metadata cannot be read.
+fn read_scope(dir: &std::path::Path) -> Option<String> {
+    let bytes = fs::read(dir.join("metadata.json")).ok()?;
+    serde_json::from_slice::<StoredSessionMetadata>(&bytes)
+        .ok()
+        .map(|metadata| metadata.auth_scope)
+}
+
+/// Only the official network's sessions go to the official backend. A local server's logs (its account, its game
+/// folder) are the player's own and are never uploaded to us; a session whose scope cannot be read is not uploaded.
+fn is_uploadable_scope(scope_key: &Option<String>) -> bool {
+    scope_key.as_deref() == Some(servers::OFFICIAL_ID)
+}
+
 #[tauri::command]
 pub async fn native_upload_last_session(app: AppHandle) -> Result<u32, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let Some(dir) = logs::latest_session_dir(&app)? else {
             return Err("No session logs found yet — play once first.".to_string());
         };
+        // The log upload belongs to our network (`NetworkRules::log_upload`).
+        if !is_uploadable_scope(&read_scope(&dir)) {
+            return Err(
+                "Logs from a local server are not uploaded to Mystic Paradox. Open the log folder to share them yourself."
+                    .to_string(),
+            );
+        }
         // The folder's name: the Play attempt's correlation id (launch/logs.rs), which groups the uploads on the
         // server. It is not a credential; the bearer token authorizes the upload.
         let session_folder = dir
