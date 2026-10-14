@@ -56,6 +56,13 @@ export type HubSupervisorOptions<T> = {
     stableUptimeMs?: number;
 };
 
+// [2026-10-11] On/off environment switches of the hubs (TRAINING_HUB): 0, false, no and off (any case, trimmed) are off,
+// anything else is on; an unset value takes the default.
+export function HubSwitchOn(value: string | undefined, defaultOn: boolean): boolean {
+    if (value == undefined || value.trim().length === 0) return defaultOn;
+    return !/^(0|false|no|off)$/i.test(value.trim());
+}
+
 export function CreateSerialGate(): <R>(fn: () => Promise<R>) => Promise<R> {
     let tail: Promise<unknown> = Promise.resolve();
     return <R>(fn: () => Promise<R>): Promise<R> => {

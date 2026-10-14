@@ -1,0 +1,7 @@
+{
+  "$comment": "Digest of the hunt manifests produced from the local hunt tables (ParadoxDirector/game-data), with the clock and random choice pinned (manifestDigest.js). Produced by the Director's resolver before the M1 move into shared/hunt-manifest on 14 October 2026; the Director and Metagame parity tests must reproduce it. It is a hash: it contains no game data. Regenerate only when the tables change on purpose.",
+  "algorithm": "sha256 of BuildManifestDump lines joined by newline",
+  "digest": "2ed744907798cc101cd97c38e3b8cf64ca243d4ba3e45d3c7d48c9987b8c8212",
+  "playerRows": 168,
+  "lines": 1384
+}

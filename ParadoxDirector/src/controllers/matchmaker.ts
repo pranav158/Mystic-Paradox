@@ -10,7 +10,7 @@
  */
 
 import { logger } from "../logger";
-import { GetRamsgateConnectionDetails, GetTrainingDojoConnectionDetails, StartupGameserverWithArgs, StartupGameserverWithHuntIdAndPlayers, TryReuseSharedHuntServer } from "./gameservers";
+import { GetRamsgateConnectionDetails, GetTrainingDojoConnectionDetailsForRequest, StartupGameserverWithArgs, StartupGameserverWithHuntIdAndPlayers, TryReuseSharedHuntServer } from "./gameservers";
 
 export async function HandleMatchmakingRequest(GameMode: string, GameArgs: string, HuntId: string, ExpectedPlayers: string[] | undefined){
     logger.info(`Handling matchmaking with GameMode: ${GameMode} HuntId: ${HuntId} and GameArgs: ${GameArgs}`);
@@ -21,7 +21,8 @@ export async function HandleMatchmakingRequest(GameMode: string, GameArgs: strin
     else if(GameMode === "SHARED"){
         if (HuntId != undefined && HuntId.trim().length > 0){
             if(HuntId == "ShatteredIsles_TrainingDojo"){
-                return GetTrainingDojoConnectionDetails();
+                // [2026-10-11] Same as before with the hub booted (TRAINING_HUB=on); an on-demand hub is started here.
+                return await GetTrainingDojoConnectionDetailsForRequest();
             }
 
             // [2026-07-13] Normal Hunting Grounds also arrive via GameMode=SHARED (e.g.

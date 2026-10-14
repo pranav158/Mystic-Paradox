@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { CreateSerialGate, DEFAULT_HUB_BACKOFF_MS, DEFAULT_HUB_STABLE_UPTIME_MS, HubSupervisor, HubSupervisorOptions } from "./hubSupervisor";
+import { CreateSerialGate, DEFAULT_HUB_BACKOFF_MS, DEFAULT_HUB_STABLE_UPTIME_MS, HubSupervisor, HubSupervisorOptions, HubSwitchOn } from "./hubSupervisor";
 
 type FakeHub = { id: number; alive: boolean };
 type FakeTimer = { fn: () => void; ms: number; cancelled: boolean };
@@ -292,4 +292,12 @@ test("the default clock is monotonic (performance.now), not the wall clock", asy
     const due = supervisor.nextAttemptDueAt;
     assert.ok(due >= before + DEFAULT_HUB_BACKOFF_MS[0] && due <= performance.now() + DEFAULT_HUB_BACKOFF_MS[0], `due=${due}`);
     supervisor.dispose();
+});
+
+test("hub switches (TRAINING_HUB): unset keeps the default, 0/false/no/off in any case switch off", () => {
+    assert.equal(HubSwitchOn(undefined, true), true);
+    assert.equal(HubSwitchOn("", true), true);
+    assert.equal(HubSwitchOn("  ", false), false);
+    for (const off of ["0", "false", "no", "off", " OFF ", "False"]) assert.equal(HubSwitchOn(off, true), false, off);
+    for (const on of ["1", "on", "yes", "true", "anything"]) assert.equal(HubSwitchOn(on, false), true, on);
 });

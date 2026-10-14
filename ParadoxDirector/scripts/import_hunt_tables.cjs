@@ -69,7 +69,7 @@
  *
  * A matchmaker table that has no vendored file yet (e.g. arena_hard_matchmaker_hunts_new in 1.14.7) is
  * written as game-data/<table>.json in the same shape as the arena files. DeployServer only sees it
- * once it is imported and registered in MatchmakerTableSources (src/controllers/gameservers.ts).
+ * once it is imported and listed in HUNT_TABLE_FILES (shared/hunt-manifest/index.js), which DeployServer and the Metagame read.
  */
 
 const fs = require("node:fs");
@@ -769,8 +769,8 @@ function Main(){
 
     if(NewFiles.length > 0){
         console.log(`\nNEW vendor table(s): ${NewFiles.join(", ")}`);
-        console.log(`  DeployServer only reads them once they are imported and listed in MatchmakerTableSources`);
-        console.log(`  (src/controllers/gameservers.ts).`);
+        console.log(`  DeployServer and the Metagame only read them once they are listed in HUNT_TABLE_FILES`);
+        console.log(`  (shared/hunt-manifest/index.js).`);
     }
 
     console.log(`\nDone. Rebuild and restart DeployServer, then check the boot log:`);

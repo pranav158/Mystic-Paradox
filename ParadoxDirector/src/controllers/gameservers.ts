@@ -19,20 +19,15 @@ import path from "node:path";
 
 import { kill } from "node:process";
 import { logger } from "../logger";
-import { loadGameData } from "../gameData/loader";
+import { gameDataDir } from "../gameData/loader";
+// [2026-10-14 M1] The hunt lookup and its tables live in shared/hunt-manifest (the Metagame resolves manifests with the same code).
+import { CreateHuntResolver, LoadHuntTables, ParseTrialsRotationMinutes, TransformExpectedPlayerArgs } from "../../../shared/hunt-manifest";
 import { PortPool } from "./portPool";
-import { CreateSerialGate, HubSupervisor, HubLogLevel } from "./hubSupervisor";
+import { CreateSerialGate, HubSupervisor, HubLogLevel, HubSwitchOn } from "./hubSupervisor";
 
-// Hunt tables from ParadoxDirector/game-data (gameData/loader.ts), exported from the client by CatalogExporter.
-const PlayerHuntTable = loadGameData<any>("player_hunts_table.json");
-const MatchmakerHuntTable = loadGameData<any>("matchmaker_hunts_table.json");
-// Trials/Arena live in their own matchmaker tables in the client, reached only via tag routing.
-const ArenaEasyMatchmakerTable = loadGameData<any>("arena_easy_matchmaker_hunts.json");
-const ArenaHardMatchmakerTable = loadGameData<any>("arena_hard_matchmaker_hunts.json");
-const ArenaEliteMatchmakerTable = loadGameData<any>("arena_elite_matchmaker_hunts.json");
-// 1.14.7 adds a second Hard/Elite table; CR19_PlayerHunt_Arena_Hard/Elite tag-route into both.
-const ArenaHardNewMatchmakerTable = loadGameData<any>("arena_hard_matchmaker_hunts_new.json");
-const ArenaEliteNewMatchmakerTable = loadGameData<any>("arena_elite_matchmaker_hunts_new.json");
+// [2026-10-14 M1] Hunt tables from ParadoxDirector/game-data (exported from the client by CatalogExporter). Trials/Arena
+// rows sit in their own matchmaker tables and are reached only through tag routing (shared/hunt-manifest).
+const HuntTables = LoadHuntTables(gameDataDir());
 
 const RAMSGATE_MAP_PATH = "/Game/Maps/ramsgate/ramsgate_01_persistent";
 const TRAINING_DOJO_MAP_PATH = "/Game/Maps/islands/dojo/training_dojo_persistent";
@@ -172,29 +167,29 @@ const TrainingHub = new HubSupervisor<Gameserver>({
     log: HubLog
 });
 
+// [2026-10-11 P2P on 1.14.7, plan 39_ §13.1 B7] The owner's target hosts the Training Grounds on players' PCs (Metagame
+// P2P_TRAINING_ENABLED), so the dedicated Training hub becomes optional. It stays the fallback either way:
+//   TRAINING_HUB=on (default)  booted with Ramsgate and supervised as before - nothing changes.
+//   TRAINING_HUB=off           not started at boot and not restarted by the watchdog until the first Training request
+//                              (a player the Metagame routes to the dedicated hub because no player host is eligible).
+//                              That request waits for the start (up to GAMESERVER_READY_TIMEOUT_MS) instead of
+//                              failing, and from then on the hub is supervised like Ramsgate.
+//                              0, false, no and off (any case) all mean off.
+const TRAINING_HUB_AT_BOOT = HubSwitchOn(process.env.TRAINING_HUB, true);
+
+// [2026-10-14 Paradox realms] A realm's Ramsgate runs on its host's PC, so the dedicated Ramsgate hub can be switched off:
+//   RAMSGATE_HUB=on (default)  booted and supervised as before - nothing changes.
+//   RAMSGATE_HUB=off           never started (not at boot, not by the watchdog, not by a request). Realm players never
+//                              use it; a player routed to the dedicated Ramsgate gets "not ready". The Director still
+//                              answers hunt manifests (realm hunts ask it for their map and Behemoth).
+//                              0, false, no and off (any case) all mean off.
+const RAMSGATE_HUB_ENABLED = HubSwitchOn(process.env.RAMSGATE_HUB, true);
+let TrainingHubWanted = TRAINING_HUB_AT_BOOT;
+
 // Trials uses 181 real numbered arena rows. Keep the live default at one week, but permit short,
 // deterministic UTC buckets for end-to-end rotation testing (for example, 30 minutes). The injected
 // server DLL reads the same inherited environment variable and uses the same Unix-epoch bucket formula,
 // so Ramsgate's advertised row and DeployServer's spawned matchmaker row cannot drift apart.
-const TRIALS_ROTATION_ROW_COUNT = 181;
-const DEFAULT_TRIALS_ROTATION_MINUTES = 7 * 24 * 60;
-
-function ParseTrialsRotationMinutes(Value: string | undefined): number {
-    const Parsed = Number(Value ?? DEFAULT_TRIALS_ROTATION_MINUTES);
-    if(!Number.isSafeInteger(Parsed) || Parsed < 1 || Parsed > 525600){
-        logger.warn(`[TrialsRotation] invalid TRIALS_ROTATION_MINUTES='${Value ?? ""}'; using ${DEFAULT_TRIALS_ROTATION_MINUTES}`);
-        return DEFAULT_TRIALS_ROTATION_MINUTES;
-    }
-    return Parsed;
-}
-
-const TRIALS_ROTATION_MINUTES = ParseTrialsRotationMinutes(process.env.TRIALS_ROTATION_MINUTES);
-
-function GetCurrentTrialsWeek(NowMs: number = Date.now()): string {
-    const Bucket = Math.floor(NowMs / (TRIALS_ROTATION_MINUTES * 60_000));
-    return String((Bucket % TRIALS_ROTATION_ROW_COUNT) + 1).padStart(3, "0");
-}
-
 // [2026-07-17 resource guardrails] Each hunt is a full UE4 dedicated-server process (~1 GB even at
 // -nullrhi), so on an 8 GB box only a couple can coexist alongside the persistent Ramsgate + Dojo.
 // Previously nothing capped spawns, so matchmaking/travel spam exhausted RAM until the whole box died.
@@ -240,20 +235,6 @@ const GAMESERVER_LOG_DIR = path.resolve(
     process.env.GAMESERVER_LOG_DIR ?? path.join(process.cwd(), "../debug/gameservers")
 );
 fs.mkdirSync(GAMESERVER_LOG_DIR, { recursive: true });
-
-function TransformExpectedPlayerArgs(ExpectedPlayers: ExpectedPlayer[]){
-    let ToReturn = "";
-
-    for(const Player of ExpectedPlayers){
-        ToReturn = ToReturn + Player.playerUid + ":" + Player.playerHuntId + ",";
-    }
-
-    if(ToReturn.length > 0){
-        ToReturn = ToReturn.slice(0, -1); // Remove trailing ','
-    }
-
-    return ToReturn;
-}
 
 function WaitForServerReady(Child: ReturnType<typeof spawn>, LaunchId: string, Port: number, Label: string): Promise<void> {
     if (!Child.stdout) {
@@ -383,8 +364,9 @@ export function ReclaimOrphanedPortLeases(): void {
 // [2026-10-10 1.14.7] Watchdog safety net for the hubs: retries a hub whose start failed (it is in neither
 // Gameservers nor its supervisor) and restarts a dead hub that sent no exit event.
 export function TickPersistentHubs(): void {
-    RamsgateHub.tick();
-    TrainingHub.tick();
+    if (RAMSGATE_HUB_ENABLED) RamsgateHub.tick();
+    // An on-demand Training hub (TRAINING_HUB=off) is left alone until someone asked for it.
+    if (TrainingHubWanted) TrainingHub.tick();
 }
 
 let ServerLaunchQueue: Promise<void> = Promise.resolve();
@@ -637,10 +619,26 @@ function HubConnectionDetails(Hub: HubSupervisor<Gameserver>, Name: string){
 }
 
 export function GetRamsgateConnectionDetails(){
+    if (!RAMSGATE_HUB_ENABLED) throw new GameserverStartupError("the dedicated Ramsgate hub is switched off (RAMSGATE_HUB=off)");
     return HubConnectionDetails(RamsgateHub, "Ramsgate");
 }
 
 export function GetTrainingDojoConnectionDetails(){
+    return HubConnectionDetails(TrainingHub, "Training Dojo");
+}
+
+// [2026-10-11] The matchmaker's Training getter. With the hub booted (TRAINING_HUB=on) this is exactly the getter above.
+// An on-demand hub (TRAINING_HUB=off) that is not up yet is started here - whatever HUB_PROMPT_RESTART says, since
+// nothing else would start it - and the request waits for that start (HubSupervisor.ensure is single-flight and never
+// rejects); a failed start still answers the usual "not ready".
+export async function GetTrainingDojoConnectionDetailsForRequest(){
+    if (TRAINING_HUB_AT_BOOT) return GetTrainingDojoConnectionDetails();
+    if (!TrainingHubWanted) logger.info("[TrainingHub] on-demand Training hub requested for the first time (TRAINING_HUB=off) - starting it");
+    TrainingHubWanted = true;
+    const Server = TrainingHub.current;
+    if (!Server || Server.state !== "ready" || !IsProcessAlive(Server.processId)) {
+        await TrainingHub.ensure("request");
+    }
     return HubConnectionDetails(TrainingHub, "Training Dojo");
 }
 
@@ -728,163 +726,27 @@ export async function StartupGameserverWithArgs(GameArgs: string, HuntId: string
 }
 
 /*
- * ---------------------------------------------------------------------------------------------
- * Matchmaker table registry + GameplayTagQuery routing (Trials/Arena).
- *
- * Most player hunts name their matchmaker rows directly in MatchmakerHuntIDs. Trials do not:
- * CR19_PlayerHunt_Arena_Easy/Hard/Elite ship with an EMPTY MatchmakerHuntIDs and instead carry
- * MatchmakerHuntsByTag — "pick any row tagged Hunt.Arena.Easy from arena_easy_matchmaker_hunts".
- * Those arena tables are separate DataTables in the client, so a single-table lookup can never
- * resolve them, and Trials failed with "no usable row" regardless of what was in
- * matchmaker_hunts_table. That is why they are registered here as additional sources rather than
- * merged into the main table: merging would invent cross-table references the client does not have.
- * ---------------------------------------------------------------------------------------------
+ * [2026-10-14 M1] The matchmaker tables, the FGameplayTagQuery evaluator and the tag routing of Trials/Arena now live in
+ * shared/hunt-manifest, which the Metagame resolves with too. This file keeps the Director's resolver over the tables it
+ * loads, and the coverage diagnostics below. Trials do not name their matchmaker rows directly (MatchmakerHuntsByTag),
+ * and their arena tables are separate DataTables, so they are registered as additional sources rather than merged.
  */
-type MatchmakerTableSource = { name: string; rows: Record<string, any> };
-
-const MatchmakerTableSources: MatchmakerTableSource[] = [
-    { name: "matchmaker_hunts_table",       rows: MatchmakerHuntTable[0].Rows as any },
-    { name: "arena_easy_matchmaker_hunts",  rows: (ArenaEasyMatchmakerTable as any)[0].Rows },
-    { name: "arena_hard_matchmaker_hunts",  rows: (ArenaHardMatchmakerTable as any)[0].Rows },
-    { name: "arena_elite_matchmaker_hunts", rows: (ArenaEliteMatchmakerTable as any)[0].Rows },
-    // 1.14.7. Their rows are named Arena_MatchmakerHunt_{Hard,Elite}_New_NNN, which the numbered-week
-    // Trials pin below deliberately does not match, so the featured-week selection is unchanged.
-    { name: "arena_hard_matchmaker_hunts_new",  rows: (ArenaHardNewMatchmakerTable as any)[0].Rows },
-    { name: "arena_elite_matchmaker_hunts_new", rows: (ArenaEliteNewMatchmakerTable as any)[0].Rows }
-];
+/** The resolver over the shared tables. A player row that is absent is recorded for the coverage diagnostics below. */
+export const HuntResolver = CreateHuntResolver({
+    tables: HuntTables,
+    log: logger,
+    trialsRotationMinutes: ParseTrialsRotationMinutes(process.env.TRIALS_ROTATION_MINUTES, logger),
+    onMissingHunt: RecordMissingHuntRequest
+});
 
 /** Looks a matchmaker row up across every registered table. Main table wins on a name collision. */
 export function FindMatchmakerRow(MatchmakerHuntId: string): any | undefined {
-    for(const Source of MatchmakerTableSources){
-        const Row = Source.rows[MatchmakerHuntId];
-        if(Row != undefined) return Row;
-    }
-    return undefined;
+    return HuntResolver.FindMatchmakerRow(MatchmakerHuntId);
 }
 
-function GetMatchmakerTableByName(TableName: string): MatchmakerTableSource | undefined {
-    return MatchmakerTableSources.find((Source) => Source.name === TableName);
-}
-
-/*
- * Evaluates a serialized FGameplayTagQuery against a row's HuntTags.
- *
- * Token stream layout, matching UE's FQueryEvaluator::Evaluate:
- *   [0] stream version
- *   [1] bHasRootExpression (0 => query matches nothing)
- *   [2] ExprType
- *   ... type-specific payload
- *
- * ExprType: 1=AnyTagsMatch 2=AllTagsMatch 3=NoTagsMatch 4=AnyExprMatch 5=AllExprMatch 6=NoExprMatch.
- * Tag expressions emit a uint8 count then that many 0-based indices into TagDictionary; expression
- * expressions emit a count then that many nested expressions.
- *
- * Verified against the live capture: [0,1,1,1,0] with TagDictionary ["Hunt.Arena.Easy"] decodes to
- * version 0 / hasRoot 1 / AnyTagsMatch / 1 tag / index 0, which is exactly the AutoDescription the
- * game itself emitted (" ANY( Hunt.Arena.Easy )").
- *
- * Tag matching is prefix-aware, as gameplay tags are hierarchical: a row tagged
- * "Hunt.Arena.Easy.Something" satisfies a query for "Hunt.Arena.Easy".
- */
-function TagMatches(RowTag: string, QueryTag: string): boolean {
-    return RowTag === QueryTag || RowTag.startsWith(`${QueryTag}.`);
-}
-
-function EvaluateTagQuery(Query: any, RowTags: string[]): boolean {
-    // Vendored (FModel) rows say QueryTokenStream; the raw CatalogExporter capture says tokenStream.
-    const Stream: number[] = Query?.QueryTokenStream ?? Query?.queryTokenStream ?? Query?.tokenStream ?? [];
-    const RawDictionary: any[] = Query?.TagDictionary ?? Query?.tagDictionary ?? [];
-
-    // The vendored tables store dictionary entries as { TagName }, the raw export as plain strings.
-    const Dictionary = RawDictionary.map((Entry) =>
-        typeof Entry === "string" ? Entry : Entry?.TagName ?? "");
-
-    if(!Array.isArray(Stream) || Stream.length < 3) return false;
-
-    let Index = 0;
-    const Next = () => Stream[Index++];
-
-    Next();                                  // stream version — unused, single version observed
-    const HasRootExpression = Next();
-    if(!HasRootExpression) return false;
-
-    let Overflowed = false;
-
-    function EvalExpr(): boolean {
-        if(Index >= Stream.length){ Overflowed = true; return false; }
-
-        const ExprType = Next();
-
-        // Tag-set expressions.
-        if(ExprType >= 1 && ExprType <= 3){
-            const NumTags = Next();
-            const Tags: string[] = [];
-            for(let i = 0; i < NumTags; i++){
-                const TagIndex = Next();
-                const Tag = Dictionary[TagIndex];
-                if(typeof Tag === "string" && Tag.length > 0) Tags.push(Tag);
-            }
-            const AnyMatched = Tags.some((QueryTag) => RowTags.some((RowTag) => TagMatches(RowTag, QueryTag)));
-            const AllMatched = Tags.every((QueryTag) => RowTags.some((RowTag) => TagMatches(RowTag, QueryTag)));
-
-            if(ExprType === 1) return AnyMatched;   // AnyTagsMatch
-            if(ExprType === 2) return AllMatched;   // AllTagsMatch
-            return !AnyMatched;                     // NoTagsMatch
-        }
-
-        // Nested-expression expressions.
-        if(ExprType >= 4 && ExprType <= 6){
-            const NumExprs = Next();
-            const Results: boolean[] = [];
-            for(let i = 0; i < NumExprs; i++) Results.push(EvalExpr());
-
-            if(ExprType === 4) return Results.some(Boolean);    // AnyExprMatch
-            if(ExprType === 5) return Results.every(Boolean);   // AllExprMatch
-            return !Results.some(Boolean);                      // NoExprMatch
-        }
-
-        // Undefined/unknown expression type — refuse rather than guess.
-        Overflowed = true;
-        return false;
-    }
-
-    const Result = EvalExpr();
-    return Overflowed ? false : Result;
-}
-
-/** Resolves MatchmakerHuntsByTag into concrete matchmaker row names. */
+/** Resolves MatchmakerHuntsByTag into concrete matchmaker row names (shared/hunt-manifest). */
 function ResolveTagRoutedMatchmakerHuntIds(PlayerHuntId: string, Row: any): string[] {
-    const Lists = Row?.MatchmakerHuntsByTag;
-    if(!Array.isArray(Lists) || Lists.length === 0) return [];
-
-    const Resolved: string[] = [];
-
-    for(const List of Lists){
-        // Vendored shape nests the table name inside an ObjectName like "DataTable'arena_easy...'".
-        const ObjectName: string = List?.MatchmakerTable?.ObjectName ?? List?.matchmakerTable ?? "";
-        const TableName = ObjectName.includes("'")
-            ? ObjectName.split("'")[1]
-            : ObjectName;
-
-        const Source = GetMatchmakerTableByName(TableName);
-        if(Source == undefined){
-            logger.warn(`[HuntTagRouting] ${PlayerHuntId} references matchmaker table '${TableName}' which is not registered — add its vendored JSON to MatchmakerTableSources`);
-            continue;
-        }
-
-        const Queries = List?.HuntTags ?? List?.queries ?? [];
-        if(!Array.isArray(Queries) || Queries.length === 0) continue;
-
-        for(const [RowName, MatchmakerRow] of Object.entries(Source.rows)){
-            const RowTags: string[] = (MatchmakerRow as any)?.HuntTags ?? [];
-            if(!Array.isArray(RowTags) || RowTags.length === 0) continue;
-
-            // A row qualifies if it satisfies every query on the list (queries are ANDed).
-            if(Queries.every((Query: any) => EvaluateTagQuery(Query, RowTags))) Resolved.push(RowName);
-        }
-    }
-
-    return Resolved;
+    return HuntResolver.ResolveTagRoutedMatchmakerHuntIds(PlayerHuntId, Row);
 }
 
 /*
@@ -934,96 +796,7 @@ export function LogMissingHuntRequests(){
 }
 
 function GetMatchmakerHuntIdFromPlayerHuntId(PlayerHuntId: string): string{
-    const Row = (PlayerHuntTable[0].Rows as any)[PlayerHuntId];
-
-    // Only a genuinely absent row is a coverage gap. An empty MatchmakerHuntIDs is normal for
-    // tag-routed hunts (Trials), which are resolved below.
-    if(Row == undefined){
-        RecordMissingHuntRequest(PlayerHuntId);
-        throw new Error(`player_hunts_table has no usable row for HuntId '${PlayerHuntId}' (missing row or empty MatchmakerHuntIDs)`);
-    }
-
-    const DirectMatchmakerHuntIds: string[] = Array.isArray(Row.MatchmakerHuntIDs)
-        ? Row.MatchmakerHuntIDs
-            .map((Entry: any) => Entry?.RowName)
-            .filter((RowName: unknown): RowName is string =>
-                typeof RowName === "string" && RowName.length > 0 && FindMatchmakerRow(RowName) != undefined)
-        : [];
-
-    // Direct references win; tag routing is the documented fallback, not a supplement.
-    let UsableMatchmakerHuntIds = DirectMatchmakerHuntIds;
-
-    let TagRouted = false;
-    if(UsableMatchmakerHuntIds.length === 0){
-        UsableMatchmakerHuntIds = ResolveTagRoutedMatchmakerHuntIds(PlayerHuntId, Row);
-
-        if(UsableMatchmakerHuntIds.length > 0){
-            TagRouted = true;
-            logger.info(`[HuntTagRouting] ${PlayerHuntId} resolved to ${UsableMatchmakerHuntIds.length} matchmaker row(s) via tag query`);
-        }
-    }
-
-    if (UsableMatchmakerHuntIds.length === 0) {
-        throw new Error(`player_hunts_table row '${PlayerHuntId}' has no resolvable 1.12 MatchmakerHuntIDs`);
-    }
-
-    // Arena/Trials rows are tag-routed to every numbered week plus test rows. Random selection diverges
-    // from the row advertised by the replicated gameplay schedule. Select the current deterministic UTC
-    // bucket instead; the DLL uses the same interval/formula. Non-arena tag-routed hunts remain random.
-    if (TagRouted) {
-        const ArenaCandidates = UsableMatchmakerHuntIds.filter((Id) =>
-            /^Arena_MatchmakerHunt_(?:Easy|Hard|Elite)_\d{3}$/.test(Id)
-        );
-        if(ArenaCandidates.length > 0){
-            const Week = GetCurrentTrialsWeek();
-            const Pinned = ArenaCandidates.filter((Id) => Id.endsWith(`_${Week}`));
-            if (Pinned.length > 0) {
-                const Chosen = Pinned[crypto.randomInt(0, Pinned.length)];
-                logger.info(`[TrialsRotation] interval=${TRIALS_ROTATION_MINUTES}m featured=_${Week} -> ${Chosen}`);
-                return Chosen;
-            }
-            logger.warn(`[TrialsRotation] no arena row matched featured week _${Week}; falling back to a numbered arena candidate`);
-            const Chosen = ArenaCandidates[crypto.randomInt(0, ArenaCandidates.length)];
-            return Chosen;
-        }
-    }
-
-    return UsableMatchmakerHuntIds[crypto.randomInt(0, UsableMatchmakerHuntIds.length)];
-}
-
-function GetBehemothPathFromMatchmakerHuntId(MatchmakerHuntId: string): string | undefined{
-    const MatchmakerHuntObject = FindMatchmakerRow(MatchmakerHuntId);
-
-    if(MatchmakerHuntObject == undefined){
-        throw new Error(`matchmaker_hunts_table has no row for MatchmakerHuntId '${MatchmakerHuntId}'`);
-    }
-
-    const AssetPathName = MatchmakerHuntObject?.SpecificBehemoth?.BehemothAsset?.AssetPathName;
-
-    // Hunting Grounds generate encounters and have no single fixed Behemoth (AssetPathName === "None"):
-    // pass NO MonsterClass so the server runs its normal encounter generation instead of forcing one.
-    if(AssetPathName == undefined || AssetPathName === "None" || String(AssetPathName).trim().length === 0){
-        return undefined;
-    }
-
-    return AssetPathName;
-}
-
-function GetMapPathFromMatchmakerHuntId(MatchmakerHuntId: string): string{
-    const MatchmakerHuntObject = FindMatchmakerRow(MatchmakerHuntId);
-
-    if(MatchmakerHuntObject == undefined || !Array.isArray(MatchmakerHuntObject.MapList) || MatchmakerHuntObject.MapList.length === 0){
-        throw new Error(`matchmaker_hunts_table row '${MatchmakerHuntId}' has no MapList`);
-    }
-
-    const UsableMaps = MatchmakerHuntObject.MapList
-        .map((Entry: any) => Entry?.MapAssetName)
-        .filter((MapAssetName: unknown): MapAssetName is string => typeof MapAssetName === "string" && MapAssetName.startsWith("/Game/") && MapAssetName.includes("."));
-    if (UsableMaps.length === 0) {
-        throw new Error(`matchmaker_hunts_table row '${MatchmakerHuntId}' has no valid /Game/ map asset path`);
-    }
-    const MapAssetName = UsableMaps[crypto.randomInt(0, UsableMaps.length)];
-    return MapAssetName.slice(0, MapAssetName.lastIndexOf("."));
+    return HuntResolver.MatchmakerHuntIdFor(PlayerHuntId);
 }
 
 
@@ -1046,20 +819,9 @@ export async function StartupGameserverWithHuntIdAndPlayers(HuntId: string, Expe
     }
 }
 
-/** Resolve and freeze the exact server arguments without allocating a port or starting a process. */
+/** Resolve and freeze the exact server arguments without allocating a port or starting a process (shared/hunt-manifest). */
 export function ResolveHuntLaunchManifest(HuntId: string, ExpectedPlayers: string[]) {
-    if (!Array.isArray(ExpectedPlayers) || ExpectedPlayers.length < 1 || ExpectedPlayers.length > 4 ||
-        ExpectedPlayers.some((accountId) => typeof accountId !== "string" || accountId.length === 0)) {
-        throw new Error("ExpectedPlayers must contain between one and four account IDs");
-    }
-    const matchmakerHuntId = GetMatchmakerHuntIdFromPlayerHuntId(HuntId);
-    const behemothPath = GetBehemothPathFromMatchmakerHuntId(matchmakerHuntId) ?? "NO_BEHEMOTH";
-    const mapPath = GetMapPathFromMatchmakerHuntId(matchmakerHuntId);
-    const expectedPlayerString = TransformExpectedPlayerArgs(ExpectedPlayers.map((playerUid) => ({
-        playerUid,
-        playerHuntId: HuntId
-    })));
-    return { huntId: HuntId, matchmakerHuntId, mapPath, behemothPath, expectedPlayerString };
+    return HuntResolver.ResolveManifest(HuntId, ExpectedPlayers);
 }
 
 /*
@@ -1114,7 +876,7 @@ export type HuntLaunchCoverageAudit = {
  * with no concrete destination remain visible as unsupported coverage instead of being guessed.
  */
 export function AuditHuntLaunchCoverage(): HuntLaunchCoverageAudit {
-    const PlayerRows = PlayerHuntTable[0].Rows as Record<string, any>;
+    const PlayerRows = HuntTables.playerRows as Record<string, any>;
     const Unresolved: string[] = [];
     const ReferencedRows = new Set<string>();
     const Maps = new Set<string>();
@@ -1164,8 +926,8 @@ export function AuditHuntLaunchCoverage(): HuntLaunchCoverageAudit {
 
 /** Non-mutating audit for generated 1.12 hunt data; never invent legacy aliases. */
 export function ValidateHuntTableData() {
-    const PlayerRows = (PlayerHuntTable[0].Rows as Record<string, any>);
-    const MatchmakerRows = (MatchmakerHuntTable[0].Rows as Record<string, any>);
+    const PlayerRows = (HuntTables.playerRows as Record<string, any>);
+    const MatchmakerRows = (HuntTables.matchmakerRows as Record<string, any>);
     const Problems: string[] = [];
     let DirectPlayerRows = 0;
     let TagRoutedReferences = 0;
@@ -1206,7 +968,7 @@ export function ValidateHuntTableData() {
     }
     const Coverage = AuditHuntLaunchCoverage();
     const Summary = { playerRows: Object.keys(PlayerRows).length, directPlayerRows: DirectPlayerRows, tagRoutedReferences: TagRoutedReferences, matchmakerRows: Object.keys(MatchmakerRows).length, problems: Problems, coverage: Coverage };
-    logger.info(`[HuntTableAudit] playerRows=${Summary.playerRows} directRows=${Summary.directPlayerRows} tagRoutedRows=${TagRoutedPlayerRows} tagRoutedRefs=${Summary.tagRoutedReferences} matchmakerRows=${Summary.matchmakerRows} (+${MatchmakerTableSources.length - 1} aux tables) problems=${Problems.length}`);
+    logger.info(`[HuntTableAudit] playerRows=${Summary.playerRows} directRows=${Summary.directPlayerRows} tagRoutedRows=${TagRoutedPlayerRows} tagRoutedRefs=${Summary.tagRoutedReferences} matchmakerRows=${Summary.matchmakerRows} (+${HuntTables.matchmakerSources.length - 1} aux tables) problems=${Problems.length}`);
     logger.info(`[HuntLaunchCoverage] resolvable=${Coverage.resolvablePlayerHunts}/${Coverage.totalPlayerHunts} referencedMatchmakerRows=${Coverage.referencedMatchmakerRows} uniqueMaps=${Coverage.uniqueMapAssets.length} gameModes=${Coverage.gameModeOverrides.length} unresolved=${Coverage.unresolvedPlayerHunts.length}`);
     if (Coverage.unresolvedPlayerHunts.length > 0) logger.warn(`[HuntLaunchCoverage] unsupported player hunt rows: ${Coverage.unresolvedPlayerHunts.join(", ")}`);
     LogHuntFamilyCoverage(Object.keys(PlayerRows));
@@ -1229,8 +991,16 @@ export async function Startup(){
     // [2026-10-10 1.14.7] Through the hub supervisors and their shared start gate: still sequential,
     // Ramsgate first, but a failed boot start is now retried with backoff instead of staying down.
     const Failures: string[] = [];
-    if (!(await RamsgateHub.ensure("boot"))) Failures.push("ramsgate");
-    if (!(await TrainingHub.ensure("boot"))) Failures.push("training_dojo");
+    if (RAMSGATE_HUB_ENABLED) {
+        if (!(await RamsgateHub.ensure("boot"))) Failures.push("ramsgate");
+    } else {
+        logger.info("[RamsgateHub] RAMSGATE_HUB=off - no dedicated Ramsgate hub (realms run their own on the host's PC)");
+    }
+    if (TRAINING_HUB_AT_BOOT) {
+        if (!(await TrainingHub.ensure("boot"))) Failures.push("training_dojo");
+    } else {
+        logger.info("[TrainingHub] TRAINING_HUB=off - the dedicated Training hub starts on its first request (fallback for hosted Training)");
+    }
 
     // [2026-10-05] Report, do not throw. The bootstrap does catch this rejection, but a failed hub start
     // is not fatal to the service: the healthy sibling must keep serving. Throwing here also marked the
