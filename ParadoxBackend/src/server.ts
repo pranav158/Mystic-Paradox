@@ -14,11 +14,14 @@ import https from "node:https";
 import http from "node:http";
 import tls from "node:tls";
 
-import { app } from "./app";
+import { app, AdminApi } from "./app";
+import { DescribeAdminApiPolicy } from "./config/adminApi";
 import { DrainAndRegisterAPIKeys } from "./controllers/apikeys";
 import { DrainAndRegisterUserAPIKeys } from "./controllers/auth";
 import { AssertApiKeyHashSecret } from "./security/apiKeyHash";
 import { GetPersistenceLifecycle } from "./persistence";
+import { LogRegistrationApprovalPolicy, ResolveRegistrationApproval } from "./config/registrationApproval";
+import { LogGuardModePolicy, ResolveGuardMode } from "./services/guardMode";
 import { initRealtime, shutdownRealtime } from "./realtime";
 import { logger } from "./logger";
 import { partyOutboxDispatcher } from "./realtime/PartyOutboxDispatcher";
@@ -26,6 +29,7 @@ import { AssertRuntimeSafety } from "./config/runtimeSafety";
 import { ReadMetagameServiceRole } from "./config/serviceRole";
 import { SetServiceReadiness } from "./observability/serviceReadiness";
 import { GetP2PExtension } from "./extensions/p2p";
+import { ResolveListenerPlan } from "./config/listenerPlan";
 
 const PORT = process.env.PORT?.trim() || "3000";
 
@@ -89,11 +93,22 @@ async function Main(): Promise<void> {
     const serviceRole = ReadMetagameServiceRole();
     const moduleSummary = GetP2PExtension().server.startupSummary(serviceRole);
     if (moduleSummary != undefined) logger.info(moduleSummary, "[Startup] Optional module policy");
+    // [2026-10-14] One line with the active registration approval mode (every provider), plus warnings for an unrecognised value or the replaced switch.
+    LogRegistrationApprovalPolicy(ResolveRegistrationApproval(process.env));
+    // [2026-10-14] One line with the Guard mode (observe by default: Guard verdicts refuse nothing).
+    LogGuardModePolicy(ResolveGuardMode(process.env));
+    // [2026-10-15] One line: whether the admin API and the manager preflight are served (config/adminApi.ts).
+    logger.info(DescribeAdminApiPolicy(AdminApi));
     if (serviceRole !== "combined" && serviceRole !== "api") {
         throw new Error(`server.ts serves the combined or api role; ${serviceRole} has its own entry point.`);
     }
-    const ParadoxCtx = LoadTlsContext(PARADOX_CERT_PATH, PARADOX_KEY_PATH, "paradox.mysticfox.dev", PARADOX_KEY_PASSPHRASE);
-    if (process.env.NODE_ENV === "production" && ParadoxCtx == undefined) {
+    // [2026-10-14 M2] Behind a reverse proxy (MYSTICPARADOX_TLS_TERMINATED_BY_PROXY=on) the proxy holds the certificate: no HTTPS
+    // listener is opened and none is loaded here, in production too. Throws on an invalid switch value.
+    const Listeners = ResolveListenerPlan(process.env);
+    const ParadoxCtx = Listeners.tlsTerminatedByProxy
+        ? undefined
+        : LoadTlsContext(PARADOX_CERT_PATH, PARADOX_KEY_PATH, "paradox.mysticfox.dev", PARADOX_KEY_PASSPHRASE);
+    if (process.env.NODE_ENV === "production" && !Listeners.tlsTerminatedByProxy && ParadoxCtx == undefined) {
         throw new Error("Production API startup requires a valid HTTPS certificate and key.");
     }
     // API keys are HMAC-hashed under API_KEY_HASH_SECRET; refuse to start without it rather than reject every
@@ -107,15 +122,26 @@ async function Main(): Promise<void> {
     partyOutboxDispatcher.start();
     GetP2PExtension().server.start(serviceRole);
 
-    HttpServer = app.listen(PORT, () => {
-        logger.info(`Mystic Paradox Metagame (HTTP) on port ${PORT}`);
+    // [2026-10-14 M2] BIND_HOST (unset = every interface, as before). Behind a proxy the listener is ready as soon as it listens.
+    const ListenHttp = (listening: () => void) => (Listeners.httpBindHost != undefined
+        ? app.listen(Number(PORT), Listeners.httpBindHost, listening)
+        : app.listen(PORT, listening));
+    HttpServer = ListenHttp(() => {
+        logger.info(`Mystic Paradox Metagame (HTTP) on port ${PORT}${Listeners.httpBindHost != undefined ? ` bound to ${Listeners.httpBindHost}` : ""}`);
         logger.info(`Clear Skies, Slayer.`);
+        if (Listeners.tlsTerminatedByProxy) SetServiceReadiness({ ready: true, reason: "API_BEHIND_PROXY_RUNNING", role: serviceRole });
     });
     HttpServer.on("error", (error) => {
         HandleListenerError("HTTP", error, serviceRole);
     });
+    // [2026-10-14 M2] Behind the proxy the XMPP WebSocket upgrade arrives on the plain listener; the Host allowlist still applies.
+    if (Listeners.realtimeListener === "HTTP") {
+        initRealtime(HttpServer, { behindProxy: Listeners.tlsTerminatedByProxy });
+    }
 
-    if (ParadoxCtx == undefined) {
+    if (Listeners.tlsTerminatedByProxy) {
+        logger.info("TLS terminates at the reverse proxy (MYSTICPARADOX_TLS_TERMINATED_BY_PROXY=on): no HTTPS listener and no certificate loaded");
+    } else if (ParadoxCtx == undefined) {
         logger.error("No HTTPS certificate available - HTTPS listener not started (game client TLS will fail)");
     } else {
         try {
@@ -146,7 +172,7 @@ async function Main(): Promise<void> {
             if (process.env.NODE_ENV === "production") throw e;
         }
     }
-    if (ParadoxCtx == undefined && process.env.NODE_ENV !== "production") {
+    if (!Listeners.tlsTerminatedByProxy && ParadoxCtx == undefined && process.env.NODE_ENV !== "production") {
         SetServiceReadiness({ ready: true, reason: "HTTP_ONLY_DEVELOPMENT", role: serviceRole });
     }
 
@@ -166,7 +192,13 @@ async function Main(): Promise<void> {
     //
     // A bind failure is logged and deliberately does NOT change readiness: the game is still playable
     // without a latency measurement, so a busy QoS port must never take the API down.
-    const QOS_PORT = Number(process.env.QOS_PORT?.trim() || "80");
+    // [2026-10-14 M2] QOS_PORT=off starts no listener (a reverse proxy answers the pings, see deploy/nginx); an invalid value is reported.
+    const QOS_PORT = Listeners.qosPort;
+    if (QOS_PORT == undefined) {
+        if (Listeners.qosProblem != undefined) logger.warn(`QoS listener not started: ${Listeners.qosProblem}`);
+        else logger.info("QoS latency-test listener off (QOS_PORT=off); a reverse proxy answers the region pings");
+        return;
+    }
     try {
         const QosServer = http.createServer((_req, res) => {
             res.statusCode = 200;

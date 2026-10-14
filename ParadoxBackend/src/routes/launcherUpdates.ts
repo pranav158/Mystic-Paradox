@@ -288,6 +288,32 @@ export function GetPublishedGuardManifest(channel: string, platform = "windows-x
     } catch { return undefined; }
 }
 
+/**
+ * [2026-10-11] The runtime feed's current manifest (runtime DLL hash plus its extra files) for one target/channel, as
+ * served to launchers; undefined when missing or unreadable. The P2P module derives the artifact hashes it expects
+ * from player hosts from it instead of pinning them in .env (plan 39_ §13.1 B3).
+ */
+export function ReadPublishedRuntimeManifest(target: string, channel: string, platform = "windows-x86_64"): Record<string, unknown> | undefined {
+    try {
+        return readJson(runtimeManifestPath(target, channel, platform));
+    } catch { return undefined; }
+}
+
+/**
+ * [2026-10-11] Role, name and SHA-256 of every artifact in the signed Guard manifest of one channel, after the same
+ * signature/window/role checks as serving it; undefined when missing or invalid. Optional modules read their roles'
+ * hashes from it (the file names stay feed data).
+ */
+export function ReadPublishedGuardArtifacts(channel: string, platform = "windows-x86_64"): Array<{ role: string; name: string; sha256: string }> | undefined {
+    try {
+        const envelope = readJson(guardManifestPath(channel, platform));
+        if (!envelope) return undefined;
+        const { payload } = parseAndVerifyGuardEnvelope(envelope);
+        if (payload.channel !== channel || payload.platform !== platform) return undefined;
+        return payload.artifacts.map((artifact) => ({ role: artifact.role, name: artifact.name, sha256: artifact.sha256.toLowerCase() }));
+    } catch { return undefined; }
+}
+
 function serveRuntimeManifest(target: string, channel: string, platform: string, res: Response): void {
     try {
         // Global kill-switch: when runtime serving is disabled, report "no update"

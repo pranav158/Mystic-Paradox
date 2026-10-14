@@ -113,3 +113,32 @@ friendsRouter.get("/friends/api/public/list/:namespace/:accountId/recentPlayers"
 friendsRouter.get("/friends/api/v1/:accountId/settings", (req, res) => {
     res.json({ acceptInvites: "public", mutualPrivacy: "ALL" });
 });
+
+// [2026-10-15] Slayer Link (social-prod, DauntlessEndpointDocumentation/Social/SlayerLink). No link or invite is stored by this
+// backend, so the status is empty and no friend has a free slot: the shapes are the captured ones, the content is the truth. The
+// invite route (PUT /slayerlink/invite) is not answered here.
+export const SLAYER_LINK_MAX_ACCOUNTS = 256;
+const SLAYER_LINK_MAX_ID_LENGTH = 128;
+
+/** POST /slayerlink/availability: every well-formed requested account, not available (no link can be made). */
+export function SlayerLinkAvailabilityPayload(body: unknown): { availability: { account_id: string; available: boolean }[] } {
+    const Requested: unknown[] = Array.isArray((body as { account_ids?: unknown } | null)?.account_ids)
+        ? (body as { account_ids: unknown[] }).account_ids : [];
+    const Ids = Requested
+        .filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= SLAYER_LINK_MAX_ID_LENGTH)
+        .slice(0, SLAYER_LINK_MAX_ACCOUNTS);
+    return { availability: Ids.map((accountId) => ({ account_id: accountId, available: false })) };
+}
+
+/** GET /slayerlink/status_good: the captured config, no invites and no links. */
+export function SlayerLinkStatusPayload(): { config: { invite_expiry_hours: number; link_duration_hours: number }; invites: unknown[]; links: unknown[] } {
+    return { config: { invite_expiry_hours: 48, link_duration_hours: 168 }, invites: [], links: [] };
+}
+
+friendsRouter.post("/slayerlink/availability", HasParadoxBackendAuth, (req, res) => {
+    res.status(200).json({ code: null, message: "OK", payload: SlayerLinkAvailabilityPayload(req.body) });
+});
+
+friendsRouter.get("/slayerlink/status_good", HasParadoxBackendAuth, (req, res) => {
+    res.status(200).json({ code: null, message: "OK", payload: SlayerLinkStatusPayload() });
+});

@@ -33,6 +33,13 @@ type CoreLauncherErrorCode =
     | "AUTH_DISCORD_ALREADY_LINKED"
     | "AUTH_TESTER_REQUIRED"
     | "AUTH_CHANNEL_MISMATCH"
+    // [2026-10-14] Terms of Use / Privacy Policy consent and the account deletion hold (launcherAuth routes, accountConsent.ts).
+    | "CONSENT_REQUIRED"
+    | "CONSENT_AGE_REQUIRED"
+    | "LEGAL_VERSION_OUTDATED"
+    | "DELETION_CONFIRMATION_MISMATCH"
+    | "DELETION_HOLD_EXPIRED"
+    | "ACCOUNT_DEACTIVATED"
     | "GAME_EXCHANGE_CODE_EXPIRED"
     | "GAME_BUILD_UNSUPPORTED"
     | "RUNTIME_BUILD_UNSUPPORTED"
@@ -79,6 +86,14 @@ const StatusByCode: Record<CoreLauncherErrorCode, number> = {
     AUTH_DISCORD_ALREADY_LINKED: 409,
     AUTH_TESTER_REQUIRED: 403,
     AUTH_CHANNEL_MISMATCH: 409,
+    // [2026-10-14] CONSENT_REQUIRED defaults to 400 (registration); a refusal of a game session or realm hosting sends 403 with
+    // { status: 403 } (LauncherApiError options), like the other statuses one code can carry.
+    CONSENT_REQUIRED: 400,
+    CONSENT_AGE_REQUIRED: 400,
+    LEGAL_VERSION_OUTDATED: 409,
+    DELETION_CONFIRMATION_MISMATCH: 400,
+    DELETION_HOLD_EXPIRED: 409,
+    ACCOUNT_DEACTIVATED: 403,
     GAME_EXCHANGE_CODE_EXPIRED: 410,
     GAME_BUILD_UNSUPPORTED: 400,
     RUNTIME_BUILD_UNSUPPORTED: 409,
@@ -92,21 +107,33 @@ const StatusByCode: Record<CoreLauncherErrorCode, number> = {
     INTERNAL: 500
 };
 
+export interface LauncherApiErrorOptions {
+    /** HTTP status for this refusal. One code may be refused with different statuses (CONSENT_REQUIRED: 400 at sign-up, 403 at play). */
+    status?: number;
+    /** Extra top-level fields of the error object (for example `scheduledFor` on ACCOUNT_DEACTIVATED), as the P2P errors send them. */
+    details?: Record<string, unknown>;
+}
+
 export class LauncherApiError extends Error {
     code: LauncherErrorCode;
+    status?: number;
+    details?: Record<string, unknown>;
 
-    constructor(code: LauncherErrorCode, message: string) {
+    constructor(code: LauncherErrorCode, message: string, options: LauncherApiErrorOptions = {}) {
         super(message);
         this.name = "LauncherApiError";
         this.code = code;
+        this.status = options.status;
+        this.details = options.details;
     }
 }
 
 export function SendLauncherError(res: Response, error: LauncherApiError): void {
     const RequestId = crypto.randomUUID();
 
-    const Status = (StatusByCode as Record<string, number>)[error.code] ?? ExtensionStatusByCode.get(error.code) ?? 500;
+    const Status = error.status ?? (StatusByCode as Record<string, number>)[error.code] ?? ExtensionStatusByCode.get(error.code) ?? 500;
     res.status(Status).json({
-        error: { code: error.code, message: error.message, requestId: RequestId }
+        // The fixed fields come last, so a detail can never replace the code, the message or the request id.
+        error: { ...(error.details ?? {}), code: error.code, message: error.message, requestId: RequestId }
     });
 }

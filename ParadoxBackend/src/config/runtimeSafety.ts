@@ -1,6 +1,8 @@
 import { ReadMetagameServiceRole } from "./serviceRole";
 import { ReadMongoRuntimeConfig } from "./mongoRuntime";
 import { GetP2PExtension } from "../extensions/p2p";
+import { ReadTlsTerminatedByProxy } from "./listenerPlan";
+import { AssertManagerOperatorConfig } from "../security/managerOperator";
 
 function LiteralTrue(value: string | undefined): boolean {
     return value?.trim().toLowerCase() === "true";
@@ -21,6 +23,8 @@ export function AssertRuntimeSafety(environment: NodeJS.ProcessEnv = process.env
     if (legacyKeys.length > 0) {
         throw new Error(`Rename these environment keys to the MYSTICPARADOX_ prefix: ${legacyKeys.sort().join(", ")}`);
     }
+    // [2026-10-14, P5.1] MYSTICPARADOX_MANAGER_ADMIN=on needs MYSTICPARADOX_MANAGER_OPERATOR_SECRET (32+ characters); refused here, not at first request.
+    AssertManagerOperatorConfig(environment);
     ReadMetagameServiceRole(environment);
     const production = environment.NODE_ENV === "production";
     // An optional module checks its own settings first (src/extensions).
@@ -58,7 +62,10 @@ export function AssertRuntimeSafety(environment: NodeJS.ProcessEnv = process.env
     const httpPort = Number(environment.PORT ?? "3000");
     const httpsPort = Number(environment.HTTPS_PORT ?? "3443");
     if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65_535) unsafe.push("PORT must be a valid production port");
-    if (!Number.isInteger(httpsPort) || httpsPort < 1 || httpsPort > 65_535) unsafe.push("HTTPS_PORT must be a valid production port");
+    // [2026-10-14 M2] Behind a reverse proxy there is no HTTPS listener, so its port is not checked.
+    if (!ReadTlsTerminatedByProxy(environment) && (!Number.isInteger(httpsPort) || httpsPort < 1 || httpsPort > 65_535)) {
+        unsafe.push("HTTPS_PORT must be a valid production port");
+    }
     if (unsafe.length > 0) throw new Error(`Unsafe production configuration: ${unsafe.join(", ")}`);
 }
 

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { Request, Response } from "express";
 import { LauncherAccountRecord } from "../persistence";
-import { GetUnitOfWork } from "../persistence";
+import { GetSqliteDirectAccess, GetUnitOfWork } from "../persistence";
 import { GetMongoDb } from "../persistence/mongo/client";
 import { Collections } from "../persistence/mongo/collections";
 import { GetOperationsPolicy, OperationsPolicyWeakeningCodes, SetOperationsPolicy } from "../services/operationsPolicy";
@@ -11,9 +11,9 @@ import { IsRateLimited } from "../security/rateLimit";
 import { GetP2PExtension } from "../extensions/p2p";
 
 export async function GetOperationsOverview(_req: Request, res: Response): Promise<void> {
-    const db = await GetMongoDb();
+    const Sqlite = GetSqliteDirectAccess();
     const [launcherGuard, policy, extension] = await Promise.all([
-        db.collection(Collections.LauncherGuardSessions).find({})
+        Sqlite ? Sqlite.listLauncherGuardSessions(100) : (await GetMongoDb()).collection(Collections.LauncherGuardSessions).find({})
             .project({ _id: 1, accountId: 1, launcherVersion: 1, manifestSequence: 1, status: 1,
                 riskScore: 1, lastHeartbeatAt: 1, expiresAt: 1, lastSignals: 1 })
             .sort({ createdAt: -1 }).limit(100).toArray(),

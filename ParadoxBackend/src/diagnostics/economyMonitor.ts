@@ -19,6 +19,7 @@ import { GetRequestId } from "../observability/requestContext.js";
  *   [DraftMon]     bounty draft tokens (TOKEN_DAILY/WEEKLY_CHALLENGE_DRAFT[_PREMIUM]) - every Ramsgate
  *                  arrival wrote them up and back down while bounties were not stored - and the bounty
  *                  saves/loads around them, with the stored counts after each (src/bountyState.ts).
+ *   [HuntPassMon]  every stored hunt pass XP grant: progress and rank (by the served requirements) before and after.
  *
  * Unlike [INV-CAP] (diagnostics/capture.ts, off by default) these stay on: they only fire for the
  * few catalog ids above. MYSTICPARADOX_ECONOMY_MONITOR=off silences both.
@@ -165,14 +166,45 @@ export function MonitorProgressionReport(userId: string, source: MonitorSource, 
 }
 
 // GET /progression/:userId - the stored values for the prestige source tracks the hunt server will start from.
-export function MonitorProgressionServed(userId: string, payload: any[], isPrestigeSourceTrack: (progressionId: string) => boolean): void {
+// [2026-10-10] The served hunt pass (`alwaysIncludeIds`) is always listed, at progress 0 too, or as `{absent}` when the
+// payload lacks it: dropping zero rows hid that season43 had no stored progress at all.
+export function MonitorProgressionServed(userId: string, payload: any[], isPrestigeSourceTrack: (progressionId: string) => boolean,
+    alwaysIncludeIds: readonly string[] = []): void {
     Safe(() => {
+        const Always = new Set(alwaysIncludeIds);
         const Rows = ToArray(payload)
-            .filter((Row) => typeof Row?.progression_id === "string" && isPrestigeSourceTrack(Row.progression_id))
-            .filter((Row, Index) => Index === 0 || Number(Row.progress) > 0)
+            .filter((Row) => typeof Row?.progression_id === "string" && (isPrestigeSourceTrack(Row.progression_id) || Always.has(Row.progression_id)))
+            .filter((Row, Index) => Index === 0 || Always.has(Row.progression_id) || Number(Row.progress) > 0)
             .map((Row) => `${Row.progression_id}{progress=${Row.progress} ranks=${Row.confirmed_fremium_rank}/${Row.confirmed_premium_rank}}`);
-        if (Rows.length === 0) return;
-        logger.info(`[PrestigeMon] SERVED user=${userId} [${Rows.join(" ")}]`);
+        const Absent = [...Always]
+            .filter((Id) => !ToArray(payload).some((Row) => Row?.progression_id === Id))
+            .map((Id) => `${Id}{absent}`);
+        if (Rows.length + Absent.length === 0) return;
+        logger.info(`[PrestigeMon] SERVED user=${userId} [${[...Rows, ...Absent].join(" ")}]`);
+    });
+}
+
+export interface HuntPassGrantEvent {
+    userId: string;
+    progressionId: string;
+    amount: number;
+    newProgress: number;
+    confirmedFremiumRank?: number;
+    confirmedPremiumRank?: number;
+    replayed: boolean;
+    grantId: string;
+}
+
+// [HuntPassMon] POST /progression/:userId/:track/:amount on the hunt pass, after the grant is stored (or replayed from
+// its ledger row). `rankFor` maps progress to a rank on the served requirements (controllers/progression.ts), so this
+// module needs no game data. Old progress is new - amount: the ledger result is the row right after that grant's $inc.
+export function MonitorHuntPassGrant(event: HuntPassGrantEvent, rankFor: (progress: number) => number | undefined): void {
+    Safe(() => {
+        const OldProgress = event.newProgress - event.amount;
+        logger.info(`[HuntPassMon] GRANT user=${event.userId} track=${event.progressionId} amount=${event.amount}`
+            + ` progress=${OldProgress}->${event.newProgress} rank=${rankFor(OldProgress) ?? "?"}->${rankFor(event.newProgress) ?? "?"}`
+            + ` confirmed=${event.confirmedFremiumRank ?? "?"}/${event.confirmedPremiumRank ?? "?"}`
+            + ` replayed=${event.replayed ? 1 : 0} grant=${event.grantId}`);
     });
 }
 
@@ -206,7 +238,7 @@ export function MonitorBountySave(userId: string, source: MonitorSource, body: a
 }
 
 // [CooldownMon] GET /cooldown and PUT /cooldown/batch (src/cooldownState.ts): every id with its start date, and the raw
-// body of the first 8 saves per process (no live capture of these endpoints exists).
+// body of the first 8 saves per process (no live capture of these endpoints exists). START: the single-id PUT below.
 const RawCooldownSaveBudget = { remaining: 8 };
 
 function CooldownList(entries: unknown): string {
@@ -221,6 +253,20 @@ export function MonitorCooldownSave(userId: string, source: MonitorSource, body:
             RawCooldownSaveBudget.remaining--;
             logger.info(`[CooldownMon] SAVE-RAW user=${userId} ${JSON.stringify(body ?? {}).slice(0, 2000)}`);
         }
+    });
+}
+
+// PUT /cooldown/:userId/:cooldownId (StartCooldownEndpoint, controllers/cooldowns.ts): one id started at the backend's
+// own time - a harvested city gatherable (32-hex node GUID) or a UCooldownComponent::StartCooldown. The request has no
+// body, so this logs no SAVE/SAVE-RAW line and does not spend their budget.
+export function MonitorCooldownStart(userId: string, source: MonitorSource, cooldownId: unknown, outcome: string): void {
+    Safe(() => {
+        // Both path values are printed bare only when plain; anything else is quoted so it cannot forge a log line
+        // (Express decodes %0D%0A in params, and the line is written before the 403 for an unauthorised caller).
+        const Plain = (Value: unknown) => typeof Value === "string" && /^[A-Za-z0-9_.:-]{1,200}$/.test(Value)
+            ? Value
+            : JSON.stringify(String(Value).slice(0, 64));
+        logger.info(`[CooldownMon] START user=${Plain(userId)} src=${source} id=${Plain(cooldownId)} => ${outcome}`);
     });
 }
 

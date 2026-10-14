@@ -19,6 +19,7 @@ import { GetRepositories } from "../persistence";
 import { HashOpaqueToken } from "../security/launcherTokens";
 import { IsAccountEligible } from "../security/accountEligibility";
 import { LauncherApiError } from "../security/launcherErrors";
+import { BindRealmPresenceAtLogin } from "../realms/entry";
 import {
     AssertRuntimeChannelMatchesAccount,
     AssertRuntimeHashApproved,
@@ -265,6 +266,19 @@ eosRouter.post("/account/api/oauth/token", async (req, res) => {
             const Code = error instanceof LauncherApiError ? error.code : "INTERNAL";
             logger.warn(`LAUNCHER auth: runtime authorization failed for ${CodeRecord.userId} (${Code})`);
             res.status(403);
+            res.send();
+            return;
+        }
+
+        // [2026-10-13 realms hub design section 2.1] The authoritative realm bind: this login's realm (the one the code was issued
+        // for, or none) replaces whatever realm context the account had, so an official Play never keeps a stale or spoofed realm.
+        // A no-op while the realms module is off. Resetting to "no realm" never blocks a login; a login that meant a realm and
+        // cannot be bound is refused (it must not go on as official play).
+        try {
+            await BindRealmPresenceAtLogin(CodeRecord.userId, CodeRecord.realmId ?? null);
+        } catch (error) {
+            logger.error(`LAUNCHER auth: could not bind the realm of ${CodeRecord.userId}: ${error}`);
+            res.status(503);
             res.send();
             return;
         }

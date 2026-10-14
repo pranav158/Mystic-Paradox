@@ -9,7 +9,7 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-import type { Server as HttpsServer } from "node:https";
+import type { Server as HttpServer } from "node:http";
 
 import { logger } from "../logger";
 import { RealtimeGateway } from "./RealtimeGateway";
@@ -17,7 +17,7 @@ import { DEFAULT_LIMITS, REALTIME_WS_PATHS, RealtimeConfig } from "./types";
 
 let gateway: RealtimeGateway | undefined;
 
-function loadConfig(): RealtimeConfig {
+function loadConfig(options: InitRealtimeOptions): RealtimeConfig {
     const enabled = process.env.REALTIME_XMPP_ENABLED === "true";
     // Capture defaults ON whenever the feature is enabled (this is the capture
     // milestone); set REALTIME_XMPP_CAPTURE=false to silence it once protocol
@@ -39,20 +39,26 @@ function loadConfig(): RealtimeConfig {
         allowedHosts,
         captureEnabled,
         limits: DEFAULT_LIMITS,
+        trustForwardedFor: options.behindProxy === true,
     };
 }
 
+export interface InitRealtimeOptions {
+    /** [2026-10-14 M2] The listener is behind a loopback reverse proxy (the proxy's X-Forwarded-For names the client). */
+    behindProxy?: boolean;
+}
+
 /**
- * Attach the realtime WebSocket upgrade handler to the HTTPS server. Always safe to
- * call: when REALTIME_XMPP_ENABLED != "true" the gateway rejects every upgrade and
- * holds no state, so ordinary HTTPS/REST is unaffected (plan §21 server rollback).
+ * Attach the realtime WebSocket upgrade handler to the HTTPS server, or, behind a reverse proxy, to the plain HTTP listener
+ * ([2026-10-14 M2] same upgrade path, same Host allowlist). Always safe to call: when REALTIME_XMPP_ENABLED != "true" the
+ * gateway rejects every upgrade and holds no state, so ordinary HTTPS/REST is unaffected (plan §21 server rollback).
  */
-export function initRealtime(server: HttpsServer): RealtimeGateway {
+export function initRealtime(server: HttpServer, options: InitRealtimeOptions = {}): RealtimeGateway {
     if (gateway) {
         logger.warn("[XMPP] initRealtime called more than once; reusing existing gateway");
         return gateway;
     }
-    const config = loadConfig();
+    const config = loadConfig(options);
     gateway = new RealtimeGateway(config);
     gateway.attach(server);
     if (!config.enabled) {

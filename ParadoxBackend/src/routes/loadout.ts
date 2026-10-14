@@ -23,7 +23,14 @@ import {
     ResolveWireLoadoutSlotCounts
 } from "../loadoutSlots";
 import { CharacterOwnershipError } from "../controllers/starterManifest";
-import { GetPlayerJourney } from "../controllers/progression";
+import {
+    GetPlayerJourney,
+    HostWriteHooks,
+    IsHostRuntimeAuth,
+    RefuseUnauthorizedHostWrite,
+    TagHostWrite
+} from "../controllers/progression";
+import type { ExtensionHttpResponse } from "../extensions/p2p";
 import { logger } from "../logger";
 import { CaptureEvent, InventoryCaptureEnabled } from "../diagnostics/capture";
 
@@ -151,15 +158,29 @@ loadoutRouter.get("/loadout/:userId/:characterId/all", HasParadoxBackendAuth, as
 // `1 + unlockedConditions - NumCharacterLoadoutSlots`. Therefore `/unlock/3` is not a desired
 // total. Treat the path value as a bounded gameserver hint and derive the exact, idempotent
 // entitlement from the persisted LoadoutSlot_01..05 nodes.
+// [2026-10-15] The gate of POST /loadout/:userId/:characterId/unlock/:n. A dedicated gameserver may unlock for any account (its own
+// authority, as before). A player-hosted runtime (AuthData.IsPlayerHostRuntime) may unlock for a player it may write: the hostWrites
+// hook decides (LOADOUT_UNLOCK: a hunt's admitted member, a realm's Ramsgate hub's present member; a Training hub refuses). Whatever
+// the caller, the slot count is derived from the target's persisted Slayer's Path below, so a host cannot grant more than the player
+// has unlocked. A player's own bearer token is refused. Undefined when the request may proceed.
+export async function AuthorizeLoadoutUnlock(req: any, targetUserId: string, hooks?: HostWriteHooks): Promise<ExtensionHttpResponse | undefined> {
+    if (IsHostRuntimeAuth(req.AuthData)) return RefuseUnauthorizedHostWrite(req, "LOADOUT_UNLOCK", targetUserId, hooks);
+    if (req.AuthData?.IsGameserver === true) return undefined;
+    logger.warn(`POST character loadout unlock rejected without gameserver authority userId=${targetUserId} characterId=${req.params?.characterId}`);
+    return { status: 403, body: { code: "forbidden", message: "Loadout slot unlocks require gameserver authority.", payload: null } };
+}
+
 loadoutRouter.post("/loadout/:userId/:characterId/unlock/:numSlots", HasParadoxBackendAuth, async (req: any, res) => {
-    // Slot entitlement comes from authoritative Slayer's Path state applied by the gameserver.
+    // Slot entitlement comes from authoritative Slayer's Path state applied by the gameserver (or a host for a player it may write).
     // A player bearer token must not be able to call /unlock directly.
-    if (req.AuthData?.IsGameserver !== true) {
-        logger.warn(`POST character loadout unlock rejected without gameserver authority userId=${req.params.userId} characterId=${req.params.characterId}`);
-        res.status(403).json({ code: "forbidden", message: "Loadout slot unlocks require gameserver authority.", payload: null });
+    const Gate = await AuthorizeLoadoutUnlock(req, req.params.userId);
+    if (Gate !== undefined) {
+        res.status(Gate.status).json(Gate.body);
         return;
     }
-    const RequestorAccountId = req.AuthData.IsGameserver ? req.params.userId : req.AuthData.userId;
+    const IsHost = IsHostRuntimeAuth(req.AuthData);
+    // The target account is the path's: a gameserver's and a host's request both name the player (never the caller's own account).
+    const RequestorAccountId = req.params.userId;
     const CharacterId = req.params.characterId;
     const RequestedAdditionalSlots = Number(req.params.numSlots);
 
@@ -190,6 +211,10 @@ loadoutRouter.post("/loadout/:userId/:characterId/unlock/:numSlots", HasParadoxB
     const Wire = ResolveWireLoadoutSlotCounts(State.loadouts.length);
     logger.info(`Loadout slot entitlement reconciled userId=${RequestorAccountId} characterId=${CharacterId} gameserverDelta=${RequestedAdditionalSlots} authoritativeTotalSlots=${State.loadouts.length} wire=account:${Wire.num_account_slots}/${Wire.max_account_slots},character:${Wire.num_character_slots}/${Wire.max_character_slots}`);
     NoteLoadoutUnlockRequest(RequestorAccountId, CharacterId, RequestedAdditionalSlots, State.loadouts.length);
+    // [2026-10-15] A host's unlock is tagged like its other writes (the summary holds counts only, no ids).
+    if (IsHost) {
+        await TagHostWrite(req, "LOADOUT_UNLOCK", RequestorAccountId, { gameserverDelta: RequestedAdditionalSlots, authoritativeTotalSlots: State.loadouts.length });
+    }
     res.status(200).json({
         code: null,
         message: "OK",

@@ -1,13 +1,28 @@
 import crypto from "node:crypto";
-import { GetRepositories, LauncherGuardRole, LauncherGuardSignals } from "../persistence";
+import { GetRepositories, LauncherGuardRole, LauncherGuardSignals, LauncherGuardUnexpectedModule } from "../persistence";
 import { GetPublishedGuardManifest } from "../routes/launcherUpdates";
 import { LauncherApiError } from "../security/launcherErrors";
 import { VersionAtLeast } from "../security/launcherVersion";
+import { logger } from "../logger";
 
 const VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const HEX64 = /^[0-9a-f]{64}$/i;
 const SESSION_LIFETIME_MS = 5 * 60_000;
 const MAX_CLOCK_SKEW_MS = 60_000;
+
+// [2026-10-14] Bounds for the launcher's unexpectedModules list (basenames, the Authenticode subject or "unsigned").
+const UNEXPECTED_MODULE_LIMIT = 32;
+const MODULE_FILE_NAME_LIMIT = 260;
+const MODULE_SIGNER_LIMIT = 256;
+const MODULE_SIZE_LIMIT = 2 ** 40;
+const MODULE_SHA256 = /^[0-9a-f]{64}$/i;
+// Separators are refused on their own (see ParseUnexpectedModules); this is the rest of what a Windows file name may not hold.
+const MODULE_FILE_NAME_FORBIDDEN = /[\u0000-\u001f<>:"|?*]/;
+// Reason codes for the score (stored with the session and in its history).
+export interface LauncherGuardExplanation {
+    score: number;
+    reasons: string[];
+}
 
 function opaque(bytes: number): string { return crypto.randomBytes(bytes).toString("base64url"); }
 
@@ -40,7 +55,43 @@ function requireSignals(value: unknown): LauncherGuardSignals {
         typeof input.debuggerPresent !== "boolean") {
         throw new LauncherApiError("GUARD_REPORT_INVALID", "The Launcher Guard report is invalid.");
     }
-    return input as LauncherGuardSignals;
+    const Signals = { ...(input as LauncherGuardSignals) };
+    const Modules = ParseUnexpectedModules(input.unexpectedModules);
+    delete Signals.unexpectedModules;
+    if (Modules !== undefined) Signals.unexpectedModules = Modules;
+    return Signals;
+}
+
+function InvalidModuleReport(): LauncherApiError {
+    return new LauncherApiError("GUARD_REPORT_INVALID", "The Launcher Guard report is invalid.");
+}
+
+/**
+ * [2026-10-14] The modules the launcher found outside the expected set. Each file name is a basename: a path separator, a drive
+ * colon, a control or Windows-forbidden character, "." and ".." are refused. The signer is the Authenticode subject or "unsigned".
+ * At most UNEXPECTED_MODULE_LIMIT entries. Absent or null means no list. Anything malformed refuses the whole heartbeat.
+ */
+export function ParseUnexpectedModules(value: unknown): LauncherGuardUnexpectedModule[] | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (!Array.isArray(value) || value.length > UNEXPECTED_MODULE_LIMIT) throw InvalidModuleReport();
+    return value.map((entry): LauncherGuardUnexpectedModule => {
+        if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw InvalidModuleReport();
+        const Input = entry as Record<string, unknown>;
+        const FileName = Input.fileName;
+        if (typeof FileName !== "string" || FileName.length === 0 || FileName.length > MODULE_FILE_NAME_LIMIT ||
+            FileName === "." || FileName === ".." || /[\\/]/.test(FileName) || MODULE_FILE_NAME_FORBIDDEN.test(FileName)) {
+            throw InvalidModuleReport();
+        }
+        const Signer = Input.signer;
+        if (typeof Signer !== "string" || Signer.length === 0 || Signer.length > MODULE_SIGNER_LIMIT || /[\u0000-\u001f]/.test(Signer)) {
+            throw InvalidModuleReport();
+        }
+        const Sha256 = Input.sha256;
+        if (typeof Sha256 !== "string" || !MODULE_SHA256.test(Sha256)) throw InvalidModuleReport();
+        const Size = Input.size;
+        if (typeof Size !== "number" || !Number.isSafeInteger(Size) || Size < 0 || Size > MODULE_SIZE_LIMIT) throw InvalidModuleReport();
+        return { fileName: FileName, signer: Signer, sha256: Sha256.toLowerCase(), size: Size };
+    });
 }
 
 export function LauncherGuardSignatureMaterial(input: {
@@ -55,21 +106,62 @@ export function LauncherGuardSignatureMaterial(input: {
         s.debuggerPresent ? 1 : 0].join("\n");
 }
 
+/**
+ * [2026-10-14] The unexpected modules split by signer. The count (unexpectedModuleCount) is signed and is the authority; the launcher's
+ * unexpectedModules list is not signed, so it only says how many of that count carry a publisher's signature, and never adds to it.
+ * A signer of "unsigned" or "invalid" (case-insensitive) is untrusted; any other signer is a signed module. Without the list (older
+ * launchers) every module is untrusted, as before.
+ */
+function SplitUnexpectedModules(signals: LauncherGuardSignals): { untrusted: number; signed: number } {
+    const count = signals.unexpectedModuleCount;
+    const signedListed = (signals.unexpectedModules ?? []).filter((module) => !/^(unsigned|invalid)$/i.test(module.signer.trim())).length;
+    const signed = Math.min(signedListed, count);
+    return { untrusted: count - signed, signed };
+}
+
+/** [2026-10-14] The score of one report, with the reason codes that gave it (the same arithmetic as before the codes). */
+function explainSignals(signals: LauncherGuardSignals, privateExecutableLimit: number,
+    writableExecutableLimit = 0): LauncherGuardExplanation {
+    let score = 0;
+    const reasons: string[] = [];
+    if (signals.debuggerPresent) {
+        score += 50;
+        reasons.push("DEBUGGER");
+    }
+    // Untrusted modules weigh as before (+15 each, a hard violation). Signed modules are a low-weight finding only.
+    const { untrusted, signed } = SplitUnexpectedModules(signals);
+    if (untrusted > 0) {
+        score += Math.min(50, untrusted * 15);
+        reasons.push(`UNEXPECTED_UNSIGNED:${untrusted}`);
+    }
+    if (signed > 0) {
+        score += Math.min(10, signed * 2);
+        reasons.push(`UNEXPECTED_SIGNED:${signed}`);
+    }
+    if (signals.protectedPageMismatchCount > 0) {
+        score += Math.min(60, signals.protectedPageMismatchCount * 30);
+        reasons.push(`PAGE_MISMATCH:${signals.protectedPageMismatchCount}`);
+    }
+    if (signals.writableExecutableBytes > writableExecutableLimit) {
+        score += 60;
+        reasons.push("WRITABLE_EXEC_OVER");
+    }
+    if (signals.privateExecutableBytes > privateExecutableLimit) {
+        score += 40;
+        reasons.push("PRIVATE_EXEC_OVER");
+    }
+    return { score: Math.min(100, score), reasons };
+}
+
 function scoreSignals(signals: LauncherGuardSignals, privateExecutableLimit: number,
     writableExecutableLimit = 0): number {
-    let score = 0;
-    if (signals.debuggerPresent) score += 50;
-    score += Math.min(50, signals.unexpectedModuleCount * 15);
-    score += Math.min(60, signals.protectedPageMismatchCount * 30);
-    if (signals.writableExecutableBytes > writableExecutableLimit) score += 60;
-    if (signals.privateExecutableBytes > privateExecutableLimit) score += 40;
-    return Math.min(100, score);
+    return explainSignals(signals, privateExecutableLimit, writableExecutableLimit).score;
 }
 
 function hasHardIntegrityViolation(signals: LauncherGuardSignals, privateExecutableLimit: number,
     writableExecutableLimit = 0): boolean {
     return signals.debuggerPresent ||
-        signals.unexpectedModuleCount > 0 ||
+        SplitUnexpectedModules(signals).untrusted > 0 ||
         signals.protectedPageMismatchCount > 0 ||
         signals.privateExecutableBytes > privateExecutableLimit ||
         signals.writableExecutableBytes > writableExecutableLimit;
@@ -81,14 +173,21 @@ function guardStatus(signals: LauncherGuardSignals, privateExecutableLimit: numb
         ? "HEALTHY" : "DEGRADED";
 }
 
-function continuityRisk(previous: LauncherGuardSignals | undefined, current: LauncherGuardSignals,
-    previousSequence: number): number {
-    if (previous == undefined) return 0;
-    if (previous.gameProcessId !== current.gameProcessId || previous.gameStartedAt !== current.gameStartedAt) return 100;
+function explainContinuity(previous: LauncherGuardSignals | undefined, current: LauncherGuardSignals,
+    previousSequence: number): LauncherGuardExplanation {
+    if (previous == undefined) return { score: 0, reasons: [] };
+    if (previous.gameProcessId !== current.gameProcessId || previous.gameStartedAt !== current.gameStartedAt) {
+        return { score: 100, reasons: ["PROCESS_CHANGED"] };
+    }
     // Allow the first two reports for normal UE/Steam lazy module loading. Once warm, a changed
     // module set is a central risk finding even when a modified client reports zero unexpected DLLs.
-    if (previousSequence >= 2 && previous.moduleSetDigest !== current.moduleSetDigest) return 50;
-    return 0;
+    if (previousSequence >= 2 && previous.moduleSetDigest !== current.moduleSetDigest) return { score: 50, reasons: ["MODULE_SET_CHANGED"] };
+    return { score: 0, reasons: [] };
+}
+
+function continuityRisk(previous: LauncherGuardSignals | undefined, current: LauncherGuardSignals,
+    previousSequence: number): number {
+    return explainContinuity(previous, current, previousSequence).score;
 }
 
 export async function StartLauncherGuard(accountId: string, body: any): Promise<Record<string, unknown>> {
@@ -160,9 +259,11 @@ export async function SubmitLauncherGuardHeartbeat(accountId: string, body: any)
     if (manifest == undefined || !IsGuardManifestCurrent(manifest, current.manifestId, current.manifestSequence)) {
         throw new LauncherApiError("GUARD_MANIFEST_MISMATCH", "The Launcher Guard manifest changed; restart the game.");
     }
-    const riskScore = Math.min(100, scoreSignals(signals, manifest.maximumPrivateExecutableBytes,
-        manifest.maximumWritableExecutableBytes) +
-        continuityRisk(current.lastSignals, signals, current.lastSequence));
+    const explained = explainSignals(signals, manifest.maximumPrivateExecutableBytes, manifest.maximumWritableExecutableBytes);
+    const continuity = explainContinuity(current.lastSignals, signals, current.lastSequence);
+    const riskScore = Math.min(100, explained.score + continuity.score);
+    // [2026-10-14] Why the score was given: stored with the session and in its history.
+    const reasons = [...explained.reasons, ...continuity.reasons];
     const status = guardStatus(signals, manifest.maximumPrivateExecutableBytes,
         manifest.maximumWritableExecutableBytes, riskScore);
     const heartbeatAt = new Date().toISOString();
@@ -170,9 +271,48 @@ export async function SubmitLauncherGuardHeartbeat(accountId: string, body: any)
     const nextChallenge = opaque(24);
     const updated = await GetRepositories().launcherGuard.advance({ guardSessionId, accountId,
         expectedChallenge: current.challenge, sequence, nextChallenge, status, riskScore,
-        heartbeatAt, expiresAt, signals });
+        heartbeatAt, expiresAt, signals, reasons, historyEntry: { at: heartbeatAt, status, riskScore, reasons } });
     if (!updated) throw new LauncherApiError("GUARD_SEQUENCE_CONFLICT", "The Launcher Guard heartbeat was superseded.");
-    return { schema: 1, accepted: true, role: current.role, status, riskScore, nextChallenge, expiresAt };
+    await RecordGuardModuleFindings({ accountId, modules: signals.unexpectedModules,
+        previousModules: current.lastSignals?.unexpectedModules, seenAt: heartbeatAt });
+    return { schema: 1, accepted: true, role: current.role, status, riskScore, reasons, nextChallenge, expiresAt };
+}
+
+function ModuleFindingKey(module: LauncherGuardUnexpectedModule): string {
+    return `${module.fileName}|${module.sha256}`;
+}
+
+/**
+ * [2026-10-14] Records each module of an accepted heartbeat in the findings (per file name and hash). sessionCount counts the modules
+ * that are new to the session (not in its previous heartbeat). A storage failure is logged and never refuses the heartbeat: the
+ * findings are a monitor. Returns how many sightings were recorded.
+ */
+export async function RecordGuardModuleFindings(input: {
+    accountId: string;
+    modules?: LauncherGuardUnexpectedModule[];
+    previousModules?: LauncherGuardUnexpectedModule[];
+    seenAt: string;
+}): Promise<number> {
+    if (input.modules == undefined || input.modules.length === 0) return 0;
+    const Previous = new Set((input.previousModules ?? []).map(ModuleFindingKey));
+    const Seen = new Set<string>();
+    let Recorded = 0;
+    for (const Module of input.modules) {
+        const Key = ModuleFindingKey(Module);
+        if (Seen.has(Key)) continue;
+        Seen.add(Key);
+        try {
+            await GetRepositories().launcherGuard.recordFindingSighting({
+                fileName: Module.fileName, sha256: Module.sha256, signer: Module.signer, size: Module.size,
+                accountId: input.accountId, seenAt: input.seenAt, newInSession: !Previous.has(Key)
+            });
+            Recorded += 1;
+        } catch (error) {
+            logger.warn(`[GuardFindings] could not record ${Module.fileName} for account=${input.accountId}: ` +
+                `${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+    return Recorded;
 }
 
 export async function GetLauncherGuardStatus(accountId: string, guardSessionId: string): Promise<Record<string, unknown>> {
@@ -183,4 +323,7 @@ export async function GetLauncherGuardStatus(accountId: string, guardSessionId: 
         lastHeartbeatAt: session.lastHeartbeatAt, expiresAt: session.expiresAt };
 }
 
-export const LauncherGuardInternals = { scoreSignals, hasHardIntegrityViolation, guardStatus, continuityRisk, IsGuardManifestCurrent };
+export const LauncherGuardInternals = {
+    scoreSignals, hasHardIntegrityViolation, guardStatus, continuityRisk, IsGuardManifestCurrent,
+    explainSignals, explainContinuity, ParseUnexpectedModules
+};

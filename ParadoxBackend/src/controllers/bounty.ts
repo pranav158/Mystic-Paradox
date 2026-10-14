@@ -6,7 +6,8 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-import { BountyMergeSummary, BountyStatePayload, MergeBountyState } from "../bountyState";
+import { RecordChallengeClaimsActivity } from "../activity/activityMonitor";
+import { BountyMergeSummary, BountyStatePayload, MergeBountyState, NewlyClaimedBountyIds } from "../bountyState";
 import { BountyStateRecord, GetRepositories } from "../persistence";
 import { PerAccountQueue } from "./perAccountQueue";
 
@@ -29,6 +30,8 @@ export function SaveBountyState(userId: string, body: unknown): Promise<{ payloa
             const { record, summary } = MergeBountyState(userId, Previous, body);
             const Saved = await Repository.saveIfVersion(record, Previous?.updateVersion);
             if (Saved !== undefined) {
+                // [2026-10-14] The activity monitor counts the season challenges this save claimed.
+                RecordChallengeClaimsActivity(userId, NewlyClaimedBountyIds(Saved).length);
                 return { payload: BountyStatePayload(Saved), record: Saved, summary };
             }
         }

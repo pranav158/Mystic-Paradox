@@ -9,23 +9,39 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
+import { TouchGameSession } from "../activity/activityMonitor";
 import { Router } from "express";
 import crypto from "node:crypto";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { logger } from "../logger";
-import { CheckAndUpdateQueueStatus, FetchLiveHubStatus, GetCandidateStatusPeriodMillis, HandlePlayerMatchmaking } from "../controllers/matchmaking";
+import { CancelMatchmakingForLeave, CheckAndUpdateQueueStatus, FetchLiveHubStatus, HandlePlayerMatchmaking } from "../controllers/matchmaking";
+import { CandidateStatusAnswerFor } from "../controllers/candidateStatus";
 import { GetPartyForPlayer } from "../controllers/party";
 import { sessionRegistry } from "../realtime/SessionRegistry";
 import { ResolveMatchmakingParty } from "../matchmakingParty";
 import { EncryptionKeyStore, EncryptionKeyTokenFingerprint } from "../encryptionKeyStore";
+import { GetP2PExtension } from "../extensions/p2p";
+import { RuntimeRosterOf } from "../security/runtimeRoster";
+import { GetRealmsService, IsRealmsModuleEnabled } from "../realms";
 
 export const matchmakingRouter = Router();
 
 const QOS_TARGET_URL = process.env.QOS_TARGET_URL;
-const TARGET_CHANGELIST = process.env.TARGET_CHANGELIST;
-// The 1.14.7 client builds its matchmaking ID as "%d_%s_shipping";
-// this version is tied to the checked target executable (CL 647472).
-const TARGET_GAME_VERSION = "1.14.7";
+
+/**
+ * [2026-10-14 realms S2] A matchmaking request of a realm member keeps its realm presence alive (presence lapses 120 s after the
+ * last touch). Only when the realms module is on; the touch never delays or fails the request.
+ */
+function TouchRealmPresence(accountId: string): void {
+    if (!IsRealmsModuleEnabled()) return;
+    try {
+        GetRealmsService().touchPresence(accountId).catch((error: unknown) => {
+            logger.warn(`[Realms] presence touch failed for ${accountId}: ${error}`);
+        });
+    } catch (error) {
+        logger.warn(`[Realms] presence touch failed for ${accountId}: ${error}`);
+    }
+}
 
 matchmakingRouter.post("/candidate/player/register", HasParadoxBackendAuth, (req: any, res) => {
     logger.info(`userId ${req.AuthData.userId} is registering for matchmaking!`);
@@ -37,7 +53,10 @@ matchmakingRouter.post("/candidate/player/register", HasParadoxBackendAuth, (req
 // [1.12 heartbeat stub — 2026-07-10]
 // Client fires this every ~5s while in matchmaking / in a game. Was logging as
 // Unstubbed with WARN per request. No state needed — just acknowledge.
-matchmakingRouter.post("/candidate/player/alive", HasParadoxBackendAuth, (_req: any, res) => {
+matchmakingRouter.post("/candidate/player/alive", HasParadoxBackendAuth, (req: any, res) => {
+    TouchRealmPresence(req.AuthData.userId);
+    // [2026-10-14] The matchmaking heartbeat of a running game extends the activity monitor's playtime (gap rule in activity/activityRules.ts).
+    TouchGameSession(req.AuthData.userId);
     res.status(200);
     res.json({});
 });
@@ -106,8 +125,10 @@ matchmakingRouter.post("/key/generate", HasParadoxBackendAuth, async (req: any, 
     const AuthHeader = typeof req.headers.authorization === "string" ? req.headers.authorization : "";
     const Token = AuthHeader.startsWith("bearer ") ? AuthHeader.slice("bearer ".length) : AuthHeader;
     const CandidateId = String(req.body && req.body.candidateId ? req.body.candidateId : "");
+    // [2026-10-11] The issuing account lets a player-host's consume be limited to its hunt roster (B5).
+    const AccountId = typeof req.AuthData?.userId === "string" && req.AuthData.userId.length > 0 ? req.AuthData.userId : undefined;
 
-    EncryptionKeys.issue(CandidateId, { key: Key, nonce: Nonce, token: Token, at: Date.now() });
+    EncryptionKeys.issue(CandidateId, { key: Key, nonce: Nonce, token: Token, at: Date.now(), accountId: AccountId });
 
     logger.info("key/generate served (256-bit key + nonce; candidateId="
         + (CandidateId || "none") + " token=" + EncryptionKeyTokenFingerprint(Token) + ")");
@@ -132,9 +153,19 @@ matchmakingRouter.post("/key/consume", HasParadoxBackendAuth, async (req: any, r
     logger.info("key/consume request: candidateId=" + (CandidateId || "none")
         + " bodyKeys=" + Object.keys(Body).join(",") + " token=" + TokenFp);
 
-    const Lookup = EncryptionKeys.lookup(CandidateId, ConsumeToken, Date.now());
+    // [2026-10-11 P2P, plan 39_ §13.1 B5] A player-host runtime gets only keys issued to its own hunt roster, by
+    // candidate or token, never the most-recent fallback (it could be any player's key). Dedicated servers unchanged.
+    const Roster = RuntimeRosterOf(req.AuthData);
+    const Lookup = EncryptionKeys.lookup(CandidateId, ConsumeToken, Date.now(), { rosterAccountIds: Roster });
     const Match = Lookup.issued;
     const MatchedBy = Lookup.matchedBy;
+    if (Roster != undefined && Match === null) {
+        logger.warn("key/consume: player-host runtime asked for a key outside its hunt roster or with no issued key"
+            + " (rosterRejected=" + (Lookup.rosterRejected === true ? 1 : 0) + " token=" + TokenFp + "); no fallback for hosts");
+        res.status(404);
+        res.json({ error: "no issued key" });
+        return;
+    }
     if (Lookup.unknownToken && Match !== null) {
         // With several players generating keys the most recent key can be someone else's.
         logger.warn("key/consume: token " + TokenFp
@@ -160,146 +191,26 @@ matchmakingRouter.post("/key/consume", HasParadoxBackendAuth, async (req: any, r
 
 matchmakingRouter.get("/candidate/status", HasParadoxBackendAuth, async (req: any, res) => {
     const UserId = req.AuthData.userId;
+    TouchRealmPresence(UserId);
 
     const MatchmakingResult = await CheckAndUpdateQueueStatus(UserId);
 
-    // [1.14.7 FIX 2026-10-04] The documented /candidate/status contract
-    // (DauntlessEndpointDocumentation/Matchmaking/Candidate/GetStatus.md) states the Ramsgate state as:
-    //     { "gameMode": "CITY", "huntId": null, ... }
-    // and its huntId table says plainly: "| null | Ramsgate |" - Ramsgate is expressed as a NULL huntId.
-    // This route hardcoded gameMode "ISLAND" and echoed the internal hunt id
-    // "ShatteredIsles_ReturnToRamsgate", so a client that asked for CITY (verified: /candidate/join with
-    // gameMode CITY) was answered ISLAND plus a hunt id and took the wrong travel branch - it created a
-    // pending net driver and timed out after 20s without ever dialling the hub (its own UE log never
-    // mentions the address it was handed, and PHOENIX reports "Can't destroy a null online session").
-    const IsRamsgateDestination = MatchmakingResult != undefined
-        && MatchmakingResult.HuntId === "ShatteredIsles_ReturnToRamsgate";
-    const ClientGameMode = IsRamsgateDestination ? "CITY" : "ISLAND";
-    const ClientHuntId = IsRamsgateDestination ? null : MatchmakingResult?.HuntId;
-
-    if(MatchmakingResult != undefined){
-        if(MatchmakingResult.Canceled){
-            logger.info(`Canceling matchmaking for user ${UserId}: ${MatchmakingResult.StatusReason ?? "HOST_ROUTE_FAILED"}`);
-
-            res.status(200);
-            res.json({
-                candidateId: MatchmakingResult.CandidateId,
-                candidateStatusPeriodMillis: GetCandidateStatusPeriodMillis(MatchmakingResult),
-                gameMode: ClientGameMode,
-                huntId: null,
-                playerStates: {
-                    [UserId]: {}
-                },
-                status: "CANCELED",
-                statusDuration: 0.0,
-                statusReason: MatchmakingResult.StatusReason ?? "HOST_ROUTE_FAILED"
-            });
-        }
-        else if(MatchmakingResult.Ready){
-            // [1.14.7 FIX 2026-10-04] The hub advertises this machine's PUBLIC address (the DeployServer logs
-            // "ramsgate ready on <public-ip>:8790"). A client running on that same machine must then reach
-            // its own public address, which needs NAT hairpin for the game's UDP port - and that is the
-            // measured failure:
-            //   [EnqueueDisconnectError] reason='The server network connection timed out. Please check your
-            //                            network connection and try again later.'
-            //   both hubs stayed at PostLogin=0
-            // while matchmaking itself succeeded (valid session, hub bound and healthy on UDP 8790).
-            //
-            // The client's own HTTPS requests DO reach the public domain, so its source address equals the
-            // advertised host exactly when it is behind the same public address - i.e. local. Answer loopback
-            // in that case so it reaches the local hub directly; remote players keep the public host.
-            const AdvertisedHost = MatchmakingResult.Host;
-            const ClientAddress = typeof req.ip === "string" ? req.ip.replace(/^::ffff:/, "") : "";
-            const IsLocalClient = ClientAddress.length > 0 && AdvertisedHost.length > 0
-                && (ClientAddress === AdvertisedHost || ClientAddress === "127.0.0.1" || ClientAddress === "::1");
-            const TravelHost = IsLocalClient ? "127.0.0.1" : AdvertisedHost;
-
-            // [1.14.7 REVALIDATION 2026-10-04] Before answering with a hub address, confirm the hub is STILL
-            // serving. A cached candidate is not proof: measured, Ramsgate left its map for AFK while the
-            // cached entry stayed "ready", the client was told to travel to 127.0.0.1:8790, and the
-            // replacement only reported "Networking::Listen returned OK" 17 seconds after the client had
-            // already timed out. The root fix (bNoAFK) stops the hub leaving at all; this is the fence that
-            // keeps a client from being sent to a dead port if it ever does.
-            //
-            // When the hub cannot be verified, answer with the SAME "still matching" shape the client already
-            // polls on so it waits instead of travelling - the existing unavailable/waiting behaviour.
-            let LivePort = MatchmakingResult.Port;
-            if (IsRamsgateDestination) {
-                const Live = await FetchLiveHubStatus();
-                const LiveRamsgate = Live?.ramsgate;
-                if (LiveRamsgate == undefined || !LiveRamsgate.ready) {
-                    logger.warn(`Ramsgate candidate for ${UserId} is stale (hub not verified as serving) - holding the client in MATCHING`);
-                    res.status(200);
-                    res.json({
-                        candidateId: MatchmakingResult.CandidateId,
-                        candidateStatusPeriodMillis: 1000,
-                        gameMode: "CITY",
-                        huntId: null,
-                        playerStates: {
-                            [UserId]: {}
-                        },
-                        status: "MATCHING",
-                        statusDuration: 0.0,
-                        statusReason: null
-                    });
-                    return;
-                }
-                if (LiveRamsgate.port !== MatchmakingResult.Port) {
-                    logger.warn(`Ramsgate port changed (${MatchmakingResult.Port} -> ${LiveRamsgate.port}); serving the live port`);
-                }
-                LivePort = LiveRamsgate.port;
-            }
-
-            logger.info(`Telling user ${UserId} to travel to ${TravelHost}:${LivePort} candidateId=${MatchmakingResult.CandidateId} local=${IsLocalClient ? 1 : 0} verified=1`);
-
-            res.status(200);
-            res.json({
-                candidateId: MatchmakingResult.CandidateId,
-                candidateStatusPeriodMillis: GetCandidateStatusPeriodMillis(MatchmakingResult),
-                gameMode: ClientGameMode,
-                huntId: ClientHuntId,
-                playerStates: {
-                    [UserId]: {}
-                },
-                serverInfo: {
-                    buildId: `${TARGET_CHANGELIST}_${TARGET_GAME_VERSION}_shipping`,
-                    gameSessionId: MatchmakingResult.GameSessionId,
-                    host: TravelHost,
-                    port: LivePort
-                },
-                status: "IN_PROGRESS",
-                statusDuration: 0.0,
-                statusReason: null
-            });
-        }
-        else{
-            logger.info(`MM not ready yet!`);
-
-            res.status(200);
-            res.json({
-                candidateId: MatchmakingResult.CandidateId,
-                candidateStatusPeriodMillis: GetCandidateStatusPeriodMillis(MatchmakingResult),
-                gameMode: ClientGameMode,
-                huntId: MatchmakingResult.HuntId,
-                playerStates: {
-                    [UserId]: {}
-                },
-                status : "MATCHING",
-                statusDuration : 0.0,
-                statusReason : null
-            })
-        }
-    }
-    else{
-        logger.error(`UserId ${UserId} was not found in the MatchmakingMap`);
-
-        res.status(404);
+    // The answer (the Ramsgate, Training and realm-hub cases) is built by controllers/candidateStatus.ts.
+    const Answer = await CandidateStatusAnswerFor(UserId, MatchmakingResult, {
+        clientIp: req.ip,
+        fetchLiveHub: FetchLiveHubStatus
+    });
+    res.status(Answer.status);
+    if (Answer.body === undefined) {
         res.send();
+        return;
     }
+    res.json(Answer.body);
 });
 
 matchmakingRouter.post("/candidate/join", HasParadoxBackendAuth, async (req: any, res) => {
     const UserId = req.AuthData.userId;
+    TouchRealmPresence(UserId);
     const GameMode = req.body.gameMode;
     const GameArgs = req.body.gameArgs;
     const HuntId = req.body.playerHuntId;
@@ -320,7 +231,14 @@ matchmakingRouter.post("/candidate/join", HasParadoxBackendAuth, async (req: any
     // Bypassing FTUE and dropping the player straight into the Ramsgate hub is the
     // achievable path — content-data population becomes a separate task.
 
-    logger.info(`UserId ${UserId} wants to join a game with GameMode ${GameMode} & GameArgs ${GameArgs} & HuntId ${HuntId}`);
+    // [2026-10-14] The request shape that tells Start Hunt from Private Hunt (captured Candidate/Join: privateMatch, isPrivate, gameType,
+    // partyId). Only the shape is logged: booleans and short strings, and whether a party id is present, never the id itself.
+    const RequestShape = (value: unknown): string => typeof value === "string" ? JSON.stringify(value.slice(0, 40))
+        : typeof value === "boolean" || typeof value === "number" ? String(value) : "absent";
+    const PartyIdShape = typeof req.body?.partyId === "string" && req.body.partyId.trim().length > 0 ? "present" : "absent";
+    logger.info(`UserId ${UserId} wants to join a game with GameMode ${GameMode} & GameArgs ${GameArgs} & HuntId ${HuntId} `
+        + `& gameType=${RequestShape(req.body?.gameType)} privateMatch=${RequestShape(req.body?.privateMatch)} `
+        + `isPrivate=${RequestShape(req.body?.isPrivate)} partyId=${PartyIdShape}`);
 
     // TODO: We put a LOT of faith in our authenticated users not abusing the matchmaking system right now
     // A reasonable addition would be checks on frequency of MM/server spinup
@@ -333,8 +251,10 @@ matchmakingRouter.post("/candidate/join", HasParadoxBackendAuth, async (req: any
         typeof req.body.partyId === "string" && req.body.partyId.trim().length > 0
             ? req.body.partyId
             : undefined;
+    // [2026-10-11] A Training request the P2P module may host also drops offline members (false without the module).
+    const FilterOffline = GetP2PExtension().matchmaking.filtersOfflinePartyMembers(GameMode, HuntId);
     const Party = ResolveMatchmakingParty(
-        GameMode, UserId, RequestedPartyId, PartyForPlayer, (Member) => sessionRegistry.isOnline(Member));
+        GameMode, UserId, RequestedPartyId, PartyForPlayer, (Member) => sessionRegistry.isOnline(Member), FilterOffline);
 
     if(Party.partyIdMismatch && PartyForPlayer != undefined && PartyForPlayer.members.length > 1){
         logger.warn(
@@ -345,7 +265,7 @@ matchmakingRouter.post("/candidate/join", HasParadoxBackendAuth, async (req: any
     }
     else if(!Party.partyIdMismatch && Party.excludedMembers.length > 0){
         logger.warn(
-            `UserId ${UserId} ISLAND party contains ${Party.excludedMembers.length} offline member(s); ` +
+            `UserId ${UserId} ${GameMode} party contains ${Party.excludedMembers.length} offline member(s); ` +
             `launching with ${Party.partyMembers?.length ?? 0} active member(s). ` +
             `excluded=${Party.excludedMembers.join(",")}`
         );
@@ -358,7 +278,8 @@ matchmakingRouter.post("/candidate/join", HasParadoxBackendAuth, async (req: any
         UserId,
         Party.partyId,
         Party.partyMembers,
-        Party.partyRevision
+        Party.partyRevision,
+        typeof req.body?.buildId === "string" ? req.body.buildId : undefined
     );
 
     if(!MatchmakingResult){
@@ -378,6 +299,44 @@ matchmakingRouter.post("/candidate/join", HasParadoxBackendAuth, async (req: any
         statusReason: null
     });
 });
+
+/** [2026-10-14 cancel] The body key names of a leave, for the log (never the values): at most 12 names, cut to safe characters. */
+function LoggedBodyKeys(body: unknown): string {
+    if (body == undefined || typeof body !== "object" || Array.isArray(body)) return "";
+    return Object.keys(body).slice(0, 12).map((Key) => Key.replace(/[^A-Za-z0-9_.-]/g, "?").slice(0, 40)).join(",");
+}
+
+/**
+ * [2026-10-14 cancel] The client's Cancel of its search. From the 1.14.7 binary (Ghidra, confirmed by the coordinator):
+ * FUN_140db6dd0 sends DELETE /candidate/leave with no request body, and only the party leader sends it - the party's
+ * CancelMatchmaking (FUN_141c1e9d0) logs "CancelMatchmaking attempted by non-leader. Request rejected." and sends nothing for a
+ * non-leader. The response the client expects is not known; 200 with {} is the safe answer (the same shape as the register and
+ * alive stubs). The other shapes (POST and PUT on /candidate/leave, DELETE /candidate, DELETE /candidate/:candidateId) are aliases
+ * kept until the log shows which the client sends; a shape none of them matches is answered 404 and shows as a [REQ] line in app.ts.
+ * Each call logs one [CandidateLeave] line with the method, path, body key names (never values) and the outcome.
+ */
+export async function CandidateLeaveHandler(req: any, res: any): Promise<void> {
+    const UserId: string = req.AuthData.userId;
+    const BodyKeys = LoggedBodyKeys(req.body);
+    try {
+        const Answer = await CancelMatchmakingForLeave(UserId);
+        logger.info(`[CandidateLeave] user=${UserId} method=${req.method} path=${req.path} bodyKeys=[${BodyKeys}] `
+            + `candidate=${Answer.candidateId ?? "none"} state=${Answer.state} -> ${Answer.outcome}`);
+        res.status(200);
+        res.json({});
+    } catch (error) {
+        logger.error(`[CandidateLeave] user=${UserId} method=${req.method} path=${req.path} bodyKeys=[${BodyKeys}] `
+            + `candidate=none state=error -> error: ${error}`);
+        res.status(500);
+        res.json({});
+    }
+}
+
+matchmakingRouter.delete("/candidate/leave", HasParadoxBackendAuth, CandidateLeaveHandler);
+matchmakingRouter.post("/candidate/leave", HasParadoxBackendAuth, CandidateLeaveHandler);
+matchmakingRouter.put("/candidate/leave", HasParadoxBackendAuth, CandidateLeaveHandler);
+matchmakingRouter.delete("/candidate", HasParadoxBackendAuth, CandidateLeaveHandler);
+matchmakingRouter.delete("/candidate/:candidateId", HasParadoxBackendAuth, CandidateLeaveHandler);
 
 matchmakingRouter.get("/QoS", (req, res) => {
     logger.info(`QoS Ping`);

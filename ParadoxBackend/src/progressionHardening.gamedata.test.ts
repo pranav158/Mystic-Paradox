@@ -38,7 +38,7 @@ test("progression grant request hashes are canonical and bind every mutation fie
 
 test("XP mutation allowlist excludes config-only historical/test tracks", () => {
     assert.equal(IsApprovedXpProgressionTrack("ExperienceTrack_PlayerLevel"), true);
-    assert.equal(IsApprovedXpProgressionTrack("single_track"), false);
+    assert.equal(IsApprovedXpProgressionTrack("season27"), false);   // has a curve; not on the allowlist, not served
     assert.equal(IsApprovedXpProgressionTrack("test_minipass01"), false);
     assert.equal(APPROVED_XP_PROGRESSION_TRACK_IDS.includes("MasteryTrack_Behemoth"), true);
 });

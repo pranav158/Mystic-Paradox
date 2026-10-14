@@ -17,6 +17,9 @@ import {
     HandleAdminDiscordCallback
 } from "../controllers/adminDiscordAuth";
 import { GetOperationsOverview, UpdateOperationsPolicy } from "../controllers/adminOperations";
+import { GetGuardSession, ListGuardFindings, ListGuardSessions } from "../controllers/adminGuard";
+import { AcknowledgeActivityFlag, GetActivityOverview, GetActivityPlayer, ListActivityFlags } from "../controllers/adminActivity";
+import { TesterMaxPlayer } from "../controllers/testerMax";
 
 export const adminRouter = Router();
 
@@ -117,3 +120,14 @@ adminRouter.delete("/admin/v1/players/:userId", HasAdminAuth, DeletePlayer);
 adminRouter.get("/admin/v1/audit", HasAdminAuth, ListAudit);
 adminRouter.get("/admin/v1/operations/overview", HasAdminAuth, GetOperationsOverview);
 adminRouter.patch("/admin/v1/operations/policy", HasAdminAuth, UpdateOperationsPolicy);
+// [2026-10-14] Launcher Guard sessions and module findings (read-only).
+adminRouter.get("/admin/v1/guard/sessions", HasAdminAuth, ListGuardSessions);
+adminRouter.get("/admin/v1/guard/sessions/:guardSessionId", HasAdminAuth, GetGuardSession);
+adminRouter.get("/admin/v1/guard/findings", HasAdminAuth, ListGuardFindings);
+// [2026-10-14] Activity monitor (src/activity): read-only player and overview views, and the flag review (PATCH, audited).
+adminRouter.get("/admin/v1/activity/players/:userId", HasAdminAuth, GetActivityPlayer);
+adminRouter.get("/admin/v1/activity/overview", HasAdminAuth, GetActivityOverview);
+adminRouter.get("/admin/v1/activity/flags", HasAdminAuth, ListActivityFlags);
+adminRouter.patch("/admin/v1/activity/flags/:id", HasAdminAuth, AcknowledgeActivityFlag);
+// [2026-10-14, launch plan section 5] Max a tester account (controllers/testerMax.ts; the kit is game-data/tester_max_kit.json).
+adminRouter.post("/admin/v1/players/:userId/tester-max", HasAdminAuth, TesterMaxPlayer);

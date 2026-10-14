@@ -90,6 +90,11 @@ export interface RealtimeConfig {
     /** Emit sanitized protocol capture logs (mirrors REALTIME_XMPP_CAPTURE). */
     captureEnabled: boolean;
     limits: RealtimeLimits;
+    /**
+     * [2026-10-14 M2] Behind a loopback reverse proxy (MYSTICPARADOX_TLS_TERMINATED_BY_PROXY=on): the client's address is the
+     * X-Forwarded-For entry the proxy added, for the per-IP limits and the auth throttle. Off = the socket address, as before.
+     */
+    trustForwardedFor?: boolean;
 }
 
 /** Parsed JID parts (plan §10.3, §20.1). */

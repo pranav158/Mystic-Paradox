@@ -9,11 +9,13 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
+import { RecordInventoryActivity } from "../activity/activityMonitor";
 import { ClientSession } from "mongodb";
 import { GetRepositories, GetUnitOfWork, InventoryTransactionAlreadyExistsError, RepositoryProvider } from "../persistence";
 import { GetCharacterWithUid } from "./character";
 import { logger } from "../logger";
 import { ApplyCurrencyDeltas, MergeWalletIntoStacked } from "./wallet";
+import { EconomyLedger, EconomyScope, GrantedItem, NewEconomyLedger } from "../diagnostics/economyLedgerMonitor";
 import { EnsureStarterBootstrapRecords, EnsureStarterBootstrapRecordsInTransaction } from "./starterManifest";
 import crypto from "node:crypto";
 import { MigrateInventoryStorageArrays, NormalizeInventoryGrantCollections } from "../inventoryStoragePolicy";
@@ -30,7 +32,8 @@ function StableStringify(value: any): string {
 // Canonical SHA-256 of the full mutation body. Bound to the ledger row (NOT the _id) so a
 // transactionId replayed with the SAME body returns the stored result, but a transactionId reused
 // with a DIFFERENT body is detected and rejected. Missing vs empty collections hash identically.
-function ComputeInventoryRequestHash(InstancedItemsToAdd: any[], StackedItemsToAdd: any[], InstancedItemsToRemove: any[], StackedItemsToRemove: any[], InstancedItemsToSave: any[]): string {
+// Exported [2026-10-15] for the host precheck, which must recognise the same body the ledger stored (p2pInventoryAuthorization.ts).
+export function ComputeInventoryRequestHash(InstancedItemsToAdd: any[], StackedItemsToAdd: any[], InstancedItemsToRemove: any[], StackedItemsToRemove: any[], InstancedItemsToSave: any[]): string {
     const Canonical = StableStringify({
         addInstancedItems: InstancedItemsToAdd ?? [],
         addStackedItems: StackedItemsToAdd ?? [],
@@ -260,6 +263,11 @@ function ValidateStackedItemRemovals(userId: string, StackedItems: any[], ItemsT
     }
 }
 
+// Every CURRENCY_* add and remove is applied to the wallet (wallet.ts ApplyCurrencyDeltas); the stacked blob holds none.
+function IsWalletCurrencyId(catalogId: unknown): boolean {
+    return typeof catalogId === "string" && catalogId.startsWith("CURRENCY_");
+}
+
 function RemoveStackedItems(StackedItems: any[], ItemsToRemove: any[]){
     if(!Array.isArray(ItemsToRemove) || ItemsToRemove.length === 0){
         return false;
@@ -426,6 +434,10 @@ export type InventoryTransactionOptions = {
     // [2026-10-10] Lets a season challenge's claim fund a CURRENCY_SEASONAL_COIN grant (controllers/challengeRewards.ts).
     // Set only by POST /inventory for dedicated-server requests; store purchases and every other caller leave it off.
     allowChallengeRewardFunding?: boolean;
+
+    // [diagnostics 2026-10-14] Where this transaction came from, for the economy ledger (diagnostics/economyLedgerMonitor.ts):
+    // a store purchase names its SKU, a player-host transaction names its P2P session and host. Absent = OTHER. Monitoring only.
+    economy?: EconomyScope;
 };
 
 export type InventoryLedgerAnnotator = (accepted: { createdInstancedItems: any[]; acceptedStackedAdds: any[] }) =>
@@ -476,9 +488,29 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
         logger.warn(`[InventoryStorage] transactionId ${TransactionId} normalized ${NormalizedGrants.corrections.length} grant entr${NormalizedGrants.corrections.length === 1 ? "y" : "ies"}: ${NormalizedGrants.corrections.map((Correction) => `${Correction.catalogId}:${Correction.from}->${Correction.to}x${Correction.quantity}`).join(", ")}`);
     }
 
+    // [diagnostics 2026-10-14] What the transaction granted, for the economy ledger's `for=` (the adds that survived normalization).
+    const GrantedForLedger: GrantedItem[] = [
+        ...EffectiveInstancedItemsToAdd.map((Item: any) => ({ catalogId: Item?.catalogId, quantity: 1 })),
+        ...EffectiveStackedItemsToAdd.map((Item: any) => ({ catalogId: Item?.catalogId, quantity: Item?.quantity })),
+    ].filter((Item): Item is GrantedItem => typeof Item.catalogId === "string" && Number.isSafeInteger(Item.quantity));
+    // The ledger of the attempt that commits: withTransaction may run this callback again, so each attempt starts a new one.
+    // [2026-10-14] The activity monitor (src/activity) reads what the committed transaction granted, moved and spent. Computed here,
+    // recorded only after the commit.
+    const EconomyOfTransaction: EconomyScope = Options.economy ?? { source: "OTHER" };
+    const ActivityGranted = GrantedForLedger.filter((Item) => !IsWalletCurrencyId(Item.catalogId));
+    const ActivityCurrencyCredits = EffectiveStackedItemsToAdd
+        .filter((Item: any) => IsWalletCurrencyId(String(Item?.catalogId ?? "")) && Number.isSafeInteger(Item?.quantity) && Item.quantity > 0)
+        .map((Item: any) => ({ catalogId: String(Item.catalogId), amount: Number(Item.quantity) }));
+    const ActivityCurrencyDebits = (StackedItemsToRemove ?? [])
+        .filter((Item: any) => IsWalletCurrencyId(String(Item?.catalogId ?? "")) && Number.isSafeInteger(Item?.quantity) && Item.quantity > 0)
+        .map((Item: any) => ({ catalogId: String(Item.catalogId), amount: Number(Item.quantity) }));
+    let CommittedLedger: EconomyLedger | undefined;
+
     try {
         const Result = await GetUnitOfWork().withTransaction(async (Repos, Session) => {
             let StepStartedAt = Date.now();
+            const Ledger = NewEconomyLedger({ userId: UserId, transactionId: TransactionId, scope: Options.economy ?? { source: "OTHER" },
+                granted: GrantedForLedger });
             await Repos.inventoryTransactions.tryBegin(TransactionId, UserId, CharacterId, RequestHash, Session);
             Timing.ledgerBegin += Date.now() - StepStartedAt;
             // tryBegin returned normally (didn't throw) => transactionId is genuinely new.
@@ -490,7 +522,7 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
             // whole transaction before anything below it runs.
             StepStartedAt = Date.now();
             const TouchedCurrencyBalances = await ApplyCurrencyDeltas(UserId, EffectiveStackedItemsToAdd, StackedItemsToRemove, Session,
-                TransactionId, Options.allowChallengeRewardFunding === true);
+                TransactionId, Options.allowChallengeRewardFunding === true, Ledger);
             Timing.wallet += Date.now() - StepStartedAt;
 
             // Non-inventory grants (entitlements, progression) - see InventoryTransactionOptions.onGrant.
@@ -564,6 +596,16 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
                 AcceptedStackedAdds.push({ catalogId: NewStackedItem.catalogId, quantity: NewStackedItem.quantity });
             }
 
+            // [2026-10-11] Currency was applied to the wallet above (ApplyCurrencyDeltas) and its post-transaction balance
+            // is reported below. It used to ALSO be merged into this stacked blob and reported with the blob's quantity, so
+            // every loot response carried CURRENCY_NOTES twice: the shadow blob stack (11,705) and the wallet (240,110). The
+            // client took the shadow one for its Rams display and showed the difference (+228,505) as each kill's loot.
+            if (IsWalletCurrencyId(NewStackedItem?.catalogId)) continue;
+            // [diagnostics 2026-10-14] A non-currency Hunt Pass reward (tokens, cores) in this grant; the ledger keeps only those.
+            if (typeof NewStackedItem?.catalogId === "string" && Number.isSafeInteger(NewStackedItem?.quantity)) {
+                Ledger?.recordReward(NewStackedItem.catalogId, NewStackedItem.quantity);
+            }
+
             const ExistingStackedItem = StackedItemsByCatalogId.get(NewStackedItem.catalogId);
 
             if(ExistingStackedItem != undefined){
@@ -618,6 +660,17 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
         // reflects the real balance immediately instead of one round-trip later.
         for(const [CatalogId, Balance] of Object.entries(TouchedCurrencyBalances)){
             UpdatedStackedItems.push({ catalogId: CatalogId, quantity: Balance });
+        }
+
+        // [2026-10-11] Drop the stale currency rows older transactions left in the blob (every account had them, always
+        // below the wallet). GET /inventory already projects the wallet over them (MergeWalletIntoStacked), so nothing
+        // reads them; removing them on this character's next write keeps a stale copy from ever being served again.
+        {
+            const WithoutCurrency = StackedItems.filter((Item) => !IsWalletCurrencyId(Item?.catalogId));
+            if (WithoutCurrency.length !== StackedItems.length) {
+                logger.info(`[Inventory] dropped ${StackedItems.length - WithoutCurrency.length} stale currency row(s) from characterId ${CharacterId}'s stacked blob (the wallet holds currency)`);
+                StackedItems.splice(0, StackedItems.length, ...WithoutCurrency);
+            }
         }
 
         for(const SavedItem of InstancedItemsToSave ?? []){
@@ -689,11 +742,22 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
         const LedgerFields = LedgerAnnotator?.({ createdInstancedItems: CreatedInstancedItems, acceptedStackedAdds: AcceptedStackedAdds });
 
         StepStartedAt = Date.now();
-        await Repos.inventoryTransactions.complete(TransactionId, UserId, CharacterId, Result, Session, LedgerFields);
+        await Repos.inventoryTransactions.complete(TransactionId, UserId, CharacterId, Result, Session, {
+            // [2026-10-14] The economy source of the row (diagnostics/economyLedgerMonitor.ts), written with the grant.
+            economySource: EconomyOfTransaction.source,
+            ...(EconomyOfTransaction.p2pSessionId !== undefined ? { economySessionId: EconomyOfTransaction.p2pSessionId } : {}),
+            ...(LedgerFields ?? {})
+        });
         Timing.ledgerComplete += Date.now() - StepStartedAt;
 
+        CommittedLedger = Ledger;
         return Result;
         });
+        // [diagnostics 2026-10-14] After the commit only: the lines and the daily rollup (never throws, never delays a grant).
+        CommittedLedger?.commit();
+        // [2026-10-14] The activity monitor: one call per committed transaction; it never throws and does no database work here.
+        RecordInventoryActivity({ userId: UserId, atMs: Date.now(), source: EconomyOfTransaction.source, storeSkuId: EconomyOfTransaction.storeSkuId,
+            granted: ActivityGranted, currencyCredits: ActivityCurrencyCredits, currencyDebits: ActivityCurrencyDebits });
         const TotalMs = Date.now() - StartedAt;
         const AccountedMs = Timing.ownership + Timing.ledgerBegin + Timing.wallet + Timing.inventoryRead + Timing.inventoryWrite + Timing.ledgerComplete;
         if (Options.diagnosticLabel || TotalMs >= 1000) {

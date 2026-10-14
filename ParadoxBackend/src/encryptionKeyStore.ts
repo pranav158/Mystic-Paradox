@@ -19,6 +19,8 @@ export interface IssuedEncryptionKey {
     nonce: string;
     token: string;
     at: number;
+    /** [2026-10-11] The account /key/generate was called by (AuthData.userId), when known. */
+    accountId?: string;
 }
 
 export type EncryptionKeyMatch = "candidateId" | "token" | "most-recent";
@@ -28,6 +30,17 @@ export interface EncryptionKeyLookup {
     matchedBy: EncryptionKeyMatch | "none";
     // A token was supplied but no key was issued under it (the most-recent fallback may be another player's).
     unknownToken: boolean;
+    // [2026-10-11] A key matched by candidate or token belongs to an account outside the caller's roster.
+    rosterRejected?: boolean;
+}
+
+export interface EncryptionKeyLookupOptions {
+    /**
+     * [2026-10-11 P2P, plan 39_ §13.1 B5] Set for a player-host runtime: only keys issued to these accounts may be
+     * served, and never through the most-recent fallback. That fallback hands out the last key issued anywhere on the
+     * server - on a player's PC it could be another player's key, from any party.
+     */
+    rosterAccountIds?: ReadonlySet<string>;
 }
 
 export const kEncryptionKeyTtlMs = 30 * 60 * 1000;
@@ -57,13 +70,28 @@ export class EncryptionKeyStore {
         this.mostRecent = Issued;
     }
 
-    lookup(CandidateId: string, Token: unknown, Now: number): EncryptionKeyLookup {
+    lookup(CandidateId: string, Token: unknown, Now: number, Options: EncryptionKeyLookupOptions = {}): EncryptionKeyLookup {
         for (const Pending of [this.byCandidate, this.byToken]) {
             for (const [Id, Issued] of Pending) {
                 if (Now - Issued.at > this.ttlMs) Pending.delete(Id);
             }
         }
         const TokenKey = NormalizeEncryptionKeyToken(Token);
+        const Roster = Options.rosterAccountIds;
+        if (Roster != undefined) {
+            let RosterRejected = false;
+            for (const [Match, Issued] of [
+                ["candidateId", CandidateId.length > 0 ? this.byCandidate.get(CandidateId) : undefined],
+                ["token", TokenKey.length > 0 ? this.byToken.get(TokenKey) : undefined]
+            ] as const) {
+                if (Issued == undefined) continue;
+                if (Issued.accountId != undefined && Roster.has(Issued.accountId)) {
+                    return { issued: Issued, matchedBy: Match, unknownToken: false };
+                }
+                RosterRejected = true;
+            }
+            return { issued: null, matchedBy: "none", unknownToken: TokenKey.length > 0 && !this.byToken.has(TokenKey), rosterRejected: RosterRejected };
+        }
         if (CandidateId.length > 0 && this.byCandidate.has(CandidateId)) {
             return { issued: this.byCandidate.get(CandidateId)!, matchedBy: "candidateId", unknownToken: false };
         }

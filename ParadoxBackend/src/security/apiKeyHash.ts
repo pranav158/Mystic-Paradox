@@ -42,6 +42,20 @@ export function HashApiKey(value: string, scope: "gameserver" | "user"): string 
         .digest("hex");
 }
 
+/**
+ * [2026-10-14] The pseudonym of an account id that a record must keep after the account is erased (the deletion tombstone, the
+ * actor of an admin or hunt record): HMAC-SHA256 under the same server secret as the API keys, domain-separated by its own scope.
+ * Without the secret the id cannot be recomputed from a copy of the database.
+ */
+export function PseudonymousAccountId(accountId: string): string {
+    return crypto
+        .createHmac("sha256", ApiKeyHashSecret())
+        .update("account-pseudonym", "utf8")
+        .update("\0")
+        .update(accountId, "utf8")
+        .digest("hex");
+}
+
 /** Constant-time comparison of one hex hash against stored records; returns the first match. */
 export function FindApiKeyRecord<T extends { keyHash?: string | null }>(records: T[], hashHex: string): T | undefined {
     const Incoming = Buffer.from(hashHex, "hex");

@@ -270,7 +270,11 @@ inventoryRouter.post("/inventory", HasParadoxBackendAuth, async (req: any, res) 
     // [2026-10-10] A season challenge's coin reward may arrive ~50 ms before the bounty save that claims the challenge;
     // give that claim a moment to land so it can fund the grant (controllers/challengeRewards.ts).
     const IsDedicatedServer = req.AuthData.IsGameserver === true && ExtensionTransaction == undefined;
-    if (IsDedicatedServer && Array.isArray(StackedItemsToAdd)
+    // [2026-10-13 realms S3] A module-authorized transaction (a realm host's game server) pays season-challenge coins the
+    // same way: only from one claimed, uncredited challenge, at most 1,000, credit recorded in the same transaction. The
+    // module's grant policy lets the coin through only in that shape (p2p/security/hostGrantPolicy.ts).
+    const FundsChallengeRewards = IsDedicatedServer || ExtensionTransaction != undefined;
+    if (FundsChallengeRewards && Array.isArray(StackedItemsToAdd)
         && StackedItemsToAdd.some((Item: any) => IsChallengeRewardGrant(Item?.catalogId, Item?.quantity))) {
         const Ready = await WaitForFundableSeasonClaim(UserId);
         if (!Ready) logger.warn(`transactionId ${TransactionId}: challenge-reward currency with no claimed, uncredited season challenge after 1.5 s`);
@@ -280,7 +284,10 @@ inventoryRouter.post("/inventory", HasParadoxBackendAuth, async (req: any, res) 
     try {
         ExtensionTransaction?.report?.("applying");
         TransactionResult = await RunInventoryTransaction(UserId, CharacterId, TransactionId, InstancedItemsToAdd, StackedItemsToAdd, InstancedItemsToRemove, StackedItemsToRemove, InstancedItemsToSave,
-            { ...(ExtensionTransaction?.options ?? {}), allowChallengeRewardFunding: IsDedicatedServer });
+            { ...(ExtensionTransaction?.options ?? {}), allowChallengeRewardFunding: FundsChallengeRewards,
+                // [diagnostics 2026-10-14] The economy ledger's source: a host's options name their session (p2p/security/p2pInventoryAuthorization.ts);
+                // a dedicated server is the game server; anything else is OTHER.
+                economy: ExtensionTransaction?.options?.economy ?? { source: IsDedicatedServer ? "INVENTORY_GAMESERVER" : "OTHER" } });
     } catch (Err) {
         CaptureInventoryTransaction({
             phase: "error",

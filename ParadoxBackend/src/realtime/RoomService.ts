@@ -86,6 +86,42 @@ export function parseRoomJid(to: string, requireNick = false): { roomBare: strin
     return { roomBare: `${roomLocal}@${MUC_DOMAIN}`, roomLocal, nick };
 }
 
+/**
+ * [2026-10-14 realms S2, design section 7.5] What the chat asks the realms module about a City room. A City-<uuid> room whose uuid
+ * is a realm's hub room id belongs to that realm: only its members who are not banned may join it. The default answers from the
+ * realms module, and only when that module is on (with it off there are no realm rooms).
+ */
+export interface RealmHubRoomAuthority {
+    /** The realm whose hub has this room id, or undefined for any other room. Throws when the lookup cannot be made. */
+    realmOfHubRoom(hubRoomId: string): Promise<string | undefined>;
+    isMember(realmId: string, accountId: string): Promise<boolean>;
+    isBanned(realmId: string, accountId: string): Promise<boolean>;
+    /** The room ids (lower-case UUIDs) of a realm's Ramsgate and Training hubs. */
+    hubRoomIds(realmId: string): string[];
+}
+
+// Loaded on first use: the chat must not pull in the realms module's database code while the module is off.
+const DefaultRealmHubRoomAuthority: RealmHubRoomAuthority = {
+    async realmOfHubRoom(hubRoomId) {
+        const config = require("../realms/realmsConfig") as typeof import("../realms/realmsConfig");
+        if (!config.IsRealmsModuleEnabled()) return undefined;
+        const realms = require("../realms") as typeof import("../realms");
+        return (await realms.GetRealmsService().findByHubRoomId(hubRoomId))?.realmId;
+    },
+    async isMember(realmId, accountId) {
+        const realms = require("../realms") as typeof import("../realms");
+        return realms.GetRealmsService().isMember(realmId, accountId);
+    },
+    async isBanned(realmId, accountId) {
+        const realms = require("../realms") as typeof import("../realms");
+        return realms.GetRealmsService().isBanned(realmId, accountId);
+    },
+    hubRoomIds(realmId) {
+        const realms = require("../realms") as typeof import("../realms");
+        return [realms.HubRoomId(realmId, "RAMSGATE"), realms.HubRoomId(realmId, "TRAINING")];
+    }
+};
+
 export class RoomService {
     private readonly rooms = new Map<string, Map<string, Occupant>>();
     private cityWarned = false;
@@ -94,6 +130,7 @@ export class RoomService {
     constructor(
         private readonly devCityMuc = DEV_CITY_MUC,
         private readonly devHuntMuc = DEV_HUNT_MUC,
+        private readonly realmHubs: RealmHubRoomAuthority = DefaultRealmHubRoomAuthority,
     ) {}
 
     /**
@@ -191,6 +228,19 @@ export class RoomService {
             return { ok: false, reason: "not a party member" };
         }
         if (roomLocal.startsWith("City-")) {
+            // A realm's hub room: its members only, and not the banned (the realm's own rules; the dev rule does not apply).
+            let realmId: string | undefined;
+            try {
+                realmId = await this.realmHubs.realmOfHubRoom(roomLocal.slice("City-".length));
+            } catch (error) {
+                logger.warn(`[XMPP] realm lookup for a City room failed; refusing the join: ${error}`);
+                return { ok: false, reason: "realm lookup failed" };
+            }
+            if (realmId !== undefined) {
+                if (await this.realmHubs.isBanned(realmId, accountId)) return { ok: false, reason: "realm banned" };
+                if (!(await this.realmHubs.isMember(realmId, accountId))) return { ok: false, reason: "not a realm member" };
+                return { ok: true, reason: "" };
+            }
             if (!this.devCityMuc) return { ok: false, reason: "city muc disabled" };
             if (!this.cityWarned) {
                 this.cityWarned = true;
@@ -230,6 +280,21 @@ export class RoomService {
         if (room == undefined) return;
         for (const occupant of [...room.values()]) {
             if (occupant.accountId === accountId) this.removeOccupant(roomLocal, accountId, occupant.resource);
+        }
+    }
+
+    /**
+     * [2026-10-14 realms S2] A member was kicked, banned or left the realm: every resource of the account leaves the realm's hub
+     * rooms (the Ramsgate and the Training room), with the usual unavailable presence to the others.
+     */
+    evictRealmMember(realmId: string, accountId: string): void {
+        for (const hubRoomId of this.realmHubs.hubRoomIds(realmId)) {
+            const roomLocal = `City-${hubRoomId}`;
+            const room = this.rooms.get(roomLocal);
+            if (room == undefined) continue;
+            for (const occupant of [...room.values()]) {
+                if (occupant.accountId === accountId) this.removeOccupant(roomLocal, accountId, occupant.resource);
+            }
         }
     }
 

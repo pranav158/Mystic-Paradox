@@ -13,6 +13,10 @@
 //   server whose airship waits forever.
 // - CITY/ReturnToRamsgate requests omit partyId in the captured 1.12 protocol, so the authoritative party is
 //   kept and returning members still fan out to the shared Ramsgate.
+// - [2026-10-11] An optional module may ask for the ISLAND member filter on another request (FilterOfflineMembers):
+//   a Training request the P2P module may host on a player's PC freezes its roster from this list, and an offline
+//   member would stall that host's start. The authoritative party id is still kept (no partyId check), and every
+//   other request is unchanged.
 
 export type MatchmakingPartySnapshot = {
     partyId: string,
@@ -33,7 +37,8 @@ export function ResolveMatchmakingParty(
     UserId: string,
     RequestedPartyId: string | undefined,
     Party: MatchmakingPartySnapshot | undefined,
-    IsOnline: (AccountId: string) => boolean
+    IsOnline: (AccountId: string) => boolean,
+    FilterOfflineMembers: boolean = false
 ): MatchmakingPartyResolution {
     if(Party == undefined){
         return { excludedMembers: [], partyIdMismatch: false };
@@ -47,8 +52,9 @@ export function ResolveMatchmakingParty(
         };
     }
 
+    const OnlineOnly = IsIslandRequest || FilterOfflineMembers;
     const PartyMembers = Party.members.filter((Member) =>
-        Member === UserId || !IsIslandRequest || IsOnline(Member)
+        Member === UserId || !OnlineOnly || IsOnline(Member)
     );
 
     return {

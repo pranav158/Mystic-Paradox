@@ -18,11 +18,16 @@ import { GetEscalationProgress, SaveEscalationProgress } from "../controllers/es
 import { GetEntitlementsForUser } from "../controllers/entitlements";
 import { ACTIVE_HUNTPASS_PROGRESSION_ID } from "../controllers/progression";
 import { MonitorBountyLoad, MonitorBountySave, MonitorCooldownLoad, MonitorCooldownSave, MonitorSourceOf } from "../diagnostics/economyMonitor";
-import { CooldownSaveValidationError, IsAuthorizedCooldownReader, IsAuthorizedCooldownWriter } from "../cooldownState";
-import { GetCooldownState, SaveCooldowns } from "../controllers/cooldowns";
-import { BountyGroupCounts, BountySaveValidationError, BountyStatePayload, IsAuthorizedBountyReader, IsAuthorizedBountyWriter } from "../bountyState";
+import { CooldownSaveValidationError, IsAuthorizedCooldownReader, IsAuthorizedCooldownWriter, IsHostCooldownWriter } from "../cooldownState";
+import { GetCooldownState, SaveCooldowns, StartCooldownHandlers } from "../controllers/cooldowns";
+import { BountyGroupCounts, BountySaveValidationError, BountyStatePayload, HostBountyWriteSummary, IsAuthorizedBountyReader, IsAuthorizedBountyWriter, IsHostBountyWriter, MergeHostBountyState, NewlyClaimedBountyIds } from "../bountyState";
+import { RecordChallengeClaimsActivity } from "../activity/activityMonitor";
 import { GetBountyState, SaveBountyState } from "../controllers/bounty";
-import { EscalationSeasonProgressUpdate, IsAuthorizedEscalationReader, IsAuthorizedEscalationWriter } from "../escalationProgress";
+import { EscalationSeasonProgressUpdate, EscalationTuning, GetEscalationTuning, IsAuthorizedEscalationReader, IsAuthorizedEscalationWriter, IsHostEscalationSeasonAllowed, IsHostEscalationWriter, MergeHostEscalationProgress, RecordToEscalationPayload } from "../escalationProgress";
+import { GetRepositories } from "../persistence";
+import { GetP2PExtension } from "../extensions/p2p";
+import { ActiveSeasonWindow } from "../seasonWindow";
+import { PerAccountQueue } from "../controllers/perAccountQueue";
 
 export const systemRouter = Router();
 
@@ -166,6 +171,17 @@ systemRouter.post("/motd/", HasParadoxBackendAuth, (req, res) => {
 	res.send();
 });
 
+// [2026-10-15] GET /motd/trigger?event_name=... (motd-prod, DauntlessEndpointDocumentation/MOTD/GetTrigger.md; the capture shows no
+// response body). Answered 404 on purpose, quietly: a 200 with the usual envelope made the 1.14.7 client open an EMPTY message-of-the-
+// day popup (art, blank title and text, "Enter Ramsgate") after sign-in (owner, 15 Oct). The 404 is what the client always got before
+// (no popup); this route only keeps it out of the "Unstubbed route" warnings. No MOTD is stored or served by this backend. The event
+// name is not logged (it is client input).
+systemRouter.get("/motd/trigger", HasParadoxBackendAuth, (req, res) => {
+	logger.debug("MOTD trigger: no message of the day (404)");
+
+	res.status(404).end();
+});
+
 // [2026-07-30] Now serves real persisted entitlements instead of an empty stub payload.
 //
 // Two changes worth calling out, both grounded in the real capture
@@ -255,19 +271,83 @@ systemRouter.get("/escalation/:escalationSeason/:userId", HasParadoxBackendAuth,
 	});
 });
 
+// [2026-10-13 realms S3] The host-write twin of controllers/escalationProgress.ts SaveEscalationProgress (same compare-and-
+// retry on the stored version), merging with MergeHostEscalationProgress so a host can only add to the stored progress.
+// Kept here because it is the only caller; the dedicated path above and its controller are untouched.
+// [2026-10-13 realms S3 limits] With game-data/escalation_tuning.json the merge judges the write against the season's real
+// limits instead (talents replaced by a valid build, level / XP / unlocks bounded; see escalationProgress.ts). Read once at
+// startup; a missing or rejected file leaves the never-lower merge, and the log line says which.
+const HOST_ESCALATION_SAVE_ATTEMPTS = 8;
+
+const EscalationLimitsAtStart = GetEscalationTuning();
+if (EscalationLimitsAtStart.status === "loaded") {
+	logger.info(`[Escalation] host write limits loaded for ${EscalationLimitsAtStart.tuning?.seasons.size ?? 0} seasons`);
+}
+else if (EscalationLimitsAtStart.status === "missing") {
+	logger.info("[Escalation] game-data/escalation_tuning.json not found: host escalation writes keep the never-lower merge");
+}
+else {
+	logger.warn(`[Escalation] game-data/escalation_tuning.json rejected (${EscalationLimitsAtStart.problem}): host escalation writes keep the never-lower merge`);
+}
+
+async function SaveHostEscalationProgress(UserId: string, SeasonId: string, Update: EscalationSeasonProgressUpdate, Limits: EscalationTuning | undefined) {
+	const Repository = GetRepositories().escalationProgress;
+	for (let Attempt = 0; Attempt < HOST_ESCALATION_SAVE_ATTEMPTS; Attempt++) {
+		const Previous = await Repository.get(UserId, SeasonId);
+		const { record, summary } = MergeHostEscalationProgress(UserId, SeasonId, Previous, Update, new Date().toISOString(), Limits);
+		const Saved = await Repository.saveIfVersion(record, Previous?.updateVersion);
+		if (Saved !== undefined) return { payload: RecordToEscalationPayload(Saved), summary };
+	}
+	throw new Error(`Host escalation progress save remained contended for ${UserId}/${SeasonId}`);
+}
+
 systemRouter.post("/escalation/:escalationSeason/:userId", HasParadoxBackendAuth, async (req, res) => {
 	const EscalationSeason = String(req.params.escalationSeason);
 	const UserId = String(req.params.userId);
-	if (!IsAuthorizedEscalationWriter((req as any).AuthData, UserId)) {
+	const AuthData = (req as any).AuthData;
+	// [2026-10-13 realms S3] A player-host runtime (Paradox-account realm) may write too, through the hostWrites hooks and
+	// a merge that never lowers stored progress and, with the season tuning table, keeps it within the game's limits
+	// (MergeHostEscalationProgress). Everyone else is judged as before.
+	const IsHostWrite = !IsAuthorizedEscalationWriter(AuthData, UserId) && IsHostEscalationWriter(AuthData);
+	if (!IsAuthorizedEscalationWriter(AuthData, UserId) && !IsHostWrite) {
 		logger.warn(`Rejected cross-account or player-host escalation write actor=${(req as any).AuthData?.userId ?? "unknown"} target=${UserId}`);
 		res.status(403).send();
+		return;
+	}
+	if (IsHostWrite) {
+		const Denied = await GetP2PExtension().hostWrites.authorize(req, "ESCALATION", UserId);
+		if (Denied !== undefined) {
+			logger.warn(`Rejected host escalation write actor=${AuthData?.userId ?? "unknown"} target=${UserId}`);
+			res.status(Denied.status).json(Denied.body);
+			return;
+		}
+	}
+	// [2026-10-13 realms S3 limits] A season the game has no table for cannot be real progress: refused like the hooks'
+	// denials (403, same envelope, nothing stored or tagged) rather than ignored with a 200, so a tampered host sees the refusal.
+	// Judged after the hooks, so a host that may not write this account learns nothing about seasons.
+	const Limits = IsHostWrite ? GetEscalationTuning().tuning : undefined;
+	if (IsHostWrite && !IsHostEscalationSeasonAllowed(Limits, EscalationSeason)) {
+		logger.warn(`Rejected host escalation write for unknown season ${JSON.stringify(EscalationSeason.slice(0, 64))} actor=${AuthData?.userId ?? "unknown"} target=${UserId}`);
+		res.status(403).json({ code: "ESCALATION_SEASON_UNKNOWN", message: "This escalation season is not known.", payload: null });
 		return;
 	}
 
 	// The gameserver posts the season data it wants persisted. Take the fields we model and keep
 	// the previous value for anything it omitted, so a partial write cannot wipe progress.
 	const Body = (req.body ?? {}) as EscalationSeasonProgressUpdate;
-	const Updated = await SaveEscalationProgress(UserId, EscalationSeason, Body);
+	let Updated;
+	if (IsHostWrite) {
+		const Saved = await SaveHostEscalationProgress(UserId, EscalationSeason, Body, Limits);
+		Updated = Saved.payload;
+		await GetP2PExtension().hostWrites.record(req, { kind: "ESCALATION", targetUserId: UserId, summary: { season: EscalationSeason, ...Saved.summary } });
+		if (Saved.summary.levelXpRejected !== undefined || Saved.summary.talentsRejected !== undefined) {
+			logger.warn(`Host escalation write partly refused season=${EscalationSeason} user=${UserId} `
+				+ `levelXp=${Saved.summary.levelXpRejected ?? "ok"} talents=${Saved.summary.talentsRejected ?? "ok"}`);
+		}
+	}
+	else {
+		Updated = await SaveEscalationProgress(UserId, EscalationSeason, Body);
+	}
 
 	logger.info(`Escalation progress saved season=${EscalationSeason} user=${UserId} `
 		+ `level=${Updated.escalation_level} version=${Updated.update_version}`);
@@ -319,18 +399,9 @@ const ENDED_PASS_WINDOW_END = "2024-12-03T00:00:00+00:00";      // the live serv
 // per open, a multi-second freeze, and gigabytes that were never returned (the client reached 19 GB after five
 // opens). Live passes ran 84 days starting Thursday 17:00 UTC (season24..26); the cycle is anchored on
 // season27's real start, so the window always covers the present and never spans more than 12 weeks.
-const ACTIVE_SEASON_ANCHOR_MS = Date.parse("2024-09-26T17:00:00+00:00");
-const ACTIVE_SEASON_LENGTH_MS = 84 * 24 * 60 * 60 * 1000;
-
-function IsoUtc(Ms: number): string {
-    return new Date(Ms).toISOString().replace(/\.\d{3}Z$/, "+00:00");
-}
-
-export function ActiveSeasonWindow(NowMs: number): { start: string; end: string } {
-    const Cycle = Math.floor((NowMs - ACTIVE_SEASON_ANCHOR_MS) / ACTIVE_SEASON_LENGTH_MS);
-    const Start = ACTIVE_SEASON_ANCHOR_MS + Cycle * ACTIVE_SEASON_LENGTH_MS;
-    return { start: IsoUtc(Start), end: IsoUtc(Start + ACTIVE_SEASON_LENGTH_MS) };
-}
+// [2026-10-13 realms S3 limits] The window arithmetic now lives in ../seasonWindow (cooldownState.ts and bountyState.ts
+// bound a host's writes by it and cannot import this router); ActiveSeasonWindow is still exported from here.
+export { ActiveSeasonWindow };
 const FUTURE_PASS_WINDOW_START = "2099-01-02T00:00:00+00:00";
 const FUTURE_PASS_WINDOW_END = "2099-12-31T00:00:00+00:00";
 
@@ -579,7 +650,10 @@ systemRouter.get("/cooldown/:userId", HasParadoxBackendAuth, async (req: any, re
 
 systemRouter.put("/cooldown/batch/:userId", HasParadoxBackendAuth, async (req: any, res) => {
 	const UserId = String(req.params.userId);
-	if (!IsAuthorizedCooldownWriter(req.AuthData)) {
+	// [2026-10-13 realms S3] A player-host runtime may save cooldowns too (hostWrites hooks), but only later than the stored
+	// date (MergeHostCooldownState); dedicated servers and everyone else are judged as before.
+	const IsHostWrite = !IsAuthorizedCooldownWriter(req.AuthData) && IsHostCooldownWriter(req.AuthData);
+	if (!IsAuthorizedCooldownWriter(req.AuthData) && !IsHostWrite) {
 		logger.warn(`Rejected cooldown write without gameserver authority actor=${req.AuthData?.userId ?? "unknown"} target=${UserId}`);
 		res.status(403).send();
 		return;
@@ -589,9 +663,19 @@ systemRouter.put("/cooldown/batch/:userId", HasParadoxBackendAuth, async (req: a
 		res.status(200).json({ code: null, message: "OK", payload: {} });
 		return;
 	}
+	if (IsHostWrite) {
+		const Denied = await GetP2PExtension().hostWrites.authorize(req, "COOLDOWN", UserId);
+		if (Denied !== undefined) {
+			logger.warn(`Rejected host cooldown write actor=${req.AuthData?.userId ?? "unknown"} target=${UserId}`);
+			res.status(Denied.status).json(Denied.body);
+			return;
+		}
+	}
 	try {
-		const { payload, record } = await SaveCooldowns(UserId, req.body);
-		MonitorCooldownSave(UserId, MonitorSourceOf(req.AuthData), req.body, `stored -> ${record.entries.length} cooldown(s) version=${record.updateVersion}`);
+		const { payload, record, changes } = await (IsHostWrite ? SaveCooldowns(UserId, req.body, { hostRules: true }) : SaveCooldowns(UserId, req.body));
+		MonitorCooldownSave(UserId, MonitorSourceOf(req.AuthData), req.body, `stored -> ${record.entries.length} cooldown(s) version=${record.updateVersion}`
+			+ (changes ? ` host: added=${changes.addedCount} raised=${changes.raisedCount} unchanged=${changes.unchanged} keptLater=${changes.keptLaterCount} droppedNew=${changes.droppedNew}` : ""));
+		if (IsHostWrite) await GetP2PExtension().hostWrites.record(req, { kind: "COOLDOWN", targetUserId: UserId, summary: { route: "batch", ...(changes ?? {}), version: record.updateVersion } });
 		res.status(200).json({ code: null, message: "OK", payload });
 	}
 	catch (Err) {
@@ -603,6 +687,15 @@ systemRouter.put("/cooldown/batch/:userId", HasParadoxBackendAuth, async (req: a
 		throw Err;
 	}
 });
+
+// [2026-10-10] StartCooldownEndpoint: one cooldown started at the backend's now - a harvested Ramsgate sprout
+// (UPlayerGatherableComponent::OnGatherableHarvested 0x141A6DDE0, id = node GUID) or UCooldownComponent::StartCooldown.
+// It 404'd before, so no sprout harvest was ever saved. Registered after the batch route, and the handlers also skip
+// "/cooldown/batch/<uid>" themselves. Unlike the routes above it never answers 200 without storing: persistence off
+// -> 503, INVALID -> 400, because a 2xx makes the server pay the harvest (controllers/cooldowns.ts).
+const StartCooldownRoute = StartCooldownHandlers(HasParadoxBackendAuth, { persistence: COOLDOWN_PERSISTENCE, noPlayerUserId: COOLDOWN_NO_PLAYER });
+systemRouter.put("/cooldown/:userId/:cooldownId", ...StartCooldownRoute);
+systemRouter.post("/cooldown/:userId/:cooldownId", ...StartCooldownRoute);
 
 systemRouter.get("/bounty/game-data", HasParadoxBackendAuth, (req: any, res) => {
 	logger.info("Bounty game data (stubbed)");
@@ -642,6 +735,30 @@ systemRouter.get("/bounty/game-data", HasParadoxBackendAuth, (req: any, res) => 
 const BOUNTY_PERSISTENCE = !/^(0|false|off|no)$/i.test(process.env.MYSTICPARADOX_BOUNTY_PERSISTENCE ?? "");
 const BOUNTY_NO_PLAYER = "INVALID";
 
+// [2026-10-13 realms S3 limits] The host-write twin of controllers/bounty.ts SaveBountyState (same one-at-a-time-per-account
+// queue and compare-and-retry on the stored version), merging with MergeHostBountyState: weekly season challenges are held to
+// their fixed schedule and objective progress is clamped (src/bountyState.ts, "Host saves"). Kept here, like the escalation
+// twin, because this route is its only caller; the dedicated path and its controller are untouched.
+const HOST_BOUNTY_SAVE_ATTEMPTS = 8;
+const HostBountySaveQueue = new PerAccountQueue();
+
+function SaveHostBountyState(UserId: string, Body: unknown) {
+	return HostBountySaveQueue.run(UserId, async () => {
+		const Repository = GetRepositories().bountyStates;
+		for (let Attempt = 0; Attempt < HOST_BOUNTY_SAVE_ATTEMPTS; Attempt++) {
+			const Previous = await Repository.get(UserId);
+			const { record, summary } = MergeHostBountyState(UserId, Previous, Body);
+			const Saved = await Repository.saveIfVersion(record, Previous?.updateVersion);
+			if (Saved !== undefined) {
+				// [2026-10-14] The activity monitor counts the season challenges a host's save claimed, as it does a dedicated server's.
+				RecordChallengeClaimsActivity(UserId, NewlyClaimedBountyIds(Saved).length);
+				return { payload: BountyStatePayload(Saved), record: Saved, summary };
+			}
+		}
+		throw new Error(`Host bounty state save remained contended for ${UserId}`);
+	});
+}
+
 systemRouter.get("/bounty/:userId", HasParadoxBackendAuth, async (req: any, res) => {
 	const UserId = String(req.params.userId);
 	if (!IsAuthorizedBountyReader(req.AuthData, UserId)) {
@@ -662,7 +779,11 @@ systemRouter.get("/bounty/:userId", HasParadoxBackendAuth, async (req: any, res)
 
 systemRouter.post("/bounty/:userId", HasParadoxBackendAuth, async (req: any, res) => {
 	const UserId = String(req.params.userId);
-	if (!IsAuthorizedBountyWriter(req.AuthData)) {
+	// [2026-10-13 realms S3] A player-host runtime (Paradox-account realm) saves bounties like a dedicated server - claims
+	// included, by owner decision - through the same SaveBountyState flow, once the hostWrites hooks allow it; the save is
+	// then tagged. Dedicated servers and everyone else are judged as before.
+	const IsHostWrite = !IsAuthorizedBountyWriter(req.AuthData) && IsHostBountyWriter(req.AuthData);
+	if (!IsAuthorizedBountyWriter(req.AuthData) && !IsHostWrite) {
 		logger.warn(`Rejected bounty write without gameserver authority actor=${req.AuthData?.userId ?? "unknown"} target=${UserId}`);
 		res.status(403).send();
 		return;
@@ -672,12 +793,23 @@ systemRouter.post("/bounty/:userId", HasParadoxBackendAuth, async (req: any, res
 		res.status(200).json({ code: null, message: "OK", payload: BountyStatePayload(undefined) });
 		return;
 	}
+	if (IsHostWrite) {
+		const Denied = await GetP2PExtension().hostWrites.authorize(req, "BOUNTY", UserId);
+		if (Denied !== undefined) {
+			logger.warn(`Rejected host bounty write actor=${req.AuthData?.userId ?? "unknown"} target=${UserId}`);
+			res.status(Denied.status).json(Denied.body);
+			return;
+		}
+	}
 
 	try {
-		const { payload, record, summary } = await SaveBountyState(UserId, req.body);
+		// [2026-10-13 realms S3 limits] A host's save is limited to what the real data shows is possible (SaveHostBountyState).
+		const { payload, record, summary } = await (IsHostWrite ? SaveHostBountyState(UserId, req.body) : SaveBountyState(UserId, req.body));
 		MonitorBountySave(UserId, MonitorSourceOf(req.AuthData), req.body,
 			`stored ${summary.mode}${summary.group ? `:${summary.group}` : ""} incoming=${summary.incoming} removed=${summary.removed}`
-			+ ` -> ${JSON.stringify(BountyGroupCounts(record))} version=${record.updateVersion}`);
+			+ ` -> ${JSON.stringify(BountyGroupCounts(record))} version=${record.updateVersion}`
+			+ (summary.host ? ` host: keptClaimedWeekly=${summary.host.keptClaimedWeekly} ignoredWeekly=${summary.host.ignoredWeekly} clampedProgress=${summary.host.clampedProgress}` : ""));
+		if (IsHostWrite) await GetP2PExtension().hostWrites.record(req, { kind: "BOUNTY", targetUserId: UserId, summary: HostBountyWriteSummary(summary, record) });
 		// The same envelope as the GET (the full merged state), as the live service answered a save.
 		res.status(200).json({ code: null, message: "OK", payload });
 	}
@@ -689,6 +821,32 @@ systemRouter.post("/bounty/:userId", HasParadoxBackendAuth, async (req: any, res
 		}
 		throw Err;
 	}
+});
+
+// [2026-10-15] POST /bounty/delete/:userId (progression-prod). In the 1.14.7 binary this is UBountyComponent::ResetBounties'
+// DeleteBountiesEndpoint: a POST with the account id in the path and no body, sent when the game resets the player's bounties
+// ("resetting N bounties for player"). Whether a reset should wipe the stored bounty state is an owner decision: that state also
+// holds the claim records that stop a season challenge being paid twice (controllers/challengeRewards.ts), so until the decision is
+// made this changes nothing and answers the usual envelope. The auth and target checks are the bounty save's (a gameserver, or a
+// host whose hostWrites hook allows BOUNTY for this player). The next save merges as before (an empty list never deletes anything,
+// src/bountyState.ts).
+systemRouter.post("/bounty/delete/:userId", HasParadoxBackendAuth, async (req: any, res) => {
+	const UserId = String(req.params.userId);
+	const IsHostWrite = !IsAuthorizedBountyWriter(req.AuthData) && IsHostBountyWriter(req.AuthData);
+	if (!IsAuthorizedBountyWriter(req.AuthData) && !IsHostWrite) {
+		logger.warn("Rejected bounty reset without gameserver authority");
+		res.status(403).send();
+		return;
+	}
+	if (IsHostWrite) {
+		const Denied = await GetP2PExtension().hostWrites.authorize(req, "BOUNTY", UserId);
+		if (Denied !== undefined) {
+			res.status(Denied.status).json(Denied.body);
+			return;
+		}
+	}
+	logger.info(`Bounty reset request acknowledged, nothing changed (source=${MonitorSourceOf(req.AuthData)})`);
+	res.status(200).json({ code: null, message: "OK", payload: {} });
 });
 
 systemRouter.get("/all/", HasParadoxBackendAuth, (req: any, res) => {

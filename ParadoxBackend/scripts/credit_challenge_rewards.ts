@@ -15,6 +15,7 @@
 import { CHALLENGE_REWARD_CURRENCIES, FindFundableSeasonClaim, InferBountyGroup, MAX_CHALLENGE_REWARD_PER_CLAIM, WithRewardCredit } from "../src/bountyState";
 import { AddCurrency, GetBalance } from "../src/controllers/wallet";
 import { GetPersistenceLifecycle, GetRepositories, GetUnitOfWork } from "../src/persistence";
+import { NewEconomyLedger, WaitForEconomyRollups } from "../src/diagnostics/economyLedgerMonitor";
 
 const APPLY_CONFIRMATION = "APPLY_CHALLENGE_REWARD_CREDIT";
 const CURRENCY = "CURRENCY_SEASONAL_COIN";
@@ -60,6 +61,8 @@ async function Main(): Promise<void> {
         if (!Apply) return;
 
         const Stamp = new Date().toISOString();
+        // [diagnostics 2026-10-14] An operator credit of Hunt Pass coins: the economy ledger logs it as an OPERATOR reward.
+        const Ledger = NewEconomyLedger({ userId: UserId!, transactionId: "backfill-20261010", scope: { source: "OPERATOR" }, granted: [] });
         await GetUnitOfWork().withTransaction(async (Repos, Session) => {
             let Current = await Repos.bountyStates.get(UserId!, Session);
             if (!Current) throw new Error("bounty state vanished");
@@ -75,10 +78,13 @@ async function Main(): Promise<void> {
             if (!Saved) throw new Error("bounty state changed during the credit; re-run");
             await AddCurrency(UserId!, CURRENCY, Total, Session);
         });
+        Ledger?.recordReward(CURRENCY, Total);
+        Ledger?.commit();
         const After = await GetBalance(UserId!, CURRENCY);
         const Remaining = FindFundableSeasonClaim(await GetRepositories().bountyStates.get(UserId!));
         console.log(`applied: ${CURRENCY} ${Before} -> ${After}; next fundable claim: ${Remaining ? Remaining.bounty.bounty_id : "none"}`);
     } finally {
+        await WaitForEconomyRollups();
         await Lifecycle.stop();
     }
 }

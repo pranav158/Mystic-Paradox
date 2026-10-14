@@ -23,6 +23,26 @@
  * for the future server-authoritative unlock transaction (validate prereq -> deduct -> persist ->
  * grant), which is a separate piece of work.
  *
+ * [2026-10-13 realms S3] WHO PAYS THE PRICE, AND WHAT A PLAYER-HOSTED SERVER MAY SAVE
+ * -----------------------------------------------------------------------------------
+ * The game pays a node's price itself, in its own POST /inventory before the journey is saved: a dedicated
+ * server relays `removeStackedItems=[CURRENCY_PJM_WEAPON x25, CURRENCY_NOTES x1875]` (exactly the node's
+ * `currencyCosts`, merits and Notes in one transaction) and posts the journey map to POST /pjm/:userId up to
+ * minutes later - on arrival or a later save - not in the same request (captures: 18 Jul 2026 VPS logs,
+ * `[INV-CAP] ... gsKey=Y removeStacked=[CURRENCY_PJM_WEAPON x25]`, wallet debit, then `Player journey map SAVED`
+ * 14 s on). So the backend must NOT charge again (double charge), and it cannot tell at /pjm time which spend belonged
+ * to which node: the inventory ledger stores request hashes only, Notes are also spent on crafting, and merit prices
+ * changed between game versions, so reconciling balances against unlocked nodes would reject real players. A host's
+ * spend goes through POST /inventory like a dedicated server's (p2pInventoryAuthorization.ts refuses only Platinum
+ * and entitlements; the inventory monitor tags it), so the price is covered there, not here.
+ *
+ * What the backend CAN check at /pjm time, and does for a player-hosted server (PlanHostPlayerJourney, applied inside
+ * SavePlayerJourney's compare-and-swap loop): a node newly unlocked must be a node the game has, and either a root of
+ * the graph (no node lists it in `childNodes`) or have at least one parent already unlocked, in the stored map or
+ * accepted earlier in the same request. A newly unlocked node that fails keeps its stored status (and so grants no
+ * reward). A host also cannot lock an unlocked node again or point one node's reward at another node's id.
+ * Dedicated servers keep the old trust: their map is stored as sent.
+ *
  * SELF-HEALING IDEMPOTENCY
  * ------------------------
  * Every journey save reconciles every unlocked, item-granting node against inventory. This is
@@ -35,7 +55,7 @@
 import crypto from "node:crypto";
 
 import { logger } from "../logger";
-import { loadGameData } from "../gameData/loader";
+import { loadGameData, tryLoadGameData } from "../gameData/loader";
 import { GetCharactersForUid } from "./character";
 import { GetInventoryForUserIdAndCharacterId, RunInventoryTransaction } from "./inventory";
 
@@ -103,6 +123,153 @@ export function ComputeNewlyUnlockedNodeIds(storedNodes: any, nextNodes: any): s
         Out.push(NodeId);
     }
     return Out;
+}
+
+// [2026-10-13 realms S3] The shape of the graph as the definitions give it, for checking a player-hosted server's
+// unlocks (PlanHostPlayerJourney). `parents` maps a node to every node that lists it in `childNodes`; a node with no
+// entry is a root. `known` is every node id the game has: the definitions, their children and the served graph
+// (50 of the 509 nodes carry no cost, reward or child and so have no definition row, but are children or served nodes).
+export interface SlayersPathGraph {
+    parents: ReadonlyMap<string, readonly string[]>;
+    known: ReadonlySet<string>;
+    /** False when no definitions loaded: nothing can be verified, so a host's unlocks are all refused. */
+    usable: boolean;
+}
+
+export function BuildSlayersPathGraph(
+    definitions: Record<string, SlayersPathNodeDefinition>,
+    servedNodeIds: Iterable<string> = []
+): SlayersPathGraph {
+    const Parents = new Map<string, string[]>();
+    const Known = new Set<string>();
+    for (const [NodeId, Def] of Object.entries(definitions ?? {})) {
+        Known.add(NodeId);
+        for (const Child of Array.isArray(Def?.childNodes) ? Def.childNodes : []) {
+            if (typeof Child !== "string" || Child.length === 0 || Child === "None") continue;
+            Known.add(Child);
+            const Existing = Parents.get(Child);
+            if (Existing === undefined) Parents.set(Child, [NodeId]);
+            else if (!Existing.includes(NodeId)) Existing.push(NodeId);
+        }
+    }
+    for (const NodeId of servedNodeIds) {
+        if (typeof NodeId === "string" && NodeId.length > 0) Known.add(NodeId);
+    }
+    return { parents: Parents, known: Known, usable: Object.keys(definitions ?? {}).length > 0 };
+}
+
+let DefaultGraphCache: SlayersPathGraph | undefined;
+
+function DefaultSlayersPathGraph(): SlayersPathGraph {
+    if (DefaultGraphCache === undefined) {
+        let Served: string[] = [];
+        try {
+            Served = Object.keys(tryLoadGameData<any>("slayers_path.json")?.payload?.nodes ?? {});
+        } catch {
+            Served = [];   // the definitions alone still give every parent edge
+        }
+        DefaultGraphCache = BuildSlayersPathGraph(DEFINITIONS, Served);
+    }
+    return DefaultGraphCache;
+}
+
+export type HostJourneyStripReason = "unknown-node" | "prerequisite" | "node-id-mismatch" | "definitions-unavailable";
+
+export interface HostJourneyPlan {
+    /** The node map to store. */
+    nodes: Record<string, any>;
+    /** Newly unlocked nodes accepted (the backend checked their prerequisite). */
+    unlocked: string[];
+    /** Newly unlocked nodes refused; the stored status is kept (a node the map did not have stays locked). */
+    stripped: { nodeId: string; reason: HostJourneyStripReason }[];
+    /** Nodes the host tried to lock again; the stored entry is kept. */
+    relocked: string[];
+}
+
+/**
+ * [2026-10-13 realms S3] Pure. Checks the journey map a player-hosted server sends for one of its players (POST /pjm),
+ * after SavePlayerJourney merged it with the stored map (`mergedNodes`; `storedNodes` is what was there), and returns the map
+ * to store. The game pays a node's price itself (see the header), so only what the backend can know is checked:
+ *   - a newly unlocked node (status 1 or 2 where the stored one was not) must exist in the game and either be a root or
+ *     have a parent that is unlocked in the stored map or accepted earlier in this request (a purchase and its
+ *     auto-unlocked children arrive together, in any key order, so this runs to a fixed point);
+ *   - an unlocked node cannot be locked again;
+ *   - an unlocked entry's own `node_id` must be its key: rewards are granted from `node_id`
+ *     (GetUnlockedNodeIds), so a free root's key must not carry another node's id.
+ * Every refusal keeps the stored entry, or a locked copy of the sent one when there was none.
+ */
+export function PlanHostPlayerJourney(storedNodes: any, mergedNodes: any, graph: SlayersPathGraph = DefaultSlayersPathGraph()): HostJourneyPlan {
+    const AsRecord = (Value: any): Record<string, any> =>
+        Value && typeof Value === "object" && !Array.isArray(Value) ? Value : {};
+    const Stored = AsRecord(storedNodes);
+    const StoredEntry = (NodeId: string): any => Object.hasOwn(Stored, NodeId) ? Stored[NodeId] : undefined;
+    // A Map keeps a "__proto__" key an ordinary entry; the result is built with Object.fromEntries for the same reason.
+    const Merged = new Map<string, any>(Object.entries(AsRecord(mergedNodes)));
+
+    const Stripped: HostJourneyPlan["stripped"] = [];
+    const Relocked: string[] = [];
+
+    for (const [NodeId, Node] of [...Merged]) {
+        if (!IsNodeUnlocked(Node) || typeof Node?.node_id !== "string" || Node.node_id === NodeId) continue;
+        const Before = StoredEntry(NodeId);
+        if (Before !== undefined && JSON.stringify(Before) === JSON.stringify(Node)) continue;   // data from before, not this write
+        Stripped.push({ nodeId: NodeId, reason: "node-id-mismatch" });
+        if (Before !== undefined) Merged.set(NodeId, Before);
+        else Merged.delete(NodeId);
+    }
+
+    for (const NodeId of Object.keys(Stored)) {
+        if (IsNodeUnlocked(Stored[NodeId]) && !IsNodeUnlocked(Merged.get(NodeId))) {
+            Merged.set(NodeId, Stored[NodeId]);
+            Relocked.push(NodeId);
+        }
+    }
+
+    const Pending: string[] = [];
+    const Unlocked = new Set<string>();
+    for (const [NodeId, Node] of Merged) {
+        if (!IsNodeUnlocked(Node)) continue;
+        if (IsNodeUnlocked(StoredEntry(NodeId))) Unlocked.add(NodeId);
+        else Pending.push(NodeId);
+    }
+
+    const Refuse: { nodeId: string; reason: HostJourneyStripReason }[] = [];
+    let Remaining: string[] = [];
+    for (const NodeId of Pending) {
+        if (!graph.usable) Refuse.push({ nodeId: NodeId, reason: "definitions-unavailable" });
+        else if (!graph.known.has(NodeId)) Refuse.push({ nodeId: NodeId, reason: "unknown-node" });
+        else Remaining.push(NodeId);
+    }
+
+    const Accepted: string[] = [];
+    for (let Progress = true; Progress && Remaining.length > 0;) {
+        Progress = false;
+        const Next: string[] = [];
+        for (const NodeId of Remaining) {
+            const Parents = graph.parents.get(NodeId);
+            if (Parents === undefined || Parents.some((Parent) => Unlocked.has(Parent))) {
+                Unlocked.add(NodeId);
+                Accepted.push(NodeId);
+                Progress = true;
+            } else {
+                Next.push(NodeId);
+            }
+        }
+        Remaining = Next;
+    }
+    for (const NodeId of Remaining) Refuse.push({ nodeId: NodeId, reason: "prerequisite" });
+
+    for (const { nodeId } of Refuse) {
+        const Before = StoredEntry(nodeId);
+        Merged.set(nodeId, Before !== undefined ? Before : { ...Merged.get(nodeId), node_status: 0 });
+    }
+
+    return {
+        nodes: Object.fromEntries(Merged),
+        unlocked: Pending.filter((NodeId) => Accepted.includes(NodeId)),
+        stripped: [...Stripped, ...Refuse],
+        relocked: Relocked
+    };
 }
 
 /**

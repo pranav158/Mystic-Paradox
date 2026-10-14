@@ -16,6 +16,7 @@ import { logger } from "../logger";
 import { loadGameData } from "../gameData/loader";
 import { PLATINUM_AGGREGATE_ID, ProjectBalances, ResolvePlatinumSpend, SumPlatinum } from "../platinumWallet";
 import { MonitorPrestigeFunding, PrestigeSourceState } from "../diagnostics/economyMonitor";
+import { EconomyLedger, IsPlatinumMovement } from "../diagnostics/economyLedgerMonitor";
 import { FundChallengeReward } from "./challengeRewards";
 
 const NO_PLAYER_SENTINEL = "INVALID";
@@ -141,7 +142,10 @@ export async function AddCurrency(userId: string, catalogId: string, delta: numb
 // dupe: you cannot receive more of a gated reward than you have collectively banked, draining
 // whichever eligible tracks have progress, in a fixed order, until the requested amount is
 // covered or rejected.
-type PrestigeRewardSource = { progressionId: string; xpPerLevel: number; rewardQuantityPerLevel: number };
+// capXp: the cumulative XP of the path's top regular rank. Prestige levels only exist past it (the game's rank maths,
+// FUN_140E53760: rank = maxRank + (progress - capXp) / xp_per_level) - 10,000 for season43's 100 ranks, 0 for a
+// PrestigeTrack_Weapon_* (one 0-XP requirement), whose prestige level is therefore its progress, the reforge count.
+type PrestigeRewardSource = { progressionId: string; xpPerLevel: number; rewardQuantityPerLevel: number; capXp: number };
 
 function BuildPrestigeRewardSources(): Map<string, PrestigeRewardSource[]> {
     const ByRewardCatalogId = new Map<string, PrestigeRewardSource[]>();
@@ -152,6 +156,8 @@ function BuildPrestigeRewardSources(): Map<string, PrestigeRewardSource[]> {
         const XpPerLevel = Number(Path?.prestige?.xp_per_level);
         const RewardItems: any[] = Path?.prestige?.free_rewards?.stacked_items ?? [];
         if (typeof ProgressionId !== "string" || !Number.isFinite(XpPerLevel) || XpPerLevel <= 0) continue;
+        const CapXp = (Array.isArray(Path?.requirements) ? Path.requirements : [])
+            .reduce((Sum: number, Requirement: any) => Sum + (Number(Requirement?.xp_required) || 0), 0);
 
         for (const Reward of RewardItems) {
             const RewardCatalogId = Reward?.catalog_id;
@@ -159,7 +165,7 @@ function BuildPrestigeRewardSources(): Map<string, PrestigeRewardSource[]> {
             if (typeof RewardCatalogId !== "string" || !Number.isFinite(RewardQuantityPerLevel) || RewardQuantityPerLevel <= 0) continue;
 
             const List = ByRewardCatalogId.get(RewardCatalogId) ?? [];
-            List.push({ progressionId: ProgressionId, xpPerLevel: XpPerLevel, rewardQuantityPerLevel: RewardQuantityPerLevel });
+            List.push({ progressionId: ProgressionId, xpPerLevel: XpPerLevel, rewardQuantityPerLevel: RewardQuantityPerLevel, capXp: CapXp });
             ByRewardCatalogId.set(RewardCatalogId, List);
         }
     }
@@ -196,7 +202,7 @@ export class InsufficientPrestigeProgressError extends Error {
     }
 }
 
-// Consumes real banked PrestigeTrack_Weapon_* progress to fund a grant of `catalogId`. A no-op
+// Claims unpaid prestige levels (past the top rank) to fund a grant of `catalogId`. A no-op
 // for any catalogId that isn't a configured prestige-claim reward (i.e. every other currency,
 // including Aether Shards, is unaffected). Throws InsufficientPrestigeProgressError — aborting
 // the caller's whole transaction, same as InsufficientBalanceError does for an ordinary overspend
@@ -206,7 +212,7 @@ async function SpendBankedPrestigeForReward(userId: string, catalogId: string, q
     if (Sources == undefined || Sources.length === 0 || !Number.isFinite(quantity) || quantity <= 0) return;
 
     let Remaining = quantity;
-    const Spends: { progressionId: string; amount: number }[] = [];
+    const Claims: { progressionId: string; claimedBefore: number; levels: number; minProgress: number }[] = [];
     let TotalAvailable = 0;
     const Observed: PrestigeSourceState[] = [];
 
@@ -220,7 +226,13 @@ async function SpendBankedPrestigeForReward(userId: string, catalogId: string, q
             confirmedFremiumRank: Track?.confirmedFremiumRank,
             confirmedPremiumRank: Track?.confirmedPremiumRank,
         });
-        const BankedLevels = Math.floor((Track?.progress ?? 0) / Source.xpPerLevel);
+        // [1.14.7 2026-10-11] Paying a prestige reward never spends progress any more: progress is what the game reads
+        // back as the track's rank (a weapon's reforge count, the Hunt Pass bar), and spending it lowered both. Paid
+        // levels are counted instead (prestigeClaimed), each level paying once, and only levels past the top regular
+        // rank count (capXp) - the old rule counted season43 coins from XP 0, 5 coins per 100 XP, and then took the XP.
+        const ClaimedBefore = Track?.prestigeClaimed ?? 0;
+        const PrestigeLevels = Math.floor(Math.max(0, (Track?.progress ?? 0) - Source.capXp) / Source.xpPerLevel);
+        const BankedLevels = Math.max(0, PrestigeLevels - ClaimedBefore);
         const AvailableFromSource = BankedLevels * Source.rewardQuantityPerLevel;
         TotalAvailable += AvailableFromSource;
 
@@ -234,7 +246,12 @@ async function SpendBankedPrestigeForReward(userId: string, catalogId: string, q
         const LevelsToSpend = UnitsToTake / Source.rewardQuantityPerLevel;
         if (!Number.isInteger(LevelsToSpend)) continue;
 
-        Spends.push({ progressionId: Source.progressionId, amount: LevelsToSpend * Source.xpPerLevel });
+        Claims.push({
+            progressionId: Source.progressionId,
+            claimedBefore: ClaimedBefore,
+            levels: LevelsToSpend,
+            minProgress: Source.capXp + (ClaimedBefore + LevelsToSpend) * Source.xpPerLevel,
+        });
         Remaining -= LevelsToSpend * Source.rewardQuantityPerLevel;
     }
 
@@ -244,20 +261,18 @@ async function SpendBankedPrestigeForReward(userId: string, catalogId: string, q
         throw new InsufficientPrestigeProgressError(userId, catalogId, quantity, TotalAvailable);
     }
     MonitorPrestigeFunding(userId, catalogId, quantity, Observed,
-        `funded from [${Spends.map((Spend) => `${Spend.progressionId}-${Spend.amount}`).join(", ")}]`);
+        `funded from [${Claims.map((Claim) => `${Claim.progressionId} claim ${Claim.levels} (claimed ${Claim.claimedBefore}->${Claim.claimedBefore + Claim.levels})`).join(", ")}]`);
 
-    for (const Spend of Spends) {
-        const Updated = await GetRepositories().progressionTracks.spend(userId, Spend.progressionId, Spend.amount, session);
-        if (Updated == undefined) {
-            // Another concurrent claim drained this track between our read above and this write.
-            // Mongo will surface this as a write conflict on the session and retry the whole
-            // transaction callback (see MongoUnitOfWork's doc comment) - but if it doesn't (e.g.
-            // the track was read outside a fully consistent snapshot), fail loudly rather than
-            // credit a reward whose backing progress was not actually, atomically consumed.
-            logger.error(`[Prestige] ${userId} spend of ${Spend.amount} on ${Spend.progressionId} lost a race after being counted as available - rejecting rather than crediting an unbacked reward`);
+    for (const Claim of Claims) {
+        // Compare-and-set on prestigeClaimed inside the caller's transaction: a concurrent claim of the same level makes
+        // this miss, and the reward is refused rather than paid twice.
+        const Claimed = await GetRepositories().progressionTracks.claimPrestigeLevels(userId, Claim.progressionId,
+            Claim.claimedBefore, Claim.levels, Claim.minProgress, session);
+        if (!Claimed) {
+            logger.error(`[Prestige] ${userId} claim of ${Claim.levels} level(s) on ${Claim.progressionId} lost a race - rejecting rather than paying twice`);
             throw new InsufficientPrestigeProgressError(userId, catalogId, quantity, TotalAvailable);
         }
-        logger.info(`[Prestige] ${userId} spent ${Spend.amount} progress on ${Spend.progressionId} to fund ${catalogId} reward`);
+        logger.info(`[Prestige] ${userId} claimed ${Claim.levels} prestige level(s) on ${Claim.progressionId} to fund ${catalogId} reward (progress kept)`);
     }
 }
 
@@ -269,7 +284,8 @@ async function SpendBankedPrestigeForReward(userId: string, catalogId: string, q
 // finding out on its next unrelated GET /inventory or GET /store/balance - the same "tell the
 // client what actually happened, right now" fix already applied to non-currency stacked items in
 // RunInventoryTransaction (see inventory.ts's BUG D fix comment).
-export async function ApplyCurrencyDeltas(userId: string, adds: any[], removes: any[], session?: ClientSession, transactionId?: string, allowChallengeRewardFunding = false): Promise<Record<string, number>> {
+export async function ApplyCurrencyDeltas(userId: string, adds: any[], removes: any[], session?: ClientSession, transactionId?: string, allowChallengeRewardFunding = false,
+    ledger?: EconomyLedger): Promise<Record<string, number>> {
     const TouchedBalances: Record<string, number> = {};
     if (!userId || userId === NO_PLAYER_SENTINEL) return TouchedBalances;
 
@@ -289,6 +305,15 @@ export async function ApplyCurrencyDeltas(userId: string, adds: any[], removes: 
                 await SpendBankedPrestigeForReward(userId, Item.catalogId, Quantity, session);
             }
             TouchedBalances[Item.catalogId] = await AddCurrency(userId, Item.catalogId, Quantity, session);
+            // [diagnostics 2026-10-14] The economy ledger (diagnostics/economyLedgerMonitor.ts) sees the credit only after the
+            // whole transaction commits; the balance it logs is the account's Platinum across all buckets.
+            if (ledger != undefined) {
+                if (IsPlatinumMovement(Item.catalogId)) {
+                    ledger.recordPlatinumCredit(Item.catalogId, Quantity, SumPlatinum(await GetWallet(userId, session)), Funded !== undefined);
+                } else {
+                    ledger.recordReward(Item.catalogId, Quantity, Funded !== undefined);
+                }
+            }
         }
     }
     for (const Item of (removes ?? [])) {
@@ -300,9 +325,14 @@ export async function ApplyCurrencyDeltas(userId: string, adds: any[], removes: 
             // Every other currency keeps the plain one-field path unchanged.
             if (Item.catalogId === PLATINUM_AGGREGATE_ID) {
                 Object.assign(TouchedBalances, await SpendPlatinum(userId, Number(Item.quantity ?? 0), session));
+                // [diagnostics 2026-10-14] A spend that got here committed with the transaction (an overspend threw above).
+                ledger?.recordPlatinumSpend(Math.trunc(Number(Item.quantity ?? 0)) || 0, TouchedBalances[PLATINUM_AGGREGATE_ID] ?? 0);
                 continue;
             }
             TouchedBalances[Item.catalogId] = await AddCurrency(userId, Item.catalogId, -Number(Item.quantity ?? 0), session);
+            if (ledger != undefined && IsPlatinumMovement(Item.catalogId)) {
+                ledger.recordPlatinumSpend(Math.trunc(Number(Item.quantity ?? 0)) || 0, SumPlatinum(await GetWallet(userId, session)));
+            }
         }
     }
     return TouchedBalances;

@@ -1,5 +1,6 @@
 import { GetMongoDb } from "../persistence/mongo/client";
 import { Collections } from "../persistence/mongo/collections";
+import { GetSqliteDirectAccess } from "../persistence";
 import { ClientSession } from "mongodb";
 import { ApplyDiagnosticsLogProfile, logger } from "../logger";
 import { GetP2PExtension } from "../extensions/p2p";
@@ -80,6 +81,8 @@ export function ResolveDiagnosticsExpiry(current: OperationsPolicy,
 
 /** The raw singleton document (null when missing). */
 export async function ReadOperationsPolicyRecord(session?: ClientSession): Promise<any | null> {
+    const Sqlite = GetSqliteDirectAccess();
+    if (Sqlite) return Sqlite.readOperationsPolicyRecord(session);
     const db = await GetMongoDb();
     return db.collection(Collections.OperationsPolicy).findOne({ _id: "global" as any }, { session });
 }
@@ -111,11 +114,19 @@ export async function GetOperationsPolicy(session?: ClientSession): Promise<Oper
 export async function SetOperationsPolicy(input: Pick<OperationsPolicy, "guardEnforcement" | "diagnosticsProfile">,
     actorUserId: string, expectedVersion: number,
     session?: ClientSession): Promise<OperationsPolicy | undefined> {
-    const db = await GetMongoDb();
     const updatedAt = new Date().toISOString();
     const current = await GetOperationsPolicy(session);
     const diagnosticsExpiresAt = ResolveDiagnosticsExpiry(current, input.diagnosticsProfile,
         Date.parse(updatedAt));
+    const Sqlite = GetSqliteDirectAccess();
+    if (Sqlite) {
+        const applied = await Sqlite.updateOperationsPolicy(expectedVersion,
+            { guardEnforcement: input.guardEnforcement, diagnosticsProfile: input.diagnosticsProfile, updatedAt,
+                updatedBy: actorUserId, ...(diagnosticsExpiresAt ? { diagnosticsExpiresAt } : {}) },
+            diagnosticsExpiresAt ? [] : ["diagnosticsExpiresAt"], session);
+        return applied ? GetOperationsPolicy(session) : undefined;
+    }
+    const db = await GetMongoDb();
     const result = await db.collection(Collections.OperationsPolicy).updateOne(
         { _id: "global" as any, version: expectedVersion },
         { $set: { guardEnforcement: input.guardEnforcement, diagnosticsProfile: input.diagnosticsProfile,

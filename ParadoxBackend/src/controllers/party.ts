@@ -9,6 +9,8 @@
 
 import crypto from "node:crypto";
 import { GetRepositories, GetUnitOfWork, PartyInviteRecord, PartyRecord } from "../persistence";
+import { GetP2PExtension } from "../extensions/p2p";
+import { logger } from "../logger";
 
 export interface Party {
     partyId: string;
@@ -121,9 +123,22 @@ export async function GetInvitesForPlayer(recipientId: string): Promise<PartyInv
     return records.map(ToInvite);
 }
 
+/**
+ * [2026-10-14] After a member leaves or is kicked: his forming player-hosted or realm hunt stops waiting for him (the P2P module's
+ * hook). A failure is logged and never fails the party change, which has already been written.
+ */
+async function AfterMemberLeft(accountId: string): Promise<void> {
+    try {
+        await GetP2PExtension().matchmaking.partyMemberLeft(accountId);
+    } catch (error) {
+        logger.warn(`[PartyLeave] could not update the forming hunt of ${accountId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
 export async function LeaveParty(playerId: string): Promise<void> {
     const now = new Date().toISOString();
     await WithPartyTransaction<void>((repos, session) => repos.parties.leave(playerId, now, session));
+    await AfterMemberLeft(playerId);
 }
 
 export async function AcceptInvite(recipientId: string, inviterId: string, buildId: string): Promise<Party | undefined> {
@@ -142,6 +157,7 @@ export async function AcceptInvite(recipientId: string, inviterId: string, build
 export async function KickMember(actorId: string, targetId: string): Promise<void> {
     const now = new Date().toISOString();
     await WithPartyTransaction<void>((repos, session) => repos.parties.kick(actorId, targetId, now, session));
+    await AfterMemberLeft(targetId);
 }
 
 export async function PromoteMember(actorId: string, targetId: string): Promise<void> {

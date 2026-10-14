@@ -12,7 +12,7 @@
 import { Router } from "express";
 import { logger } from "../logger";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
-import { GetNotesForUser, GetStoreSkus, PurchaseStoreSku, FindStoreSkuByIdOrCatalogId } from "../controllers/store";
+import { GetNotesForUser, GetStoreSkusForPlayer, IsDailyClaimSection, PurchaseStoreSku, FindStoreSkuByIdOrCatalogId } from "../controllers/store";
 import { GetWallet, BuildBalanceDict } from "../controllers/wallet";
 import { ProjectBalances } from "../platinumWallet";
 import { GetCharactersForUid } from "../controllers/character";
@@ -119,6 +119,8 @@ storeRouter.get("/balance", HasParadoxBackendAuth, async (req: any, res) => {
 // `ladyluckstore` is backed by its verified/cross-checked data set. `season_store` serves the
 // deterministic reconstructed Season 19 cosmetic rotation generated from the verified 1.12 catalog;
 // every other tag remains an empty section.
+// [1.14.7 2026-10-10] `fountain_daily_free_bundle` (the Ramsgate coin toss) is per player: its one offer is left out
+// once the requesting player has claimed it in the current 17:00 UTC window (controllers/store.ts GetStoreSkusForPlayer).
 storeRouter.get("/product/skus/public", HasParadoxBackendAuth, async (req: any, res) => {
     const RequiredTags = req.query.requiredTags;
 
@@ -128,10 +130,13 @@ storeRouter.get("/product/skus/public", HasParadoxBackendAuth, async (req: any, 
         return;
     }
 
-    const StoreSkus = GetStoreSkus(RequiredTags);
+    const StoreSkus = await GetStoreSkusForPlayer(RequiredTags, req.AuthData?.userId);
 
     if (StoreSkus.length === 0) {
-        logger.info(`Store SKUs requested for unimplemented tag '${RequiredTags}' - returning empty`);
+        // A daily section already logged why (claimed this window, no data file, lookup failed).
+        if (!IsDailyClaimSection(RequiredTags)) {
+            logger.info(`Store SKUs requested for unimplemented tag '${RequiredTags}' - returning empty`);
+        }
         res.status(200);
         res.json([]);
         return;

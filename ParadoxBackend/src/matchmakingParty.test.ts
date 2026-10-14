@@ -69,3 +69,22 @@ test("a player without a party travels solo", () => {
     assert.equal(Result.partyMembers, undefined);
     assert.equal(Result.partyIdMismatch, false);
 });
+
+test("SHARED keeps offline members unless a module asks for the online filter (P2P Training, 2026-10-11)", () => {
+    const Online = (AccountId: string) => AccountId === "online-member";
+    const Default = ResolveMatchmakingParty("SHARED", "leader", undefined, Party, Online);
+    assert.deepEqual(Default.partyMembers, ["leader", "online-member", "offline-member"]);
+    assert.deepEqual(Default.excludedMembers, []);
+
+    const Filtered = ResolveMatchmakingParty("SHARED", "leader", undefined, Party, Online, true);
+    assert.equal(Filtered.partyId, "party-live");
+    assert.equal(Filtered.partyRevision, 7);
+    assert.equal(Filtered.partyIdMismatch, false);
+    assert.deepEqual(Filtered.partyMembers, ["leader", "online-member"]);
+    assert.deepEqual(Filtered.excludedMembers, ["offline-member"]);
+
+    // CITY is never filtered unless asked, and ISLAND keeps its partyId rule either way.
+    assert.deepEqual(ResolveMatchmakingParty("CITY", "leader", undefined, Party, Online).partyMembers,
+        ["leader", "online-member", "offline-member"]);
+    assert.equal(ResolveMatchmakingParty("ISLAND", "leader", undefined, Party, Online, true).partyIdMismatch, true);
+});

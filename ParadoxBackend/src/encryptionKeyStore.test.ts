@@ -63,3 +63,33 @@ test("the log fingerprint never contains the token", () => {
     assert.ok(!LeaderToken.includes(Fp));
     assert.equal(EncryptionKeyTokenFingerprint(""), "none");
 });
+
+test("a player-host lookup serves only its roster's keys and never the most-recent fallback (B5, 2026-10-11)", () => {
+    const Store = new EncryptionKeyStore();
+    Store.issue("leader-candidate", { key: "leader-key", nonce: "n1", token: LeaderToken, at: 1000, accountId: "leader" });
+    Store.issue("", { key: "stranger-key", nonce: "n2", token: "BEARER stranger", at: 1100, accountId: "stranger" });
+    const Roster = new Set(["leader", "member"]);
+
+    const Leader = Store.lookup("", LeaderToken, 2000, { rosterAccountIds: Roster });
+    assert.equal(Leader.matchedBy, "token");
+    assert.equal(Leader.issued?.key, "leader-key");
+    assert.equal(Store.lookup("leader-candidate", "", 2000, { rosterAccountIds: Roster }).issued?.key, "leader-key");
+
+    // Another party's player: matched by token but outside the roster.
+    const Stranger = Store.lookup("", "BEARER stranger", 2000, { rosterAccountIds: Roster });
+    assert.equal(Stranger.issued, null);
+    assert.equal(Stranger.rosterRejected, true);
+
+    // An unknown token or no token at all: the dedicated path would fall back to the most recent key.
+    const Unknown = Store.lookup("", "BEARER nobody", 2000, { rosterAccountIds: Roster });
+    assert.equal(Unknown.issued, null);
+    assert.equal(Unknown.unknownToken, true);
+    assert.equal(Store.lookup("", "", 2000, { rosterAccountIds: Roster }).issued, null);
+    assert.equal(Store.lookup("", "", 2000).matchedBy, "most-recent");
+
+    // A key issued without a known account is never served to a host.
+    Store.issue("", { key: "anonymous-key", nonce: "n3", token: "BEARER anonymous", at: 1200 });
+    assert.equal(Store.lookup("", "BEARER anonymous", 2000, { rosterAccountIds: Roster }).issued, null);
+    // An empty roster (malformed auth data) gets nothing.
+    assert.equal(Store.lookup("", LeaderToken, 2000, { rosterAccountIds: new Set() }).issued, null);
+});

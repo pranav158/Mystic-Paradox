@@ -16,6 +16,7 @@ import { LauncherApiError } from "../security/launcherErrors";
 import { CreateSessionForUser, ToAccountView, LauncherSessionResult } from "./launcherAuth";
 import { logger } from "../logger";
 import { AssertAccountAdmitted } from "../security/accountEligibility";
+import { ResolveRegistrationApproval } from "../config/registrationApproval";
 
 const STATE_TTL_MS = 5 * 60 * 1000; // 5 minutes to complete the Discord consent screen
 const COMPLETION_CODE_TTL_MS = 60 * 1000; // matches the game exchange code's spec-driven lifetime
@@ -117,7 +118,7 @@ async function ExchangeDiscordCode(code: string, codeVerifier: string): Promise<
     return (await UserResponse.json()) as DiscordUser;
 }
 
-async function ResolveOrCreateAccountForDiscordUser(discordUser: DiscordUser): Promise<string> {
+export async function ResolveOrCreateAccountForDiscordUser(discordUser: DiscordUser): Promise<string> {
     const Repos = GetRepositories();
 
     const ExistingIdentity = await Repos.authIdentities.findByProviderSubject("discord", discordUser.id);
@@ -129,6 +130,8 @@ async function ResolveOrCreateAccountForDiscordUser(discordUser: DiscordUser): P
 
     const UserId = crypto.randomUUID();
     const Now = new Date().toISOString();
+    // [2026-10-14] The same switch as launcher sign-up (MYSTICPARADOX_REGISTRATION_APPROVAL), on every provider.
+    const approvalStatus = ResolveRegistrationApproval(process.env).approvalStatus;
 
     // Create the account WITHOUT a chosen username. The launcher forces a set-username step after
     // Discord sign-in (account.needsUsername === true). Use the opaque userId as a unique placeholder
@@ -138,7 +141,7 @@ async function ResolveOrCreateAccountForDiscordUser(discordUser: DiscordUser): P
         displayNameNormalized: UserId.toLowerCase(),
         displayName: UserId,
         status: "active",
-        approvalStatus: "pending",
+        approvalStatus,
         roles: ["player"],
         createdAt: Now,
         usernameSet: false

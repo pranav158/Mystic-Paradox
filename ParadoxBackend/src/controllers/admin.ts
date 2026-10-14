@@ -89,14 +89,21 @@ export async function AdminLogin(req: Request, res: Response): Promise<void> {
 }
 
 export async function AdminLogout(req: Request, res: Response): Promise<void> {
-    await GetRepositories().admin.revokeSession((req as any).AdminAuth.session.id);
+    const Session = (req as any).AdminAuth.session;
+    // [2026-10-14, P5.1] A manager operator request has no backend session to revoke or cookie to clear.
+    if (Session == undefined) {
+        res.json({});
+        return;
+    }
+    await GetRepositories().admin.revokeSession(Session.id);
     res.setHeader("Set-Cookie", `${ADMIN_COOKIE_NAME}=; ${AdminCookieOptions(0)}`);
     res.json({});
 }
 
 export async function AdminMe(req: Request, res: Response): Promise<void> {
     const Auth = (req as any).AdminAuth;
-    res.json({ csrfToken: Auth.session.csrfToken, account: PublicAccount(Auth.account) });
+    // A manager operator request has no session, so no CSRF token (the signature covers the request instead).
+    res.json({ csrfToken: Auth.session?.csrfToken ?? null, account: PublicAccount(Auth.account) });
 }
 
 export async function ListPlayers(req: Request, res: Response): Promise<void> {

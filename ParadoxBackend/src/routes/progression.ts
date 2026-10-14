@@ -9,15 +9,20 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
+import { RecordSlayersPathUnlocksActivity } from "../activity/activityMonitor";
 import { Router } from "express";
 import { loadGameData } from "../gameData/loader";
 import { WidenHuntPassWindows } from "./system";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { logger } from "../logger";
-import { AddEncounteredContent, GetBreadcrumbsForCharacterIdAndUserId, GetPlayerJourney, QueryEncounteredContent, SavePlayerJourney, SetBreadcrumbsForCharacterIdAndUserId, GrantProgressionXp, GetPersistedProgressionForUser, CaptureProgressionObjectiveEvent, GetPersistedObjectivesForUser, ConfirmPublicProgressionRank, IsAuthorizedProgressionReader, IsAuthorizedProgressionReporter, IsApprovedXpProgressionTrack, IsValidProgressionGrantId, ProgressionGrantConflictError, IsCharacterOwnedByUser } from "../controllers/progression";
-import { GetUnlockedNodeIds, GrantSlayersPathRewards } from "../controllers/slayersPath";
+import { AddEncounteredContent, GetBreadcrumbsForCharacterIdAndUserId, GetPlayerJourney, QueryEncounteredContent, SavePlayerJourney, SetBreadcrumbsForCharacterIdAndUserId, GrantProgressionXp, GetPersistedProgressionForUser, CaptureProgressionObjectiveEvent, GetPersistedObjectivesForUser, ConfirmPublicProgressionRank, IsAuthorizedProgressionReader, IsAuthorizedProgressionReporter, IsApprovedXpProgressionTrack, IsValidProgressionGrantId, ProgressionGrantConflictError, IsCharacterOwnedByUser, DescribeUnapprovedXpTrack, IsHuntPassXpTrack, RankForProgress, ServedHuntPassProgressionId, IsHostRuntimeAuth, RefuseUnauthorizedHostWrite, TagHostWrite, SummarizeObjectiveReport, CheckHostXpGrant, DescribeHostGrantRefusal, HostGrantLimitDenial, HostGrantLimitError, MAX_PROGRESSION_GRANT_AMOUNT } from "../controllers/progression";
+import { ApplyMasteryReport, ApplyMasteryReportWithPlan, HostMasteryLimits, MASTERY_PERSISTENCE, SummarizeMasteryPlan } from "../controllers/masteryReport";
+import { ClassifyReforgeGrant, ExperienceTrackForPrestige, FinishStaleReforgesForUser, IsReforgeableTrack, PlanPurchaseRestore, ReforgeConflictError, ReforgeGrantHook, ReforgeGrantPlan, ReforgeReset } from "../controllers/reforge";
+import { GetRepositories } from "../persistence";
+import { GetUnlockedNodeIds, GrantSlayersPathRewards, HostJourneyPlan, PlanHostPlayerJourney } from "../controllers/slayersPath";
 import { IsPrestigeSourceTrack } from "../controllers/wallet";
-import { MonitorProgressionReport, MonitorProgressionServed, MonitorSourceOf } from "../diagnostics/economyMonitor";
+import { MonitorHuntPassGrant, MonitorProgressionReport, MonitorProgressionServed, MonitorSourceOf } from "../diagnostics/economyMonitor";
+import type { HostWriteKind } from "../extensions/p2p";
 
 // Game data from ParadoxBackend/game-data (gameData/loader.ts; the loader also strips a UTF-8 BOM).
 // [1.12.0] The Slayer's Path graph was captured from production.
@@ -384,7 +389,11 @@ progressionRouter.post("/breadcrumbs/:characterId", HasParadoxBackendAuth, async
 // Rule 1/6 (plan 6.1): game-server-only. A player's own bearer token must never be able to call
 // this — only req.AuthData.IsGameserver === true is accepted, exactly the flag
 // middleware/HasParadoxBackendAuth.ts already sets for validated gameserver-api-key requests.
-const MAX_XP_GRANT_AMOUNT = 100000; // Rule 5: conservative bound, configurable later if too low.
+// [2026-10-13 realms S3] The one other caller: a player-hosted server's runtime (AuthData.IsPlayerHostRuntime, set by the
+// optional P2P module's auth). It gets the same grant, with the same mandatory grant id, only after the module's hostWrites
+// hook accepts it for that player (a running hunt of that host, a member of it); the accepted grant is then tagged. Without
+// the module the hook refuses, so the public build stays dedicated-only.
+const MAX_XP_GRANT_AMOUNT = MAX_PROGRESSION_GRANT_AMOUNT; // Rule 5: conservative bound, configurable later if too low.
 const PROGRESSION_ID_MAX_LENGTH = 128;
 
 function ReadAuthoritativeGrantId(req: any): string | undefined {
@@ -395,8 +404,31 @@ function ReadAuthoritativeGrantId(req: any): string | undefined {
     return IsValidProgressionGrantId(Candidate) ? Candidate : undefined;
 }
 
+// "invalid": a grant id was sent but fails IsValidProgressionGrantId, or the header and body ids disagree.
+function DescribeGrantIdPresence(req: any, grantId: string | undefined): "present" | "absent" | "invalid" {
+    if(grantId !== undefined) return "present";
+    const Sent = req.get?.("x-mysticparadox-grant-id") ?? req.get?.("idempotency-key") ?? req.body?.grant_id ?? req.body?.grantId;
+    return Sent === undefined ? "absent" : "invalid";
+}
+
+// Route params are decoded, so a crafted URL could carry a newline; keep the REQ line one line.
+function LogSafe(value: unknown): string {
+    return String(value).slice(0, PROGRESSION_ID_MAX_LENGTH).replace(/[^\x21-\x7E]/g, "?");
+}
+
 progressionRouter.post("/progression/:userId/:progressionId/:amount", HasParadoxBackendAuth, async (req: any, res) => {
-    if(req.AuthData?.IsGameserver !== true){
+    const GrantId = ReadAuthoritativeGrantId(req);
+    const IsHost = IsHostRuntimeAuth(req.AuthData);
+
+    // [2026-10-10] One line per request before any gate, so each refusal below is attributable. Every 1.14.7 XP source
+    // (hunt pass challenge claims via HuntPassXPReward, ProgressPerGatherable harvests, hunt completion, weapon/player XP)
+    // ends in GrantProgressionInTrack (0x140E61610), which posts {accountid}/{progressionid}/{amount} with an empty
+    // body; the hunt server only logs "OnGrantOnlineProgressionComplete - BadRequest" for a refusal.
+    logger.info(`[ProgressionGrant] REQ user=${LogSafe(req.params.userId)} track=${LogSafe(req.params.progressionId)}`
+        + ` amount=${LogSafe(req.params.amount)} grantId=${DescribeGrantIdPresence(req, GrantId)}`
+        + ` src=${IsHost ? "host" : req.AuthData?.IsGameserver === true ? "gs" : "other"}`);
+
+    if(!IsHost && req.AuthData?.IsGameserver !== true){
         logger.warn(`Rejected XP grant attempt without gameserver auth (userId=${req.params.userId}, track=${req.params.progressionId})`);
         res.status(403);
         res.json({ code: null, message: "Forbidden", payload: {} });
@@ -406,7 +438,6 @@ progressionRouter.post("/progression/:userId/:progressionId/:amount", HasParadox
     const RequestedUserId = req.params.userId;
     const ProgressionId = req.params.progressionId;
     const AmountRaw = req.params.amount;
-    const GrantId = ReadAuthoritativeGrantId(req);
 
     if(typeof RequestedUserId !== "string" || RequestedUserId.length === 0 || RequestedUserId === NO_PLAYER_SENTINEL){
         logger.warn(`Rejected XP grant: invalid/sentinel userId (${RequestedUserId})`);
@@ -423,7 +454,7 @@ progressionRouter.post("/progression/:userId/:progressionId/:amount", HasParadox
     }
 
     if(!IsApprovedXpProgressionTrack(ProgressionId)){
-        logger.warn(`Rejected XP grant: progression track is not approved (user=${RequestedUserId}, track=${ProgressionId})`);
+        logger.warn(`Rejected XP grant: progression track is not approved (user=${RequestedUserId}, track=${ProgressionId}): ${DescribeUnapprovedXpTrack(ProgressionId)}`);
         res.status(400).json({ code: null, message: "Bad Request", payload: {} });
         return;
     }
@@ -442,9 +473,68 @@ progressionRouter.post("/progression/:userId/:progressionId/:amount", HasParadox
         return;
     }
 
+    // [2026-10-13 realms S3] A host's grant is checked (running hunt of that host, a member of it) once it is known to be
+    // well formed, and before any read of that player's track.
+    // [2026-10-14 realms S4] A weapon's prestige +1 is the reforge's own step (controllers/reforge.ts, step 4). A realm hub
+    // takes no XP, so a prestige grant it is refused as XP is authorized as the reforge's REFORGE write instead; a hunt takes
+    // it as XP, as before. Whether the +1 is granted at all is still the reforge rules' call (below).
+    let HostWriteAs: HostWriteKind = "XP";
+    if(IsHost){
+        let Denial = await RefuseUnauthorizedHostWrite(req, "XP", RequestedUserId);
+        if(Denial !== undefined && ExperienceTrackForPrestige(ProgressionId) !== undefined
+            && await RefuseUnauthorizedHostWrite(req, "REFORGE", RequestedUserId) === undefined){
+            HostWriteAs = "REFORGE";
+            Denial = undefined;
+        }
+        if(Denial !== undefined){
+            res.status(Denial.status).json(Denial.body);
+            return;
+        }
+
+        // [2026-10-13 realms S3 limits] Only the impossible is refused (controllers/progression.ts, HostXpGrantCeiling): a
+        // host's grant above the per-track ceiling, a prestige grant that is not +1, any MasteryTrack_ grant. After the
+        // authorization check above, so a host that may not write this player learns nothing about the limits; before any
+        // read of the player's tracks. 403, like the module's own refusals: the request is well formed, this host may not
+        // write it. Never clamped: a clamped grant would still be recorded under its grant id.
+        const Refusal = CheckHostXpGrant(ProgressionId, Amount);
+        if(Refusal !== undefined){
+            logger.warn(`[HostWrite] refused kind=${HostWriteAs} target=${LogSafe(RequestedUserId)} ${DescribeHostGrantRefusal(Refusal)} grant=${LogSafe(GrantId)}`);
+            const Limit = HostGrantLimitDenial();
+            res.status(Limit.status).json(Limit.body);
+            return;
+        }
+    }
+
+    // [1.14.7 2026-10-11] Reforge follow-ups (controllers/reforge.ts): the +1 on PrestigeTrack_Weapon_* and the banked
+    // re-grant are accepted once per reforge. A grant id the ledger already holds is a transport retry and replays as
+    // before, so it is not classified again.
+    let ReforgePlan: ReforgeGrantPlan = { kind: "normal" };
+    if((IsReforgeableTrack(ProgressionId) || ExperienceTrackForPrestige(ProgressionId) !== undefined)
+        && await GetRepositories().progressionGrants.findByGrantId(GrantId) === undefined){
+        const ExperienceTrack = ExperienceTrackForPrestige(ProgressionId) ?? ProgressionId;
+        const ExperienceRow = await GetRepositories().progressionTracks.get(RequestedUserId, ExperienceTrack);
+        ReforgePlan = ClassifyReforgeGrant(ProgressionId, Amount, ExperienceRow, Date.now());
+        if(ReforgePlan.kind === "refuse"){
+            logger.warn(`[Reforge] DUP/REFUSED grant user=${RequestedUserId} track=${ProgressionId} amount=${Amount} grant=${GrantId}: ${ReforgePlan.reason}`);
+            res.status(409).json({ code: null, message: "Conflict", payload: {} });
+            return;
+        }
+        // [2026-10-14 realms S4] A REFORGE-authorized grant is the reforge's +1 and nothing else. ClassifyReforgeGrant gives a
+        // PrestigeTrack_* grant only a prestige plan or a refusal, but with MYSTICPARADOX_REFORGE=off it returns "normal" for
+        // every grant; without this check a host could then add an unreviewed +1 that the hub would never have accepted as XP.
+        // [2026-10-14] The same holds for a hunt's host (authorized as XP): the game grants a weapon's prestige only from a
+        // reforge (38_ section 23.6), so any host prestige grant that is not an open reforge's +1 is refused, switch or not.
+        if(IsHost && ExperienceTrackForPrestige(ProgressionId) !== undefined && ReforgePlan.kind !== "prestige"){
+            logger.warn(`[Reforge] REFUSED host prestige grant user=${RequestedUserId} track=${ProgressionId} grant=${GrantId}: not a reforge +1 (${ReforgePlan.kind})`);
+            res.status(409).json({ code: null, message: "Conflict", payload: {} });
+            return;
+        }
+    }
+
     let GrantResult;
     try{
-        GrantResult = await GrantProgressionXp(RequestedUserId, ProgressionId, Amount, GrantId);
+        GrantResult = await GrantProgressionXp(RequestedUserId, ProgressionId, Amount, GrantId, undefined,
+            ReforgeGrantHook(RequestedUserId, ReforgePlan), IsHost ? "host" : "gameserver");
     }
     catch(ErrorValue){
         if(ErrorValue instanceof ProgressionGrantConflictError){
@@ -452,9 +542,45 @@ progressionRouter.post("/progression/:userId/:progressionId/:amount", HasParadox
             res.status(409).json({ code: null, message: "Conflict", payload: {} });
             return;
         }
+        if(ErrorValue instanceof ReforgeConflictError){
+            logger.warn(`[Reforge] DUP/REFUSED grant user=${RequestedUserId} track=${ProgressionId} amount=${Amount}: ${ErrorValue.message}`);
+            res.status(409).json({ code: null, message: "Conflict", payload: {} });
+            return;
+        }
+        // [2026-10-13 realms S3 limits] The refusals that need the stored track (a full player level track), decided inside
+        // the grant's transaction; nothing was stored.
+        if(ErrorValue instanceof HostGrantLimitError){
+            logger.warn(`[HostWrite] refused kind=XP target=${LogSafe(RequestedUserId)} ${DescribeHostGrantRefusal(ErrorValue.refusal)} grant=${LogSafe(GrantId)}`);
+            const Limit = HostGrantLimitDenial();
+            res.status(Limit.status).json(Limit.body);
+            return;
+        }
         throw ErrorValue;
     }
     const Updated = GrantResult.record;
+
+    // [2026-10-13 realms S3] Tag the host's grant. A replay of a grant id the ledger already holds changed nothing and
+    // belongs to the request that stored it (its tag exists); tagging it again would attribute it to this host session too.
+    // [2026-10-14 realms S4] A prestige +1 authorized as REFORGE is tagged as one, with its reforge (for reversal).
+    if(IsHost && !GrantResult.replayed){
+        const Grant = { track: ProgressionId, amount: Amount, grantId: GrantId };
+        await TagHostWrite(req, HostWriteAs, RequestedUserId, HostWriteAs === "REFORGE" && ReforgePlan.kind === "prestige"
+            ? { route: "xp", ...Grant, reforgeId: ReforgePlan.reforge.reforgeId }
+            : Grant);
+    }
+
+    if(IsHuntPassXpTrack(ProgressionId)){
+        MonitorHuntPassGrant({
+            userId: RequestedUserId,
+            progressionId: ProgressionId,
+            amount: Amount,
+            newProgress: Number(Updated.progress),
+            confirmedFremiumRank: Updated.confirmedFremiumRank,
+            confirmedPremiumRank: Updated.confirmedPremiumRank,
+            replayed: GrantResult.replayed,
+            grantId: GrantId,
+        }, (Progress) => RankForProgress(ProgressionId, Progress));
+    }
 
     res.status(200);
     res.json({
@@ -475,16 +601,28 @@ progressionRouter.post("/progression/:userId/:progressionId/:amount", HasParadox
 
 progressionRouter.post("/progression/:userId", HasParadoxBackendAuth, async (req: any, res) => {
     const RequestorAccountId = ResolveRequestUserId(req);
+    const IsHost = IsHostRuntimeAuth(req.AuthData);
 
     // A player bearer may only report its own objective state. Dedicated and scoped
     // player-host runtimes resolve the acting roster identity in auth middleware; in both cases
     // an authenticated userId, when present, must match the route target exactly.
-    if(!IsAuthorizedProgressionReporter(req.AuthData, RequestorAccountId)){
+    // [2026-10-13 realms S3] A player-hosted server's runtime (IsAuthorizedProgressionReporter stays false for it) reports
+    // for the players it hosts: the module's hostWrites hook decides, instead of the synchronous check above.
+    if(IsHost){
+        const Denial = await RefuseUnauthorizedHostWrite(req, "OBJECTIVES", RequestorAccountId);
+        if(Denial !== undefined){
+            logger.warn(`Rejected host progression report actor=${req.AuthData?.userId ?? "unknown"} target=${RequestorAccountId}`);
+            res.status(Denial.status).json(Denial.body);
+            return;
+        }
+    }
+    else if(!IsAuthorizedProgressionReporter(req.AuthData, RequestorAccountId)){
         logger.warn(`Rejected cross-account progression report actor=${req.AuthData?.userId ?? "unknown"} target=${RequestorAccountId}`);
         res.status(403).json({ code: null, message: "Forbidden", payload: {} });
         return;
     }
 
+    let ResponsePayload: any = {};
     if(RequestorAccountId === NO_PLAYER_SENTINEL){
         logger.debug("Progression/objective event received for no-player sentinel - discarding, not persisting");
     }
@@ -504,13 +642,53 @@ progressionRouter.post("/progression/:userId", HasParadoxBackendAuth, async (req
             }
             throw error;
         }
+
+        // [2026-10-13 realms S3] Tag a host's report itself (what it carried); what mastery it changed is tagged below.
+        if(IsHost){
+            await TagHostWrite(req, "OBJECTIVES", RequestorAccountId, SummarizeObjectiveReport(req.body));
+        }
+
+        // [1.14.7 2026-10-11] Mastery persistence (controllers/masteryReport.ts): only a dedicated game server's report
+        // changes stored state - a player's own token may report, but stays diagnostics-only. A failure keeps the old
+        // empty answer: nothing was stored, so the objective is reported again from the next arrival's cache.
+        // [2026-10-13 realms S3] A player-hosted server's report persists too once the hostWrites hook accepts MASTERY for
+        // that player (always after the OBJECTIVES check above; a refusal here leaves the report diagnostics-only).
+        let PersistMastery = false;
+        if(MASTERY_PERSISTENCE){
+            if(IsHost){
+                const Denial = await RefuseUnauthorizedHostWrite(req, "MASTERY", RequestorAccountId);
+                PersistMastery = Denial === undefined;
+                if(Denial !== undefined) logger.warn(`[MasteryMon] user=${RequestorAccountId} host report left diagnostics-only: write refused (${Denial.status})`);
+            }
+            else{
+                PersistMastery = req.AuthData?.IsGameserver === true;
+            }
+        }
+        if(PersistMastery){
+            try{
+                if(IsHost){
+                    // [2026-10-13 realms S3 limits] A host's report is applied under HostMasteryLimits (known objective ids,
+                    // at most 64 new completions, bounded counts and values, track totals); a dedicated server's is not.
+                    const Applied = await ApplyMasteryReportWithPlan(RequestorAccountId, req.body, undefined, HostMasteryLimits());
+                    ResponsePayload = Applied.payload;
+                    await TagHostWrite(req, "MASTERY", RequestorAccountId, SummarizeMasteryPlan(Applied.plan));
+                }
+                else{
+                    ResponsePayload = await ApplyMasteryReport(RequestorAccountId, req.body);
+                }
+            }
+            catch(error){
+                logger.error(`[MasteryMon] user=${RequestorAccountId} report NOT applied: ${error instanceof Error ? error.message : String(error)}`);
+                ResponsePayload = {};
+            }
+        }
     }
 
     res.status(200);
     res.json({
         code: null,
         message: "OK",
-        payload: {}
+        payload: ResponsePayload
     });
 });
 
@@ -530,8 +708,13 @@ progressionRouter.post("/progression/:userId", HasParadoxBackendAuth, async (req
 // the trusted gameserver on a player's behalf, exactly like the grant endpoint — never a player's
 // own bearer token), a validated integer rank, and ConfirmPublicProgressionRank enforcing the
 // rank is in-range for the track and the account's persisted XP actually qualifies for it.
+// [2026-10-14 realms S4] The one other caller: a player-hosted runtime (AuthData.IsPlayerHostRuntime), for a player it may write
+// (hostWrites RANK_CONFIRM: a hunt's admitted member, a realm's Ramsgate hub's present member; a Training hub refuses). Its
+// confirm is tagged only when the confirmed rank rises. Until now a hunt's rank-ups never confirmed; the dedicated path is
+// unchanged.
 progressionRouter.post("/progression/:userId/:progressionId/:rank/confirm/public", HasParadoxBackendAuth, async (req: any, res) => {
-    if(req.AuthData?.IsGameserver !== true){
+    const IsHost = IsHostRuntimeAuth(req.AuthData);
+    if(!IsHost && req.AuthData?.IsGameserver !== true){
         logger.warn(`Rejected rank confirm attempt without gameserver auth (userId=${req.params.userId}, track=${req.params.progressionId})`);
         res.status(403);
         res.json({ code: null, message: "Forbidden", payload: {} });
@@ -557,7 +740,22 @@ progressionRouter.post("/progression/:userId/:progressionId/:rank/confirm/public
         return;
     }
 
-    const Result = await ConfirmPublicProgressionRank(RequestedUserId, ProgressionId, Rank);
+    // [2026-10-14 realms S4] A host's confirm is checked once it is well formed, before any read of the player's track.
+    if(IsHost){
+        const Denial = await RefuseUnauthorizedHostWrite(req, "RANK_CONFIRM", RequestedUserId);
+        if(Denial !== undefined){
+            res.status(Denial.status).json(Denial.body);
+            return;
+        }
+    }
+    // The confirmed rank before this confirm, so a host's confirm is tagged only when it actually raised the rank (the store
+    // keeps the higher of the two, so the record after it cannot tell). Read for a host only; the dedicated path is unchanged.
+    const PreviousRank = IsHost
+        ? (await GetRepositories().progressionTracks.get(RequestedUserId, ProgressionId))?.confirmedFremiumRank ?? DEFAULT_CONFIRMED_RANK
+        : undefined;
+
+    // [2026-10-15] Only a host or a dedicated server reaches this point, so both may use the bounded mastery sync (ConfirmRankOptions).
+    const Result = await ConfirmPublicProgressionRank(RequestedUserId, ProgressionId, Rank, { boundedMasterySync: true });
 
     if(!Result.ok){
         const StatusByReason = { unknown_track: 400, rank_out_of_range: 400, insufficient_xp: 409 } as const;
@@ -568,6 +766,12 @@ progressionRouter.post("/progression/:userId/:progressionId/:rank/confirm/public
 
     const Updated = Result.record;
     logger.info(`Confirm public progression rank ${Rank} for userId ${RequestedUserId} track ${ProgressionId} - progress preserved at ${Updated.progress}`);
+
+    if(IsHost && PreviousRank !== undefined && Updated.confirmedFremiumRank > PreviousRank){
+        await TagHostWrite(req, "RANK_CONFIRM", RequestedUserId, {
+            track: ProgressionId, rank: Rank, previousRank: PreviousRank, confirmedRank: Updated.confirmedFremiumRank
+        });
+    }
 
     res.status(200);
     res.json({
@@ -610,10 +814,20 @@ progressionRouter.get("/progression/:userId", HasParadoxBackendAuth, async (req:
     // received XP, with any OTHER persisted (unanticipated) track id preserved verbatim per
     // plan section 6.2. This replaces the old always-zero stub that made XP look like it was
     // never saving even after the grant endpoint started persisting it.
+    // [1.14.7 2026-10-11] A weapon reforge whose follow-ups never arrived is finished before the load (banked XP back,
+    // +1), so the arriving server starts from the right level. Only on a game server's load; failures never block it.
+    if(req.AuthData?.IsGameserver === true){
+        try{
+            await FinishStaleReforgesForUser(RequestorAccountId);
+        }
+        catch(error){
+            logger.error(`[Reforge] stale-reforge recovery failed for ${RequestorAccountId}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
     const Payload = await GetPersistedProgressionForUser(RequestorAccountId, DEFAULT_PROGRESSION_IDS);
 
     logger.info(`Progression fetched for userId ${RequestorAccountId} (${Payload.length} tracks, persisted)`);
-    MonitorProgressionServed(RequestorAccountId, Payload, IsPrestigeSourceTrack);
+    MonitorProgressionServed(RequestorAccountId, Payload, IsPrestigeSourceTrack, [ServedHuntPassProgressionId()]);
 
     res.status(200);
     res.json({
@@ -690,10 +904,23 @@ progressionRouter.post("/pjm/:userId", HasParadoxBackendAuth, async (req: any, r
     // not be able to forge node_status=Unlocked for arbitrary reward nodes (or another user).
     // The 1.12 flow reaches this endpoint through the game server, which supplies the validated
     // x-mysticparadox-gameserver-apikey header and receives AuthData.IsGameserver=true in the auth layer.
-    if(req.AuthData?.IsGameserver !== true){
+    // [2026-10-13 realms S3] The other caller is a player-hosted server's runtime (IsPlayerHostRuntime, optional P2P module).
+    // It saves the map for its players too, after the module's hostWrites hook accepts SLAYERS_PATH for that player, but its
+    // unlocks are checked here (PlanHostPlayerJourney: the node exists and a parent is unlocked; an unlocked node never
+    // locks again) and the checked result is what is stored and granted. The price is not charged here: the game pays it with
+    // its own POST /inventory, as on a dedicated server (controllers/slayersPath.ts, header).
+    const IsHost = IsHostRuntimeAuth(req.AuthData);
+    if(!IsHost && req.AuthData?.IsGameserver !== true){
         logger.warn(`Rejected player journey mutation without gameserver auth (userId=${RequestedUserId})`);
         res.status(403).json({ code: null, message: "Forbidden", payload: {} });
         return;
+    }
+    if(IsHost){
+        const Denial = await RefuseUnauthorizedHostWrite(req, "SLAYERS_PATH", RequestedUserId);
+        if(Denial !== undefined){
+            res.status(Denial.status).json(Denial.body);
+            return;
+        }
     }
 
     if(RequestedUserId === "INVALID"){
@@ -704,9 +931,33 @@ progressionRouter.post("/pjm/:userId", HasParadoxBackendAuth, async (req: any, r
 
     const Nodes = req.body?.nodes ?? {};
     const UpdateVersion = req.body?.update_version ?? 1;
-    const Saved = await SavePlayerJourney(RequestedUserId, Nodes, UpdateVersion);
+    const HostVerdict: { plan?: HostJourneyPlan } = {};
+    const Saved = await SavePlayerJourney(RequestedUserId, Nodes, UpdateVersion, IsHost
+        ? (StoredNodes, MergedNodes) => {
+            // Runs again on a compare-and-swap retry; the plan of the attempt that stored is the one kept.
+            const Planned = PlanHostPlayerJourney(StoredNodes, MergedNodes);
+            HostVerdict.plan = Planned;
+            return Planned.nodes;
+        }
+        : undefined);
 
+    // [2026-10-14] The activity monitor's unlock history: the nodes this save newly unlocked, and where the save came from.
+    void RecordSlayersPathUnlocksActivity(RequestedUserId, Saved.newlyUnlocked, IsHost ? "host" : "gameserver");
     logger.info(`Player journey map SAVED for userId ${RequestedUserId} (${Object.keys(Nodes).length} nodes, v${UpdateVersion})`);
+
+    const Plan = HostVerdict.plan;
+    // An arrival save that changes no node status (the usual one) is not a write worth a tag.
+    if(Plan !== undefined && (Plan.unlocked.length > 0 || Plan.stripped.length > 0 || Plan.relocked.length > 0)){
+        if(Plan.stripped.length > 0 || Plan.relocked.length > 0){
+            logger.warn(`[slayers-path] host journey save for ${RequestedUserId}: kept stored status for`
+                + ` stripped=[${Plan.stripped.map((Strip) => `${Strip.nodeId}(${Strip.reason})`).join(", ")}] relocked=[${Plan.relocked.join(", ")}]`);
+        }
+        await TagHostWrite(req, "SLAYERS_PATH", RequestedUserId, {
+            unlocked: Plan.unlocked,
+            stripped: Plan.stripped.map((Strip) => `${Strip.nodeId}:${Strip.reason}`),
+            ...(Plan.relocked.length > 0 ? { relocked: Plan.relocked } : {})
+        });
+    }
 
     // Reconcile ALL unlocked reward nodes after every save, not only this request's transitions.
     // SavePlayerJourney and inventory currently cannot commit in one Mongo transaction; if the
@@ -787,3 +1038,160 @@ progressionRouter.post("/progression/tracked_objectives/:phxAccountId", HasParad
     });
 });
 
+
+// [1.14.7 2026-10-11] Single-track read: FindProgressionTrackEndpoint (0x140E7CF90). The weapon reforge reads its track
+// back with it right after the DELETE below; if this failed the game skipped the +1 and the banked re-grant. Registered
+// last so the fixed /progression/<word>/... routes above keep their paths.
+const SINGLE_TRACK_RESERVED_SEGMENTS = new Set(["objectives", "tracked_objectives", "config"]);
+
+function SingleTrackPayload(UserId: string, ProgressionId: string, Row: any){
+    return {
+        phx_account_id: UserId,
+        progression_id: ProgressionId,
+        progress: Row?.progress ?? 0,
+        confirmed_fremium_rank: Row?.confirmedFremiumRank ?? 0,
+        confirmed_premium_rank: Row?.confirmedPremiumRank ?? 0,
+        confirmed_date: Row?.updatedAt ?? new Date().toISOString(),
+    };
+}
+
+progressionRouter.get("/progression/:userId/:progressionId", (req: any, res, next) => {
+    if(SINGLE_TRACK_RESERVED_SEGMENTS.has(req.params.userId)) return next("route");
+    next();
+}, HasParadoxBackendAuth, async (req: any, res) => {
+    const RequestedUserId = req.params.userId;
+    const ProgressionId = req.params.progressionId;
+    if(!RequireProgressionRead(req, res, RequestedUserId)) return;
+    if(RequestedUserId === NO_PLAYER_SENTINEL || typeof ProgressionId !== "string" || ProgressionId.length === 0
+        || ProgressionId.length > PROGRESSION_ID_MAX_LENGTH){
+        res.status(200).json({ code: null, message: "OK", payload: SingleTrackPayload(RequestedUserId, String(ProgressionId), undefined) });
+        return;
+    }
+    const Row = await GetRepositories().progressionTracks.get(RequestedUserId, ProgressionId);
+    logger.info(`Progression track fetched user=${RequestedUserId} track=${ProgressionId} progress=${Row?.progress ?? 0}${Row?.reforge ? ` reforge=${Row.reforge.status}` : ""}`);
+    res.status(200).json({ code: null, message: "OK", payload: SingleTrackPayload(RequestedUserId, ProgressionId, Row) });
+});
+
+// [1.14.7 2026-10-11] Weapon reforge reset: DeleteProgressionEndpoint (DeleteProgressionInTrack 0x140E4F170), captured live
+// 11 Oct 12:28 as DELETE /progression/<acct>/ExperienceTrack_Weapon_Axe with no body, after the game had already paid the
+// cost. Dedicated game servers only, weapon ExperienceTracks only; controllers/reforge.ts holds the rules. The game
+// accepts 200-206 with a JSON object; anything else stops the reforge with nothing reset.
+// [2026-10-14 realms S4] The one other caller: the runtime of a player-hosted realm Ramsgate hub (AuthData.IsPlayerHostRuntime,
+// optional P2P module). Its hostWrites hook accepts REFORGE only for a member present in a RAMSGATE hub of that runtime's
+// session - a hunt, a Training hub and the dedicated-only build refuse it - and the same reset then runs unchanged; an
+// applied reset is tagged. Without the module the hook refuses, so the public build stays dedicated-only.
+progressionRouter.delete("/progression/:userId/:progressionId", HasParadoxBackendAuth, async (req: any, res) => {
+    const RequestedUserId = req.params.userId;
+    const ProgressionId = req.params.progressionId;
+    const IsHost = IsHostRuntimeAuth(req.AuthData);
+    logger.info(`[Reforge] DELETE-REQ user=${RequestedUserId} track=${ProgressionId} gs=${req.AuthData?.IsGameserver === true ? 1 : 0}${IsHost ? " src=host" : ""}`);
+    if(IsHost){
+        const Denial = await RefuseUnauthorizedHostWrite(req, "REFORGE", RequestedUserId);
+        if(Denial !== undefined){
+            res.status(Denial.status).json(Denial.body);
+            return;
+        }
+    }
+    else if(req.AuthData?.IsGameserver !== true){
+        res.status(403).json({ code: null, message: "Forbidden", payload: {} });
+        return;
+    }
+    if(RequestedUserId === NO_PLAYER_SENTINEL || typeof ProgressionId !== "string" || !IsReforgeableTrack(ProgressionId)){
+        logger.warn(`[Reforge] REFUSED user=${RequestedUserId} track=${ProgressionId}: not a reforgeable weapon track`);
+        res.status(409).json({ code: null, message: "Conflict", payload: {} });
+        return;
+    }
+    const Result = await ReforgeReset(RequestedUserId, ProgressionId);
+    // [2026-10-14 realms S4] Tag a host reset that was applied. A replay of an open reforge changed nothing and belongs to
+    // the request that opened it (its tag exists).
+    if(IsHost && Result.status === 200 && Result.outcome === "reset"){
+        const Reforge = Result.record.reforge;
+        await TagHostWrite(req, "REFORGE", RequestedUserId, {
+            route: "delete", track: ProgressionId, reforgeId: Reforge?.reforgeId, priorProgress: Reforge?.priorProgress,
+            cap: Reforge?.cap, banked: Reforge?.banked
+        });
+    }
+    res.status(Result.status).json({
+        code: null,
+        message: Result.status === 200 ? "OK" : "Conflict",
+        payload: Result.status === 200 ? SingleTrackPayload(RequestedUserId, ProgressionId, Result.record) : {},
+    });
+});
+
+// [1.14.7 2026-10-11] The reforge's banked re-grant: GrantProgressionPurchaseEndPoint, POST /progression/purchase/{acct}/
+// {track}/{amount} (captured 11 Oct 13:57:34, no grant id). Accepted only as an open reforge's banked restore
+// (controllers/reforge.ts PlanPurchaseRestore); the grant id is derived from the reforge, so a retry replays. A request that
+// matches a reforge already restored replays only if the ledger holds that grant - a stale reforge finished on arrival
+// has no ledger row, and paying it again would double the banked XP.
+// [2026-10-14 realms S4] Open to the runtime of a player-hosted realm Ramsgate hub exactly as the DELETE above (hostWrites
+// REFORGE). The restore is not subject to the host XP ceilings (it is not passed as a host grant): its amount must equal the
+// banked XP the reset stored for this weapon, which is what PlanPurchaseRestore checks.
+progressionRouter.post("/progression/purchase/:userId/:progressionId/:amount", HasParadoxBackendAuth, async (req: any, res) => {
+    const RequestedUserId = req.params.userId;
+    const ProgressionId = req.params.progressionId;
+    const Amount = Number(req.params.amount);
+    const IsHost = IsHostRuntimeAuth(req.AuthData);
+    logger.info(`[Reforge] PURCHASE-REQ user=${RequestedUserId} track=${ProgressionId} amount=${req.params.amount} gs=${req.AuthData?.IsGameserver === true ? 1 : 0}${IsHost ? " src=host" : ""}`);
+    if(IsHost){
+        const Denial = await RefuseUnauthorizedHostWrite(req, "REFORGE", RequestedUserId);
+        if(Denial !== undefined){
+            res.status(Denial.status).json(Denial.body);
+            return;
+        }
+    }
+    else if(req.AuthData?.IsGameserver !== true){
+        res.status(403).json({ code: null, message: "Forbidden", payload: {} });
+        return;
+    }
+    if(RequestedUserId === NO_PLAYER_SENTINEL || typeof ProgressionId !== "string" || !Number.isInteger(Amount) || Amount <= 0 || Amount > MAX_XP_GRANT_AMOUNT){
+        res.status(400).json({ code: null, message: "Bad Request", payload: {} });
+        return;
+    }
+    const Row = await GetRepositories().progressionTracks.get(RequestedUserId, ProgressionId);
+    const Purchase = PlanPurchaseRestore(ProgressionId, Amount, Row, Date.now());
+    const Refuse = (Reason: string) => {
+        logger.warn(`[Reforge] DUP/REFUSED purchase user=${RequestedUserId} track=${ProgressionId} amount=${Amount}: ${Reason}`);
+        res.status(409).json({ code: null, message: "Conflict", payload: {} });
+    };
+    if(Purchase.plan.kind === "refuse" || Purchase.grantId === undefined){
+        Refuse(Purchase.plan.kind === "refuse" ? Purchase.plan.reason : "no grant id");
+        return;
+    }
+    if(Purchase.plan.kind === "normal" && await GetRepositories().progressionGrants.findByGrantId(Purchase.grantId) === undefined){
+        Refuse("the banked XP was already restored (stale-reforge recovery)");
+        return;
+    }
+    let GrantResult;
+    try{
+        GrantResult = await GrantProgressionXp(RequestedUserId, ProgressionId, Amount, Purchase.grantId, undefined,
+            ReforgeGrantHook(RequestedUserId, Purchase.plan));
+    }
+    catch(ErrorValue){
+        if(ErrorValue instanceof ReforgeConflictError || ErrorValue instanceof ProgressionGrantConflictError){
+            Refuse(ErrorValue.message);
+            return;
+        }
+        throw ErrorValue;
+    }
+    const Updated = GrantResult.record;
+    // [2026-10-14 realms S4] Tag a host restore that was applied (a replay changed nothing; its tag exists).
+    if(IsHost && !GrantResult.replayed){
+        await TagHostWrite(req, "REFORGE", RequestedUserId, {
+            route: "purchase", track: ProgressionId, amount: Amount, grantId: Purchase.grantId, reforgeId: Row?.reforge?.reforgeId
+        });
+    }
+    res.status(200).json({
+        code: null,
+        message: "OK",
+        payload: {
+            phx_account_id: RequestedUserId,
+            progression_id: ProgressionId,
+            progress: Updated.progress,
+            confirmed_fremium_rank: Updated.confirmedFremiumRank,
+            confirmed_premium_rank: Updated.confirmedPremiumRank,
+            confirmed_date: Updated.updatedAt,
+            grant_id: Purchase.grantId,
+            replayed: GrantResult.replayed,
+        }
+    });
+});

@@ -9,13 +9,13 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-import type { IncomingMessage } from "node:http";
-import type { Server as HttpsServer } from "node:https";
+import type { IncomingMessage, Server as HttpServer } from "node:http";
 import type { Duplex } from "node:stream";
 
 import { WebSocketServer, type WebSocket } from "ws";
 
 import { logger } from "../logger";
+import { ForwardedClientAddress } from "../config/proxyTrust";
 import { isAuthThrottled } from "./authThrottle";
 import { XMPPConnection } from "./XMPPConnection";
 import { ConnectionInfo, RealtimeConfig } from "./types";
@@ -38,7 +38,7 @@ export class RealtimeGateway {
     private readonly connections = new Map<string, XMPPConnection>();
     private readonly perIp = new Map<string, number>();
     private accepting = true;
-    private boundServer?: HttpsServer;
+    private boundServer?: HttpServer;
     private upgradeHandler?: (req: IncomingMessage, socket: Duplex, head: Buffer) => void;
 
     constructor(config: RealtimeConfig) {
@@ -54,7 +54,8 @@ export class RealtimeGateway {
         });
     }
 
-    attach(server: HttpsServer): void {
+    /** Attaches to the HTTPS listener, or to the plain HTTP listener behind a reverse proxy (both emit 'upgrade'). */
+    attach(server: HttpServer): void {
         this.boundServer = server;
         this.upgradeHandler = (req, socket, head) => this.onUpgrade(req, socket, head);
         server.on("upgrade", this.upgradeHandler);
@@ -67,7 +68,10 @@ export class RealtimeGateway {
     private onUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
         const url = req.url ?? "";
         const pathOnly = url.split("?")[0];
-        const remoteIp = req.socket?.remoteAddress ?? "unknown";
+        // [2026-10-14 M2] Behind a loopback proxy the client is the forwarded address (per-IP limits, auth throttle).
+        const remoteIp = this.config.trustForwardedFor
+            ? (ForwardedClientAddress(req.socket?.remoteAddress, req.headers["x-forwarded-for"]) ?? "unknown")
+            : (req.socket?.remoteAddress ?? "unknown");
 
         if (!this.config.enabled || !this.accepting) {
             this.rejectUpgrade(socket, 503, "Service Unavailable", pathOnly);
