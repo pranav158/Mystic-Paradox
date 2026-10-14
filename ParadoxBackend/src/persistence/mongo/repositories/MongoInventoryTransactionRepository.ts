@@ -102,6 +102,35 @@ export class MongoInventoryTransactionRepository implements InventoryTransaction
             { session }
         );
     }
+    // [2026-10-15] A plain read of one ledger row (the contract's findRecord); no session, so it sees the last committed row.
+    async findRecord(userId: string, characterId: string, transactionId: string): Promise<InventoryTransactionRecord | undefined> {
+        const Db = await this.getDb();
+        const Row = await Db.collection(Collections.InventoryTransactions).findOne({ _id: LedgerId(userId, characterId, transactionId) as any });
+        if (Row == undefined) return undefined;
+        return {
+            transactionId: Row.transactionId,
+            userId: Row.userId,
+            characterId: Row.characterId,
+            requestHash: Row.requestHash,
+            status: Row.status,
+            result: Row.result,
+            createdAt: Row.createdAt,
+            completedAt: Row.completedAt
+        };
+    }
+    // [2026-10-14] The admin player timeline: the newest rows of one account, without the stored results.
+    async listRecentForUser(userId: string, limit: number): Promise<Record<string, any>[]> {
+        const Db = await this.getDb();
+        const Rows = await Db.collection(Collections.InventoryTransactions)
+            .find({ userId: { $eq: userId } as any }, {
+                projection: { _id: 0, transactionId: 1, characterId: 1, status: 1, createdAt: 1, completedAt: 1, economySource: 1, economySessionId: 1 }
+            })
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .toArray();
+        return Rows as Record<string, any>[];
+    }
+
 }
 
 // [hardening] Thrown by tryBegin instead of returning a value, specifically so the caller is

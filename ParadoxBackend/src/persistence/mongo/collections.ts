@@ -38,6 +38,17 @@ export const Collections = {
     // Per-account cooldowns for GET /cooldown/:userId and PUT /cooldown/batch/:userId (src/cooldownState.ts). _id = userId.
     CooldownStates: "cooldownStates",
 
+    // [2026-10-14] Per-account, per-UTC-day economy totals (diagnostics/economyLedgerMonitor.ts; monitoring only, ~400 days).
+    // _id = `${userId}:${day}:${currency}`.
+    EconomyDaily: "economyDaily",
+
+    // [2026-10-14] Activity monitor (src/activity; monitoring only, ~400 days, every collection in the account deletion plan):
+    // per-account, per-UTC-day counters; hunt participation rows (dedicated and P2P); Slayer's Path unlock history; review flags.
+    PlayerActivityDaily: "playerActivityDaily",
+    ActivityHunts: "activityHunts",
+    SlayersPathUnlocks: "slayersPathUnlocks",
+    ActivityFlags: "activityFlags",
+
     // [hardening] Idempotency ledger for POST /inventory transactions (see
     // contracts/InventoryTransactionRepository.ts). _id = sha256(userId, characterId,
     // transactionId), unique automatically.
@@ -52,6 +63,9 @@ export const Collections = {
     DiscordOAuthTransactions: "discordOAuthTransactions",
     AdminSessions: "adminSessions",
     AdminAudit: "adminAudit",
+    // [2026-10-14] One pseudonymous tombstone per erased account (scripts/process_account_deletions.ts). _id = pseudonymousId.
+    // Nothing else about the account is kept: no id, email, name or game data.
+    AccountDeletions: "accountDeletions",
 
     // Social graph for the Epic-compatible friends service (routes/friends.ts).
     Friendships: "friendships",
@@ -63,6 +77,8 @@ export const Collections = {
 
     // Short-lived, challenge-bound launcher Guard sessions and the operator policy singleton.
     LauncherGuardSessions: "launcherGuardSessions",
+    // [2026-10-14] Module findings from the Guard heartbeats (file name, hash, signer, accounts that reported it); 90 days.
+    GuardFindings: "guardFindings",
     OperationsPolicy: "operationsPolicy",
 
     // Durable social party authority. Membership is a separate one-row-per-account collection so

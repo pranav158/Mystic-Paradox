@@ -58,6 +58,25 @@ export interface LauncherAccountRecord {
      *  yet (the launcher forces a set-username step). Absent/true once a username is set —
      *  email/password accounts set it at registration. */
     usernameSet?: boolean;
+    /** [2026-10-14] The Terms of Use and Privacy Policy the player accepted, and the age confirmation (accountConsent.ts). Absent
+     *  for a Discord account that has not accepted yet, and for accounts created before consent existed. */
+    consent?: LauncherConsentRecord;
+    /** [2026-10-14] A deletion request (routes/launcherAuth.ts). While present the account is deactivated: it can sign in
+     *  and restore it, but it cannot play, host or join. scripts/process_account_deletions.ts erases it after scheduledFor. */
+    deletion?: LauncherDeletionRecord;
+}
+
+export interface LauncherConsentRecord {
+    termsVersion: string;
+    privacyVersion: string;
+    ageConfirmed: true;
+    acceptedAt: string;
+}
+
+export interface LauncherDeletionRecord {
+    requestedAt: string;
+    /** requestedAt plus the hold (retentionPolicy.ts DELETION_HOLD_DAYS). */
+    scheduledFor: string;
 }
 
 export interface LauncherAccountRepository {
@@ -76,6 +95,15 @@ export interface LauncherAccountRepository {
      *  usernameSet=true. Also updates the game-owned `name` field. Caller has already
      *  validated the format and confirmed availability. */
     setUsername(userId: string, displayName: string, displayNameNormalized: string): Promise<void>;
+
+    /** [2026-10-14] Records the account's consent to the current documents (replaces an earlier record). */
+    setConsent(userId: string, consent: LauncherConsentRecord): Promise<void>;
+
+    /** [2026-10-14] Sets or, with undefined, clears the deletion request. */
+    setDeletion(userId: string, deletion: LauncherDeletionRecord | undefined): Promise<void>;
+
+    /** [2026-10-14] Launcher accounts whose deletion hold has ended by `nowIso` (oldest first, at most `limit`). */
+    listDeletionsDue(nowIso: string, limit: number): Promise<LauncherAccountRecord[]>;
 
     listForAdmin(filters: {
         approvalStatus?: AccountApprovalStatus;

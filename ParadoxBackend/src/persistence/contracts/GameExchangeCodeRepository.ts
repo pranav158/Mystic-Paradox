@@ -28,6 +28,11 @@ export interface GameExchangeCodeRecord {
     /** Exact signed release and canonical digest of all five installed runtime artifacts. */
     runtimeManifestVersion: string;
     runtimeArtifactSetSha256: string;
+    /**
+     * [2026-10-13 realms hub design section 2.1] The Paradox realm this Play was authorized for (RealmsService.authorizeEntry), absent
+     * for official play. The game login (routes/eos.ts) binds it as the account's realm presence when it consumes the code.
+     */
+    realmId?: string;
     createdAt: string;
     expiresAt: string;
     consumedAt?: string;

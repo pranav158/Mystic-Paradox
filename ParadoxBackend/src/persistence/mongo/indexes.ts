@@ -13,6 +13,7 @@ import { Db } from "mongodb";
 import { Collections } from "./collections";
 import { MongoWalletRepository } from "./repositories/MongoWalletRepository";
 import { GetP2PExtension } from "../../extensions/p2p";
+import { DAY_MS, GUARD_SESSION_RETENTION_DAYS } from "../../legal/retentionPolicy";
 import {
     AssertMongoSchemaVersionSupported,
     CURRENT_MONGO_SCHEMA_VERSION,
@@ -132,6 +133,9 @@ export async function EnsureMongoIndexes(Db: Db): Promise<void> {
     await Db.collection(Collections.DiscordOAuthTransactions).createIndex({ completionCodeHash: 1 });
     await Db.collection(Collections.DiscordOAuthTransactions).createIndex({ userId: 1 });
     await Db.collection(Collections.InventoryTransactions).createIndex({ userId: 1, characterId: 1 });
+    // Daily store claims (controllers/store.ts FindClaimInInventoryLedger) look one row up by (userId, transactionId) on
+    // every Ramsgate arrival; without this the lookup reads the player's whole ledger.
+    await Db.collection(Collections.InventoryTransactions).createIndex({ userId: 1, transactionId: 1 });
     await Db.collection(Collections.Friendships).createIndex({ ownerId: 1 });
     await Db.collection(Collections.Friendships).createIndex({ otherId: 1 });
 
@@ -156,6 +160,41 @@ export async function EnsureMongoIndexes(Db: Db): Promise<void> {
     await Db.collection(Collections.RefreshSessions).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
     await Db.collection(Collections.GameExchangeCodes).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
     await Db.collection(Collections.DiscordOAuthTransactions).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
+
+    // [2026-10-14] Daily economy rollups (diagnostics/economyLedgerMonitor.ts): kept about 400 days, then purged by TTL.
+    await Db.collection(Collections.EconomyDaily).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
+    await Db.collection(Collections.EconomyDaily).createIndex({ userId: 1, day: -1 });
+
+    // [2026-10-14] Activity monitor (src/activity): counters per account and day, hunt rows, unlock history and flags. Kept about
+    // 400 days, then purged by TTL (ttlAt, set by MongoActivityRepository and by the monitor).
+    await Db.collection(Collections.PlayerActivityDaily).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
+    await Db.collection(Collections.PlayerActivityDaily).createIndex({ day: 1 });
+    await Db.collection(Collections.ActivityHunts).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
+    await Db.collection(Collections.ActivityHunts).createIndex({ userId: 1, kind: 1, startedAt: -1 });
+    await Db.collection(Collections.ActivityHunts).createIndex({ userId: 1, startedAt: -1 });
+    await Db.collection(Collections.SlayersPathUnlocks).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
+    await Db.collection(Collections.SlayersPathUnlocks).createIndex({ userId: 1, unlockedAt: -1 });
+    await Db.collection(Collections.ActivityFlags).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
+    await Db.collection(Collections.ActivityFlags).createIndex({ status: 1, createdAt: -1 });
+    await Db.collection(Collections.ActivityFlags).createIndex({ userId: 1, createdAt: -1 });
+    // [2026-10-14] The admin player timeline reads an account's recent ledger rows (no index existed for that read).
+    await Db.collection(Collections.InventoryTransactions).createIndex({ userId: 1, createdAt: -1 });
+    await Db.collection(Collections.ProgressionTransactions).createIndex({ userId: 1, createdAt: -1 });
+
+    // [2026-10-14] Privacy Policy section 5: launcher Guard sessions are kept 90 days after their last update. ttlAt is the BSON
+    // date of that (set by MongoLauncherGuardRepository on create, heartbeat and revoke). Rows written before it existed take
+    // the last heartbeat (or creation) time, once, so they age out with the rest.
+    await Db.collection(Collections.LauncherGuardSessions).updateMany(
+        { ttlAt: { $exists: false } },
+        [{ $set: { ttlAt: { $add: [{ $toDate: { $ifNull: ["$lastHeartbeatAt", "$createdAt"] } }, GUARD_SESSION_RETENTION_DAYS * DAY_MS] } } }]
+    );
+    await Db.collection(Collections.LauncherGuardSessions).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
+    // [2026-10-14] Admin listings (newest sessions first; findings most seen first). A finding is one module file (name + hash), kept
+    // 90 days after it was last seen (ttlAt, retentionPolicy.ts).
+    await Db.collection(Collections.LauncherGuardSessions).createIndex({ createdAt: -1 });
+    await Db.collection(Collections.GuardFindings).createIndex({ fileName: 1, sha256: 1 }, { unique: true });
+    await Db.collection(Collections.GuardFindings).createIndex({ sessionCount: -1, lastSeenAt: -1 });
+    await Db.collection(Collections.GuardFindings).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
 
     // [hardening] One-time, idempotent migration: wallets created before the wallet-hardening
     // pass stored `balances` as a JSON-string blob. Sweep and convert any remaining legacy rows

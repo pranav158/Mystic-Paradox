@@ -19,6 +19,8 @@ export class MongoBountyStateRepository implements BountyStateRepository {
             userId: Doc.userId,
             bounties: Array.isArray(Doc.bounties) ? Doc.bounties : [],
             draftData: Doc.draftData ?? {},
+            ...(typeof Doc.dailyRewardCreditedOn === "string" ? { dailyRewardCreditedOn: Doc.dailyRewardCreditedOn } : {}),
+            ...(typeof Doc.dailyPremiumDraftGrantedOn === "string" ? { dailyPremiumDraftGrantedOn: Doc.dailyPremiumDraftGrantedOn } : {}),
             updateVersion: Doc.updateVersion,
             createdAt: Doc.createdAt,
             updatedAt: Doc.updatedAt
@@ -38,6 +40,8 @@ export class MongoBountyStateRepository implements BountyStateRepository {
             userId: record.userId,
             bounties: record.bounties,
             draftData: record.draftData,
+            ...(record.dailyRewardCreditedOn !== undefined ? { dailyRewardCreditedOn: record.dailyRewardCreditedOn } : {}),
+            ...(record.dailyPremiumDraftGrantedOn !== undefined ? { dailyPremiumDraftGrantedOn: record.dailyPremiumDraftGrantedOn } : {}),
             updateVersion: record.updateVersion,
             createdAt: record.createdAt,
             updatedAt: record.updatedAt

@@ -13,7 +13,7 @@ import { ClientSession } from "mongodb";
 import { GetMongoDb } from "../client";
 import { Collections } from "../collections";
 import { ProgressionTrackRepository } from "../../contracts/ProgressionTrackRepository";
-import { ProgressionTrackRecord, ProgressionObjectiveEventRecord, ProgressionObjectiveRecord } from "../../mapping/domainTypes";
+import { ProgressionTrackRecord, ProgressionObjectiveEventRecord, ProgressionObjectiveRecord, WeaponReforgeState } from "../../mapping/domainTypes";
 
 // WP-1 (Plans/PROGRESSION_XP_COMBAT_DATA_IMPLEMENTATION_PLAN.md section 5.1/16). _id is the
 // composite "userId::progressionId" string — Mongo has no native composite-key _id without a
@@ -44,7 +44,9 @@ export class MongoProgressionTrackRepository implements ProgressionTrackReposito
             confirmedPremiumRank: Doc.confirmedPremiumRank,
             updateVersion: Doc.updateVersion,
             createdAt: Doc.createdAt,
-            updatedAt: Doc.updatedAt
+            updatedAt: Doc.updatedAt,
+            reforge: Doc.reforge ?? undefined,
+            prestigeClaimed: Doc.prestigeClaimed ?? undefined
         }));
     }
 
@@ -64,7 +66,9 @@ export class MongoProgressionTrackRepository implements ProgressionTrackReposito
             confirmedPremiumRank: Doc.confirmedPremiumRank,
             updateVersion: Doc.updateVersion,
             createdAt: Doc.createdAt,
-            updatedAt: Doc.updatedAt
+            updatedAt: Doc.updatedAt,
+            reforge: Doc.reforge ?? undefined,
+            prestigeClaimed: Doc.prestigeClaimed ?? undefined
         };
     }
 
@@ -106,7 +110,9 @@ export class MongoProgressionTrackRepository implements ProgressionTrackReposito
             confirmedPremiumRank: Doc.confirmedPremiumRank,
             updateVersion: Doc.updateVersion,
             createdAt: Doc.createdAt,
-            updatedAt: Doc.updatedAt
+            updatedAt: Doc.updatedAt,
+            reforge: Doc.reforge ?? undefined,
+            prestigeClaimed: Doc.prestigeClaimed ?? undefined
         };
     }
 
@@ -146,7 +152,9 @@ export class MongoProgressionTrackRepository implements ProgressionTrackReposito
             confirmedPremiumRank: Doc.confirmedPremiumRank,
             updateVersion: Doc.updateVersion,
             createdAt: Doc.createdAt,
-            updatedAt: Doc.updatedAt
+            updatedAt: Doc.updatedAt,
+            reforge: Doc.reforge ?? undefined,
+            prestigeClaimed: Doc.prestigeClaimed ?? undefined
         };
     }
 
@@ -188,7 +196,9 @@ export class MongoProgressionTrackRepository implements ProgressionTrackReposito
             confirmedPremiumRank: Doc.confirmedPremiumRank,
             updateVersion: Doc.updateVersion,
             createdAt: Doc.createdAt,
-            updatedAt: Doc.updatedAt
+            updatedAt: Doc.updatedAt,
+            reforge: Doc.reforge ?? undefined,
+            prestigeClaimed: Doc.prestigeClaimed ?? undefined
         };
     }
 
@@ -222,7 +232,9 @@ export class MongoProgressionTrackRepository implements ProgressionTrackReposito
             confirmedPremiumRank: Doc.confirmedPremiumRank,
             updateVersion: Doc.updateVersion,
             createdAt: Doc.createdAt,
-            updatedAt: Doc.updatedAt
+            updatedAt: Doc.updatedAt,
+            reforge: Doc.reforge ?? undefined,
+            prestigeClaimed: Doc.prestigeClaimed ?? undefined
         };
     }
 
@@ -246,6 +258,82 @@ export class MongoProgressionTrackRepository implements ProgressionTrackReposito
             completedCount: Doc.completedCount,
             updatedAt: Doc.updatedAt
         }));
+    }
+
+    async beginReforge(userId: string, progressionId: string, expectedProgress: number, expectedVersion: number,
+        reforge: WeaponReforgeState): Promise<ProgressionTrackRecord | undefined> {
+        const Db = await GetMongoDb();
+        const Result = await Db.collection(Collections.ProgressionTracks).findOneAndUpdate(
+            {
+                _id: this.TrackId(userId, progressionId) as any,
+                progress: { $eq: expectedProgress },
+                updateVersion: { $eq: expectedVersion },
+                "reforge.status": { $ne: "open" }
+            },
+            {
+                $set: { progress: 0, confirmedFremiumRank: 0, confirmedPremiumRank: 0, reforge, updatedAt: reforge.openedAt },
+                $inc: { updateVersion: 1 }
+            },
+            { returnDocument: "after" }
+        );
+        return Result == undefined ? undefined : (await this.get(userId, progressionId));
+    }
+
+    async updateReforge(userId: string, progressionId: string, reforgeId: string, expected: Partial<WeaponReforgeState>,
+        set: Partial<WeaponReforgeState>, session?: ClientSession): Promise<boolean> {
+        const Db = await GetMongoDb();
+        const Filter: Record<string, unknown> = { _id: this.TrackId(userId, progressionId), "reforge.reforgeId": { $eq: reforgeId } };
+        for (const [Key, Value] of Object.entries(expected)) Filter[`reforge.${Key}`] = { $eq: Value };
+        const Set: Record<string, unknown> = {};
+        for (const [Key, Value] of Object.entries(set)) Set[`reforge.${Key}`] = Value;
+        const Result = await Db.collection(Collections.ProgressionTracks).updateOne(Filter as any, { $set: Set }, { session });
+        return Result.modifiedCount === 1;
+    }
+
+    async claimPrestigeLevels(userId: string, progressionId: string, claimedBefore: number, levels: number, minProgress: number,
+        session?: ClientSession): Promise<boolean> {
+        const Db = await GetMongoDb();
+        const ClaimedFilter = claimedBefore === 0
+            ? { $or: [{ prestigeClaimed: { $exists: false } }, { prestigeClaimed: { $eq: 0 } }] }
+            : { prestigeClaimed: { $eq: claimedBefore } };
+        const Result = await Db.collection(Collections.ProgressionTracks).updateOne(
+            { _id: this.TrackId(userId, progressionId) as any, progress: { $gte: minProgress }, ...ClaimedFilter },
+            { $inc: { prestigeClaimed: levels }, $set: { updatedAt: new Date().toISOString() } },
+            { session }
+        );
+        return Result.modifiedCount === 1;
+    }
+
+    async getObjectives(userId: string, objectiveIds: string[], session?: ClientSession): Promise<ProgressionObjectiveRecord[]> {
+        if (objectiveIds.length === 0) return [];
+        const Db = await GetMongoDb();
+        const Ids = objectiveIds.map((ObjectiveId) => `${userId}::${ObjectiveId}`);
+        const Docs = await Db.collection(Collections.ProgressionObjectives)
+            .find({ _id: { $in: Ids as any[] }, userId: { $eq: userId } }, { session })
+            .toArray();
+        return Docs.map((Doc) => ({
+            userId: Doc.userId,
+            objectiveId: Doc.objectiveId,
+            value: Doc.value,
+            completedCount: Doc.completedCount,
+            updatedAt: Doc.updatedAt
+        }));
+    }
+
+    async mergeObjectives(userId: string, rows: { objectiveId: string; value: number; completedCount: number }[], session?: ClientSession): Promise<void> {
+        if (rows.length === 0) return;
+        const Db = await GetMongoDb();
+        const Now = new Date().toISOString();
+        await Db.collection(Collections.ProgressionObjectives).bulkWrite(rows.map((Row) => ({
+            updateOne: {
+                filter: { _id: `${userId}::${Row.objectiveId}` as any },
+                update: {
+                    $max: { value: Row.value, completedCount: Row.completedCount },
+                    $set: { userId, objectiveId: Row.objectiveId, updatedAt: Now }
+                },
+                upsert: true
+            }
+        })), { session, ordered: false });
     }
 
     async setObjectiveIfGreater(userId: string, objectiveId: string, value: number, completedCount: number): Promise<ProgressionObjectiveRecord> {

@@ -64,4 +64,15 @@ export class MongoProgressionGrantRepository implements ProgressionGrantReposito
             createdAt: record.createdAt
         }, { session });
     }
+    // [2026-10-14] The admin player timeline: the newest applied grants of one account.
+    async listRecentForUser(userId: string, limit: number): Promise<ProgressionGrantRecord[]> {
+        const Db = await this.getDb();
+        const Rows = await Db.collection(Collections.ProgressionTransactions)
+            .find({ userId: { $eq: userId } as any })
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .toArray();
+        return Rows.map((Doc) => MapDocument(Doc));
+    }
+
 }

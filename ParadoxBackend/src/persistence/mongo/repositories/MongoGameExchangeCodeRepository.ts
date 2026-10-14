@@ -24,6 +24,8 @@ function ToRecord(Doc: any): GameExchangeCodeRecord {
         runtimeSha256: Doc.runtimeSha256,
         runtimeManifestVersion: Doc.runtimeManifestVersion,
         runtimeArtifactSetSha256: Doc.runtimeArtifactSetSha256,
+        // Only present for a realm Play: an official code has no realmId key at all.
+        ...(typeof Doc.realmId === "string" ? { realmId: Doc.realmId } : {}),
         createdAt: Doc.createdAt,
         expiresAt: Doc.expiresAt,
         consumedAt: Doc.consumedAt ?? undefined

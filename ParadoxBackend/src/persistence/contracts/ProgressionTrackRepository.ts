@@ -10,7 +10,7 @@
  */
 
 import { ClientSession } from "mongodb";
-import { ProgressionTrackRecord, ProgressionObjectiveEventRecord, ProgressionObjectiveRecord } from "../mapping/domainTypes";
+import { ProgressionTrackRecord, ProgressionObjectiveEventRecord, ProgressionObjectiveRecord, WeaponReforgeState } from "../mapping/domainTypes";
 
 // Repository contract for WP-1 (Plans/PROGRESSION_XP_COMBAT_DATA_IMPLEMENTATION_PLAN.md
 // section 5.2). Covers the `progressionTracks` collection (raw per-track XP totals), the
@@ -72,6 +72,37 @@ export interface ProgressionTrackRepository {
      * (possible) update.
      */
     setObjectiveIfGreater(userId: string, objectiveId: string, value: number, completedCount: number): Promise<ProgressionObjectiveRecord>;
+
+    /**
+     * [2026-10-11] Weapon reforge reset (controllers/reforge.ts): sets progress and both confirmed ranks to 0 and stores
+     * `reforge`, only if the row still holds exactly `expectedProgress` / `expectedVersion` and has no open reforge.
+     * Returns the row after the reset, or undefined when the guard did not match (nothing changed).
+     */
+    beginReforge(userId: string, progressionId: string, expectedProgress: number, expectedVersion: number,
+        reforge: WeaponReforgeState): Promise<ProgressionTrackRecord | undefined>;
+
+    /**
+     * [2026-10-11] Compare-and-set on the stored reforge: applies `set` to `reforge.*` only if the row's reforge has
+     * `reforgeId` and every `expected` field still holds. Returns whether it applied.
+     */
+    updateReforge(userId: string, progressionId: string, reforgeId: string, expected: Partial<WeaponReforgeState>,
+        set: Partial<WeaponReforgeState>, session?: ClientSession): Promise<boolean>;
+
+    /**
+     * [2026-10-11] Prestige reward claim (wallet.ts): adds `levels` to `prestigeClaimed` only if it still equals
+     * `claimedBefore` and progress is at least `minProgress`. Progress (the prestige count) is never spent.
+     */
+    claimPrestigeLevels(userId: string, progressionId: string, claimedBefore: number, levels: number, minProgress: number,
+        session?: ClientSession): Promise<boolean>;
+
+    /** [2026-10-11] The stored state of the named objectives (missing ids are simply absent), inside a transaction. */
+    getObjectives(userId: string, objectiveIds: string[], session?: ClientSession): Promise<ProgressionObjectiveRecord[]>;
+
+    /**
+     * [2026-10-11] setObjectiveIfGreater for a whole report in one bulk write ($max on value and completedCount, upsert),
+     * inside the mastery report's transaction (controllers/masteryReport.ts).
+     */
+    mergeObjectives(userId: string, rows: { objectiveId: string; value: number; completedCount: number }[], session?: ClientSession): Promise<void>;
 
     /**
      * [hardening 2026-07-26] Atomically applies `-amount` to `progress` via Mongo's native $inc,

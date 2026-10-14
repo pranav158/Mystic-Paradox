@@ -16,4 +16,7 @@ import { ProgressionGrantRecord } from "../mapping/domainTypes";
 export interface ProgressionGrantRepository {
     findByGrantId(grantId: string, session?: ClientSession): Promise<ProgressionGrantRecord | undefined>;
     insertApplied(record: ProgressionGrantRecord, session: ClientSession): Promise<void>;
+    /** [2026-10-14] The account's most recent applied XP grants, newest first (the admin player timeline). */
+    listRecentForUser(userId: string, limit: number): Promise<ProgressionGrantRecord[]>;
+
 }

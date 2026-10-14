@@ -10,6 +10,8 @@ import { ClientSession } from "mongodb";
 import { AdminAuditRecord, AdminRepository, AdminSessionRecord, PlayerDeletionResult } from "../../contracts/AdminRepository";
 import { GetMongoClient, GetMongoDb } from "../client";
 import { Collections } from "../collections";
+import { AccountDeletionSteps, ApplyAccountDeletionSteps, BuildAccountDeletionContext } from "../accountDeletionPlan";
+import { PseudonymousAccountId } from "../../../security/apiKeyHash";
 
 function ToSession(Doc: any): AdminSessionRecord {
     return {
@@ -93,47 +95,16 @@ export class MongoAdminRepository implements AdminRepository {
         try {
             await Session.withTransaction(async () => {
                 const Db = await GetMongoDb();
-                const Characters = await Db.collection(Collections.Characters)
-                    .find({ userId }, { session: Session })
-                    .project({ _id: 1, characterId: 1 })
-                    .toArray();
-                const CharacterIds = Characters.map((Character) => String(Character.characterId ?? Character._id));
-                CharacterCount = CharacterIds.length;
+                const Context = await BuildAccountDeletionContext(Db, userId, new Date().toISOString(), PseudonymousAccountId(userId), Session);
+                CharacterCount = Context.characterIds.length;
 
-                const Remove = async (collection: string, filter: any): Promise<void> => {
-                    const Result = await Db.collection(collection).deleteMany(filter, { session: Session });
-                    DeletedCounts[collection] = Result.deletedCount;
-                };
-                const UserOwned = { $or: [{ userId }, { _id: userId as any }] };
-                const CharacterOwned = {
-                    $or: [
-                        { userId },
-                        { characterId: { $in: CharacterIds } },
-                        { _id: { $in: CharacterIds } }
-                    ]
-                };
-
-                // Authentication and live-session state first. The transaction means
-                // none of these removals become visible unless the full cascade commits.
-                await Remove(Collections.RefreshSessions, { userId });
-                await Remove(Collections.GameExchangeCodes, { userId });
-                await Remove(Collections.AdminSessions, { userId });
-                await Remove(Collections.AuthIdentities, { userId });
-                await Remove(Collections.DiscordOAuthTransactions, { userId });
-                await Remove(Collections.UserApiKeys, UserOwned);
-                await Remove(Collections.Friendships, { $or: [{ ownerId: userId }, { otherId: userId }] });
-
-                await Remove(Collections.InventoryTransactions, CharacterOwned);
-                await Remove(Collections.Inventories, CharacterOwned);
-                await Remove(Collections.Loadouts, CharacterOwned);
-                await Remove(Collections.Breadcrumbs, CharacterOwned);
-                await Remove(Collections.EncounteredContent, CharacterOwned);
-                await Remove(Collections.ProgressionTracks, { userId });
-                await Remove(Collections.ProgressionObjectives, { userId });
-                await Remove(Collections.ProgressionObjectiveEvents, { userId });
-                await Remove(Collections.PlayerJourney, UserOwned);
-                await Remove(Collections.Wallets, UserOwned);
-                await Remove(Collections.Characters, { userId });
+                // [2026-10-14] The shared plan (persistence/mongo/accountDeletionPlan.ts) covers every collection that keys the account,
+                // including the P2P, realm and anti-cheat ones this delete used to miss. The admin delete does not wait for live activity
+                // (guards are skipped, as before) and keeps its audit trail (AdminAudit is not touched). The transaction means none of
+                // these removals become visible unless the full cascade commits.
+                const Steps = AccountDeletionSteps().filter((step) => step.kind !== "guard" && step.collection !== Collections.AdminAudit);
+                const Changed = await ApplyAccountDeletionSteps(Db, Session, Context, Steps);
+                for (const [Collection, Count] of Object.entries(Changed)) DeletedCounts[Collection] = Count;
 
                 const AccountResult = await Db.collection(Collections.Accounts)
                     .deleteOne({ _id: userId as any, displayNameNormalized: { $exists: true } }, { session: Session });

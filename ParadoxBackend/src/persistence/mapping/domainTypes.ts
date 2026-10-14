@@ -183,6 +183,27 @@ export interface ProgressionTrackRecord {
     updateVersion: number;
     createdAt: string;
     updatedAt: string;
+    /** [2026-10-11] ExperienceTrack_Weapon_* only: the last weapon reforge (controllers/reforge.ts). */
+    reforge?: WeaponReforgeState;
+    /** [2026-10-11] PrestigeTrack_* only: prestige levels whose reward was already paid (wallet.ts). */
+    prestigeClaimed?: number;
+}
+
+/**
+ * One weapon reforge (weapon prestige), stored on the weapon's ExperienceTrack row so the reset and its follow-ups are
+ * single-document updates. The game resets the track (DELETE), then grants +1 on PrestigeTrack_Weapon_* and re-grants
+ * the banked XP (progress over the level-20 cap) 0.5 s later; each of those is accepted once per reforge.
+ */
+export interface WeaponReforgeState {
+    reforgeId: string;
+    status: "open" | "closed";
+    priorProgress: number;
+    cap: number;
+    banked: number;
+    bankedRestored: number;
+    prestigeGranted: boolean;
+    openedAt: string;
+    closedAt?: string;
 }
 
 /** Exactly-once result ledger entry for an authoritative gameserver XP grant. */
@@ -219,6 +240,11 @@ export interface BountyStateRecord {
     userId: string;
     bounties: StoredBounty[];
     draftData: { base?: Record<string, unknown>; daily?: Record<string, unknown>; weekly?: Record<string, unknown> };
+    /** UTC day (YYYY-MM-DD) a daily challenge's Cache Coins were last paid: at most one daily reward per day (14 Oct). */
+    dailyRewardCreditedOn?: string;
+    /** [2026-10-15] UTC day (YYYY-MM-DD) a realm host last added the daily premium draft token for this account: at most one per day
+     *  (p2p/security/hostDraftPremium.ts). Kept on the account, not the character, and written in the grant's inventory transaction. */
+    dailyPremiumDraftGrantedOn?: string;
     updateVersion: number;
     createdAt: string;
     updatedAt: string;

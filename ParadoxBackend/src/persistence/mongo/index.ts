@@ -35,6 +35,8 @@ import { MongoCooldownStateRepository } from "./repositories/MongoCooldownStateR
 import { MongoEntitlementRepository } from "./repositories/MongoEntitlementRepository";
 import { MongoPartyRepository } from "./repositories/MongoPartyRepository";
 import { MongoLauncherGuardRepository } from "./repositories/MongoLauncherGuardRepository";
+import { MongoEconomyRollupRepository } from "./repositories/MongoEconomyRollupRepository";
+import { MongoActivityRepository } from "./repositories/MongoActivityRepository";
 
 // Builds the MongoDB-backed RepositoryProvider. Each repository lazily resolves
 // the shared pooled Db handle (src/persistence/mongo/client.ts) on first use.
@@ -54,6 +56,8 @@ export function CreateMongoRepositoryProvider(): RepositoryProvider {
         escalationProgress: new MongoEscalationProgressRepository(),
         bountyStates: new MongoBountyStateRepository(),
         cooldownStates: new MongoCooldownStateRepository(),
+        economyRollups: new MongoEconomyRollupRepository(),
+        activity: new MongoActivityRepository(),
         launcherAccounts: new MongoLauncherAccountRepository(),
         authIdentities: new MongoAuthIdentityRepository(),
         refreshSessions: new MongoRefreshSessionRepository(),

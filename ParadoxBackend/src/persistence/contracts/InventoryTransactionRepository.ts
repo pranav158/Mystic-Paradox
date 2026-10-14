@@ -45,4 +45,16 @@ export interface InventoryTransactionRepository {
      *  an onGrant annotator) are stored on the same row; they never replace the core ledger fields. */
     complete(transactionId: string, userId: string, characterId: string, result: unknown, session: ClientSession,
         extraFields?: Record<string, unknown>): Promise<void>;
+    /**
+     * [2026-10-15] The stored row of one (userId, characterId, transactionId) tuple, read outside any transaction, or undefined. The
+     * host draft-premium precheck (p2p/security/p2pInventoryAuthorization.ts) uses it to recognise a replay of an accepted transaction
+     * before the transaction starts. Only a completed row is a stored result; the transaction itself still decides every write.
+     */
+    findRecord(userId: string, characterId: string, transactionId: string): Promise<InventoryTransactionRecord | undefined>;
+    /**
+     * [2026-10-14] The account's most recent ledger rows, newest first, with only the fields an admin timeline shows (transactionId,
+     * characterId, status, createdAt, completedAt, economySource, economySessionId). Never the stored results.
+     */
+    listRecentForUser(userId: string, limit: number): Promise<Record<string, any>[]>;
+
 }

@@ -16,7 +16,9 @@ import {
     AccountApprovalStatus,
     AccountOperationalStatus,
     LauncherAccountRepository,
-    LauncherAccountRecord
+    LauncherAccountRecord,
+    LauncherConsentRecord,
+    LauncherDeletionRecord
 } from "../../contracts/LauncherAccountRepository";
 
 // Reads/writes the SAME `accounts` collection as MongoAccountRepository (see
@@ -41,7 +43,9 @@ function ToRecord(Doc: any): LauncherAccountRecord {
         rolesUpdatedBy: Doc.rolesUpdatedBy ?? undefined,
         createdAt: Doc.createdAt,
         lastLoginAt: Doc.lastLoginAt ?? undefined,
-        usernameSet: Doc.usernameSet ?? undefined
+        usernameSet: Doc.usernameSet ?? undefined,
+        consent: Doc.consent ?? undefined,
+        deletion: Doc.deletion ?? undefined
     };
 }
 
@@ -90,11 +94,39 @@ export class MongoLauncherAccountRepository implements LauncherAccountRepository
             createdAt: account.createdAt,
             lastLoginAt: account.lastLoginAt,
             usernameSet: account.usernameSet,
+            consent: account.consent,
+            deletion: account.deletion,
             // Game-owned fields (AccountRepository/AccountRecord) — see this file's
             // header comment for why a launcher-created account needs these too.
             name: account.displayName,
             notes: 0
         }, { session });
+    }
+
+    async setConsent(userId: string, consent: LauncherConsentRecord): Promise<void> {
+        const Db = await GetMongoDb();
+        await Db.collection(Collections.Accounts).updateOne(
+            { _id: userId as any, displayNameNormalized: { $exists: true } },
+            { $set: { consent } }
+        );
+    }
+
+    async setDeletion(userId: string, deletion: LauncherDeletionRecord | undefined): Promise<void> {
+        const Db = await GetMongoDb();
+        await Db.collection(Collections.Accounts).updateOne(
+            { _id: userId as any, displayNameNormalized: { $exists: true } },
+            deletion === undefined ? { $unset: { deletion: "" } } : { $set: { deletion } }
+        );
+    }
+
+    async listDeletionsDue(nowIso: string, limit: number): Promise<LauncherAccountRecord[]> {
+        const Db = await GetMongoDb();
+        const Docs = await Db.collection(Collections.Accounts)
+            .find({ displayNameNormalized: { $exists: true }, "deletion.scheduledFor": { $lte: nowIso } })
+            .sort({ "deletion.scheduledFor": 1 })
+            .limit(limit)
+            .toArray();
+        return Docs.map(ToRecord);
     }
 
     async updateLastLogin(userId: string, whenIso: string): Promise<void> {

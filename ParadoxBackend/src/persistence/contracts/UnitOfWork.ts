@@ -35,6 +35,8 @@ import { CooldownStateRepository } from "./CooldownStateRepository";
 import { EntitlementRepository } from "./EntitlementRepository";
 import { PartyRepository } from "./PartyRepository";
 import { LauncherGuardRepository } from "./LauncherGuardRepository";
+import { EconomyRollupRepository } from "./EconomyRollupRepository";
+import { ActivityRepository } from "./ActivityRepository";
 
 // The set of repositories the MongoDB provider supplies. This is the
 // "composition root" surface — controllers/services obtain repositories
@@ -54,6 +56,11 @@ export interface RepositoryProvider {
     escalationProgress: EscalationProgressRepository;
     bountyStates: BountyStateRepository;
     cooldownStates: CooldownStateRepository;
+
+    // [2026-10-14] Daily economy rollups for the monitors (diagnostics/economyLedgerMonitor.ts). Never read by a grant.
+    economyRollups: EconomyRollupRepository;
+    // [2026-10-14] Activity monitor (src/activity): counters, hunt rows, unlock history, flags. Monitoring only.
+    activity: ActivityRepository;
 
     // Launcher auth (Plans/LAUNCHER_BACKEND_AUTH_REQUIREMENTS.md) — additive,
     // does not change any existing game route's behavior.
