@@ -1,0 +1,185 @@
+/* [2026-10-13 realms S1] Servers page: the list of official, Paradox-realm and local servers, and the add form. */
+
+.muted {
+  color: var(--ink-3);
+}
+
+.server-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
+
+.server-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.server-row {
+  position: relative;
+}
+
+/* The server in use gets a thin aether rule down its left edge. */
+.server-row[data-selected="true"]::before {
+  content: "";
+  position: absolute;
+  inset: 16px auto 16px 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: linear-gradient(180deg, var(--aether-hi), var(--aether-lo));
+}
+
+/* A local server is a different trust boundary: its row carries a red rule instead. */
+.server-row[data-kind="local"]::before {
+  content: "";
+  position: absolute;
+  inset: 16px auto 16px 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--bad);
+}
+
+.server-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.note.warning {
+  padding: 10px 12px;
+  border: 1px solid var(--bad-line);
+  border-radius: var(--r-sm);
+  background: var(--bad-a);
+  color: #ffd3da;
+}
+
+.note.warning svg {
+  color: var(--bad);
+}
+
+.server-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 16px;
+  margin-top: 18px;
+}
+
+@container main (max-width: 720px) {
+  .server-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* [2026-10-14] The add form inside the sign-in card (ServerSwitcher): the card is narrow, so the head, the kind switch and the
+   fields stack instead of sharing a row (side by side the description wrapped one word per line). */
+.add-server-compact {
+  padding: 14px 0 0;
+}
+
+.add-server-compact .section-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+}
+
+.add-server-compact .segmented {
+  align-self: flex-start;
+}
+
+.add-server-compact .server-form {
+  grid-template-columns: minmax(0, 1fr);
+  margin-top: 12px;
+}
+
+/* [2026-10-13 realms S5] The badge is a button: it opens the local server warning. */
+.chip-button {
+  cursor: pointer;
+  transition: background-color var(--t-fast), border-color var(--t-fast), transform var(--t-fast) var(--ease-out);
+}
+
+.chip-button:hover {
+  border-color: color-mix(in srgb, var(--tone, var(--bad)) 60%, transparent);
+  background: color-mix(in srgb, var(--tone, var(--bad)) 24%, transparent);
+}
+
+.chip-button:active {
+  transform: scale(0.97);
+}
+
+/* "Which server am I signing in to?" on the sign-in and registration cards. */
+.server-switch {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.server-switch[data-kind="local"] {
+  border-color: var(--bad-line);
+  background: var(--bad-a);
+}
+
+.server-switch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.server-switch-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border-radius: 9px;
+  background: var(--aether-a10);
+  color: var(--aether-hi);
+}
+
+.server-switch[data-kind="local"] .server-switch-icon {
+  background: var(--bad-a);
+  color: var(--bad);
+}
+
+.server-switch-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.server-switch-label {
+  color: var(--ink-3);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* [2026-10-14] The switcher's dropdown (components/Dropdown.tsx) fills the row beside its label. */
+.server-switch-dropdown {
+  flex: 1;
+  min-width: 0;
+}
+
+/* [2026-10-14] A realm's own name, under its realm name in the Servers list, when the player named it differently. */
+.server-alias {
+  display: block;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-switch-note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--ink-3);
+  font-size: 12px;
+}

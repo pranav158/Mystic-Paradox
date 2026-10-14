@@ -1,0 +1,216 @@
+/* [2026-10-14 realms hub design 6.2] "Host my realm" panel (RealmHostPanel.tsx). Glass card, tokens and controls are the
+   launcher's own (tokens.css, components.css, pages.css); only what they do not cover is here. */
+
+.rh-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
+
+.rh-chip-spinner {
+  width: 11px;
+  height: 11px;
+  border-width: 2px;
+}
+
+.rh-loading {
+  margin-top: 14px;
+}
+
+/* A line from the launcher: why the realm restarts, or why it stopped by itself. */
+.rh-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--aether-line);
+  border-radius: var(--r-sm);
+  background: var(--aether-a10);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.rh-notice svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin-top: 2px;
+  color: var(--aether-hi);
+}
+
+.rh-notice[data-tone="warn"] {
+  border-color: var(--warn-line);
+  background: var(--warn-a);
+  color: #fbe6b8;
+}
+
+.rh-notice[data-tone="warn"] svg {
+  color: var(--warn);
+}
+
+.rh-notice[data-tone="bad"] {
+  border-color: var(--bad-line);
+  background: var(--bad-a);
+  color: #ffd3da;
+}
+
+.rh-notice[data-tone="bad"] svg {
+  color: var(--bad);
+}
+
+.rh-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.rh-heading {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.rh-sub {
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+
+.rh-limits {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px 16px;
+  margin-top: 14px;
+}
+
+@container main (max-width: 720px) {
+  .rh-limits {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---- Meters ---------------------------------------------------------------- */
+
+.rh-meters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 16px 24px;
+  margin-top: 14px;
+}
+
+.rh-meter {
+  --meter: var(--aether);
+  min-width: 0;
+}
+
+.rh-meter[data-tone="warn"] { --meter: var(--warn); }
+.rh-meter[data-tone="bad"] { --meter: var(--bad); }
+
+.rh-meter-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 7px;
+  font-size: 12.5px;
+}
+
+.rh-meter-label {
+  color: var(--ink-3);
+  font-weight: 600;
+}
+
+.rh-meter-text {
+  color: var(--ink-2);
+  text-align: right;
+}
+
+.rh-meter-track {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.rh-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--meter) 70%, transparent), var(--meter));
+  box-shadow: 0 0 12px color-mix(in srgb, var(--meter) 45%, transparent);
+  transition: width var(--t-slow) var(--ease-out), background-color var(--t-med);
+}
+
+.rh-servers {
+  margin-top: 18px;
+}
+
+/* One line per running server; the list is a grid of dt/dd pairs, so each pair spans the whole row. */
+.rh-server {
+  display: contents;
+}
+
+/* ---- Player and ban lists --------------------------------------------------- */
+
+.rh-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.rh-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  padding: 11px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.rh-who {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 240px;
+  gap: 6px;
+}
+
+.rh-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.rh-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rh-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.rh-meta .chip {
+  height: 22px;
+  padding: 0 9px;
+  font-size: 11px;
+}
+
+.rh-actions {
+  display: flex;
+  flex: none;
+  gap: 8px;
+}
