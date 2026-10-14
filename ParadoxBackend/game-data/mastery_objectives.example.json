@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "source": "example (synthetic placeholder, not game data)",
+  "objectiveIds": [
+    "AchievementObjective_Example_Kill",
+    "MasteryObjective_Behemoth_Example_Kill",
+    "MasteryObjective_Behemoth_Example_PrestigeXP",
+    "MasteryObjective_Behemoth_Example_XP",
+    "MasteryObjective_Weapon_Example_Craft"
+  ],
+  "cards": [
+    {
+      "cardId": "MasteryCard_Behemoth_Example",
+      "track": "MasteryTrack_Behemoth",
+      "objectives": [
+        { "id": "MasteryObjective_Behemoth_Example_Kill", "target": 1, "type": "KillBehemoth" }
+      ],
+      "type": "Behemoth",
+      "baseXpObjectiveId": "MasteryObjective_Behemoth_Example_XP",
+      "prestigeXpObjectiveId": "MasteryObjective_Behemoth_Example_PrestigeXP"
+    },
+    {
+      "cardId": "MasteryCard_Weapon_Example",
+      "track": "MasteryTrack_Weapon_Sword",
+      "objectives": [
+        { "id": "MasteryObjective_Weapon_Example_Craft", "target": 1, "type": "PossessItems" }
+      ],
+      "type": "Weapon"
+    }
+  ],
+  "achievements": [
+    {
+      "id": "Release_Example",
+      "objectives": [
+        { "id": "AchievementObjective_Example_Kill", "target": 1, "type": "KillBehemoth" }
+      ]
+    }
+  ]
+}

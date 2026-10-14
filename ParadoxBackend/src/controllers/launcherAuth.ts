@@ -9,15 +9,19 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
+import { TouchGameSession } from "../activity/activityMonitor";
 import crypto from "crypto";
 import { GetRepositories, LauncherAccountRecord } from "../persistence";
+import { ResolveRegistrationApproval } from "../config/registrationApproval";
 import { HashPassword, VerifyPassword } from "../security/passwords";
 import { GenerateOpaqueToken, HashOpaqueToken, SignLauncherAccessToken } from "../security/launcherTokens";
 import { LauncherApiError } from "../security/launcherErrors";
 import { IsRateLimited } from "../security/rateLimit";
 import { logger } from "../logger";
+import { AuthorizeGameSessionRealm } from "../realms/entry";
 import { MongoServerError } from "mongodb";
 import { AssertAccountAdmitted, AssertAccountEligible, EffectiveApprovalStatus } from "../security/accountEligibility";
+import { AssertAccountNotDeactivated, AssertConsentCurrentWhenEnforced, ValidateRegistrationConsent } from "../security/accountConsent";
 import {
     AssertRuntimeArtifactSetApproved,
     AssertRuntimeChannelMatchesAccount,
@@ -67,7 +71,8 @@ export interface LauncherSessionResult {
 }
 
 export interface PendingRegistrationResult {
-    approvalRequired: true;
+    /** False when the account was approved at once (MYSTICPARADOX_REGISTRATION_APPROVAL=off, the default). */
+    approvalRequired: boolean;
     account: LauncherAccountView;
 }
 
@@ -187,7 +192,9 @@ export async function RegisterAccount(
     password: string,
     deviceName: string,
     deviceId: string,
-    ip: string
+    ip: string,
+    // [2026-10-14] The consent the launcher sends ({termsVersion, privacyVersion, ageConfirmed}); see ValidateRegistrationConsent.
+    consent?: unknown
 ): Promise<PendingRegistrationResult> {
     if (IsRateLimited(`register:${ip}`, 5, 60 * 60 * 1000)) {
         throw new LauncherApiError("AUTH_RATE_LIMITED", "Too many registration attempts. Try again later.");
@@ -195,6 +202,7 @@ export async function RegisterAccount(
 
     const CleanUsername = ValidateUsername(displayName);
     ValidateRegistrationInput(email, password);
+    const AcceptedConsent = ValidateRegistrationConsent(consent, new Date().toISOString());
 
     const NormalizedEmail = NormalizeEmail(email);
     const NormalizedDisplayName = NormalizeDisplayName(CleanUsername);
@@ -211,6 +219,8 @@ export async function RegisterAccount(
 
     const UserId = crypto.randomUUID();
     const PasswordHash = await HashPassword(password);
+    // [2026-10-14] MYSTICPARADOX_REGISTRATION_APPROVAL: off (the default) approves at once on every provider; required keeps pending.
+    const approvalStatus = ResolveRegistrationApproval(process.env).approvalStatus;
 
     const Account: LauncherAccountRecord = {
         userId: UserId,
@@ -219,10 +229,11 @@ export async function RegisterAccount(
         displayName: CleanUsername,
         passwordHash: PasswordHash,
         status: "active",
-        approvalStatus: "pending",
+        approvalStatus,
         roles: ["player"],
         createdAt: new Date().toISOString(),
-        usernameSet: true
+        usernameSet: true,
+        ...(AcceptedConsent === undefined ? {} : { consent: AcceptedConsent })
     };
 
     try {
@@ -243,7 +254,7 @@ export async function RegisterAccount(
 
     // Pending accounts deliberately receive no access/refresh token. Possession
     // of the open-source launcher cannot bypass server-side admission.
-    return { approvalRequired: true, account: await ToAccountView(Account) };
+    return { approvalRequired: approvalStatus === "pending", account: await ToAccountView(Account) };
 }
 
 export async function LoginWithPassword(email: string, password: string, deviceId: string, deviceName: string, ip: string): Promise<LauncherSessionResult> {
@@ -350,7 +361,10 @@ export async function RequestGameExchangeCode(
     executableSha256: string,
     runtimeChannel: RuntimeChannel,
     runtimeManifestVersion: unknown,
-    runtimeArtifacts: unknown
+    runtimeArtifacts: unknown,
+    // [2026-10-13 realms hub design section 2.1] The optional `realm` of the request body, untouched. Absent (or null) = official
+    // play, exactly as before; present = the realms module decides, and the code then carries the realm it was authorized for.
+    realm?: unknown
 ): Promise<{ exchangeCode: string; expiresInSeconds: number }> {
     if (IsRateLimited(`game-session:${userId}`, 10, 5 * 60 * 1000)) {
         throw new LauncherApiError("AUTH_RATE_LIMITED", "Too many launch attempts. Try again in a few minutes.");
@@ -361,6 +375,9 @@ export async function RequestGameExchangeCode(
         throw new LauncherApiError("AUTH_UNAUTHORIZED", "Sign in required.");
     }
     AssertAccountEligible(Account);
+    // [2026-10-14] A deletion request deactivates the account (ACCOUNT_DEACTIVATED); MYSTICPARADOX_CONSENT_ENFORCE gates the consent.
+    AssertAccountNotDeactivated(Account);
+    AssertConsentCurrentWhenEnforced(Account);
 
     // The server derives the channel from CURRENT roles and verifies the exact runtime DLL hash
     // against that channel's signed release manifest. The launcher cannot retain a cached beta
@@ -382,6 +399,9 @@ export async function RequestGameExchangeCode(
         throw new LauncherApiError("GAME_BUILD_UNSUPPORTED", "This Dauntless installation isn't recognized. Verify or repair your installation.");
     }
 
+    // Last gate before the code exists: entering a realm may use an invite and add the member, so nothing above may still refuse.
+    const RealmEntry = await AuthorizeGameSessionRealm(userId, realm);
+
     const Code = GenerateOpaqueToken();
     const Now = new Date();
     const ExpiresAt = new Date(Now.getTime() + EXCHANGE_CODE_TTL_MS);
@@ -396,10 +416,13 @@ export async function RequestGameExchangeCode(
         runtimeSha256: RuntimeAttestation.runtimeSha256,
         runtimeManifestVersion: RuntimeAttestation.version,
         runtimeArtifactSetSha256: RuntimeAttestation.artifactSetSha256,
+        ...(RealmEntry === undefined ? {} : { realmId: RealmEntry.realmId }),
         createdAt: Now.toISOString(),
         expiresAt: ExpiresAt.toISOString()
     });
 
+    // [2026-10-14] A game session starts here (the activity monitor's playtime; presence touches extend it).
+    TouchGameSession(userId);
     return { exchangeCode: Code, expiresInSeconds: EXCHANGE_CODE_TTL_MS / 1000 };
 }
 

@@ -12,6 +12,9 @@ This directory holds the **locally generated** game data the backend reads at ru
 | `platinum_store.json` | Platinum store |
 | `reward_cache_store.json` | Reward Cache store (seasonal coins) |
 | `inventory_storage_policy.json` | Per-item inventory storage (instanced or stacked) and quantity limits |
+| `fountain_daily_bundle.json` | **Optional.** The Ramsgate fountain coin toss ("Daily Free Bundle", store tag `fountain_daily_free_bundle`) |
+| `mastery_objectives.json` | **Optional.** Every mastery card / achievement objective id the game can report (`objectiveIds`, which also holds the card XP-bar ids), plus per-card track and completion targets. Exported from the game's `mastery_card_table` and `achievements_table` (CatalogExporter, or read from the paks) |
+| `escalation_tuning.json` | **Optional.** Heroic Escalation seasons `ESC_SEASON_1..6`: XP curve, max level, the six unlock rewards and every talent's costs and tier gate; checks escalation saves from realm hosts (without it hosts keep the never-lower merge). Read from the paks (`escalation_progression`, `escalation_talents*`) |
 
 **These files are not distributed:** they are Phoenix Labs game data. Generate them from your own lawful
 game installation; see `docs/GENERATING_GAME_DATA.md` at the repository root. Only the synthetic
@@ -46,3 +49,26 @@ npm run platinum:generate                               # from the catalog and s
 The `generate:*` scripts preview without `--apply`; the others write directly. `npm run
 inventory:storage-policy:generate` rebuilds the storage policy alone (from the catalog, for every item
 the code and the game data reference). Set `MYSTICPARADOX_CATALOG_PATH` to read another catalog.
+
+## Fountain daily bundle (optional, hand-written)
+
+`fountain_daily_bundle.json` is not generated: no live capture of the fountain's offer exists, so its
+contents are the **operator's choice**. Without the file (or if it is rejected) the fountain coin toss
+simply stays unavailable; nothing else changes and `npm test` does not require it.
+
+- Exactly one offer in `{ "skus": [ ... ] }` (a `comment` field is allowed), tagged
+  `fountain_daily_free_bundle`, priced `[{ "currencyId": "id_currency_platinum", "price": 0 }]` - the client
+  opens the coin toss only for a 0-Platinum offer.
+- Stacked items only (`"instanced": false`, and `stacked` in `inventory_storage_policy.json` - rerun
+  `npm run inventory:storage-policy:generate` after choosing a new item). No entitlements, progression or
+  prestige-gated currency (`CURRENCY_SEASONAL_COIN` and the other season coins). Any problem rejects the
+  whole offer, with the reason in the startup log (`[Store:fountain_daily_free_bundle]`).
+- One claim per player per window; the window resets at 17:00 UTC. A repeat claim in the same window only
+  replays the first one, and the offer is left out of the player's listing until the reset.
+- Our own server uses Rams (`CURRENCY_NOTES`) x500; `fountain_daily_bundle.example.json` shows the shape.
+
+## Tester max kit (`tester_max_kit.json`, optional, hand-written)
+
+`POST /admin/v1/players/:userId/tester-max` (controllers/testerMax.ts) reads this file. Copy `tester_max_kit.example.json`
+and extend it with ids confirmed in `inventory_storage_policy.json` and `Items_Analysis/catalog_1_14_7.jsonl`. Without the file
+the route answers 503; an invalid kit answers 422 with every problem listed. The kit never names a catalog id the policy does not know.

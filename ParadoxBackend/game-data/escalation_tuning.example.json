@@ -1,0 +1,26 @@
+{
+  "_doc": [
+    "Synthetic placeholder: same schema as escalation_tuning.json (see the _doc in that file, or src/escalationProgress.ts), tiny and not the",
+    "game's real values. Copying it over escalation_tuning.json makes the backend limit host writes to this one fake season - fine for a",
+    "smoke test, wrong for real play. Generate the real file from your own installation instead; without it host writes keep the never-lower merge."
+  ],
+  "schemaVersion": 1,
+  "source": "synthetic example",
+  "seasons": {
+    "ESC_SEASON_1": {
+      "context": "Example",
+      "talentTable": "example_talents",
+      "maxLevel": 3,
+      "xpToReachLevel": [100, 200, 300],
+      "unlocks": {
+        "EXAMPLE_REWARD_A": { "level": 1, "type": "StatBoost" },
+        "EXAMPLE_REWARD_B": { "level": 3, "type": "ItemGrant" }
+      },
+      "talents": {
+        "EXAMPLE_TALENT_TIER1_A": { "pointsToUnlock": 0, "pointCosts": [1, 1] },
+        "EXAMPLE_TALENT_TIER1_B": { "pointsToUnlock": 0, "pointCosts": [1] },
+        "EXAMPLE_TALENT_TIER2_A": { "pointsToUnlock": 2, "pointCosts": [1] }
+      }
+    }
+  }
+}

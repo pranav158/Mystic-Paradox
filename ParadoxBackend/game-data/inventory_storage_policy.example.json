@@ -3,7 +3,7 @@
   "targetVersion": "example",
   "catalogSha256": "",
   "generatedAt": "1970-01-01T00:00:00.000Z",
-  "referencedCatalogIds": 2,
+  "referencedCatalogIds": 3,
   "entries": {
     "EXAMPLE_ITEM_00": {
       "storage": "instanced",
@@ -17,6 +17,13 @@
       "maxQuantity": 1,
       "tags": [
         "Dye"
+      ]
+    },
+    "EXAMPLE_CURRENCY_00": {
+      "storage": "stacked",
+      "maxQuantity": 0,
+      "tags": [
+        "Currency"
       ]
     }
   }

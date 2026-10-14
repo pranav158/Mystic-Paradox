@@ -1,0 +1,23 @@
+{
+  "comment": "Kit for POST /admin/v1/players/:userId/tester-max (src/controllers/testerMaxCore.ts). Copy to tester_max_kit.json and extend it. Only ids listed here are confirmed: each is in inventory_storage_policy.json and in Items_Analysis/catalog_1_14_7.jsonl. EXTEND WITH CONFIRMED IDS ONLY: a catalog id that is not in the policy is refused, and inventing one puts a dead row in the account. progression: targetProgress is the XP the track is set to (never lowered); \"max\" is the top regular rank (TrackCapXp); the track must be an approved XP track in progression_config.json. slayersPath: unlockAll saves every known node as unlocked; grantNodeRewards grants each reward item not already owned. inventory: stacked adds by catalog id (the storage policy mints instances where needed). currencies: CURRENCY_* ids; prestige-gated currencies and the CURRENCY_PLATINUM aggregate are refused (grant a CURRENCY_PLATINUM_* bucket for Platinum). Every grant carries the economy source OPERATOR_TEST, which the activity and economy monitors do not count.",
+  "progression": [
+    { "progressionId": "ExperienceTrack_PlayerLevel", "targetProgress": "max" },
+    { "progressionId": "ExperienceTrack_Weapon_Axe", "targetProgress": "max" },
+    { "progressionId": "ExperienceTrack_Weapon_ChainBlades", "targetProgress": "max" },
+    { "progressionId": "ExperienceTrack_Weapon_Hammer", "targetProgress": "max" },
+    { "progressionId": "ExperienceTrack_Weapon_Repeaters", "targetProgress": "max" },
+    { "progressionId": "ExperienceTrack_Weapon_Spear", "targetProgress": "max" },
+    { "progressionId": "ExperienceTrack_Weapon_Strikers", "targetProgress": "max" },
+    { "progressionId": "ExperienceTrack_Weapon_Sword", "targetProgress": "max" }
+  ],
+  "slayersPath": {
+    "unlockAll": true,
+    "grantNodeRewards": true
+  },
+  "inventory": [
+    { "catalogId": "AC_HEAD_ARMSTRONG_00", "quantity": 1 }
+  ],
+  "currencies": [
+    { "catalogId": "CURRENCY_NOTES", "quantity": 1000000 }
+  ]
+}

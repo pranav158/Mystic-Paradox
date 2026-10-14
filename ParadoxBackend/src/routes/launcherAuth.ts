@@ -28,6 +28,8 @@ import {
 } from "../controllers/launcherAuth";
 import { StartDiscordAuth, HandleDiscordCallback, CompleteDiscordLogin } from "../controllers/discordAuth";
 import { GetLauncherPolicy } from "../controllers/launcherPolicy";
+import { AcceptConsent, CancelAccountDeletion, GetConsentState, GetDeletionState, RequestAccountDeletion } from "../controllers/launcherAccount";
+import { CurrentLegalRequirements } from "../legal/legalPolicy";
 import { ParseRuntimeChannel } from "../security/runtimeAuthorization";
 
 // Implements the /launcher/v1 contract from Plans/LAUNCHER_BACKEND_AUTH_REQUIREMENTS.md.
@@ -84,7 +86,8 @@ launcherAuthRouter.use((req, res, next) => {
         }
         res.header("Access-Control-Allow-Origin", Origin);
         res.header("Vary", "Origin");
-        res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        // DELETE is for DELETE /launcher/v1/account/deletion (restore a deactivated account); nothing else uses it.
+        res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
         res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
         logger.info(`[CORS] Allowed origin: ${Origin}`);
     }
@@ -131,7 +134,7 @@ async function Handle(req: Request, res: Response, fn: () => Promise<unknown>, s
 launcherAuthRouter.post("/launcher/v1/auth/register", (req, res) =>
     Handle(req, res, () => {
         const { deviceId, deviceName } = GetDeviceFields(req);
-        return RegisterAccount(req.body?.displayName, req.body?.email, req.body?.password, deviceName, deviceId, GetClientIp(req));
+        return RegisterAccount(req.body?.displayName, req.body?.email, req.body?.password, deviceName, deviceId, GetClientIp(req), req.body?.consent);
     }, 202)
 );
 
@@ -224,7 +227,8 @@ launcherAuthRouter.post("/launcher/v1/game-sessions", HasLauncherAuth, (req, res
             ExecutableSha256,
             RuntimeChannel,
             RuntimeManifestVersion,
-            RuntimeArtifacts
+            RuntimeArtifacts,
+            req.body?.realm
         );
     })
 );
@@ -238,4 +242,29 @@ launcherAuthRouter.get("/launcher/v1/status", (req, res) =>
         online: await GetPersistenceLifecycle().isHealthy(),
         supportedBuildChangelist: Number(process.env.TARGET_CHANGELIST ?? 0)
     }))
+);
+
+// [2026-10-14] The Terms of Use and Privacy Policy versions and the minimum age the launcher must show (no sign-in needed).
+launcherAuthRouter.get("/launcher/v1/legal", (req, res) => Handle(req, res, async () => CurrentLegalRequirements()));
+
+// [2026-10-14] Consent to the current documents. These routes and the deletion ones keep working while the account is deactivated.
+launcherAuthRouter.get("/launcher/v1/account/consent", HasLauncherAuth, (req, res) =>
+    Handle(req, res, () => GetConsentState((req as any).LauncherAuthData.userId))
+);
+
+launcherAuthRouter.post("/launcher/v1/account/consent", HasLauncherAuth, (req, res) =>
+    Handle(req, res, () => AcceptConsent((req as any).LauncherAuthData.userId, req.body))
+);
+
+// [2026-10-14] Account deletion: a request deactivates the account for DELETION_HOLD_DAYS (30); DELETE restores it while the hold lasts.
+launcherAuthRouter.get("/launcher/v1/account/deletion", HasLauncherAuth, (req, res) =>
+    Handle(req, res, () => GetDeletionState((req as any).LauncherAuthData.userId))
+);
+
+launcherAuthRouter.post("/launcher/v1/account/deletion", HasLauncherAuth, (req, res) =>
+    Handle(req, res, () => RequestAccountDeletion((req as any).LauncherAuthData.userId, req.body))
+);
+
+launcherAuthRouter.delete("/launcher/v1/account/deletion", HasLauncherAuth, (req, res) =>
+    Handle(req, res, () => CancelAccountDeletion((req as any).LauncherAuthData.userId))
 );

@@ -1,0 +1,30 @@
+{
+  "comment": "Synthetic placeholder for smoke tests only. The real file is an operator choice (no live capture exists): one offer, price 0 Platinum, stacked items only. See README.md.",
+  "skus": [
+    {
+      "id": "example_fountain_daily_bundle",
+      "displayName": "Example Daily Bundle",
+      "displayDescription": "Synthetic placeholder store entry for smoke tests only.",
+      "displayPriority": 0,
+      "prices": [
+        {
+          "currencyId": "id_currency_platinum",
+          "price": 0
+        }
+      ],
+      "maxAllowed": 1,
+      "images": {},
+      "tags": [
+        "fountain_daily_free_bundle"
+      ],
+      "items": [
+        {
+          "catalogId": "EXAMPLE_CURRENCY_00",
+          "quantity": 100,
+          "instanced": false
+        }
+      ],
+      "duplicateInstancedItems": []
+    }
+  ]
+}
