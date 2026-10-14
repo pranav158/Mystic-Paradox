@@ -20,9 +20,11 @@ import path from "node:path";
 import type { Express, NextFunction, Request, Response } from "express";
 import type { Db } from "mongodb";
 import type { InventoryTransactionOptions } from "../controllers/inventory";
+import type { AccountDeletionStep } from "../persistence/mongo/accountDeletionPlan";
 import type { MatchmakingResult } from "../controllers/matchmaking";
 import type { MetagameServiceRole } from "../config/serviceRole";
 import { logger } from "../logger";
+import type { ReleaseGate } from "../observability/releaseGates";
 
 export interface ExtensionHttpResponse {
     status: number;
@@ -44,6 +46,29 @@ export interface ExtensionInventoryTransaction {
     report?(phase: "applying" | "accepted" | "failed"): void;
 }
 
+/**
+ * What a hosting runtime writes for a player, besides inventory (hostWrites hooks).
+ * [2026-10-14 realms S4] REFORGE: the weapon reforge reset and its banked restore (DELETE /progression/:u/:track,
+ * POST /progression/purchase/...). Only a realm's Ramsgate hub may make it; a hunt, a Training hub and the dedicated-only
+ * build refuse it. The same kind also carries a weapon's prestige +1 (POST /progression/:u/PrestigeTrack_Weapon_X/1) in a
+ * Ramsgate hub, where XP is refused; a hunt takes that +1 as XP as before.
+ * [2026-10-14 realms S4] RANK_CONFIRM: a public rank confirm (POST /progression/:u/:track/:rank/confirm/public). Hunts: an
+ * admitted roster member; the realm's Ramsgate: a present member; a Training hub refuses it.
+ * [2026-10-15] LOADOUT_UNLOCK: a loadout slot unlock (POST /loadout/:u/:character/unlock/:n). The slot count is still derived from
+ * the player's persisted Slayer's Path, so a host can only reach what the player has unlocked. The same membership rule as
+ * RANK_CONFIRM: a hunt's admitted member; a realm's Ramsgate hub's present member; a Training hub refuses it.
+ */
+export type HostWriteKind =
+    | "XP" | "MASTERY" | "OBJECTIVES" | "ESCALATION" | "COOLDOWN" | "BOUNTY" | "SLAYERS_PATH" | "REFORGE" | "RANK_CONFIRM"
+    | "LOADOUT_UNLOCK";
+
+/** One accepted host write, as tagged for monitoring and reversal. `summary` holds what changed (no secrets). */
+export interface HostWriteRecordInput {
+    kind: HostWriteKind;
+    targetUserId: string;
+    summary: Record<string, unknown>;
+}
+
 export interface HuntRouteContext {
     gameMode: string;
     huntId: string;
@@ -51,6 +76,8 @@ export interface HuntRouteContext {
     partyId?: string;
     partyMembers?: string[];
     partyRevision?: number;
+    /** [2026-10-14] The client's build id from the join body; a solo party created for the request carries it, as POST /party does. */
+    buildId?: string;
     /** Ramsgate, the city and the Training Dojo: persistent shared servers. */
     isHub: boolean;
     /** Publishes the travel candidate of one account. */
@@ -61,6 +88,16 @@ export interface HuntRouteContext {
 
 /** `handled: false` continues with the dedicated DeployServer route. */
 export type HuntRouteOutcome = { handled: false } | { handled: true; result: boolean };
+
+/**
+ * [2026-10-14 cancel] What the client's Cancel (DELETE /candidate/leave) did to a search the module owns.
+ * canceled: the forming hunt was ended for its player (the party members in it get PARTY_MEMBER_CANCELED).
+ * already-canceled / already-ended: nothing is left to cancel (a second press). too-late: the hunt is running, or a member
+ * was already told to travel, so it is left alone. hub-not-cancelled: a realm hub entry is never cancelled.
+ */
+export type CandidateLeaveOutcome = "canceled" | "already-canceled" | "already-ended" | "too-late" | "hub-not-cancelled";
+/** `handled: false` leaves the search to the shared (dedicated) cancel. */
+export type CandidateLeaveResult = { handled: false } | { handled: true; outcome: CandidateLeaveOutcome; state: string };
 
 export interface OperationsOverviewExtension {
     /** Merged into the overview's `policy` object. */
@@ -83,6 +120,8 @@ export interface P2PExtension {
         startupSummary(role: MetagameServiceRole): Record<string, unknown> | undefined;
         /** Collections, indexes and data the module needs. Runs before the schema marker is written. */
         ensureDatabase(db: Db): Promise<void>;
+        /** [2026-10-14] The module's steps of the account deletion plan (persistence/mongo/accountDeletionPlan.ts). */
+        accountDeletionSteps(): AccountDeletionStep[];
         start(role: MetagameServiceRole): void;
         stop(): Promise<void>;
     };
@@ -97,9 +136,16 @@ export interface P2PExtension {
         requestLogTags(req: Request): string;
         /**
          * Authenticates a request that carries the module's own credential. Returns true when it
-         * handled the request (responded, or set req.AuthData and called next).
+         * handled the request (responded, or set req.AuthData and called next). A runtime it authenticates
+         * (AuthData.IsPlayerHostRuntime) carries the accounts it may act for in AuthData.RuntimeRosterAccountIds
+         * (security/runtimeRoster.ts).
          */
         authenticate(req: Request, res: Response, next: NextFunction): Promise<boolean>;
+        /**
+         * Request-budget bucket of a request carrying the module's own credential (security/rateLimit.ts), or
+         * undefined to keep the per-address bucket. Only a credential the module validated may get a bucket.
+         */
+        rateLimitBucket(req: Request): Promise<string | undefined>;
     };
     inventory: {
         /**
@@ -109,9 +155,25 @@ export interface P2PExtension {
         authorizeTransaction(req: Request, context: InventoryTransactionContext):
             Promise<ExtensionInventoryTransaction | ExtensionHttpResponse>;
     };
+    /**
+     * [2026-10-13 realms S3] Writes a module-authenticated runtime (AuthData.IsPlayerHostRuntime) makes for the players it
+     * hosts, beyond inventory: in a Paradox-account realm a host does what a dedicated server does, granted instantly and
+     * tagged for monitoring and reversal (SteamDocs/PARADOX_REALMS_PLAN_2026_10_13.md §4).
+     */
+    hostWrites: {
+        /** Undefined when the write may proceed; otherwise the response that refuses it. */
+        authorize(req: Request, kind: HostWriteKind, targetUserId: string): Promise<ExtensionHttpResponse | undefined>;
+        /** Tags an accepted write (who hosted, which session, what changed). Never throws. */
+        record(req: Request, write: HostWriteRecordInput): Promise<void>;
+    };
     matchmaking: {
         /** True when non-hub hunts must not start on DeployServer. */
         dedicatedHuntsDisabled(): boolean;
+        /**
+         * True when a request of this mode and hunt takes only the party members with a live session, as ISLAND
+         * requests always do (matchmakingParty.ts). False keeps the authoritative party.
+         */
+        filtersOfflinePartyMembers(gameMode: string, huntId: string | undefined): boolean;
         /** Candidate of an account the in-memory map does not know (for example after a restart). */
         restoreCandidate(playerId: string): Promise<MatchmakingResult | undefined>;
         /** Status of a candidate the module owns; undefined for a dedicated candidate. */
@@ -119,6 +181,10 @@ export interface P2PExtension {
         /** Shared candidate of a party whose hunt the module owns. */
         partyInstance(partyId: string): Promise<MatchmakingResult | undefined>;
         routeHunt(context: HuntRouteContext): Promise<HuntRouteOutcome>;
+        /** [2026-10-14 cancel] The client's Cancel of a search the module owns (a player-hosted or realm hunt, or a realm hub entry). */
+        cancelCandidate(playerId: string, current: MatchmakingResult): Promise<CandidateLeaveResult>;
+        /** [2026-10-14] A member left the party or was kicked (DELETE /party/member): a forming hunt of his stops waiting for him. */
+        partyMemberLeft(accountId: string): Promise<void>;
     };
     launcher: {
         /** Extra fields of GET /launcher/v1/policy. */
@@ -131,6 +197,11 @@ export interface P2PExtension {
         policyFieldsValid(record: unknown): boolean;
         overview(): Promise<OperationsOverviewExtension>;
     };
+    /**
+     * [2026-10-14] The module's gates for the manager preflight (GET /health/release-gates, observability/releaseGates.ts): the P2P env
+     * policy, the durable emergency stop and the Tier 1 grants. Optional; absent contributes none (the dedicated-only build).
+     */
+    releaseGates?(): Promise<ReleaseGate[]>;
 }
 
 const DEDICATED_ONLY: P2PExtension = {
@@ -140,6 +211,7 @@ const DEDICATED_ONLY: P2PExtension = {
         runtimeSafetyIssues: () => [],
         startupSummary: () => undefined,
         ensureDatabase: async () => undefined,
+        accountDeletionSteps: () => [],
         start: () => undefined,
         stop: async () => undefined
     },
@@ -149,18 +221,27 @@ const DEDICATED_ONLY: P2PExtension = {
         mountErrorHandlers: () => undefined,
         metricClass: () => undefined,
         requestLogTags: () => "",
-        authenticate: async () => false
+        authenticate: async () => false,
+        rateLimitBucket: async () => undefined
     },
     inventory: {
         authorizeTransaction: async () => ({ status: 403,
             body: { code: "forbidden", message: "This runtime cannot mutate inventory.", payload: null } })
     },
+    hostWrites: {
+        authorize: async () => ({ status: 403,
+            body: { code: "forbidden", message: "This runtime cannot write player state.", payload: null } }),
+        record: async () => undefined
+    },
     matchmaking: {
         dedicatedHuntsDisabled: () => false,
+        filtersOfflinePartyMembers: () => false,
         restoreCandidate: async () => undefined,
         candidateStatus: async () => undefined,
         partyInstance: async () => undefined,
-        routeHunt: async () => ({ handled: false })
+        routeHunt: async () => ({ handled: false }),
+        cancelCandidate: async () => ({ handled: false }),
+        partyMemberLeft: async () => undefined
     },
     launcher: {
         policyFields: () => ({}),
@@ -169,7 +250,8 @@ const DEDICATED_ONLY: P2PExtension = {
     operations: {
         policyFieldsValid: () => true,
         overview: async () => ({ policy: {}, sections: {} })
-    }
+    },
+    releaseGates: async () => []
 };
 
 let Extension: P2PExtension | undefined;
