@@ -139,6 +139,20 @@ The unsigned development build does not require release signing keys. Some Rust 
 temporary files; if your temp folder blocks freshly built test binaries, point `TMP`/`TEMP` at an
 ignored folder such as `src-tauri\target\test-tmp`.
 
+### GitHub Actions build caches
+
+CI caches the launcher's Rust dependencies for Clippy and tests. Only successful `main` push or
+manual runs save that cache; pull requests restore it without saving. A separate job on `main`
+builds the unsigned release profile in parallel to warm the optimized dependencies used by releases.
+It skips the build on an exact cache hit, creates no installer and receives no signing key.
+
+Tag releases restore the release dependency cache from `main`, then rebuild the launcher's own code
+from the tag with the locked dependencies and create fresh installer, hashes and provenance.
+GitHub does not share caches between different tags, so the cache warmer on `main` is necessary.
+The signing and publishing job does not restore build caches. The first run, an expired cache, or
+a Rust toolchain/dependency change may still require a cold build. Let the cache warmer finish
+before tagging to use the newest dependencies; CI can also be run manually on `main` to seed it.
+
 ## Security model
 
 - Passwords and refresh tokens remain in the native layer; the webview receives account metadata.
