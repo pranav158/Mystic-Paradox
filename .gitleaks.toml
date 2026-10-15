@@ -15,4 +15,7 @@ regexes = [
   '''tok-SECRET-123''',                          # the hunt-search cancel test's body
   '''dGhlIHNhbXBsZSBub25jZQ==''',                # the sample Sec-WebSocket-Key from RFC 6455
   '''GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ''',        # RFC 6238's TOTP test secret ("12345678901234567890" in base32)
+  '''MYSTICPARADOX_EMAIL_VERIFICATION''',        # an env key name (32 characters, the shape the discord-client-secret rule matches)
+  '''discord-route-test-secret-that-is-long-enough-7788''', # API_KEY_HASH_SECRET in the Discord route tests
+  '''sweep-test-secret-that-is-long-enough-3456789012''',   # API_KEY_HASH_SECRET in the unverified-registration sweep test
 ]
