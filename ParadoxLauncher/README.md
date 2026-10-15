@@ -139,6 +139,12 @@ The unsigned development build does not require release signing keys. Some Rust 
 temporary files; if your temp folder blocks freshly built test binaries, point `TMP`/`TEMP` at an
 ignored folder such as `src-tauri\target\test-tmp`.
 
+### GitHub Actions build caches
+
+CI caches the launcher's Rust dependencies for Clippy and tests. Only successful `main` push or
+manual runs save that cache; pull requests restore it without saving. Release builds use no build
+cache: every input of a signed installer comes from the tag and the lock files.
+
 ## Security model
 
 - Passwords and refresh tokens remain in the native layer; the webview receives account metadata.
