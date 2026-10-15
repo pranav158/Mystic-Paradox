@@ -246,6 +246,12 @@ pub fn guarded_host_process_id() -> Option<u32> {
     session::guarded_host_process_id()
 }
 
+/// [2026-10-15] Whether this PC is hosting anything right now: a realm (any state but stopped) or a player-hosted
+/// session. A launcher self-update restarts the launcher and ends them, so it waits (commands/updates.rs).
+pub fn hosting_active() -> bool {
+    realm::hosting_active() || !session::hosted_sessions().is_empty()
+}
+
 /// Testing override of the co-op switch: %LOCALAPPDATA%\MysticParadox\DISABLE_COOP_TRANSPORT.flag (same root as
 /// the session logs) keeps co-op off. Delete the file to let the switch decide again.
 fn coop_transport_disabled() -> bool {

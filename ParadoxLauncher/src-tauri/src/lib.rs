@@ -39,6 +39,8 @@ macro_rules! launcher_commands {
             commands::install::pick_install_path,
             // [2026-10-15] About -> "Check against GitHub" (contacts GitHub only when asked).
             commands::provenance::check_public_builds,
+            // [2026-10-15] The launcher's own update waits while a game runs or this PC hosts.
+            commands::updates::launcher_update_hold_reason,
             commands::launch::is_game_running,
             commands::launch::secure_launch,
             commands::updates::check_runtime_update,

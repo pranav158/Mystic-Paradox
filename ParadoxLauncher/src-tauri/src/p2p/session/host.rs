@@ -524,7 +524,7 @@ pub fn start_host_bundle(
                     Some(&live),
                 );
             }
-            drain_transport_diagnostics(&supervisor_log, link);
+            drain_host_diagnostics(&supervisor_log, link, &live);
             if receiver.try_recv().is_ok()
                 || !link.session_running()
                 || server.try_wait().ok().flatten().is_some()

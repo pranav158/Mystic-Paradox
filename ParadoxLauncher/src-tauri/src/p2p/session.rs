@@ -478,6 +478,18 @@ fn drain_transport_diagnostics(log: &SharedLog, link: Link) {
     }
 }
 
+/// [2026-10-15] A host session's diagnostics: logged, and this PC's own admission (`ADMISSION_ACCEPTED role=host ...
+/// source=local`) applied to the session's live state. The transport reports that admission as a diagnostic, not a peer
+/// event, so until now the realm panel never saw the host's own game and showed 0 players (15 Oct repro).
+fn drain_host_diagnostics(log: &SharedLog, link: Link, live: &hub::SharedLive) {
+    for line in link.drain_diagnostics() {
+        append_log(log, "transport", &line);
+        if hub::is_local_admission(&line) {
+            hub::apply_peer_line(live, &line, &crate::launch::logs::iso8601_now());
+        }
+    }
+}
+
 fn write_once(path: &Path, contents: &[u8]) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)

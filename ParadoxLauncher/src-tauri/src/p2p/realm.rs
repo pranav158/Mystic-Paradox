@@ -399,6 +399,11 @@ struct HostRecord {
     supervisor_stop: Option<mpsc::Sender<()>>,
 }
 
+/// [2026-10-15] Whether the realm is hosted from this PC in any state but stopped (mod.rs `hosting_active`).
+pub(crate) fn hosting_active() -> bool {
+    lock(host_state()).state != HostState::Stopped
+}
+
 fn host_state() -> &'static Mutex<HostRecord> {
     static HOST: OnceLock<Mutex<HostRecord>> = OnceLock::new();
     HOST.get_or_init(|| {

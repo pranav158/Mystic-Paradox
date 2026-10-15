@@ -1,7 +1,16 @@
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { invoke } from "@tauri-apps/api/core";
 
 export type LauncherUpdate = Update;
+
+/**
+ * [2026-10-15] Why the launcher's own update must wait right now (a game runs, or this PC hosts a realm or a session), or
+ * null. Installing restarts the launcher, which closes a game it started and ends what this PC hosts.
+ */
+export async function launcherUpdateHoldReason(): Promise<string | null> {
+  return (await invoke<string | null>("launcher_update_hold_reason")) ?? null;
+}
 
 export async function checkLauncherUpdate(): Promise<LauncherUpdate | null> {
   return check({ timeout: 15_000 });

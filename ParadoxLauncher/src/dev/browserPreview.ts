@@ -242,6 +242,9 @@ mockIPC((cmd, args) => {
     case "get_install_status":
       return delay(installFor(payload.serverId), 200);
     // [2026-10-15] About -> "Check against GitHub" (?builddiff shows a launcher that differs from its release).
+    // [2026-10-15] The update toast's hold (?running holds it, as a running game does).
+    case "launcher_update_hold_reason":
+      return delay(params.has("running") ? "Installs after you close the game: installing restarts the launcher, which closes the game." : null, 50);
     case "check_public_builds":
       return delay(previewBuildReport(params.has("builddiff")), 900);
     case "list_servers":

@@ -14,38 +14,72 @@ import { TitleBar } from "./components/TitleBar";
 import { AuthCard, AuthLayout } from "./components/AuthLayout";
 import { AetherMark } from "./components/AetherMark";
 import { SparkIcon } from "./components/icons";
-import { checkLauncherUpdate, installLauncherUpdate, type LauncherUpdate } from "./api/updates";
+import { checkLauncherUpdate, installLauncherUpdate, launcherUpdateHoldReason, type LauncherUpdate } from "./api/updates";
 import { sanitizeError } from "./lib/sanitize";
 
 const DEV = import.meta.env.DEV;
 
+/** [2026-10-15] How often the update toast asks whether the update must still wait (a game, or hosting). */
+const UPDATE_HOLD_POLL_MS = 5000;
+
 function UpdateToast({ update }: { update: LauncherUpdate }) {
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // [2026-10-15] Never mid-hunt: while a game runs or this PC hosts, the update waits and says why.
+  const [hold, setHold] = useState<string | null>(null);
   const notes = update.body?.trim().split("\n")[0]?.slice(0, 160);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      void launcherUpdateHoldReason()
+        .then((reason) => {
+          if (!cancelled) setHold(reason);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const timer = setInterval(poll, UPDATE_HOLD_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   return (
     <div className="glass glass-strong toast" role="status">
       <div className="toast-icon"><SparkIcon /></div>
       <div className="toast-copy">
         <p className="toast-title">Launcher {update.version} is ready</p>
-        <p className="toast-body">{error ?? notes ?? "Security and compatibility updates are ready to install."}</p>
+        <p className="toast-body">{error ?? hold ?? notes ?? "Security and compatibility updates are ready to install."}</p>
       </div>
       <Button
         size="sm"
         loading={installing}
         loadingLabel="Installing…"
+        disabled={hold !== null}
         onClick={() => {
           setInstalling(true);
           setError(null);
-          void installLauncherUpdate(update).catch((err) => {
-            setInstalling(false);
-            if (DEV) console.error("[updater] install failed:", err);
-            setError(sanitizeError(err instanceof Error ? err.message : String(err)));
-          });
+          // Asked once more right before installing: a game may have started since the last poll.
+          void launcherUpdateHoldReason()
+            .catch(() => null)
+            .then((reason) => {
+              if (reason) {
+                setHold(reason);
+                setInstalling(false);
+                return;
+              }
+              return installLauncherUpdate(update);
+            })
+            .catch((err) => {
+              setInstalling(false);
+              if (DEV) console.error("[updater] install failed:", err);
+              setError(sanitizeError(err instanceof Error ? err.message : String(err)));
+            });
         }}
       >
-        Update now
+        {hold ? "Waiting" : "Update now"}
       </Button>
     </div>
   );

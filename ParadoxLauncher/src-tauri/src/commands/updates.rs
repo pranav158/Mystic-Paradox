@@ -585,11 +585,49 @@ async fn install_extra_file(
     Ok(())
 }
 
+/// [2026-10-15] Why the launcher's own update must wait right now, or None (owner's rule: never restart mid-hunt; hold the
+/// update for the next launch). Installing closes the launcher - its Job Object then closes a game it started - and ends
+/// the realm or sessions this PC hosts. The update toast disables "Update now" while this answers.
+pub(crate) fn update_hold_reason(game_running: bool, hosting: bool) -> Option<&'static str> {
+    if game_running {
+        Some("Installs after you close the game: installing restarts the launcher, which closes the game.")
+    } else if hosting {
+        Some("Installs after you stop hosting: installing restarts the launcher, which ends your realm's servers.")
+    } else {
+        None
+    }
+}
+
+#[tauri::command]
+pub fn launcher_update_hold_reason() -> Option<String> {
+    // A failed process check does not hold the update: the next check runs in a few seconds.
+    let game_running = crate::launch::process::is_game_running().unwrap_or(false);
+    #[cfg(mystic_p2p)]
+    let hosting = crate::p2p::hosting_active();
+    #[cfg(not(mystic_p2p))]
+    let hosting = false;
+    update_hold_reason(game_running, hosting).map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn the_launcher_update_waits_while_a_game_runs_or_this_pc_hosts() {
+        assert!(
+            update_hold_reason(true, false).is_some_and(|reason| reason.contains("close the game"))
+        );
+        assert!(
+            update_hold_reason(false, true).is_some_and(|reason| reason.contains("stop hosting"))
+        );
+        assert!(
+            update_hold_reason(true, true).is_some_and(|reason| reason.contains("close the game"))
+        );
+        assert_eq!(update_hold_reason(false, false), None);
+    }
 
     fn digest(bytes: &[u8]) -> String {
         Sha256::digest(bytes)
