@@ -1,0 +1,179 @@
+# Launcher release, started by pushing a tag launcher-v<version> (the version in tauri.conf.json, package.json and Cargo.toml).
+#
+#   build    builds the NSIS installer from the tag and records its build provenance. It has no secrets.
+#   publish  waits for the owner's approval (environment "release"), signs the installer for the launcher's self-update and
+#            publishes the GitHub release: installer, .sig and SHA256SUMS. It installs no npm package: the signer is a
+#            dependency-free script, so no third-party build code ever runs next to the signing key.
+#
+# Players are not sent here directly. The official server offers a version only after its operator has checked this release
+# (SHA256SUMS, the updater signature, the provenance) and added it to the update feed.
+# Check a download yourself:
+#   sha256sum -c SHA256SUMS
+#   gh attestation verify MysticParadoxLauncher_<version>_x64-setup.exe --repo pranav158/Mystic-Paradox
+name: Release launcher
+
+on:
+  push:
+    tags: ["launcher-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-launcher
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the installer
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      installer: ${{ steps.collect.outputs.installer }}
+      sha256: ${{ steps.collect.outputs.sha256 }}
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: ParadoxLauncher
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Check the tag against the launcher version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ($env:TAG -match '^launcher-v(\d+\.\d+\.\d+)$') { $v = $Matches[1] } else { throw "tag '$env:TAG' is not launcher-v<major.minor.patch>" }
+          $conf = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $pkg = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $cargo = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($conf -ne $v -or $pkg -ne $v -or $cargo -ne $v) { throw "tag $v, tauri.conf.json $conf, package.json $pkg and Cargo.toml $cargo must agree" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      # No caches in a release build: every input comes from the tag and the lock files.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Rust (stable, through the runner's rustup)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - run: npm ci
+
+      - name: Build the installer (unsigned here; the publish job signs it)
+        run: |
+          [IO.File]::WriteAllText("$PWD\release.tauri.conf.json", '{"bundle":{"createUpdaterArtifacts":false}}')
+          npm run tauri build -- --bundles nsis --config "$PWD\release.tauri.conf.json"
+          if ($LASTEXITCODE -ne 0) { throw "tauri build failed (exit $LASTEXITCODE)" }
+
+      - name: Name the installer without spaces and hash it
+        id: collect
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $product = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).productName
+          $built = "src-tauri\target\release\bundle\nsis\${product}_$($env:VERSION)_x64-setup.exe"
+          $name = "MysticParadoxLauncher_$($env:VERSION)_x64-setup.exe"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item -LiteralPath $built "out\$name"
+          $sha = (Get-FileHash "out\$name").Hash.ToLower()
+          "installer=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          @("### Launcher $env:VERSION", '```', "$sha  $name", '```') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          "$sha  $name"
+
+      - name: Record the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ParadoxLauncher/out/${{ steps.collect.outputs.installer }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: launcher-installer
+          path: ParadoxLauncher/out/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Sign and publish (owner approval)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      # Only the signer, its tests and the updater public key; nothing is installed.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            ParadoxLauncher/scripts/sign-launcher-update.mjs
+            ParadoxLauncher/scripts/sign-launcher-update.test.mjs
+            ParadoxLauncher/src-tauri/tauri.conf.json
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: launcher-installer
+          path: release
+
+      - name: Check the installer is the one the build job hashed
+        env:
+          INSTALLER: ${{ needs.build.outputs.installer }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [ "$(ls -A release)" = "$INSTALLER" ] || { echo "release/ must hold exactly $INSTALLER"; ls -la release; exit 1; }
+          echo "$SHA256  release/$INSTALLER" | sha256sum -c -
+
+      - name: Test the signer
+        run: node --test ParadoxLauncher/scripts/sign-launcher-update.test.mjs
+
+      - name: Sign for the launcher's self-update
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          INSTALLER: ${{ needs.build.outputs.installer }}
+        run: node ParadoxLauncher/scripts/sign-launcher-update.mjs --file "release/$INSTALLER"
+
+      - name: SHA256SUMS
+        run: |
+          set -euo pipefail
+          (cd release && sha256sum -- * > ../SHA256SUMS)
+          mv SHA256SUMS release/
+          { echo '### Release files'; echo '```'; cat release/SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          INSTALLER: ${{ needs.build.outputs.installer }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Mystic Paradox launcher ${VERSION}, built from tag \`${TAG}\` by this repository's release workflow.
+
+          Players receive it through the launcher's own update check once the official server offers it.
+
+          Check a download:
+          - \`sha256sum -c SHA256SUMS\`
+          - \`gh attestation verify ${INSTALLER} --repo ${GITHUB_REPOSITORY}\` (build provenance)
+          - \`${INSTALLER}.sig\` is the updater signature (minisign key 30ADC58308BDAEAD; public key in \`ParadoxLauncher/src-tauri/tauri.conf.json\`).
+          EOF
+          gh release create "$TAG" release/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Launcher ${VERSION}" --notes-file notes.md --latest

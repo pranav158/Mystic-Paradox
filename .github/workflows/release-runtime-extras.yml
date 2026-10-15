@@ -1,0 +1,156 @@
+# Runtime extras release, started by pushing a tag runtime-extras-v<runtime feed version>: the winmm runtime loader
+# (tools/RuntimeLoader) and the co-op transport (ParadoxTransport), each built from the tag with its build provenance
+# recorded, published as a GitHub release with SHA256SUMS. No secrets: these files are signed later, when the official
+# server's operator publishes them with a runtime version (the runtime feed signs every file it serves, and the launcher
+# checks that signature before installing).
+# The main runtime DLL (MysticParadox.dll) is not built here: it needs files that are not in this repository.
+# Check a download yourself:
+#   sha256sum -c SHA256SUMS
+#   gh attestation verify winmm.dll --repo pranav158/Mystic-Paradox
+name: Release runtime extras
+
+on:
+  push:
+    tags: ["runtime-extras-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-runtime-extras
+  cancel-in-progress: false
+
+jobs:
+  check-tag:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^runtime-extras-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag '$TAG' is not runtime-extras-v<major.minor.patch>"; exit 1; }
+
+  loader:
+    name: winmm runtime loader
+    needs: check-tag
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: tools/RuntimeLoader
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml pins the toolchain; rustup installs it on the first cargo call.
+      - name: Build
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
+          rustc --version
+      - name: Collect and hash
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item target\release\winmm.dll out\
+          $sum = "{0}  winmm.dll" -f (Get-FileHash out\winmm.dll).Hash.ToLower()
+          @("### winmm runtime loader", '```', $sum, '```') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          $sum
+      - name: Record the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: tools/RuntimeLoader/out/winmm.dll
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-loader
+          path: tools/RuntimeLoader/out/
+          retention-days: 7
+          if-no-files-found: error
+
+  transport:
+    name: Co-op transport
+    needs: check-tag
+    runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: ParadoxTransport
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The projects use toolset v145 (Visual Studio 2026 on windows-latest); build.ps1 -PlatformToolset v143 is the fallback.
+      # libjuice comes from its v1.7.4 tag archive, checked against a recorded hash (prepare-dependencies.ps1).
+      - name: Build
+        run: |
+          pwsh -NoProfile -File build.ps1
+          if ($LASTEXITCODE -ne 0) { throw "build.ps1 failed (exit $LASTEXITCODE)" }
+      - name: Self-test (direct and through a local relay)
+        timeout-minutes: 10
+        run: |
+          .\build\Release\ParadoxTransportTest.exe all --relay-local
+          if ($LASTEXITCODE -ne 0) { throw "self-test failed (exit $LASTEXITCODE)" }
+      - name: Collect and hash
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item build\Release\ParadoxTransport.dll out\
+          $sum = "{0}  ParadoxTransport.dll" -f (Get-FileHash out\ParadoxTransport.dll).Hash.ToLower()
+          @("### Co-op transport", '```', $sum, '```') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          $sum
+      - name: Record the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ParadoxTransport/out/ParadoxTransport.dll
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: transport
+          path: ParadoxTransport/out/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [loader, transport]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: release
+          merge-multiple: true
+      - name: SHA256SUMS
+        run: |
+          set -euo pipefail
+          [ "$(ls -A release | sort | tr '\n' ' ')" = "ParadoxTransport.dll winmm.dll " ] || { echo "unexpected files"; ls -la release; exit 1; }
+          (cd release && sha256sum -- * > ../SHA256SUMS)
+          mv SHA256SUMS release/
+          { echo '### Release files'; echo '```'; cat release/SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#runtime-extras-v}"
+          cat > notes.md <<EOF
+          Runtime extras for runtime feed version ${VERSION}: the winmm runtime loader and the co-op transport, built from tag \`${TAG}\` by this repository's release workflow.
+
+          These files are not signed here. The official server signs them when it serves them with a runtime version, and the launcher checks that signature before installing.
+
+          Check a download:
+          - \`sha256sum -c SHA256SUMS\`
+          - \`gh attestation verify winmm.dll --repo ${GITHUB_REPOSITORY}\` (and the same for \`ParadoxTransport.dll\`)
+          EOF
+          gh release create "$TAG" release/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Runtime extras ${VERSION}" --notes-file notes.md --latest=false
