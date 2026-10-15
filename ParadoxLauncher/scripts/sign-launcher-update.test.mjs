@@ -1,3 +1,10 @@
+/*
+ * Copyright (C) 2026 MysticFox / Pranav Karande (pranav158/Mystic-Paradox)
+ * Licensed under the GNU Affero General Public License v3.0.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
+ */
 // Tests for sign-launcher-update.mjs with a throwaway key: run with `node --test scripts/sign-launcher-update.test.mjs`.
 // The release workflow runs them before it signs anything.
 import assert from "node:assert/strict";

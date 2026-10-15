@@ -7,6 +7,7 @@ import { ExternalIcon, LinkIcon, ShieldIcon } from "../../components/icons";
 import { useServices } from "../../services/ServicesContext";
 import { buildName } from "../../lib/sessions";
 import { useLegalViewer } from "../../components/LegalDocument";
+import { PublicBuildCheck } from "../../components/PublicBuildCheck";
 import { LEGAL } from "../../legal/legalMeta";
 
 // [2026-10-15] The attribution notice that ADDITIONAL_TERMS.md (section 1) asks for in the Appropriate Legal Notices. The launcher is
@@ -80,7 +81,12 @@ export function AboutTab() {
           </div>
         </section>
 
-        <section className="glass card reveal" style={at(3)} aria-label="Licence and disclaimer">
+        {/* [2026-10-15] This build compared with the public repository's release builds. */}
+        <section className="glass card reveal" style={at(3)} aria-label="Check this build">
+          <PublicBuildCheck />
+        </section>
+
+        <section className="glass card reveal" style={at(4)} aria-label="Licence and disclaimer">
           <div className="section">
             <p className="section-desc">
               Mystic Paradox is free software under the GNU Affero General Public License, version 3 (AGPL-3.0). It comes
@@ -103,7 +109,7 @@ export function AboutTab() {
         </section>
 
         {/* [2026-10-14] The Terms of Use and Privacy Policy, read in the launcher. */}
-        <section className="glass card reveal" style={at(4)} aria-label="Terms and privacy">
+        <section className="glass card reveal" style={at(5)} aria-label="Terms and privacy">
           <div className="section">
             <div className="link-list">
               <button type="button" className="link-row" onClick={() => legal.open("terms")}>

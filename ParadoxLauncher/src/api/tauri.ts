@@ -293,3 +293,33 @@ export async function requestAccountDeletion(confirmUsername: string, serverId?:
 export async function cancelAccountDeletion(serverId?: string): Promise<DeletionStatus> {
   return invoke<DeletionStatus>("native_cancel_deletion", { serverId });
 }
+
+// ---- [2026-10-15] About -> "Check against GitHub" ----
+
+export type PublicBuildStatus = "match" | "differs" | "notPublished" | "missing" | "operatorBuild" | "unavailable";
+
+/** One installed file compared with the public repository's release build (commands/provenance.rs). */
+export interface PublicBuildCheck {
+  name: string;
+  label: string;
+  /** The installed file's full path, for checking it by hand. */
+  path?: string | null;
+  installedSha256?: string | null;
+  publishedSha256?: string | null;
+  /** The release tag the published hash comes from. */
+  release?: string | null;
+  status: PublicBuildStatus;
+  note: string;
+}
+
+export interface PublicBuildReport {
+  /** The public repository (owner/name). */
+  repository: string;
+  launcherVersion: string;
+  files: PublicBuildCheck[];
+}
+
+/** Compares this launcher, the runtime loader and the co-op transport with the public release builds. Contacts GitHub. */
+export async function checkPublicBuilds(): Promise<PublicBuildReport> {
+  return invoke<PublicBuildReport>("check_public_builds");
+}

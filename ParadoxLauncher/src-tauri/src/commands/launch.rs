@@ -40,6 +40,17 @@ struct GameSessionRequest<'a> {
     // No invite code or host key is stored by the launcher yet, so a realm entry carries the name only.
     #[serde(skip_serializing_if = "Option::is_none")]
     realm: Option<RealmEntryRequest<'a>>,
+    // [2026-10-15] This launcher's own build (official server and Paradox realms only). The backend flags a hash that is not
+    // the build its Guard manifest pins (UNOFFICIAL_LAUNCHER, a monitor: Play is never refused for it). Self-reported, so a
+    // modified launcher can lie; it catches self-built and repackaged launchers that do not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launcher: Option<LauncherBuildReport<'a>>,
+}
+
+#[derive(Serialize)]
+struct LauncherBuildReport<'a> {
+    version: &'a str,
+    sha256: &'a str,
 }
 
 #[derive(Serialize)]
@@ -477,6 +488,14 @@ fn secure_launch_after_runtime(
         .realm_name
         .clone()
         .filter(|_| target.kind() == ServerKind::ParadoxRealm);
+    // [2026-10-15] The installed launcher.exe, hashed whole (the file Guard's LAUNCHER role pins); a local server gets nothing.
+    let launcher_sha256 = if target.kind() == ServerKind::Local {
+        None
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| verify::hash_file_sha256(&path).ok())
+    };
     let ticket_response = client
         .post(format!("{base}/launcher/v1/game-sessions"))
         .bearer_auth(&refreshed.access_token)
@@ -490,6 +509,12 @@ fn secure_launch_after_runtime(
                 name,
                 known_host_key: target.server.host_public_key.as_deref(),
             }),
+            launcher: launcher_sha256
+                .as_deref()
+                .map(|sha256| LauncherBuildReport {
+                    version: env!("CARGO_PKG_VERSION"),
+                    sha256,
+                }),
         })
         .send()
         .map_err(|_| "Couldn't request a game session.".to_string())?;
@@ -688,8 +713,31 @@ mod tests {
                 name,
                 known_host_key,
             }),
+            launcher: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn the_ticket_reports_this_launcher_build_when_it_could_hash_itself() {
+        let body = serde_json::to_value(GameSessionRequest {
+            build_changelist: 647472,
+            executable_sha256: "00",
+            runtime_channel: "stable",
+            runtime_manifest_version: "0.2.137",
+            runtime_artifacts: &[],
+            realm: None,
+            launcher: Some(LauncherBuildReport {
+                version: "0.1.65",
+                sha256: "ab",
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            body["launcher"],
+            serde_json::json!({ "version": "0.1.65", "sha256": "ab" })
+        );
+        assert_eq!(body.as_object().unwrap().len(), 6);
     }
 
     #[test]

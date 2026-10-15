@@ -37,6 +37,8 @@ macro_rules! launcher_commands {
             commands::account::native_cancel_deletion,
             commands::install::get_install_status,
             commands::install::pick_install_path,
+            // [2026-10-15] About -> "Check against GitHub" (contacts GitHub only when asked).
+            commands::provenance::check_public_builds,
             commands::launch::is_game_running,
             commands::launch::secure_launch,
             commands::updates::check_runtime_update,

@@ -49,7 +49,7 @@ try {
   $config = Get-Content -Raw -LiteralPath "src-tauri\tauri.conf.json" | ConvertFrom-Json
   $installer = Join-Path (Get-Location) "src-tauri\target\release\bundle\nsis\$($config.productName)_$($config.version)_x64-setup.exe"
   $installedLauncher = Join-Path (Get-Location) "src-tauri\target\release\installed\launcher.exe"
-  node "$PSScriptRoot\..\..\scripts\extract-nsis-launcher-payload.mjs" --installer $installer --output $installedLauncher --replace
+  node "$PSScriptRoot\extract-installed-launcher.mjs" --installer $installer --output $installedLauncher --replace
   if ($LASTEXITCODE -ne 0) { throw "Failed to extract the final NSIS launcher payload (exit code $LASTEXITCODE)" }
 } finally {
   Set-Location -LiteralPath $previousLocation

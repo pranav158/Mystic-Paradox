@@ -25,8 +25,26 @@ use crate::commands::auth::{api_base_url, http_client, safe_api_error};
 use crate::install::{paths, verify};
 use crate::launch::logs::{format_epoch_rfc3339, iso8601_now as iso_now};
 
-const KEY_ID: &str = "runtime-2026-01";
-const PUBLIC_KEY_B64: &str = "3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc=";
+/// [2026-10-15] Guard manifest signing keys by key id (launch plan P6.1, the key split). `runtime-2026-01` is the runtime
+/// update key, which signed every Guard manifest up to now; `guard-2026-10` is Guard's own key. Launchers from 0.1.65 accept
+/// both, so Guard signing moves to its own key once older launchers are gone; a later release then drops the first entry.
+const GUARD_KEYS: [(&str, &str); 2] = [
+    (
+        "runtime-2026-01",
+        "3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc=",
+    ),
+    (
+        "guard-2026-10",
+        "cqOh1F/NOXtZ4ZSyefheKk0Md//2L85OgMiQH8Jyi/U=",
+    ),
+];
+
+fn guard_public_key_b64(key_id: &str) -> Option<&'static str> {
+    GUARD_KEYS
+        .iter()
+        .find(|(id, _)| *id == key_id)
+        .map(|(_, key)| *key)
+}
 const TARGET_CHANGELIST: u32 = 647472;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_LIFETIME_DAYS: i64 = 365;
@@ -178,9 +196,10 @@ fn verify_envelope(
     envelope: GuardEnvelope,
     expected_channel: &str,
 ) -> Result<GuardPayload, String> {
-    if envelope.schema != 1 || envelope.key_id != KEY_ID {
-        return Err("Unknown Guard manifest signing key.".to_string());
-    }
+    let key_b64 = match guard_public_key_b64(&envelope.key_id) {
+        Some(key) if envelope.schema == 1 => key,
+        _ => return Err("Unknown Guard manifest signing key.".to_string()),
+    };
     let payload_bytes = BASE64
         .decode(&envelope.payload_base64)
         .map_err(|_| "Invalid Guard manifest encoding.".to_string())?;
@@ -188,7 +207,7 @@ fn verify_envelope(
         return Err("Guard manifest is outside its size limit.".to_string());
     }
     let public: [u8; 32] = BASE64
-        .decode(PUBLIC_KEY_B64)
+        .decode(key_b64)
         .map_err(|_| "Invalid Guard public key.".to_string())?
         .try_into()
         .map_err(|_| "Invalid Guard public key size.".to_string())?;
@@ -947,6 +966,41 @@ mod tests {
             "dev",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn guard_manifests_verify_under_the_runtime_key_and_guards_own_key() {
+        // [2026-10-15] The key split: both key ids are known, each to its own 32-byte key; anything else is unknown.
+        let runtime = guard_public_key_b64("runtime-2026-01").expect("runtime key id");
+        let guard = guard_public_key_b64("guard-2026-10").expect("guard key id");
+        assert_ne!(runtime, guard);
+        for key in [runtime, guard] {
+            let raw = BASE64.decode(key).expect("base64");
+            assert_eq!(raw.len(), 32);
+            assert!(VerifyingKey::from_bytes(&raw.try_into().unwrap()).is_ok());
+        }
+        assert!(guard_public_key_b64("guard-2026-11").is_none());
+        assert!(guard_public_key_b64("").is_none());
+    }
+
+    #[test]
+    fn a_manifest_signed_by_a_known_key_id_with_another_key_is_refused() {
+        // Signed by a random key but claiming Guard's key id: the signature check fails.
+        let signer = SigningKey::from_bytes(&[7u8; 32]);
+        let payload = br#"{"schema":1}"#;
+        let result = verify_envelope(
+            GuardEnvelope {
+                schema: 1,
+                key_id: "guard-2026-10".into(),
+                payload_base64: BASE64.encode(payload),
+                signature: BASE64.encode(signer.sign(payload).to_bytes()),
+            },
+            "stable",
+        );
+        assert_eq!(
+            result.err().as_deref(),
+            Some("Guard manifest signature verification failed.")
+        );
     }
 
     #[test]

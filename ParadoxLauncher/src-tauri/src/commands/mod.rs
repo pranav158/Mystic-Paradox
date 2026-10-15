@@ -3,6 +3,7 @@ pub mod auth;
 pub mod install;
 pub mod launch;
 pub mod logs;
+pub mod provenance;
 pub mod servers;
 #[cfg(test)]
 pub(crate) mod test_support;

@@ -137,6 +137,23 @@ const serverViews = () => servers.map((server) => ({
   warningRemembered: server.kind === "local" && rememberedServers.has(server.id),
 }));
 
+function previewBuildReport(launcherDiffers: boolean) {
+  const hash = (seed: string) => seed.repeat(64 / seed.length);
+  const dir = "C:\\Games\\Dauntless\\Archon\\Binaries\\Win64";
+  return {
+    repository: "pranav158/Mystic-Paradox",
+    launcherVersion: "0.1.65",
+    files: [
+      launcherDiffers
+        ? { name: "launcher.exe", label: "Launcher", path: "C:\\Users\\you\\AppData\\Local\\Mystic Paradox Launcher\\launcher.exe", installedSha256: hash("1f"), publishedSha256: hash("d3"), release: "launcher-v0.1.65", status: "differs", note: "Not the launcher.exe of the public release launcher-v0.1.65: this launcher was built elsewhere or changed." }
+        : { name: "launcher.exe", label: "Launcher", path: "C:\\Users\\you\\AppData\\Local\\Mystic Paradox Launcher\\launcher.exe", installedSha256: hash("d3"), publishedSha256: hash("d3"), release: "launcher-v0.1.65", status: "match", note: "Identical to the launcher.exe of the public release launcher-v0.1.65." },
+      { name: "winmm.dll", label: "Runtime loader", path: `${dir}\\winmm.dll`, installedSha256: hash("23"), publishedSha256: hash("23"), release: "runtime-extras-v0.2.137", status: "match", note: "Identical to winmm.dll of the public release runtime-extras-v0.2.137." },
+      { name: "ParadoxTransport.dll", label: "Co-op transport", path: `${dir}\\ParadoxTransport.dll`, installedSha256: hash("6e"), publishedSha256: hash("6e"), release: "runtime-extras-v0.2.137", status: "match", note: "Identical to ParadoxTransport.dll of the public release runtime-extras-v0.2.137." },
+      { name: "MysticParadox.dll", label: "Runtime", path: `${dir}\\MysticParadox.dll`, installedSha256: hash("c4"), publishedSha256: null, release: null, status: "operatorBuild", note: "Built by the official server's operator: it needs the game's SDK headers, which are not public. Its source is public, and the launcher checks the runtime's signature before installing it." },
+    ],
+  };
+}
+
 function installFor(serverId?: string) {
   const server = servers.find((candidate) => candidate.id === (serverId ?? selectedServerId)) ?? servers[0];
   const identity = { serverId: server.id, serverKind: server.kind, serverName: server.name, runtimeManaged: server.kind !== "local", playBlockedReason: warningBlock(server) };
@@ -224,6 +241,9 @@ mockIPC((cmd, args) => {
       return params.has("offline") ? Promise.reject("offline") : delay({ online: true, supportedBuildChangelist: 647472 }, 300);
     case "get_install_status":
       return delay(installFor(payload.serverId), 200);
+    // [2026-10-15] About -> "Check against GitHub" (?builddiff shows a launcher that differs from its release).
+    case "check_public_builds":
+      return delay(previewBuildReport(params.has("builddiff")), 900);
     case "list_servers":
       return delay(serverViews(), 150);
     case "add_server":

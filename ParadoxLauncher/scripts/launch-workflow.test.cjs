@@ -2345,6 +2345,7 @@ test('About links the Terms of Use and the Privacy Policy, read in the launcher'
     '../../services/ServicesContext': { useServices: () => services },
     '../../lib/sessions': sessionsLib,
     '../../components/LegalDocument': LegalDocument,
+    '../../components/PublicBuildCheck': { PublicBuildCheck: () => null },
     '../../legal/legalMeta': legalMeta,
   }).AboutTab;
   await mount(about);
@@ -2354,6 +2355,36 @@ test('About links the Terms of Use and the Privacy Policy, read in the launcher'
   assert.equal(titleOfDialog(), 'Terms of Use');
   await escapeKey();
   assert.equal(document.querySelector('[role="dialog"]'), null);
+});
+
+// [2026-10-15] About -> "Check against GitHub" (components/PublicBuildCheck.tsx).
+test('the build check asks GitHub only when the button is pressed, and shows each file\'s result', async () => {
+  let calls = 0;
+  const report = {
+    repository: 'pranav158/Mystic-Paradox',
+    launcherVersion: '0.1.65',
+    files: [
+      { name: 'launcher.exe', label: 'Launcher', path: 'C:\\L\\launcher.exe', installedSha256: '1f'.repeat(32), publishedSha256: 'd3'.repeat(32), release: 'launcher-v0.1.65', status: 'differs', note: 'Not the launcher.exe of the public release launcher-v0.1.65.' },
+      { name: 'winmm.dll', label: 'Runtime loader', path: null, installedSha256: '23'.repeat(32), publishedSha256: '23'.repeat(32), release: 'runtime-extras-v0.2.137', status: 'match', note: 'Identical.' },
+      { name: 'MysticParadox.dll', label: 'Runtime', installedSha256: 'c4'.repeat(32), status: 'operatorBuild', note: 'Built by the operator.' },
+    ],
+  };
+  const { PublicBuildCheck } = load('src/components/PublicBuildCheck.tsx', {
+    '../api/tauri': { checkPublicBuilds: async () => { calls += 1; return report; } },
+    './Button': { Button: plainButton },
+  });
+  await mount(PublicBuildCheck);
+  assert.equal(calls, 0, 'nothing is asked of GitHub before the button');
+  await act(async () => button('Check against GitHub').click());
+  await act(async () => {});
+  assert.equal(calls, 1);
+  const rows = [...document.querySelectorAll('.build-check-row')];
+  assert.deepEqual(rows.map((row) => row.dataset.status), ['differs', 'match', 'operatorBuild']);
+  assert.ok(rows[0].textContent.includes('Differs'));
+  assert.ok(rows[0].textContent.includes('Published'), 'a difference shows the published hash too');
+  assert.ok(!rows[1].textContent.includes('Published'), 'a match shows one hash');
+  assert.ok(document.body.textContent.includes('gh attestation verify "C:\\L\\launcher.exe" --repo pranav158/Mystic-Paradox'));
+  assert.ok(button('Check again'), 'the button offers a second check');
 });
 
 // ---- [2026-10-14] The launcher's dropdown, and a realm named by its realm name --------------------------------------

@@ -382,3 +382,50 @@ button.link-row {
   font-family: inherit;
   cursor: pointer;
 }
+
+/* [2026-10-15] About -> "Check against GitHub" (components/PublicBuildCheck.tsx). */
+.build-check-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.build-check-row {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+.build-check-row[data-status="differs"] {
+  border-color: color-mix(in srgb, var(--bad) 55%, var(--line));
+}
+.build-check-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.build-check-head .sub {
+  display: block;
+  color: var(--ink-3);
+  font-size: 12px;
+  font-weight: 500;
+}
+.build-check-row .section-desc {
+  margin: 6px 0 0;
+}
+.build-check-hashes {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 10px;
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.build-check-hashes dd {
+  margin: 0;
+}
+.build-check-row code,
+.subpage .section-desc code {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}

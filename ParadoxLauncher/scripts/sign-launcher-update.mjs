@@ -1,3 +1,10 @@
+/*
+ * Copyright (C) 2026 MysticFox / Pranav Karande (pranav158/Mystic-Paradox)
+ * Licensed under the GNU Affero General Public License v3.0.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
+ */
 // Signs a launcher installer for the Tauri updater without the Tauri CLI or any npm package, so the release workflow can
 // sign in a job that never installs dependencies (the signing key is never in the same job as third-party build code).
 // Output: the installer's .sig exactly as `tauri build` writes it - base64 of a minisign signature with a prehashed
