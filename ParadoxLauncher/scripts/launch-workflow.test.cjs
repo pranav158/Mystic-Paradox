@@ -2259,6 +2259,10 @@ function accountTab(rules, serverState = officialServerState) {
     '../../components/Banner': { Banner },
     '../../components/LegalDocument': LegalDocument,
     '../../legal/legalMeta': legalMeta,
+    // [2026-10-15] The Discord unlink panel's imports (the deletion tests never open it).
+    '../../components/TextField': { TextField: TextFieldPlain, RevealToggle: () => null },
+    '../../auth/authRules': authRules,
+    '../../auth/useResendCooldown': load('src/auth/useResendCooldown.ts', {}),
   }).AccountTab;
 }
 
@@ -3112,21 +3116,114 @@ function accountTabWith(auth, rules = accountRulesDefault()) {
     '../../components/DeleteAccountDialog': { DeleteAccountDialog },
     '../../components/LegalDocument': LegalDocument,
     '../../legal/legalMeta': legalMeta,
+    // [2026-10-15] The unlink panel: its code field, the resend wait and the Discord refusal copy.
+    '../../components/TextField': { TextField: TextFieldPlain, RevealToggle: () => null },
+    '../../auth/authRules': authRules,
+    '../../auth/useResendCooldown': load('src/auth/useResendCooldown.ts', {}),
   }).AccountTab;
 }
 
+test('Discord unlink copy: the codes the Account page reads have their own sentences, the rest keep the native one', () => {
+  const { discordUnlinkErrorText } = authRules;
+  assert.equal(discordUnlinkErrorText('AUTH_CODE_INVALID'), 'That code is wrong or has expired. Check the latest email or resend the code.');
+  assert.equal(discordUnlinkErrorText('AUTH_EMAIL_UNAVAILABLE'), "Email isn't available on this server right now, so Discord can't be unlinked.");
+  assert.equal(discordUnlinkErrorText('AUTH_RATE_LIMITED'), 'Too many tries. Wait a minute and try again.');
+  assert.equal(discordUnlinkErrorText('AUTH_DISCORD_ONLY_LOGIN'), null);
+  assert.equal(discordUnlinkErrorText(null), null);
+});
+
+test('Settings: Unlink mails a code and opens the panel in the row; a wrong code keeps it open; the right one unlinks and says so', async () => {
+  const calls = [];
+  await mount(accountTabWith({
+    account: { ...account, discord: { linked: true, username: 'MysticFox' } },
+    startDiscordUnlink: async () => { calls.push('start'); return { email: 's***@example.com' }; },
+    confirmDiscordUnlink: async (code) => {
+      calls.push(`confirm ${code}`);
+      if (code !== '123456') throw 'AUTH_CODE_INVALID: That code is wrong or has expired. Check the latest email or resend the code.';
+    },
+  }));
+  await act(async () => button('Unlink').click());
+  assert.deepEqual(calls, ['start']);
+  assert.equal(button('Unlink'), undefined, 'the panel stands in for the Unlink button');
+  assert.ok(document.body.textContent.includes('Enter the 6-digit code we sent to s***@example.com to unlink Discord.'));
+  assert.equal(document.activeElement, field('6-digit code'), 'the code field takes focus when the panel opens');
+  assert.equal(button('Resend code in 60 s').disabled, true, 'the code was just sent, so the resend wait starts now');
+
+  await act(async () => typeInto(field('6-digit code'), '000000'));
+  await act(async () => button('Confirm unlink').click());
+  assert.deepEqual(calls, ['start', 'confirm 000000']);
+  assert.ok(document.body.textContent.includes('That code is wrong or has expired. Check the latest email or resend the code.'));
+  assert.ok(button('Confirm unlink'), 'a wrong code keeps the panel open');
+
+  await act(async () => typeInto(field('6-digit code'), '123456'));
+  await act(async () => button('Confirm unlink').click());
+  assert.deepEqual(calls, ['start', 'confirm 000000', 'confirm 123456']);
+  assert.equal(button('Confirm unlink'), undefined, 'the panel closes after the unlink');
+  assert.ok(document.body.textContent.includes('Discord unlinked.'));
+  await unmountNow();
+});
+
+test('Settings: a refused unlink shows its own sentence; the rate limit and an outage read as the Account page says', async () => {
+  await mount(accountTabWith({
+    account: { ...account, discord: { linked: true, username: 'MysticFox' } },
+    startDiscordUnlink: async () => { throw "AUTH_EMAIL_UNAVAILABLE: Email isn't available on this server right now."; },
+  }));
+  await act(async () => button('Unlink').click());
+  assert.ok(document.body.textContent.includes("Email isn't available on this server right now, so Discord can't be unlinked."));
+  assert.ok(button('Unlink'), 'no panel opens after a refused start');
+  await unmountNow();
+
+  await mount(accountTabWith({
+    account: { ...account, discord: { linked: true, username: 'MysticFox' } },
+    startDiscordUnlink: async () => { throw "Discord is this account's only sign-in, so it can't be unlinked."; },
+  }));
+  await act(async () => button('Unlink').click());
+  assert.ok(document.body.textContent.includes("Discord is this account's only sign-in, so it can't be unlinked."));
+  await unmountNow();
+
+  await mount(accountTabWith({
+    account: { ...account, discord: { linked: true, username: 'MysticFox' } },
+    startDiscordUnlink: async () => ({ email: 's***@example.com' }),
+    confirmDiscordUnlink: async () => { throw 'AUTH_RATE_LIMITED: Too many tries. Wait a minute and try again.'; },
+  }));
+  await act(async () => button('Unlink').click());
+  await act(async () => typeInto(field('6-digit code'), '123456'));
+  await act(async () => button('Confirm unlink').click());
+  assert.ok(document.body.textContent.includes('Too many tries. Wait a minute and try again.'));
+  assert.ok(button('Confirm unlink'), 'the panel stays open for another try');
+  await unmountNow();
+});
+
+test('Settings: Cancel closes the code panel without unlinking, and the Unlink button comes back', async () => {
+  const calls = [];
+  await mount(accountTabWith({
+    account: { ...account, discord: { linked: true, username: 'MysticFox' } },
+    startDiscordUnlink: async () => { calls.push('start'); return { email: 's***@example.com' }; },
+    confirmDiscordUnlink: async () => { calls.push('confirm'); },
+  }));
+  await act(async () => button('Unlink').click());
+  await act(async () => button('Cancel').click());
+  assert.equal(button('Confirm unlink'), undefined);
+  assert.ok(button('Unlink'), 'Unlink is back');
+  assert.deepEqual(calls, ['start'], 'nothing was unlinked');
+  await unmountNow();
+});
+
 test('Settings: a linked Discord shows its name and Unlink, an unlinked one offers Link Discord, a missing status offers nothing', async () => {
   const calls = [];
-  await mount(accountTabWith({ account: { ...account, discord: { linked: true, username: 'MysticFox' } }, unlinkDiscord: async () => { calls.push('unlink'); } }));
+  await mount(accountTabWith({
+    account: { ...account, discord: { linked: true, username: 'MysticFox' } },
+    startDiscordUnlink: async () => { calls.push('start'); return { email: 's***@example.com' }; },
+  }));
   assert.ok(document.body.textContent.includes('Linked as MysticFox.'));
   await act(async () => button('Unlink').click());
-  assert.deepEqual(calls, ['unlink']);
+  assert.deepEqual(calls, ['start']);
   await unmountNow();
 
   await mount(accountTabWith({ account: { ...account, discord: { linked: false } }, linkDiscord: async () => { calls.push('link'); } }));
   assert.ok(document.body.textContent.includes('Not linked.'));
   await act(async () => button('Link Discord').click());
-  assert.deepEqual(calls, ['unlink', 'link']);
+  assert.deepEqual(calls, ['start', 'link']);
   assert.ok(document.body.textContent.includes('Finish linking in the browser window that opened.'));
   await unmountNow();
 

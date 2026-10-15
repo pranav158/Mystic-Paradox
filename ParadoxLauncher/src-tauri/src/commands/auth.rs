@@ -252,6 +252,10 @@ pub(crate) fn api_error_message(status: u16, code: Option<&str>, fallback: &str)
         Some("AUTH_DISCORD_ACCOUNT_HAS_LINK") => {
             "This account already has a Discord account linked.".to_string()
         }
+        // [2026-10-15] Unlinking an account with no Discord link (the unlink routes).
+        Some("AUTH_DISCORD_NOT_LINKED") => {
+            "Discord isn't linked to this account, so there is nothing to unlink.".to_string()
+        }
         Some("AUTH_USERNAME_REQUIRED") => {
             "Choose your launcher username before playing.".to_string()
         }
@@ -1305,11 +1309,80 @@ pub(crate) fn discord_link_start_with(
     checked_discord_url(&start.authorize_url)
 }
 
-/// `DELETE /launcher/v1/account/discord` with the signed-in session: the account without its Discord link.
-pub(crate) fn unlink_discord_with(
+/// [2026-10-15] The sentence for a rate-limited unlink. The Account panel reads its code, so it keeps the code.
+const UNLINK_RATE_LIMITED: &str = "Too many tries. Wait a minute and try again.";
+
+/// [2026-10-15] The answer of an unlink route. A rate limit keeps its code; every other refusal reads as the shared table
+/// reads it (`safe_api_error`), so the coded ones (`AUTH_CODE_INVALID`, `AUTH_EMAIL_UNAVAILABLE`) keep their code too.
+fn unlink_answer<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+    fallback: &str,
+) -> Result<T, String> {
+    if response.status().is_success() {
+        return response
+            .json::<T>()
+            .map_err(|_| "The account server returned an invalid response.".to_string());
+    }
+    let status = response.status().as_u16();
+    let body = response
+        .bytes()
+        .map(|bytes| bytes.to_vec())
+        .unwrap_or_default();
+    if let Some(message) = deactivated_message(&body) {
+        return Err(message);
+    }
+    match error_code_of(&body).as_deref() {
+        Some("AUTH_RATE_LIMITED") => Err(coded("AUTH_RATE_LIMITED", UNLINK_RATE_LIMITED)),
+        code => Err(api_error_message(status, code, fallback)),
+    }
+}
+
+/// [2026-10-15] The code a Discord unlink was mailed to, masked (`s***@example.com`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUnlinkCode {
+    pub email: String,
+}
+
+/// [2026-10-15] `POST /launcher/v1/account/discord/unlink/start` (signed in, body `{}`): mails the unlink code. The
+/// answer is `{ sent, email }`, the address masked; a resend calls this again.
+pub(crate) fn start_discord_unlink_with(
     host: &dyn SessionHost,
     scope: &AuthScope,
+) -> Result<NativeUnlinkCode, String> {
+    #[derive(Deserialize)]
+    struct Started {
+        email: String,
+    }
+
+    let response = send_authorized_with(host, scope, |token| {
+        http_client_for(scope)?
+            .post(format!(
+                "{}/launcher/v1/account/discord/unlink/start",
+                scope.base_url()
+            ))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .map_err(|_| "Couldn't reach the account server.".to_string())
+    })?;
+    let started: Started = unlink_answer(response, "Couldn't start unlinking Discord.")?;
+    Ok(NativeUnlinkCode {
+        email: started.email,
+    })
+}
+
+/// [2026-10-15] `POST /launcher/v1/account/discord/unlink` (signed in) `{ code }`: checks the emailed code and unlinks
+/// Discord. The account without its Discord link, as `{ account }`.
+pub(crate) fn confirm_discord_unlink_with(
+    host: &dyn SessionHost,
+    scope: &AuthScope,
+    code: &str,
 ) -> Result<NativeAccount, String> {
+    #[derive(Serialize)]
+    struct CodeRequest<'a> {
+        code: &'a str,
+    }
     #[derive(Deserialize)]
     struct Unlinked {
         account: NativeAccount,
@@ -1317,12 +1390,16 @@ pub(crate) fn unlink_discord_with(
 
     let response = send_authorized_with(host, scope, |token| {
         http_client_for(scope)?
-            .delete(format!("{}/launcher/v1/account/discord", scope.base_url()))
+            .post(format!(
+                "{}/launcher/v1/account/discord/unlink",
+                scope.base_url()
+            ))
             .bearer_auth(token)
+            .json(&CodeRequest { code })
             .send()
             .map_err(|_| "Couldn't reach the account server.".to_string())
     })?;
-    let unlinked: Unlinked = parse_success(response, "Couldn't unlink Discord.")?;
+    let unlinked: Unlinked = unlink_answer(response, "Couldn't unlink Discord.")?;
     Ok(unlinked.account)
 }
 
@@ -1338,10 +1415,22 @@ pub async fn native_start_discord_link(app: AppHandle) -> Result<(), String> {
     .await
 }
 
-/// Removes this account's Discord link. Refused (`AUTH_DISCORD_ONLY_LOGIN`) when Discord is its only sign-in.
+/// [2026-10-15] Unlinking step one: emails the code and answers the masked address it went to. Refused
+/// (`AUTH_DISCORD_ONLY_LOGIN`) when Discord is the account's only sign-in.
 #[tauri::command]
-pub async fn native_unlink_discord(app: AppHandle) -> Result<NativeAccount, String> {
-    run_auth_task(move || unlink_discord_with(&AppHost(&app), &AuthScope::Official)).await
+pub async fn native_start_discord_unlink(app: AppHandle) -> Result<NativeUnlinkCode, String> {
+    run_auth_task(move || start_discord_unlink_with(&AppHost(&app), &AuthScope::Official)).await
+}
+
+/// [2026-10-15] Unlinking step two: checks the emailed code and unlinks Discord. A wrong or expired code is
+/// `AUTH_CODE_INVALID`.
+#[tauri::command]
+pub async fn native_confirm_discord_unlink(
+    app: AppHandle,
+    code: String,
+) -> Result<NativeAccount, String> {
+    run_auth_task(move || confirm_discord_unlink_with(&AppHost(&app), &AuthScope::Official, &code))
+        .await
 }
 
 #[tauri::command]
@@ -2315,26 +2404,65 @@ mod tests {
         assert!(checked_discord_url("not a url").is_err());
     }
 
+    // ---- [2026-10-15] unlinking takes an emailed code: start mails it, confirm checks it and unlinks ----------------
+
+    fn unlinking_session(name: &str) -> NativeSession {
+        NativeSession {
+            access_token: access_token(name),
+            refresh_token: "r".into(),
+            account: serde_json::from_str::<NativeSession>(&session_json(name, "r"))
+                .unwrap()
+                .account,
+        }
+    }
+
     #[test]
-    fn unlinking_returns_the_account_and_a_sole_sign_in_is_refused_as_a_sentence() {
+    fn starting_an_unlink_mails_a_code_and_answers_the_masked_address() {
+        let (base, requests) = mock_backend(vec![(
+            200,
+            r#"{"sent":true,"email":"s***@example.com"}"#.to_string(),
+        )]);
+        let scope = local("s-unlink-start", &base);
+        let host = TestHost::default();
+        cache_access(
+            &scope,
+            session_epoch::current(scope.key()),
+            &unlinking_session("unlink-start"),
+        );
+
+        let started = start_discord_unlink_with(&host, &scope).unwrap();
+        assert_eq!(
+            started,
+            NativeUnlinkCode {
+                email: "s***@example.com".to_string()
+            }
+        );
+        let request = requests.recv().unwrap();
+        assert_eq!(request.method, "post");
+        assert_eq!(request.path, "/launcher/v1/account/discord/unlink/start");
+        assert!(request
+            .text
+            .contains(&access_token("unlink-start").to_lowercase()));
+        assert!(request.text.ends_with("{}"), "the body is empty");
+    }
+
+    #[test]
+    fn confirming_the_code_unlinks_and_returns_the_account() {
         let mut account = email_account("approved");
         account["discord"] = serde_json::json!({ "linked": false });
         let (base, requests) = mock_backend(vec![(
             200,
             serde_json::json!({ "account": account }).to_string(),
         )]);
-        let scope = local("s-discord-unlink", &base);
+        let scope = local("s-unlink-confirm", &base);
         let host = TestHost::default();
-        let session = NativeSession {
-            access_token: access_token("unlinking"),
-            refresh_token: "r".into(),
-            account: serde_json::from_str::<NativeSession>(&session_json("unlinking", "r"))
-                .unwrap()
-                .account,
-        };
-        cache_access(&scope, session_epoch::current(scope.key()), &session);
+        cache_access(
+            &scope,
+            session_epoch::current(scope.key()),
+            &unlinking_session("unlink-confirm"),
+        );
 
-        let unlinked = unlink_discord_with(&host, &scope).unwrap();
+        let unlinked = confirm_discord_unlink_with(&host, &scope, "123456").unwrap();
         assert_eq!(
             unlinked.discord,
             Some(NativeDiscordLink {
@@ -2343,17 +2471,66 @@ mod tests {
             })
         );
         let request = requests.recv().unwrap();
-        assert_eq!(request.method, "delete");
-        assert_eq!(request.path, "/launcher/v1/account/discord");
+        assert_eq!(request.method, "post");
+        assert_eq!(request.path, "/launcher/v1/account/discord/unlink");
+        assert!(
+            request.text.contains(r#""code":"123456""#),
+            "{}",
+            request.text
+        );
+    }
 
-        let (base, requests) = mock_backend(vec![(409, error_json("AUTH_DISCORD_ONLY_LOGIN"))]);
-        let scope = local("s-discord-only", &base);
-        cache_access(&scope, session_epoch::current(scope.key()), &session);
-        let error = unlink_discord_with(&host, &scope).err().unwrap();
+    #[test]
+    fn the_unlink_refusals_reach_the_caller_with_their_codes_or_sentences() {
+        let (base, requests) = mock_backend(vec![
+            (400, error_json("AUTH_CODE_INVALID")),
+            (503, error_json("AUTH_EMAIL_UNAVAILABLE")),
+            (429, error_json("AUTH_RATE_LIMITED")),
+            (409, error_json("AUTH_DISCORD_ONLY_LOGIN")),
+            (409, error_json("AUTH_DISCORD_NOT_LINKED")),
+        ]);
+        let scope = local("s-unlink-refused", &base);
+        let host = TestHost::default();
+        cache_access(
+            &scope,
+            session_epoch::current(scope.key()),
+            &unlinking_session("unlink-refused"),
+        );
+
+        let wrong = confirm_discord_unlink_with(&host, &scope, "000000")
+            .err()
+            .unwrap();
+        requests.recv().unwrap();
+        assert!(wrong.starts_with("AUTH_CODE_INVALID: "), "{wrong}");
+
+        let unavailable = start_discord_unlink_with(&host, &scope).err().unwrap();
+        requests.recv().unwrap();
+        assert!(
+            unavailable.starts_with("AUTH_EMAIL_UNAVAILABLE: "),
+            "{unavailable}"
+        );
+
+        let limited = start_discord_unlink_with(&host, &scope).err().unwrap();
         requests.recv().unwrap();
         assert_eq!(
-            error,
+            limited,
+            "AUTH_RATE_LIMITED: Too many tries. Wait a minute and try again."
+        );
+
+        let sole = start_discord_unlink_with(&host, &scope).err().unwrap();
+        requests.recv().unwrap();
+        assert_eq!(
+            sole,
             "Discord is this account's only sign-in, so it can't be unlinked."
+        );
+
+        let not_linked = confirm_discord_unlink_with(&host, &scope, "123456")
+            .err()
+            .unwrap();
+        requests.recv().unwrap();
+        assert_eq!(
+            not_linked,
+            "Discord isn't linked to this account, so there is nothing to unlink."
         );
     }
 

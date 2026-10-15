@@ -42,6 +42,17 @@ export function discordLinkErrorText(code: string): string {
   return "Discord linking didn't complete. Please try again.";
 }
 
+/**
+ * [2026-10-15] The sentence an unlink refusal shows on the Account page, for the codes that page reads. Null: the refusal
+ * reads as the native sentence (`describeAuthError`), as the other Discord refusals do.
+ */
+export function discordUnlinkErrorText(code: string | null): string | null {
+  if (code === "AUTH_CODE_INVALID") return "That code is wrong or has expired. Check the latest email or resend the code.";
+  if (code === "AUTH_EMAIL_UNAVAILABLE") return "Email isn't available on this server right now, so Discord can't be unlinked.";
+  if (code === "AUTH_RATE_LIMITED") return "Too many tries. Wait a minute and try again.";
+  return null;
+}
+
 /** The password rule registration and a password reset share. Null when the pair is acceptable. */
 export function passwordProblem(password: string, confirmation: string): string | null {
   if (password.length < 8) return "Password must be at least 8 characters.";

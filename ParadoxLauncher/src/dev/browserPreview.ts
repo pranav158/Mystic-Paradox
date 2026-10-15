@@ -226,8 +226,14 @@ mockIPC((cmd, args) => {
       return delay(params.has("officialdown") ? { available: false } : { available: true }, 200);
     case "native_start_discord_link":
       return delay(null, 300);
-    case "native_unlink_discord":
-      return delay({ ...account, discord: { linked: false } }, 300);
+    // [2026-10-15] Unlinking: the start mails a code (answered with the masked address; ?emailoff refuses it), and the
+    // confirmation takes 123456 only, as the sign-in code does.
+    case "native_start_discord_unlink":
+      if (params.has("emailoff")) return Promise.reject("AUTH_EMAIL_UNAVAILABLE: Email isn't available on this server right now.");
+      return delay({ email: "s***@example.com" }, 300);
+    case "native_confirm_discord_unlink":
+      if (payload.code !== "123456") return Promise.reject("AUTH_CODE_INVALID: That code is wrong or has expired. Check the latest email or resend the code.");
+      return delay({ ...account, discord: { linked: false } }, 400);
     case "native_logout":
     case "native_forget_session":
       signedInServers.delete(payload.serverId ?? selectedServerId);

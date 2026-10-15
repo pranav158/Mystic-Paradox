@@ -1,6 +1,8 @@
-import { useState, type CSSProperties } from "react";
+import { useState, type CSSProperties, type FormEvent } from "react";
 import { describeAuthError, useAuth } from "../../auth/AuthContext";
 import { useAccountRules } from "../../auth/AccountRules";
+import { authErrorCode, codeDigits, discordUnlinkErrorText, isCodeComplete } from "../../auth/authRules";
+import { useResendCooldown } from "../../auth/useResendCooldown";
 import { useServer } from "../../servers/ServerContext";
 import { formatClock } from "../../lib/sessions";
 import { formatLongDay, deactivationMessage } from "../../lib/accountDeletion";
@@ -11,18 +13,27 @@ import { Button } from "../../components/Button";
 import { DeactivationBanner } from "../../components/DeactivationBanner";
 import { DeleteAccountDialog } from "../../components/DeleteAccountDialog";
 import { useLegalViewer } from "../../components/LegalDocument";
+import { TextField } from "../../components/TextField";
 
 function at(index: number): CSSProperties {
   return { "--i": index } as CSSProperties;
 }
 
+/** [2026-10-15] The sentence for a refused unlink step: the Account page's own copy for its codes, else the native one. */
+function unlinkRefusal(error: unknown): string {
+  return discordUnlinkErrorText(authErrorCode(error)) ?? describeAuthError(error);
+}
+
 export function AccountTab() {
   const { account, logout, accountCheckedAt, accountRefreshing, accountRefreshError, refreshAccount } = useAuth();
-  // [2026-10-15] The Discord row: link or unlink the account's Discord, and show how the last link ended.
-  const { discordLinkNotice, linkDiscord, unlinkDiscord, dismissDiscordLinkNotice } = useAuth();
+  // [2026-10-15] The Discord row: link Discord, or unlink it in two steps (the emailed code, then the confirmation).
+  const { discordLinkNotice, linkDiscord, startDiscordUnlink, confirmDiscordUnlink, dismissDiscordLinkNotice } = useAuth();
   const [discordBusy, setDiscordBusy] = useState<"link" | "unlink" | null>(null);
   const [discordError, setDiscordError] = useState<string | null>(null);
   const [linkOpened, setLinkOpened] = useState(false);
+  // [2026-10-15] The masked address the unlink code went to (null: the panel is closed), and the note after a success.
+  const [unlinkEmail, setUnlinkEmail] = useState<string | null>(null);
+  const [unlinkedNote, setUnlinkedNote] = useState(false);
   const rules = useAccountRules();
   const { officialNetwork, selected } = useServer();
   const legal = useLegalViewer();
@@ -151,25 +162,30 @@ export function AccountTab() {
                 {account.discord !== undefined && (
                   <div className="section-actions">
                     {account.discord.linked ? (
-                      <Button
-                        variant="secondary"
-                        loading={discordBusy === "unlink"}
-                        loadingLabel="Unlinking…"
-                        disabled={discordBusy !== null}
-                        onClick={async () => {
-                          setDiscordError(null);
-                          setDiscordBusy("unlink");
-                          try {
-                            await unlinkDiscord();
-                          } catch (err) {
-                            setDiscordError(describeAuthError(err));
-                          } finally {
-                            setDiscordBusy(null);
-                          }
-                        }}
-                      >
-                        Unlink
-                      </Button>
+                      // [2026-10-15] While the code panel is open its own buttons stand in for this one.
+                      unlinkEmail === null && (
+                        <Button
+                          variant="secondary"
+                          loading={discordBusy === "unlink"}
+                          loadingLabel="Sending code…"
+                          disabled={discordBusy !== null}
+                          onClick={async () => {
+                            setDiscordError(null);
+                            setUnlinkedNote(false);
+                            setDiscordBusy("unlink");
+                            try {
+                              const started = await startDiscordUnlink();
+                              setUnlinkEmail(started.email);
+                            } catch (err) {
+                              setDiscordError(unlinkRefusal(err));
+                            } finally {
+                              setDiscordBusy(null);
+                            }
+                          }}
+                        >
+                          Unlink
+                        </Button>
+                      )
                     ) : (
                       <Button
                         variant="secondary"
@@ -178,6 +194,7 @@ export function AccountTab() {
                         disabled={discordBusy !== null}
                         onClick={async () => {
                           setDiscordError(null);
+                          setUnlinkedNote(false);
                           setDiscordBusy("link");
                           try {
                             await linkDiscord();
@@ -203,6 +220,18 @@ export function AccountTab() {
                 <Banner tone={discordLinkNotice.tone === "ok" ? "success" : "danger"} onDismiss={() => { setLinkOpened(false); dismissDiscordLinkNotice(); }}>
                   {discordLinkNotice.text}
                 </Banner>
+              )}
+              {unlinkEmail !== null && (
+                <DiscordUnlinkPanel
+                  email={unlinkEmail}
+                  onConfirm={(code) => confirmDiscordUnlink(code)}
+                  onResend={async () => setUnlinkEmail((await startDiscordUnlink()).email)}
+                  onDone={() => { setUnlinkEmail(null); setUnlinkedNote(true); }}
+                  onCancel={() => setUnlinkEmail(null)}
+                />
+              )}
+              {unlinkedNote && (
+                <Banner tone="success" onDismiss={() => setUnlinkedNote(false)}>Discord unlinked.</Banner>
               )}
             </div>
           )}
@@ -301,6 +330,94 @@ export function AccountTab() {
       )}
       {legal.dialog}
     </div>
+  );
+}
+
+/**
+ * [2026-10-15] The emailed code for unlinking Discord, inline in the Discord row (no screen of its own). The same six-digit
+ * field and resend wait as the code screen. The code was just sent, so the resend wait starts when the panel opens.
+ */
+function DiscordUnlinkPanel({ email, onConfirm, onResend, onDone, onCancel }: {
+  email: string;
+  onConfirm: (code: string) => Promise<void>;
+  onResend: () => Promise<void>;
+  onDone: () => void;
+  onCancel: () => void;
+}) {
+  const cooldown = useResendCooldown(true);
+  const [code, setCode] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [resending, setResending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const cooling = cooldown.remaining > 0;
+
+  async function confirm(event: FormEvent) {
+    event.preventDefault();
+    if (!isCodeComplete(code)) {
+      setError("Enter the 6-digit code we sent.");
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    setConfirming(true);
+    try {
+      await onConfirm(code);
+      onDone();
+    } catch (err) {
+      setError(unlinkRefusal(err));
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  async function resend() {
+    setError(null);
+    setNotice(null);
+    setResending(true);
+    try {
+      await onResend();
+      cooldown.start();
+      setNotice(`A new code was sent to ${email}.`);
+    } catch (err) {
+      setError(unlinkRefusal(err));
+    } finally {
+      setResending(false);
+    }
+  }
+
+  return (
+    <form className="discord-unlink" onSubmit={confirm} noValidate>
+      <p className="section-desc">Enter the 6-digit code we sent to {email} to unlink Discord.</p>
+      {error && <Banner>{error}</Banner>}
+      {notice && <Banner tone="success">{notice}</Banner>}
+      <TextField
+        label="6-digit code"
+        inputMode="numeric"
+        autoComplete="one-time-code"
+        value={code}
+        onChange={(e) => setCode(codeDigits(e.target.value))}
+        disabled={confirming}
+        autoFocus
+      />
+      <div className="section-actions">
+        <Button type="submit" loading={confirming} loadingLabel="Unlinking…" disabled={resending}>
+          Confirm unlink
+        </Button>
+        <Button
+          variant="secondary"
+          disabled={cooling || resending || confirming}
+          loading={resending}
+          loadingLabel="Sending a new code…"
+          onClick={() => void resend()}
+        >
+          {cooling ? `Resend code in ${cooldown.remaining} s` : "Resend code"}
+        </Button>
+        <Button variant="ghost" disabled={confirming || resending} onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    </form>
   );
 }
 

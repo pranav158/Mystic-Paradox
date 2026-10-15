@@ -35,9 +35,11 @@ macro_rules! launcher_commands {
             commands::auth::native_forgot_password,
             commands::auth::native_reset_password,
             commands::auth::native_official_play,
-            // [2026-10-15] Link and unlink Discord on the Account page (the signed-in official account).
+            // [2026-10-15] Link and unlink Discord on the Account page (the signed-in official account). Unlinking
+            // takes two steps: the emailed code, then the confirmation.
             commands::auth::native_start_discord_link,
-            commands::auth::native_unlink_discord,
+            commands::auth::native_start_discord_unlink,
+            commands::auth::native_confirm_discord_unlink,
             // [2026-10-14] Terms of Use and Privacy Policy consent, and account deletion (official accounts only).
             commands::account::native_consent_status,
             commands::account::native_accept_consent,

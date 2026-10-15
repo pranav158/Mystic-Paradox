@@ -13,6 +13,11 @@ export interface DiscordLinkNotice {
   text: string;
 }
 
+/** [2026-10-15] The unlink code went out to this address (masked, as the server gives it). */
+export interface DiscordUnlinkCode {
+  email: string;
+}
+
 // "needsServerConsent": the selected server is a local one whose warning has not been accepted. Nothing is sent to it
 // (no session restore, no sign-in) until the player accepts.
 // [2026-10-15] "awaitingEmailCode": a code was emailed (after sign-up, or a sign-in that the backend refused as unverified);
@@ -58,8 +63,10 @@ interface AuthContextValue {
   discordLinkNotice: DiscordLinkNotice | null;
   /** Opens Discord's authorise page to link this account (the result comes back by deep link). */
   linkDiscord: () => Promise<void>;
-  /** Removes this account's Discord link. Refused for an account whose only sign-in is Discord. */
-  unlinkDiscord: () => Promise<void>;
+  /** [2026-10-15] Unlinking step one: emails the code. Refused for an account whose only sign-in is Discord. */
+  startDiscordUnlink: () => Promise<DiscordUnlinkCode>;
+  /** [2026-10-15] Unlinking step two: checks the emailed code and removes the link. A wrong code rejects with AUTH_CODE_INVALID. */
+  confirmDiscordUnlink: (code: string) => Promise<void>;
   dismissDiscordLinkNotice: () => void;
 }
 
@@ -301,9 +308,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await invoke("native_start_discord_link");
   }, []);
 
-  const unlinkDiscord = useCallback(async () => {
+  // [2026-10-15] Unlinking takes the emailed code: the start mails it (and a resend starts again), the confirmation checks it.
+  const startDiscordUnlink = useCallback(async () => {
     setDiscordLinkNotice(null);
-    const next = await invoke<LauncherAccount>("native_unlink_discord");
+    return invoke<DiscordUnlinkCode>("native_start_discord_unlink");
+  }, []);
+
+  const confirmDiscordUnlink = useCallback(async (code: string) => {
+    const next = await invoke<LauncherAccount>("native_confirm_discord_unlink", { code });
     applyAccount(next);
   }, [applyAccount]);
 
@@ -453,10 +465,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       backToSignIn,
       discordLinkNotice,
       linkDiscord,
-      unlinkDiscord,
+      startDiscordUnlink,
+      confirmDiscordUnlink,
       dismissDiscordLinkNotice,
     }),
-    [status, serverId, account, authError, accountSync, refreshAccount, login, register, logout, startDiscordLogin, setUsername, restoreSavedSession, forgetSavedSession, emailCode, verifyEmailCode, resendEmailCode, startPasswordReset, sendPasswordResetCode, completePasswordReset, backToSignIn, discordLinkNotice, linkDiscord, unlinkDiscord, dismissDiscordLinkNotice],
+    [status, serverId, account, authError, accountSync, refreshAccount, login, register, logout, startDiscordLogin, setUsername, restoreSavedSession, forgetSavedSession, emailCode, verifyEmailCode, resendEmailCode, startPasswordReset, sendPasswordResetCode, completePasswordReset, backToSignIn, discordLinkNotice, linkDiscord, startDiscordUnlink, confirmDiscordUnlink, dismissDiscordLinkNotice],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
