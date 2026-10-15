@@ -32,6 +32,8 @@ import {
 // [2026-10-15] The email routes (email verification, resend, password reset by code) and their code flow (controllers/emailCodes.ts).
 import { ResendEmailCode, RequestPasswordResetCode, ResetPasswordWithCode, VerifyEmailWithPassword } from "../controllers/launcherEmail";
 import { GetLauncherPolicy } from "../controllers/launcherPolicy";
+// [2026-10-15] The launcher notices the launcher shows (controllers/launcherNotices.ts): public, the sign-in screen shows them too.
+import { GetPublicLauncherNotices } from "../controllers/launcherNotices";
 import { AcceptConsent, CancelAccountDeletion, GetConsentState, GetDeletionState, RequestAccountDeletion } from "../controllers/launcherAccount";
 import { CurrentLegalRequirements } from "../legal/legalPolicy";
 import { ReadOfficialPlay } from "../config/officialPlay";
@@ -293,6 +295,9 @@ launcherAuthRouter.get("/launcher/v1/status", (req, res) =>
 
 // [2026-10-14] The Terms of Use and Privacy Policy versions and the minimum age the launcher must show (no sign-in needed).
 launcherAuthRouter.get("/launcher/v1/legal", (req, res) => Handle(req, res, async () => CurrentLegalRequirements()));
+
+// [2026-10-15] The sticky announcements and tags active now (no sign-in; a read error answers the empty set).
+launcherAuthRouter.get("/launcher/v1/notices", (req, res) => GetPublicLauncherNotices(req, res));
 
 // [2026-10-14] Consent to the current documents. These routes and the deletion ones keep working while the account is deactivated.
 launcherAuthRouter.get("/launcher/v1/account/consent", HasLauncherAuth, (req, res) =>

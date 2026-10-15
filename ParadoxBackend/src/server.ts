@@ -23,6 +23,9 @@ import { GetPersistenceLifecycle } from "./persistence";
 import { LogRegistrationApprovalPolicy, ResolveRegistrationApproval } from "./config/registrationApproval";
 import { AssertEmailVerificationConfig, EmailVerificationRequired, LogEmailVerificationPolicy, ResolveEmailVerification } from "./config/emailVerification";
 import { StartUnverifiedRegistrationSweeper } from "./controllers/launcherEmail";
+// [2026-10-15] The automatic purge of the uploaded launcher logs (90 days after their last upload; MYSTICPARADOX_LOG_RETENTION=off).
+import { LOG_STORAGE_ROOT } from "./routes/launcherLogs";
+import { StartUploadedLogRetention, UploadedLogRetentionJob } from "./services/launcherLogRetention";
 import { LogGuardModePolicy, ResolveGuardMode } from "./services/guardMode";
 import { initRealtime, shutdownRealtime } from "./realtime";
 import { logger } from "./logger";
@@ -77,6 +80,8 @@ function LoadTlsContext(CertPath: string, KeyPath: string, Label: string, Passph
 // Mongo client — GetPersistenceLifecycle().stop() existed already but nothing ever called it.
 let HttpServer: import("node:http").Server | undefined;
 let HttpsServer: https.Server | undefined;
+// [2026-10-15] The uploaded-log purge (services/launcherLogRetention.ts); undefined when MYSTICPARADOX_LOG_RETENTION=off.
+let UploadedLogRetention: UploadedLogRetentionJob | undefined;
 
 function HandleListenerError(Label: "HTTP" | "HTTPS", Error: Error, ServiceRole: ReturnType<typeof ReadMetagameServiceRole>): void {
     const reason = `${Label}_LISTENER_ERROR`;
@@ -128,6 +133,8 @@ async function Main(): Promise<void> {
 
     partyOutboxDispatcher.start();
     GetP2PExtension().server.start(serviceRole);
+    // [2026-10-15] One pass about a minute after start, then every six hours. Each pass logs counts only.
+    UploadedLogRetention = StartUploadedLogRetention({ root: LOG_STORAGE_ROOT, log: (line) => logger.info(line) });
 
     // [2026-10-14 M2] BIND_HOST (unset = every interface, as before). Behind a proxy the listener is ready as soon as it listens.
     const ListenHttp = (listening: () => void) => (Listeners.httpBindHost != undefined
@@ -262,6 +269,7 @@ async function GracefulShutdown(Signal: string, ExitCode = 0): Promise<void> {
         // listeners go away (plan §8.4). No-op when realtime is disabled.
         await shutdownRealtime();
         partyOutboxDispatcher.stop();
+        UploadedLogRetention?.stop();
         await GetP2PExtension().server.stop();
         logger.info("Realtime (XMPP) gateway stopped");
 

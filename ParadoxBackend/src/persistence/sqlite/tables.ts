@@ -47,6 +47,8 @@ export const Tables = {
     launcherGuardSessions: new DocTable("launcherGuardSessions"),
     guardFindings: new DocTable("guardFindings"),
     operationsPolicy: new DocTable("operationsPolicy"),
+    // [2026-10-15] The launcher notices singleton (_id "current"), as launcherNotices in MongoDB.
+    launcherNotices: new DocTable("launcherNotices"),
     entitlements: new DocTable("entitlements"),
     parties: new DocTable("parties"),
     partyMemberships: new DocTable("partyMemberships"),

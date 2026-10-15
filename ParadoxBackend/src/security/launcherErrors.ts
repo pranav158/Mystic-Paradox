@@ -58,6 +58,10 @@ type CoreLauncherErrorCode =
     | "GUARD_SEQUENCE_CONFLICT"
     // [2026-10-15] A launch with no realm while MYSTICPARADOX_OFFICIAL_PLAY is off (config/officialPlay.ts).
     | "OFFICIAL_PLAY_UNAVAILABLE"
+    // [2026-10-15] Launcher notices (controllers/launcherNotices.ts): a manager save that is refused (400), and one whose expectedVersion
+    // is stale (409, the answer carries the current document).
+    | "NOTICES_INVALID"
+    | "NOTICES_VERSION_CONFLICT"
     | "NOT_FOUND"
     | "INTERNAL";
 
@@ -122,6 +126,9 @@ const StatusByCode: Record<CoreLauncherErrorCode, number> = {
     GUARD_SEQUENCE_CONFLICT: 409,
     // [2026-10-15] Official play is off on this server (the same 503 as the other "not available here" codes).
     OFFICIAL_PLAY_UNAVAILABLE: 503,
+    // [2026-10-15] Launcher notices: a refused save (400) and a stale expectedVersion (409).
+    NOTICES_INVALID: 400,
+    NOTICES_VERSION_CONFLICT: 409,
     NOT_FOUND: 404,
     INTERNAL: 500
 };

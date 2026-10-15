@@ -234,6 +234,9 @@ export const TABLES: TableSpec[] = [
         ]
     },
     { name: "operationsPolicy" },
+    // [2026-10-15] The launcher notices singleton (one row, _id "current"). Added without a schema version change: EnsureTablesExist
+    // creates it on existing databases, as emailCodes was added.
+    { name: "launcherNotices" },
     { name: "entitlements" },
     { name: "parties" },
     { name: "partyMemberships", columns: { partyId: "partyId" }, indexes: [{ name: "partyMemberships_partyId", columns: ["partyId"] }] },

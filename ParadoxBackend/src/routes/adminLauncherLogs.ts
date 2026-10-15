@@ -11,6 +11,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { LOG_STORAGE_ROOT } from "./launcherLogs";
+// [2026-10-15] The shared segment rule (services/launcherLogNames.ts); the same test as before.
+import { isSafeSegment } from "../services/launcherLogNames";
 
 // A separate, narrowly-scoped credential from the interactive admin dashboard's
 // TOTP+cookie+CSRF session — this is for an unattended script (see
@@ -44,10 +46,6 @@ interface SessionEntry {
     launchSessionId: string;
     uploadedAt: string;
     files: string[];
-}
-
-function isSafeSegment(value: string): boolean {
-    return /^[A-Za-z0-9._-]+$/.test(value) && value !== "." && value !== "..";
 }
 
 function listSessions(sinceIso: string | undefined): SessionEntry[] {

@@ -38,6 +38,7 @@ import { MongoPartyRepository } from "./repositories/MongoPartyRepository";
 import { MongoLauncherGuardRepository } from "./repositories/MongoLauncherGuardRepository";
 import { MongoEconomyRollupRepository } from "./repositories/MongoEconomyRollupRepository";
 import { MongoActivityRepository } from "./repositories/MongoActivityRepository";
+import { MongoLauncherNoticesRepository } from "./repositories/MongoLauncherNoticesRepository";
 
 // Builds the MongoDB-backed RepositoryProvider. Each repository lazily resolves
 // the shared pooled Db handle (src/persistence/mongo/client.ts) on first use.
@@ -65,6 +66,7 @@ export function CreateMongoRepositoryProvider(): RepositoryProvider {
         gameExchangeCodes: new MongoGameExchangeCodeRepository(),
         discordOAuthTransactions: new MongoDiscordOAuthTransactionRepository(),
         emailCodes: new MongoEmailCodeRepository(),
+        launcherNotices: new MongoLauncherNoticesRepository(),
         inventoryTransactions: new MongoInventoryTransactionRepository(),
         friendships: new MongoFriendshipRepository(),
         admin: new MongoAdminRepository(),

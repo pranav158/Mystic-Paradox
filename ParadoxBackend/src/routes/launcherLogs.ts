@@ -14,6 +14,8 @@ import { GetRepositories, LauncherAccountRecord } from "../persistence";
 import { LauncherApiError, SendLauncherError } from "../security/launcherErrors";
 import { IsRateLimited } from "../security/rateLimit";
 import { TESTER_ROLE } from "../security/testerFeatures";
+// [2026-10-15] The allowed names and the session id pattern live in services/launcherLogNames.ts (shared with the admin reads).
+import { isAllowedLauncherLogFileName, LAUNCHER_LOG_SESSION_ID_PATTERN } from "../services/launcherLogNames";
 
 // Stored on this backend's own host — it's already the authenticated, publicly-reachable
 // service the launcher talks to (paradox.mysticfox.dev), so a session-log upload endpoint
@@ -22,21 +24,12 @@ import { TESTER_ROLE } from "../security/testerFeatures";
 // outside dist/ so `npm run build`'s clean step and any redeploy never touch it.
 export const LOG_STORAGE_ROOT = path.resolve(process.env.LAUNCHER_LOG_STORAGE_DIR ?? path.join(process.cwd(), "..", "MysticLauncherLogs"));
 
-const SESSION_ID_PATTERN = /^[a-f0-9-]{8,64}$/i;
-// Exactly the files the launcher's launch::logs module writes into a session folder — see
-// ParadoxLauncher/src-tauri/src/launch/logs.rs. Anything else is rejected before it reaches disk.
-const ALLOWED_EXACT_FILENAMES = new Set(["metadata.json", "launcher.log"]);
-const ALLOWED_FILENAME_PATTERN = /^runtime-mysticparadox_dll_port\d+\.log$/i;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 // Per-account caps so a tester (the only role that can reach this endpoint) can't fill the
 // disk by minting unlimited session ids or re-uploading indefinitely. Generous for real
 // usage (a handful of sessions/day, a few small text files each) but bounded.
 const MAX_ACCOUNT_STORAGE_BYTES = 200 * 1024 * 1024;
 const MAX_SESSIONS_PER_ACCOUNT = 200;
-
-function isAllowedFilename(name: string): boolean {
-    return ALLOWED_EXACT_FILENAMES.has(name) || ALLOWED_FILENAME_PATTERN.test(name);
-}
 
 function accountStorageUsage(userId: string): { totalBytes: number; sessionCount: number } {
     const userDir = path.join(LOG_STORAGE_ROOT, userId);
@@ -80,7 +73,7 @@ launcherLogsRouter.put(
 
         const LaunchSessionId = String(req.params.launchSessionId ?? "");
         const FileName = String(req.params.fileName ?? "");
-        if (!SESSION_ID_PATTERN.test(LaunchSessionId) || !isAllowedFilename(FileName)) {
+        if (!LAUNCHER_LOG_SESSION_ID_PATTERN.test(LaunchSessionId) || !isAllowedLauncherLogFileName(FileName)) {
             SendLauncherError(res, new LauncherApiError("AUTH_VALIDATION_FAILED", "Invalid session id or file name."));
             return;
         }

@@ -20,6 +20,7 @@ import { SqliteBreadcrumbRepository } from "./repositories/SqliteBreadcrumbRepos
 import { SqliteCharacterRepository } from "./repositories/SqliteCharacterRepository";
 import { SqliteDiscordOAuthTransactionRepository } from "./repositories/SqliteDiscordOAuthTransactionRepository";
 import { SqliteEmailCodeRepository } from "./repositories/SqliteEmailCodeRepository";
+import { SqliteLauncherNoticesRepository } from "./repositories/SqliteLauncherNoticesRepository";
 import { SqliteEconomyRollupRepository } from "./repositories/SqliteEconomyRollupRepository";
 import { SqliteActivityRepository } from "./repositories/SqliteActivityRepository";
 import { SqliteEncounteredContentRepository } from "./repositories/SqliteEncounteredContentRepository";
@@ -76,6 +77,7 @@ export function CreateSqliteRepositoryProvider(db: SqliteDatabase): RepositoryPr
         gameExchangeCodes: new SqliteGameExchangeCodeRepository(db),
         discordOAuthTransactions: new SqliteDiscordOAuthTransactionRepository(db),
         emailCodes: new SqliteEmailCodeRepository(db),
+        launcherNotices: new SqliteLauncherNoticesRepository(db),
         inventoryTransactions: new SqliteInventoryTransactionRepository(db),
         friendships: new SqliteFriendshipRepository(db),
         admin: new SqliteAdminRepository(db),

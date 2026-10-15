@@ -67,6 +67,8 @@ export const CORE_ACCOUNT_DELETION_EXEMPTIONS: AccountDeletionExemption[] = [
     { collection: Collections.SchemaMigrations, reason: "the migration ledger; no account data" },
     { collection: Collections.GameServerApiKeys, reason: "gameserver keys; no account data" },
     { collection: Collections.OperationsPolicy, reason: "the operator policy singleton; no account data" },
+    // [2026-10-15] The launcher notices singleton: the operator's announcements and tags, no player data (the manager's audit record names the operator).
+    { collection: Collections.LauncherNotices, reason: "the launcher notices singleton; no account data" },
     { collection: Collections.AccountDeletions, reason: "the pseudonymous tombstones written by the erasure itself" }
 ];
 

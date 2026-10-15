@@ -38,6 +38,7 @@ import { PartyRepository } from "./PartyRepository";
 import { LauncherGuardRepository } from "./LauncherGuardRepository";
 import { EconomyRollupRepository } from "./EconomyRollupRepository";
 import { ActivityRepository } from "./ActivityRepository";
+import { LauncherNoticesRepository } from "./LauncherNoticesRepository";
 
 // The set of repositories the MongoDB provider supplies. This is the
 // "composition root" surface — controllers/services obtain repositories
@@ -72,6 +73,9 @@ export interface RepositoryProvider {
     discordOAuthTransactions: DiscordOAuthTransactionRepository;
     // [2026-10-15] The live one-time codes of email verification and password reset (contracts/EmailCodeRepository.ts).
     emailCodes: EmailCodeRepository;
+
+    // [2026-10-15] The launcher notices: sticky announcements and tags set from the manager (contracts/LauncherNoticesRepository.ts).
+    launcherNotices: LauncherNoticesRepository;
 
     // [hardening] Idempotency ledger for POST /inventory (see InventoryTransactionRepository.ts).
     inventoryTransactions: InventoryTransactionRepository;

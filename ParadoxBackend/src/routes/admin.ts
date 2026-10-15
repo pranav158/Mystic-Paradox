@@ -20,6 +20,10 @@ import { GetOperationsOverview, UpdateOperationsPolicy } from "../controllers/ad
 import { GetGuardSession, ListGuardFindings, ListGuardSessions } from "../controllers/adminGuard";
 import { AcknowledgeActivityFlag, GetActivityOverview, GetActivityPlayer, ListActivityFlags } from "../controllers/adminActivity";
 import { TesterMaxPlayer } from "../controllers/testerMax";
+// [2026-10-15] The launcher notices (controllers/launcherNotices.ts): the manager's read and versioned save.
+import { GetAdminLauncherNotices, UpdateLauncherNotices } from "../controllers/launcherNotices";
+// [2026-10-15] Player logs: the tester uploads, listed, read and deleted (controllers/adminPlayerLogs.ts; the delete is audited).
+import { DeletePlayerLogSessionRoute, ListPlayerLogs, ReadPlayerLogFileRoute } from "../controllers/adminPlayerLogs";
 
 export const adminRouter = Router();
 
@@ -60,7 +64,8 @@ adminRouter.use("/admin/v1", (req, res, next) => {
         res.header("Access-Control-Allow-Origin", Origin);
         res.header("Access-Control-Allow-Credentials", "true");
         res.header("Access-Control-Allow-Headers", "Content-Type, X-CSRF-Token");
-        res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+        // [2026-10-15] PUT is the launcher notices save (PUT /admin/v1/launcher-notices).
+        res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
         res.header("Vary", "Origin");
     }
     res.header("Cache-Control", "no-store");
@@ -120,6 +125,9 @@ adminRouter.delete("/admin/v1/players/:userId", HasAdminAuth, DeletePlayer);
 adminRouter.get("/admin/v1/audit", HasAdminAuth, ListAudit);
 adminRouter.get("/admin/v1/operations/overview", HasAdminAuth, GetOperationsOverview);
 adminRouter.patch("/admin/v1/operations/policy", HasAdminAuth, UpdateOperationsPolicy);
+// [2026-10-15] The launcher notices (SteamDocs/LAUNCHER_NOTICES_2026_10_15.md): the whole document, and the versioned save.
+adminRouter.get("/admin/v1/launcher-notices", HasAdminAuth, GetAdminLauncherNotices);
+adminRouter.put("/admin/v1/launcher-notices", HasAdminAuth, UpdateLauncherNotices);
 // [2026-10-14] Launcher Guard sessions and module findings (read-only).
 adminRouter.get("/admin/v1/guard/sessions", HasAdminAuth, ListGuardSessions);
 adminRouter.get("/admin/v1/guard/sessions/:guardSessionId", HasAdminAuth, GetGuardSession);
@@ -131,3 +139,8 @@ adminRouter.get("/admin/v1/activity/flags", HasAdminAuth, ListActivityFlags);
 adminRouter.patch("/admin/v1/activity/flags/:id", HasAdminAuth, AcknowledgeActivityFlag);
 // [2026-10-14, launch plan section 5] Max a tester account (controllers/testerMax.ts; the kit is game-data/tester_max_kit.json).
 adminRouter.post("/admin/v1/players/:userId/tester-max", HasAdminAuth, TesterMaxPlayer);
+// [2026-10-15] Player logs (controllers/adminPlayerLogs.ts): the list (newest first, paged), one file (?download=1 as an attachment), and the
+// audited delete of one session.
+adminRouter.get("/admin/v1/player-logs", HasAdminAuth, ListPlayerLogs);
+adminRouter.get("/admin/v1/player-logs/:userId/:launchSessionId/:fileName", HasAdminAuth, ReadPlayerLogFileRoute);
+adminRouter.delete("/admin/v1/player-logs/:userId/:launchSessionId", HasAdminAuth, DeletePlayerLogSessionRoute);

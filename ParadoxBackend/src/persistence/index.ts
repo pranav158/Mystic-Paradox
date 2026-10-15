@@ -46,6 +46,8 @@ export * from "./contracts/RefreshSessionRepository";
 export * from "./contracts/GameExchangeCodeRepository";
 export * from "./contracts/DiscordOAuthTransactionRepository";
 export * from "./contracts/EmailCodeRepository";
+// [2026-10-15] The launcher notices store (contracts/LauncherNoticesRepository.ts).
+export * from "./contracts/LauncherNoticesRepository";
 export * from "./contracts/InventoryTransactionRepository";
 export * from "./contracts/FriendshipRepository";
 export * from "./contracts/AdminRepository";

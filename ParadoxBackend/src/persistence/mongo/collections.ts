@@ -84,6 +84,9 @@ export const Collections = {
     GuardFindings: "guardFindings",
     OperationsPolicy: "operationsPolicy",
 
+    // [2026-10-15] The launcher notices (contracts/LauncherNoticesRepository.ts): one singleton document, _id "current".
+    LauncherNotices: "launcherNotices",
+
     // Durable social party authority. Membership is a separate one-row-per-account collection so
     // Mongo can enforce that an account belongs to at most one party even under concurrent writes.
     Parties: "parties",
