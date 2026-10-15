@@ -142,16 +142,8 @@ ignored folder such as `src-tauri\target\test-tmp`.
 ### GitHub Actions build caches
 
 CI caches the launcher's Rust dependencies for Clippy and tests. Only successful `main` push or
-manual runs save that cache; pull requests restore it without saving. A separate job on `main`
-builds the unsigned release profile in parallel to warm the optimized dependencies used by releases.
-It skips the build on an exact cache hit, creates no installer and receives no signing key.
-
-Tag releases restore the release dependency cache from `main`, then rebuild the launcher's own code
-from the tag with the locked dependencies and create fresh installer, hashes and provenance.
-GitHub does not share caches between different tags, so the cache warmer on `main` is necessary.
-The signing and publishing job does not restore build caches. The first run, an expired cache, or
-a Rust toolchain/dependency change may still require a cold build. Let the cache warmer finish
-before tagging to use the newest dependencies; CI can also be run manually on `main` to seed it.
+manual runs save that cache; pull requests restore it without saving. Release builds use no build
+cache: every input of a signed installer comes from the tag and the lock files.
 
 ## Security model
 

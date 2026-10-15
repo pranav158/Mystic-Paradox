@@ -74,47 +74,6 @@ jobs:
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
-  # Tags can restore main's caches, but cannot restore a different tag's cache.
-  # Warm the optimized dependency artifacts in parallel with the normal checks.
-  launcher-release-cache:
-    name: Warm launcher release dependencies
-    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
-    runs-on: windows-latest
-    timeout-minutes: 30
-    defaults:
-      run:
-        shell: pwsh
-        working-directory: ParadoxLauncher
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: ParadoxLauncher/package-lock.json
-      - name: Rust (stable, through the runner's rustup)
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustc --version
-      - name: Cache launcher release dependencies
-        id: release-cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: ParadoxLauncher/src-tauri -> target
-          shared-key: launcher-release-windows-v1
-          cache-bin: false
-      - if: steps.release-cache.outputs.cache-hit != 'true'
-        run: npm ci
-      - name: Warm the release profile (no installer or signing)
-        if: steps.release-cache.outputs.cache-hit != 'true'
-        run: |
-          [IO.File]::WriteAllText("$PWD\release.tauri.conf.json", '{"bundle":{"createUpdaterArtifacts":false}}')
-          npm run tauri build -- --no-bundle --config "$PWD\release.tauri.conf.json" -- --locked --timings
-          if ($LASTEXITCODE -ne 0) { throw "tauri build failed (exit $LASTEXITCODE)" }
-
   runtime-loader:
     runs-on: windows-latest
     defaults:

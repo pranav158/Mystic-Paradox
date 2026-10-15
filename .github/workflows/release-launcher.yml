@@ -57,12 +57,10 @@ jobs:
           if ($conf -ne $v -or $pkg -ne $v -or $cargo -ne $v) { throw "tag $v, tauri.conf.json $conf, package.json $pkg and Cargo.toml $cargo must agree" }
           "version=$v" >> $env:GITHUB_OUTPUT
 
-      # npm verifies cached package downloads against package-lock.json; node_modules is rebuilt.
+      # No caches in a release build: every input comes from the tag and the lock files.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: ParadoxLauncher/package-lock.json
 
       - name: Rust (stable, through the runner's rustup)
         run: |
@@ -70,22 +68,12 @@ jobs:
           rustup default stable
           rustc --version
 
-      # CI on main warms the release profile. Different tags cannot share their own caches.
-      # Restore dependencies only; always rebuild this tag's launcher and generate fresh artifacts.
-      - name: Restore launcher release dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: ParadoxLauncher/src-tauri -> target
-          shared-key: launcher-release-windows-v1
-          cache-bin: false
-          save-if: false
-
       - run: npm ci
 
       - name: Build the installer (unsigned here; the publish job signs it)
         run: |
           [IO.File]::WriteAllText("$PWD\release.tauri.conf.json", '{"bundle":{"createUpdaterArtifacts":false}}')
-          npm run tauri build -- --bundles nsis --config "$PWD\release.tauri.conf.json" -- --locked --timings
+          npm run tauri build -- --bundles nsis --config "$PWD\release.tauri.conf.json"
           if ($LASTEXITCODE -ne 0) { throw "tauri build failed (exit $LASTEXITCODE)" }
 
       - name: Name the installer without spaces and hash it
