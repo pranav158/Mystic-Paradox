@@ -1236,6 +1236,19 @@ export type ExistingPartySessionAction =
  * conflict, routed to a dedicated server.
  */
 export function ClassifyExistingPartySession(existing: P2PHuntSessionRecord, huntId: string, requesterId: string, now = Date.now()): ExistingPartySessionAction {
+    const action = ClassifyPartySessionBeforeDrain(existing, huntId, requesterId, now);
+    // [2026-10-15] Any supersede of a running Tier 0 hunt drains instead of fencing: a finished hunt (HUNT_FINISHED) still shows
+    // its results and its players travel only later, and a party that changed hunt or roster may still have players in the old
+    // one. The drain keeps the server and its lease until the server empties and stops. A lapsed lease and an ending session
+    // stay superseded (there is no live server to keep); a realm hub has its own lifecycle.
+    if (action.action === "SUPERSEDE" && existing.state === "RUNNING" && (existing.trustTier ?? 0) === 0 &&
+        existing.sessionKind !== "REALM_HUB" && action.reason !== "HOST_LEASE_EXPIRED" && action.reason !== "SESSION_ENDING") {
+        return { action: "DRAIN", reason: action.reason };
+    }
+    return action;
+}
+
+function ClassifyPartySessionBeforeDrain(existing: P2PHuntSessionRecord, huntId: string, requesterId: string, now: number): ExistingPartySessionAction {
     if (existing.state === "ABORTING" || existing.state === "SUSPECT") return { action: "SUPERSEDE", reason: "SESSION_ENDING" };
     if (existing.guardEncounterState === "COMPLETION_REQUESTED" || existing.guardEncounterState === "ABORTED") {
         return { action: "SUPERSEDE", reason: "HUNT_FINISHED" };
@@ -1393,6 +1406,16 @@ export async function NoteHubReturn(accountId: string): Promise<{ partyId: strin
                 ` stillInHunt=${marked.stillInHunt.length}`);
         }
         if (marked.stillInHunt.length > 0) return undefined;
+        // [2026-10-15] A running Tier 0 hunt drains instead of ending. Ending it revoked the host's credential: the host's transport
+        // then had its lease refused twice within seconds and fenced its own server while the last player was still on the results
+        // screen (Escalation, 15 Oct 16:50 UTC: hub request 1.4 s after the hunt ended, server gone 3.6 s later, travel timed out).
+        // The drain keeps the generation and the lease; the server exits 50 s after its last connection, and the drain then ends on
+        // the lapsed lease without a fence. The party is freed at once, as the end freed it.
+        if (hunt.state === "RUNNING" && (hunt.trustTier ?? 0) === 0 && hunt.sessionKind !== "REALM_HUB") {
+            const drained = await BeginDrainPartySession(hunt, "PARTY_RETURNED_TO_HUB", accountId, "PARTY_RETURNED_TO_HUB");
+            if (drained == undefined) continue;   // the session moved on concurrently: read it again
+            return { partyId: hunt.partyId, partyRevision: drained.partyRevision };
+        }
         // [2026-10-13 realms plan step 5] No FENCE_NOW here. This request is the last player's hub matchmaking: its
         // client is still connected to the host and travels only once the hub answers. Fencing the host (or a joiner's
         // bridge) now killed that connection ~1 s before the travel, and the client sat in the hunt with a dead server
@@ -1428,7 +1451,8 @@ export async function SupersedePartySession(existing: P2PHuntSessionRecord, reas
  * cap no deadline is set, so the drain runs as long as the server does. Same return as EndP2PHuntSession; undefined when the session
  * had already moved on.
  */
-export async function BeginDrainPartySession(existing: P2PHuntSessionRecord, reason: string, requesterId: string):
+export async function BeginDrainPartySession(existing: P2PHuntSessionRecord, reason: string, requesterId: string,
+    completionReason = `SUPERSEDED_${reason}`):
     Promise<{ record: P2PHuntSessionRecord; partyRevision?: number } | undefined> {
     const now = new Date();
     // [2026-10-15] A deadline only when a cap is configured: the default drain has none (see ReadP2PHuntDrainCapMs).
@@ -1447,7 +1471,7 @@ export async function BeginDrainPartySession(existing: P2PHuntSessionRecord, rea
             set: {
                 state: "DRAINING",
                 ...(drainDeadline !== undefined ? { drainDeadline } : {}),
-                completionReason: `SUPERSEDED_${reason}`
+                completionReason
             },
             unset: ["activePartyKey"]
         }, mongoSession);

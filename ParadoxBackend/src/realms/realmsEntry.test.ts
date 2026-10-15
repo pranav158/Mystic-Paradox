@@ -53,7 +53,7 @@ test("an unknown realm, an unknown or foreign invite and a changed owner are eac
     assert.deepEqual(await service.authorizeEntry("friend-1", { name: "friends", inviteCode: "ZZZZZZZZZZ" }), { ok: false, code: "REALM_INVITE_INVALID" });
     assert.deepEqual(await service.authorizeEntry("friend-1", { name: "friends", inviteCode: invite.code }), { ok: false, code: "REALM_INVITE_INVALID" }, "an invite of another realm");
     assert.deepEqual(await service.authorizeEntry("friend-1", { name: "friends", knownHostKey: KEY_B }), { ok: false, code: "REALM_OWNER_CHANGED" });
-    assert.deepEqual(await service.authorizeEntry("friend-1", { name: "friends", knownHostKey: KEY_A }), { ok: false, code: "REALM_INVITE_REQUIRED" });
+    assert.deepEqual(await service.authorizeEntry("friend-1", { name: "friends", knownHostKey: KEY_A }), { ok: false, code: "REALM_JOIN_REQUESTED" });
     assert.equal(other.realmId, "realm-2");
     assert.equal((await service.getByName("host-1", "friends")).realm.memberCount, 1, "nothing was joined");
 });
@@ -61,7 +61,7 @@ test("an unknown realm, an unknown or foreign invite and a changed owner are eac
 test("a stranger needs an invite for an invite-only realm; used up, expired and revoked invites are refused and used nothing", async () => {
     const { clock, repo, service, serve, realm } = await Prepare();
     await serve("host-1", realm.realmId);
-    assert.deepEqual(await service.authorizeEntry("friend-1", { name: "friends" }), { ok: false, code: "REALM_INVITE_REQUIRED" });
+    assert.deepEqual(await service.authorizeEntry("friend-1", { name: "friends" }), { ok: false, code: "REALM_JOIN_REQUESTED" });
 
     const spent = (await service.createInvite("host-1", { maxUses: 1, ttlHours: 24 })).invite;
     assert.equal((await service.authorizeEntry("friend-1", { name: "friends", inviteCode: spent.code })).ok, true);
@@ -140,7 +140,7 @@ test("an offline refusal costs nothing: the invite is not used and the stranger 
 });
 
 test("a full realm refuses the entry and gives the invite use back", async () => {
-    const kit = SetupRealms({ limits: { maxMembers: 2, maxBans: 5, maxActiveInvites: 25 } });
+    const kit = SetupRealms({ limits: { maxMembers: 2, maxBans: 5, maxActiveInvites: 25, maxJoinRequests: 50 } });
     const realm = await kit.create("host-1", "friends");
     await kit.serve("host-1", realm.realmId);
     const { invite } = await kit.service.createInvite("host-1", { maxUses: 5, ttlHours: 24 });
@@ -204,7 +204,7 @@ test("an authorized game session names its realm; every refusal of the service s
     const deps = { enabled: () => true, service: () => kit.service };
 
     // Offline first.
-    await Rejects(AuthorizeGameSessionRealm("friend-1", { name: "friends" }, deps), "REALM_INVITE_REQUIRED");
+    await Rejects(AuthorizeGameSessionRealm("friend-1", { name: "friends" }, deps), "REALM_JOIN_REQUESTED");
     assert.deepEqual(await AuthorizeGameSessionRealm("host-1", { name: "friends" }, deps), { realmId: realm.realmId, isHost: true });
 
     await kit.serve("host-1", realm.realmId);

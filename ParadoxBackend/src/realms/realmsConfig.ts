@@ -23,9 +23,15 @@ export interface RealmLimits {
     maxBans: number;
     /** Invites a host may have open (unexpired, unrevoked, unused up) at once. */
     maxActiveInvites: number;
+    /**
+     * [2026-10-15] Join requests a realm holds at once. A player who asks when the list is full is refused (REALM_REQUESTS_FULL)
+     * instead of pushing out someone who asked earlier; the host clears the list by approving or denying. Not configurable: a
+     * realm's request list is a small, visible queue, not a backstop like the two above.
+     */
+    maxJoinRequests: number;
 }
 
-export const DEFAULT_REALM_LIMITS: RealmLimits = Object.freeze({ maxMembers: 1000, maxBans: 1000, maxActiveInvites: 25 });
+export const DEFAULT_REALM_LIMITS: RealmLimits = Object.freeze({ maxMembers: 1000, maxBans: 1000, maxActiveInvites: 25, maxJoinRequests: 50 });
 
 function ReadBoundedInt(raw: string | undefined, fallback: number, min: number, max: number): number {
     if (raw === undefined || !/^\d{1,6}$/.test(raw.trim())) return fallback;
@@ -37,6 +43,7 @@ export function ReadRealmLimits(env: NodeJS.ProcessEnv = process.env): RealmLimi
     return {
         maxMembers: ReadBoundedInt(env.MYSTICPARADOX_REALMS_MAX_MEMBERS, DEFAULT_REALM_LIMITS.maxMembers, 2, 5000),
         maxBans: ReadBoundedInt(env.MYSTICPARADOX_REALMS_MAX_BANS, DEFAULT_REALM_LIMITS.maxBans, 1, 5000),
-        maxActiveInvites: DEFAULT_REALM_LIMITS.maxActiveInvites
+        maxActiveInvites: DEFAULT_REALM_LIMITS.maxActiveInvites,
+        maxJoinRequests: DEFAULT_REALM_LIMITS.maxJoinRequests
     };
 }

@@ -376,4 +376,44 @@ export function RunRealmsRepositoryContract(label: string, harness: () => Promis
         assert.equal(await repo.findByHubRoomId(""), undefined);
         assert.deepEqual((await repo.findByHubRoomId("11111111-1111-5111-8111-111111111111"))!.hubRoomIds, ["11111111-1111-5111-8111-111111111111", "22222222-2222-5222-8222-222222222222"]);
     });
+
+    // [2026-10-15] Join requests: the checks run in the order of AddJoinRequestResult, and a refused request changes nothing.
+    Case("join requests: recorded once, refused for a member, a banned account and a full list, and withdrawn on request", async (repo) => {
+        await repo.insertRealm(MakeRealm("friends", "host-1", {
+            members: [{ accountId: "host-1", role: "HOST", joinedAt: NOW }, { accountId: "friend", role: "MEMBER", joinedAt: NOW }],
+            bans: [{ accountId: "banned", at: NOW }]
+        }));
+        assert.equal(await repo.addJoinRequest("id-friends", { accountId: "stranger-1", at: NOW }, 2), "ADDED");
+        assert.equal(await repo.addJoinRequest("id-friends", { accountId: "stranger-1", at: LATER }, 2), "ALREADY_REQUESTED");
+        assert.equal(await repo.addJoinRequest("id-friends", { accountId: "banned", at: NOW }, 2), "BANNED");
+        assert.equal(await repo.addJoinRequest("id-friends", { accountId: "friend", at: NOW }, 2), "ALREADY_MEMBER");
+        assert.equal(await repo.addJoinRequest("id-friends", { accountId: "host-1", at: NOW }, 2), "ALREADY_MEMBER");
+        assert.equal(await repo.addJoinRequest("id-friends", { accountId: "stranger-2", at: NOW }, 2), "ADDED");
+        assert.equal(await repo.addJoinRequest("id-friends", { accountId: "stranger-3", at: NOW }, 2), "FULL");
+        assert.equal(await repo.addJoinRequest("id-nope", { accountId: "stranger-3", at: NOW }, 2), "NOT_FOUND");
+        assert.deepEqual((await repo.findById("id-friends"))!.joinRequests, [{ accountId: "stranger-1", at: NOW }, { accountId: "stranger-2", at: NOW }]);
+
+        assert.equal(await repo.removeJoinRequest("id-friends", "stranger-1"), true);
+        assert.equal(await repo.removeJoinRequest("id-friends", "stranger-1"), false);
+        assert.deepEqual((await repo.findById("id-friends"))!.joinRequests, [{ accountId: "stranger-2", at: NOW }]);
+        assert.equal(await repo.addJoinRequest("id-friends", { accountId: "stranger-3", at: NOW }, 2), "ADDED", "a withdrawn request frees its place");
+    });
+
+    Case("a ban withdraws the banned account's join request and leaves the others", async (repo) => {
+        await repo.insertRealm(MakeRealm("friends", "host-1"));
+        await repo.addJoinRequest("id-friends", { accountId: "stranger", at: NOW }, 10);
+        await repo.addJoinRequest("id-friends", { accountId: "other", at: NOW }, 10);
+        assert.equal(await repo.addBan("id-friends", { accountId: "stranger", at: LATER }, 10), "BANNED");
+        assert.deepEqual((await repo.findById("id-friends"))!.joinRequests, [{ accountId: "other", at: NOW }]);
+        assert.equal(await repo.removeJoinRequest("id-friends", "stranger"), false);
+    });
+
+    Case("racing join requests never exceed the bound", async (repo) => {
+        await repo.insertRealm(MakeRealm("friends", "host-1"));
+        const results = await Promise.all(Array.from({ length: 6 }, (_, index) =>
+            repo.addJoinRequest("id-friends", { accountId: `stranger-${index}`, at: NOW }, 3)));
+        assert.equal(results.filter((result) => result === "ADDED").length, 3);
+        assert.equal(results.filter((result) => result === "FULL").length, 3);
+        assert.equal((await repo.findById("id-friends"))!.joinRequests?.length, 3);
+    });
 }

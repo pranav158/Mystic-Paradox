@@ -29,6 +29,13 @@ const REALM_ERROR_STATUSES = {
     REALM_OWNER_CHANGED: 409,
     REALM_INVALID_TARGET: 400,
     REALM_HOST_CANNOT_LEAVE: 409,
+    // [2026-10-15] Join requests: an invite-only realm refused a player without an invite and recorded a request (the answer to
+    // a Play or join is REALM_JOIN_REQUESTED, a plain "wait" rather than a failure); the realm's request list is full; the host
+    // adds or approves a player by a username nobody has, or acts on a request that is not there.
+    REALM_JOIN_REQUESTED: 409,
+    REALM_REQUESTS_FULL: 409,
+    REALM_REQUEST_NOT_FOUND: 404,
+    REALM_PLAYER_NOT_FOUND: 404,
     // [2026-10-13 realms hub design section 2.1] Play with a realm: the host's hub is not running (the host itself is exempt), and
     // the module is switched off on this server (a request that names a realm is refused, never played as official).
     REALM_OFFLINE: 409,
@@ -52,7 +59,9 @@ export type RealmEntryErrorCode =
     | "REALM_INVITE_INVALID"
     | "REALM_INVITE_EXPIRED"
     | "REALM_FULL"
-    | "REALM_OFFLINE";
+    | "REALM_OFFLINE"
+    | "REALM_JOIN_REQUESTED"
+    | "REALM_REQUESTS_FULL";
 
 /** The readable message of each refusal, shared by the join route and the game-session route. */
 export const REALM_ENTRY_MESSAGES: Readonly<Record<RealmEntryErrorCode, string>> = Object.freeze({
@@ -63,7 +72,9 @@ export const REALM_ENTRY_MESSAGES: Readonly<Record<RealmEntryErrorCode, string>>
     REALM_INVITE_INVALID: "That invite code is not valid for this realm.",
     REALM_INVITE_EXPIRED: "That invite has expired, was revoked or has been used up.",
     REALM_FULL: "This realm cannot take more members.",
-    REALM_OFFLINE: "This realm is offline: its host is not running it right now."
+    REALM_OFFLINE: "This realm is offline: its host is not running it right now.",
+    REALM_JOIN_REQUESTED: "Request sent to the host. Wait for their approval, then press Play again.",
+    REALM_REQUESTS_FULL: "This realm has too many join requests waiting. Try again later."
 });
 
 export function RealmEntryError(code: RealmEntryErrorCode): LauncherApiError {

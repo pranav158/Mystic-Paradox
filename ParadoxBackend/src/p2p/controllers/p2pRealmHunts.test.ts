@@ -261,7 +261,10 @@ test("travel: a member admitted into a realm hunt leaves the realm's hub (TRAVEL
     });
 });
 
-test("return: a realm hunt's member who asks for Ramsgate ends its hunt (PARTY_RETURNED_TO_HUB) and is placed in the running hub", async () => {
+// [2026-10-15] The hub request comes while the player still sees the hunt's results (Escalation: 1.4 s after its end), so the hunt
+// drains: its credential and lease stay alive until its server empties and stops. Ending it at once revoked the credential and
+// the host fenced its own server under the player.
+test("return: a realm hunt's member who asks for Ramsgate drains its hunt (PARTY_RETURNED_TO_HUB, credential kept) and is placed in the running hub", async () => {
     await WithKit(async (kit) => {
         const hub = await StartRunningHub(kit);
         const { hunt } = await RealmHunt(kit, "party-return", [MEMBER]);
@@ -273,6 +276,18 @@ test("return: a realm hunt's member who asks for Ramsgate ends its hunt (PARTY_R
 
         const back = Harness(MEMBER, { gameMode: "CITY", huntId: "ShatteredIsles_ReturnToRamsgate", isHub: true });
         assert.deepEqual(await RouteP2PHunt(back.context), { handled: true, result: true });
+        const drained = kit.hunts.hunts.get(hunt!.sessionId)!;
+        assert.equal(drained.state, "DRAINING");
+        assert.equal(drained.completionReason, "PARTY_RETURNED_TO_HUB");
+        assert.equal(drained.activePartyKey, undefined, "the party is free for its next request");
+        assert.equal(kit.hunts.capabilities.get(capability.capabilityId)!.revokedAt, undefined, "the host's credential stays valid");
+        assert.equal(Messages(kit, MEMBER, "FENCE_NOW").length + Messages(kit, HOST, "FENCE_NOW").length, 0, "nothing is fenced");
+        // The lease keeps renewing while the player is still on the hunt server.
+        assert.equal((await RenewHostLease(capability, { leaseSequence: 1, bridgeAlive: true, serverReady: true, admittedPeerCount: 1,
+            queuePressure: 0 })).state, "DRAINING");
+        // The server empties and stops: its lease lapses past the suspect window and the drain ends COMPLETED.
+        kit.hunts.hunts.get(hunt!.sessionId)!.leaseExpiresAt = new Date(Date.now() - 60_000).toISOString();
+        await new P2PHuntLifecycleMonitor().tick();
         const ended = kit.hunts.hunts.get(hunt!.sessionId)!;
         assert.equal(ended.state, "COMPLETED");
         assert.equal(ended.completionReason, "PARTY_RETURNED_TO_HUB");

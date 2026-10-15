@@ -11,6 +11,7 @@ import {
     RealmHostingPatch,
     RealmInviteRecord,
     RealmJoinPolicy,
+    RealmJoinRequest,
     RealmMember,
     RealmPresenceRecord,
     RealmRecord
@@ -24,6 +25,8 @@ import { HeartbeatUpdate } from "../realmRules";
 export type InsertRealmResult = "INSERTED" | "NAME_TAKEN" | "HOST_HAS_REALM";
 export type AddMemberResult = "ADDED" | "ALREADY_MEMBER" | "BANNED" | "FULL" | "NOT_FOUND";
 export type AddBanResult = "BANNED" | "ALREADY_BANNED" | "FULL" | "NOT_FOUND";
+/** [2026-10-15] A join request: ADDED now; the other answers say why it was not (checked in the order listed). */
+export type AddJoinRequestResult = "ADDED" | "ALREADY_REQUESTED" | "BANNED" | "ALREADY_MEMBER" | "FULL" | "NOT_FOUND";
 
 export interface RealmsRepository {
     findById(realmId: string): Promise<RealmRecord | undefined>;
@@ -72,8 +75,16 @@ export interface RealmsRepository {
     removeMember(realmId: string, accountId: string): Promise<boolean>;
     /** Bans an account (member or not) and removes it from the members. */
     addBan(realmId: string, ban: RealmBan, maxBans: number): Promise<AddBanResult>;
-    /** Lifts a ban. False when the account was not banned. */
+    /** Lifts a ban. False when the account was not banned. A ban also removes the account's join request (addBan). */
     removeBan(realmId: string, accountId: string): Promise<boolean>;
+
+    /**
+     * [2026-10-15] Records a join request unless the account already has one, is banned or is a member, or the realm already holds
+     * `maxRequests` requests. The checks and the insert are one update, so two racing requests cannot exceed the bound.
+     */
+    addJoinRequest(realmId: string, request: RealmJoinRequest, maxRequests: number): Promise<AddJoinRequestResult>;
+    /** Removes the account's join request. False when it had none. */
+    removeJoinRequest(realmId: string, accountId: string): Promise<boolean>;
 
     insertInvite(invite: RealmInviteRecord): Promise<"INSERTED" | "DUPLICATE">;
     findInvite(code: string): Promise<RealmInviteRecord | undefined>;

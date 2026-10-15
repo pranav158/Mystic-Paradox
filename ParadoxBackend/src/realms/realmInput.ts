@@ -301,6 +301,26 @@ export function ParseBanBody(body: unknown): Parsed<{ reason?: string }> {
     return Ok(trimmed.length === 0 ? {} : { reason: trimmed });
 }
 
+export const USERNAME_MAX_LENGTH = 64;
+
+/**
+ * [2026-10-15] POST /launcher/v1/realms/mine/members/add: the username of the player to let in. Trimmed; 1-64 characters without
+ * control characters. Format is not policed beyond that: an unknown name is simply not found (REALM_PLAYER_NOT_FOUND), so accounts
+ * created under older rules still resolve.
+ */
+export function ParseUsernameBody(body: unknown): Parsed<{ username: string }> {
+    const source = AsObject(body);
+    if (source === undefined) return Fail("The request body must be a JSON object.");
+    if (!Has(source, "username")) return Fail("username is required.");
+    const raw = source.username;
+    if (typeof raw !== "string") return Fail("username must be text.");
+    const username = raw.trim();
+    if (username.length < 1 || username.length > USERNAME_MAX_LENGTH || /[\u0000-\u001f\u007f]/.test(username)) {
+        return Fail(`username must be 1 to ${USERNAME_MAX_LENGTH} characters of plain text.`);
+    }
+    return Ok({ username });
+}
+
 export const LIST_DEFAULT_LIMIT = 25;
 export const LIST_MAX_LIMIT = 50;
 export const LIST_MAX_OFFSET = 10_000;

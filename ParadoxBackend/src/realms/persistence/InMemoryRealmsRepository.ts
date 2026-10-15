@@ -12,11 +12,19 @@ import {
     RealmHostingPatch,
     RealmInviteRecord,
     RealmJoinPolicy,
+    RealmJoinRequest,
     RealmMember,
     RealmPresenceRecord,
     RealmRecord
 } from "../realmTypes";
-import { AddBanResult, AddMemberResult, InsertRealmResult, RealmPresenceRepository, RealmsRepository } from "./RealmsRepository";
+import {
+    AddBanResult,
+    AddJoinRequestResult,
+    AddMemberResult,
+    InsertRealmResult,
+    RealmPresenceRepository,
+    RealmsRepository
+} from "./RealmsRepository";
 
 // [2026-10-13 realms S2] The realms persistence contract held in memory: the test double of the service and route tests
 // (no MongoDB needed), and the reference for the contract's semantics. Records are copied on the way in and out, as a
@@ -168,6 +176,7 @@ export class InMemoryRealmsRepository implements RealmsRepository {
         if (realm.bans.length >= maxBans) return "FULL";
         realm.bans.push(Copy(ban));
         realm.members = realm.members.filter((member) => !(member.accountId === ban.accountId && member.role === "MEMBER"));
+        if (realm.joinRequests !== undefined) realm.joinRequests = realm.joinRequests.filter((request) => request.accountId !== ban.accountId);
         return "BANNED";
     }
 
@@ -177,6 +186,26 @@ export class InMemoryRealmsRepository implements RealmsRepository {
         const index = realm.bans.findIndex((ban) => ban.accountId === accountId);
         if (index < 0) return false;
         realm.bans.splice(index, 1);
+        return true;
+    }
+
+    async addJoinRequest(realmId: string, request: RealmJoinRequest, maxRequests: number): Promise<AddJoinRequestResult> {
+        const realm = this.realms.get(realmId);
+        if (realm === undefined) return "NOT_FOUND";
+        const requests = realm.joinRequests ?? [];
+        if (realm.bans.some((ban) => ban.accountId === request.accountId)) return "BANNED";
+        if (realm.members.some((member) => member.accountId === request.accountId)) return "ALREADY_MEMBER";
+        if (requests.some((entry) => entry.accountId === request.accountId)) return "ALREADY_REQUESTED";
+        if (requests.length >= maxRequests) return "FULL";
+        realm.joinRequests = [...requests, Copy(request)];
+        return "ADDED";
+    }
+
+    async removeJoinRequest(realmId: string, accountId: string): Promise<boolean> {
+        const realm = this.realms.get(realmId);
+        const index = realm?.joinRequests?.findIndex((request) => request.accountId === accountId) ?? -1;
+        if (realm === undefined || index < 0) return false;
+        realm.joinRequests!.splice(index, 1);
         return true;
     }
 

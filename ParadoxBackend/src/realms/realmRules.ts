@@ -178,6 +178,18 @@ export function DecideJoin(
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Join requests [2026-10-15]
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * The host's list of join requests: newest first. ISO strings of one shape compare correctly as text; requests with the same time
+ * keep the order they were stored in (the sort is stable).
+ */
+export function SortJoinRequestsNewestFirst<T extends { at: string }>(requests: readonly T[]): T[] {
+    return [...requests].sort((a, b) => b.at.localeCompare(a.at));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Online state
 // ---------------------------------------------------------------------------------------------------------------
 

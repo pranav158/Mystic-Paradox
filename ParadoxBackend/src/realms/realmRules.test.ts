@@ -20,6 +20,7 @@ import {
     NormalizeRealmName,
     RESERVED_REALM_NAMES,
     RealmNameReleaseAt,
+    SortJoinRequestsNewestFirst,
     ValidateRealmName
 } from "./realmRules";
 import { RealmBan, RealmInviteRecord, RealmMember } from "./realmTypes";
@@ -222,4 +223,16 @@ test("a heartbeat records the version only when the host sent one, and online:fa
 test("a realm with no heartbeat, or a garbled one, is offline", () => {
     assert.equal(IsRealmOnline({}, T0), false);
     assert.equal(IsRealmOnline({ onlineUntil: "garbage" }, T0), false);
+});
+
+test("join requests are listed newest first; requests at the same time keep their stored order", () => {
+    const requests = [
+        { accountId: "a", at: iso(T0) },
+        { accountId: "b", at: iso(T0 + 2_000) },
+        { accountId: "c", at: iso(T0) },
+        { accountId: "d", at: iso(T0 + 1_000) }
+    ];
+    assert.deepEqual(SortJoinRequestsNewestFirst(requests).map((request) => request.accountId), ["b", "d", "a", "c"]);
+    assert.deepEqual(requests.map((request) => request.accountId), ["a", "b", "c", "d"], "the input is not reordered");
+    assert.deepEqual(SortJoinRequestsNewestFirst([]), []);
 });

@@ -208,9 +208,15 @@ test("a running Tier 0 hunt the requester left is drained; every other supersede
     // A realm hub is never drained (it has its own lifecycle).
     assert.deepEqual(ClassifyExistingPartySession(session({ sessionKind: "REALM_HUB" }), "ShatteredIsles_IslandA", "joiner"),
         { action: "SUPERSEDE", reason: "REQUESTER_LEFT_HUNT" });
-    // The completion, abort, suspect and expired-lease states keep their own reasons.
+    // [2026-10-15] A finished running Tier 0 hunt drains too (its players are still on the results screen); a finished hunt that
+    // is no longer running is superseded. The suspect and expired-lease states keep their own reasons.
     assert.deepEqual(ClassifyExistingPartySession(session({ guardEncounterState: "COMPLETION_REQUESTED" }), "ShatteredIsles_IslandA", "joiner"),
+        { action: "DRAIN", reason: "HUNT_FINISHED" });
+    assert.deepEqual(ClassifyExistingPartySession(session({ guardEncounterState: "COMPLETION_REQUESTED", trustTier: 1 }), "ShatteredIsles_IslandA", "joiner"),
         { action: "SUPERSEDE", reason: "HUNT_FINISHED" });
+    // A party that changed hunt while its running hunt still has players drains it as well.
+    assert.deepEqual(ClassifyExistingPartySession(session(), "ShatteredIsles_IslandB", "joiner2"),
+        { action: "DRAIN", reason: "PARTY_CHANGED_HUNT" });
     assert.deepEqual(ClassifyExistingPartySession(session({ state: "SUSPECT", preSuspectState: "RUNNING" }), "ShatteredIsles_IslandA", "joiner"),
         { action: "SUPERSEDE", reason: "SESSION_ENDING" });
     assert.deepEqual(ClassifyExistingPartySession(session({ leaseExpiresAt: new Date(Date.now() - 1_000).toISOString() }), "ShatteredIsles_IslandA", "joiner"),

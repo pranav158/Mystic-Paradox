@@ -8,7 +8,7 @@
 
 import type { LauncherAccountRecord, LauncherConsentRecord } from "../persistence/contracts/LauncherAccountRepository";
 import { ReadPersistenceProvider } from "../persistence";
-import { CurrentLegalRequirements, LegalRequirements } from "../legal/legalPolicy";
+import { CurrentLegalRequirements, IsAcceptedPrivacyVersion, LegalRequirements } from "../legal/legalPolicy";
 import { LauncherApiError } from "./launcherErrors";
 
 // [2026-10-14] Consent to the Terms of Use and Privacy Policy, the age confirmation, and the account deletion hold. The pure rules
@@ -38,7 +38,7 @@ export function IsConsentCurrent(consent: LauncherConsentRecord | undefined, req
         && consent !== null
         && consent.ageConfirmed === true
         && consent.termsVersion === required.termsVersion
-        && consent.privacyVersion === required.privacyVersion;
+        && IsAcceptedPrivacyVersion(consent.privacyVersion, required);
 }
 
 /** The consent as the launcher reads it (GET /launcher/v1/account/consent), or null when none is stored. */
@@ -68,13 +68,14 @@ export function ValidateRegistrationConsent(
     if (Body.ageConfirmed !== true) {
         throw new LauncherApiError("CONSENT_AGE_REQUIRED", `You must be at least ${required.minimumAge} years old to create an account.`);
     }
-    if (Body.termsVersion !== required.termsVersion || Body.privacyVersion !== required.privacyVersion) {
+    if (Body.termsVersion !== required.termsVersion || !IsAcceptedPrivacyVersion(Body.privacyVersion, required)) {
         if (Required) throw ConsentRequiredError();
         return undefined;
     }
     return {
         termsVersion: required.termsVersion,
-        privacyVersion: required.privacyVersion,
+        // [2026-10-15] The version the player was shown (the current one, or one still accepted during its transition).
+        privacyVersion: Body.privacyVersion as string,
         ageConfirmed: true,
         acceptedAt: nowIso
     };

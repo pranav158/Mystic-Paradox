@@ -7,12 +7,14 @@ import {
     RealmHostingPatch,
     RealmInviteRecord,
     RealmJoinPolicy,
+    RealmJoinRequest,
     RealmMember,
     RealmPresenceRecord,
     RealmRecord
 } from "../../realmTypes";
 import {
     AddBanResult,
+    AddJoinRequestResult,
     AddMemberResult,
     DisplayNameResolver,
     InsertRealmResult,
@@ -249,7 +251,11 @@ export class MongoRealmsRepository implements RealmsRepository {
                 "bans.accountId": { $ne: ban.accountId },
                 $expr: { $lt: [{ $size: "$bans" }, maxBans] }
             },
-            { $push: { bans: { ...ban } as any }, $pull: { members: { accountId: ban.accountId, role: "MEMBER" } as any } }
+            {
+                $push: { bans: { ...ban } as any },
+                // [2026-10-15] A ban also withdraws the account's join request (the same update, so no request outlives the ban).
+                $pull: { members: { accountId: ban.accountId, role: "MEMBER" } as any, joinRequests: { accountId: ban.accountId } as any }
+            }
         );
         if (result.modifiedCount === 1) return "BANNED";
         const doc = await realms.findOne({ _id: { $eq: realmId as any } }, { projection: { bans: 1 } });
@@ -263,6 +269,38 @@ export class MongoRealmsRepository implements RealmsRepository {
         const result = await realms.updateOne(
             { _id: { $eq: realmId as any }, "bans.accountId": { $eq: accountId } },
             { $pull: { bans: { accountId } as any } }
+        );
+        return result.modifiedCount === 1;
+    }
+
+    async addJoinRequest(realmId: string, request: RealmJoinRequest, maxRequests: number): Promise<AddJoinRequestResult> {
+        const { realms } = await this.collections();
+        // $ifNull: a realm that never had a request has no joinRequests field, and $size of a missing field is an error.
+        const result = await realms.updateOne(
+            {
+                _id: { $eq: realmId as any },
+                "bans.accountId": { $ne: request.accountId },
+                "members.accountId": { $ne: request.accountId },
+                "joinRequests.accountId": { $ne: request.accountId },
+                $expr: { $lt: [{ $size: { $ifNull: ["$joinRequests", []] } }, maxRequests] }
+            },
+            { $push: { joinRequests: { ...request } as any } }
+        );
+        if (result.modifiedCount === 1) return "ADDED";
+        // Nothing changed: find out which precondition failed (the same order as the in-memory double).
+        const doc = await realms.findOne({ _id: { $eq: realmId as any } }, { projection: { members: 1, bans: 1, joinRequests: 1 } });
+        if (doc == undefined) return "NOT_FOUND";
+        if ((doc.bans ?? []).some((ban: RealmBan) => ban.accountId === request.accountId)) return "BANNED";
+        if ((doc.members ?? []).some((member: RealmMember) => member.accountId === request.accountId)) return "ALREADY_MEMBER";
+        if ((doc.joinRequests ?? []).some((entry: RealmJoinRequest) => entry.accountId === request.accountId)) return "ALREADY_REQUESTED";
+        return "FULL";
+    }
+
+    async removeJoinRequest(realmId: string, accountId: string): Promise<boolean> {
+        const { realms } = await this.collections();
+        const result = await realms.updateOne(
+            { _id: { $eq: realmId as any }, "joinRequests.accountId": { $eq: accountId } },
+            { $pull: { joinRequests: { accountId } as any } }
         );
         return result.modifiedCount === 1;
     }

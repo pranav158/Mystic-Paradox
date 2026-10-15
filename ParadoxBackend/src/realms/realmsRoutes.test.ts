@@ -36,7 +36,7 @@ function FakeAuth(req: Request, res: Response, next: NextFunction) {
     next();
 }
 
-async function Start(): Promise<Harness> {
+async function Start(resolveUsername?: (username: string) => Promise<string | undefined>): Promise<Harness> {
     const repo = new InMemoryRealmsRepository();
     const clock = { now: T0 };
     let counter = 0;
@@ -46,7 +46,8 @@ async function Start(): Promise<Harness> {
         displayNames: async (ids) => new Map(ids.filter((id) => NAMES.has(id)).map((id) => [id, NAMES.get(id)!])),
         now: () => clock.now,
         isRateLimited: () => false,
-        generateRealmId: () => `realm-${++counter}`
+        generateRealmId: () => `realm-${++counter}`,
+        resolveUsername
     });
     const app = express();
     app.use(express.json());
@@ -105,6 +106,75 @@ function ExpectError(reply: Reply, status: number, code: string): void {
 
 const BASE = "/launcher/v1/realms";
 
+// [2026-10-15] Join requests and adding players by username, over HTTP.
+// The resolver matches case-insensitively, as the production one does.
+const NAMED = async (name: string) => (name.toLowerCase() === "friendly" ? "friend-1" : undefined);
+
+test("join requests over HTTP: the host lists, approves and denies them; anyone else gets the host routes' not-found", async () => {
+    const H = await Start(NAMED);
+    try {
+        await Call(H.port, "POST", BASE, "host-1", { name: "friends", hostPublicKey: KEY_A });
+        ExpectError(await Call(H.port, "POST", `${BASE}/join`, "friend-1", { name: "friends" }), 409, "REALM_JOIN_REQUESTED");
+
+        const listed = await Call(H.port, "GET", `${BASE}/mine/requests`, "host-1");
+        assert.equal(listed.status, 200);
+        assert.deepEqual(Object.keys(listed.json), ["requests"]);
+        assert.equal(listed.json.requests.length, 1);
+        assert.deepEqual(Object.keys(listed.json.requests[0]).sort(), ["accountId", "at", "displayName"]);
+        assert.equal(listed.json.requests[0].accountId, "friend-1");
+        assert.equal(listed.json.requests[0].displayName, "Friendly");
+        assert.equal((await Call(H.port, "GET", `${BASE}/mine`, "host-1")).json.hosted.joinRequestCount, 1);
+
+        ExpectError(await Call(H.port, "GET", `${BASE}/mine/requests`, "friend-2"), 404, "REALM_NOT_FOUND");
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/requests/friend-1/approve`, "friend-2"), 404, "REALM_NOT_FOUND");
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/requests/friend-1/deny`, "friend-2"), 404, "REALM_NOT_FOUND");
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/members/add`, "friend-2", { username: "Friendly" }), 404, "REALM_NOT_FOUND");
+
+        const denied = await Call(H.port, "POST", `${BASE}/mine/requests/friend-1/deny`, "host-1");
+        assert.equal(denied.status, 200);
+        assert.deepEqual(denied.json, { accountId: "friend-1", status: "DENIED" });
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/requests/friend-1/deny`, "host-1"), 404, "REALM_REQUEST_NOT_FOUND");
+
+        ExpectError(await Call(H.port, "POST", `${BASE}/join`, "friend-1", { name: "friends" }), 409, "REALM_JOIN_REQUESTED");
+        const approved = await Call(H.port, "POST", `${BASE}/mine/requests/friend-1/approve`, "host-1");
+        assert.equal(approved.status, 200);
+        assert.deepEqual(approved.json, { accountId: "friend-1", status: "APPROVED" });
+        assert.deepEqual((await Call(H.port, "GET", `${BASE}/mine/requests`, "host-1")).json.requests, []);
+
+        const joined = await Call(H.port, "POST", `${BASE}/join`, "friend-1", { name: "friends" });
+        assert.equal(joined.status, 200);
+        assert.equal(joined.json.joined, false);
+        assert.equal(joined.json.realm.membership, "MEMBER");
+    } finally {
+        await H.close();
+        StopRealmsSweeper();
+    }
+});
+
+test("the host adds a player by username over HTTP: 200 with added, 404 for an unknown name, 400 for a bad body", async () => {
+    const H = await Start(NAMED);
+    try {
+        await Call(H.port, "POST", BASE, "host-1", { name: "friends", hostPublicKey: KEY_A });
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/members/add`, "host-1", {}), 400, "REALM_VALIDATION_FAILED");
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/members/add`, "host-1", { username: 7 }), 400, "REALM_VALIDATION_FAILED");
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/members/add`, "host-1", { username: "   " }), 400, "REALM_VALIDATION_FAILED");
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/members/add`, "host-1", { username: "a\nb" }), 400, "REALM_VALIDATION_FAILED");
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/members/add`, "host-1", { username: "nobody" }), 404, "REALM_PLAYER_NOT_FOUND");
+
+        const added = await Call(H.port, "POST", `${BASE}/mine/members/add`, "host-1", { username: "  Friendly " });
+        assert.equal(added.status, 200);
+        assert.deepEqual(added.json, { accountId: "friend-1", displayName: "Friendly", added: true });
+        const again = await Call(H.port, "POST", `${BASE}/mine/members/add`, "host-1", { username: "friendly" });
+        assert.deepEqual(again.json, { accountId: "friend-1", displayName: "Friendly", added: false });
+
+        const joined = await Call(H.port, "POST", `${BASE}/join`, "friend-1", { name: "friends" });
+        assert.equal(joined.status, 200, "the added player joins without an invite");
+    } finally {
+        await H.close();
+        StopRealmsSweeper();
+    }
+});
+
 test("every route needs a launcher sign-in and answers the launcher error envelope without one", async () => {
     const H = await Start();
     try {
@@ -115,6 +185,8 @@ test("every route needs a launcher sign-in and answers the launcher error envelo
             ["POST", `${BASE}/mine/invites/ABCDEFGHJK/revoke`], ["POST", `${BASE}/mine/members/x/kick`],
             ["POST", `${BASE}/mine/members/x/ban`], ["POST", `${BASE}/mine/members/x/unban`],
             ["POST", `${BASE}/mine/heartbeat`], ["POST", `${BASE}/mine/release`], ["POST", `${BASE}/presence/heartbeat`],
+            ["GET", `${BASE}/mine/requests`], ["POST", `${BASE}/mine/requests/x/approve`], ["POST", `${BASE}/mine/requests/x/deny`],
+            ["POST", `${BASE}/mine/members/add`],
             ["POST", `${BASE}/presence/leave`], ["GET", `${BASE}/presence`], ["GET", `${BASE}/nope`]
         ]) {
             ExpectError(await Call(H.port, method, path, undefined, method === "POST" ? {} : undefined), 401, "AUTH_UNAUTHORIZED");
@@ -205,7 +277,7 @@ test("a whole realm lifecycle: invite, preview, join, list, kick, ban, unban, he
         await Call(H.port, "POST", BASE, "host-1", { name: "friends", hostPublicKey: KEY_A });
 
         // Invite-only: no invite, no entry.
-        ExpectError(await Call(H.port, "POST", `${BASE}/join`, "friend-1", { name: "friends" }), 403, "REALM_INVITE_REQUIRED");
+        ExpectError(await Call(H.port, "POST", `${BASE}/join`, "friend-1", { name: "friends" }), 409, "REALM_JOIN_REQUESTED");
 
         const created = await Call(H.port, "POST", `${BASE}/mine/invites`, "host-1", { maxUses: 2, expiresInHours: 24 });
         assert.equal(created.status, 201);

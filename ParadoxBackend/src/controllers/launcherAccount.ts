@@ -8,7 +8,7 @@
 
 import { GetRepositories } from "../persistence";
 import type { LauncherAccountRecord, LauncherConsentRecord, LauncherDeletionRecord } from "../persistence/contracts/LauncherAccountRepository";
-import { CurrentLegalRequirements, LegalRequirements } from "../legal/legalPolicy";
+import { CurrentLegalRequirements, IsAcceptedPrivacyVersion, LegalRequirements } from "../legal/legalPolicy";
 import { DELETION_HOLD_DAYS, RetentionDateAfter } from "../legal/retentionPolicy";
 import { ConsentView, IsConsentCurrent } from "../security/accountConsent";
 import { LauncherApiError } from "../security/launcherErrors";
@@ -62,7 +62,7 @@ export async function AcceptConsent(userId: string, body: unknown, now: Date = n
     if (typeof Fields.termsVersion !== "string" || typeof Fields.privacyVersion !== "string") {
         throw new LauncherApiError("AUTH_VALIDATION_FAILED", "termsVersion and privacyVersion are required.");
     }
-    if (Fields.termsVersion !== Required.termsVersion || Fields.privacyVersion !== Required.privacyVersion) {
+    if (Fields.termsVersion !== Required.termsVersion || !IsAcceptedPrivacyVersion(Fields.privacyVersion, Required)) {
         throw new LauncherApiError("LEGAL_VERSION_OUTDATED",
             "These Terms of Use or this Privacy Policy have changed. Update the launcher, read them again and accept.",
             { details: { termsVersion: Required.termsVersion, privacyVersion: Required.privacyVersion } });
@@ -71,7 +71,8 @@ export async function AcceptConsent(userId: string, body: unknown, now: Date = n
     await RequireAccount(userId);
     const Consent: LauncherConsentRecord = {
         termsVersion: Required.termsVersion,
-        privacyVersion: Required.privacyVersion,
+        // [2026-10-15] The version the player was shown (the current one, or one still accepted during its transition).
+        privacyVersion: Fields.privacyVersion,
         ageConfirmed: true,
         acceptedAt: now.toISOString()
     };

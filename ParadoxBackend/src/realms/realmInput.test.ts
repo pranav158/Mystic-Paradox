@@ -13,6 +13,7 @@ import {
     ParseListQuery,
     ParseNameParam,
     ParseSettingsBody,
+    ParseUsernameBody,
     ParseVersion
 } from "./realmInput";
 import { IsRealmsModuleEnabled, ReadRealmLimits } from "./realmsConfig";
@@ -153,8 +154,21 @@ test("the module switch: only on, true or 1 (any case) turns it on; the default 
     assert.equal(IsRealmsModuleEnabled({}), false);
 });
 
+test("adding a player: a username is required, trimmed, 1-64 plain characters; nothing else is read", () => {
+    assert.deepEqual(ParseUsernameBody({ username: "  Friendly " }), { ok: true, value: { username: "Friendly" } });
+    assert.deepEqual(ParseUsernameBody({ username: "x", accountId: "someone-else" }), { ok: true, value: { username: "x" } });
+    assert.deepEqual(ParseUsernameBody({ username: "x".repeat(64) }), { ok: true, value: { username: "x".repeat(64) } });
+    for (const body of [undefined, null, {}, { username: 7 }, { username: ["a"] }, { username: "" }, { username: "   " },
+        { username: "x".repeat(65) }, { username: "a\tb" }, { username: "a\u007fb" }]) {
+        const parsed = ParseUsernameBody(body);
+        assert.equal(parsed.ok, false, JSON.stringify(body));
+        if (!parsed.ok) assert.equal(parsed.code, "REALM_VALIDATION_FAILED");
+    }
+    assert.equal(ParseUsernameBody([]).ok, false);
+});
+
 test("realm limits: defaults, bounded overrides, garbage ignored", () => {
-    assert.deepEqual(ReadRealmLimits({}), { maxMembers: 1000, maxBans: 1000, maxActiveInvites: 25 });
+    assert.deepEqual(ReadRealmLimits({}), { maxMembers: 1000, maxBans: 1000, maxActiveInvites: 25, maxJoinRequests: 50 });
     assert.equal(ReadRealmLimits({ MYSTICPARADOX_REALMS_MAX_MEMBERS: "50" }).maxMembers, 50);
     assert.equal(ReadRealmLimits({ MYSTICPARADOX_REALMS_MAX_MEMBERS: "1" }).maxMembers, 1000);
     assert.equal(ReadRealmLimits({ MYSTICPARADOX_REALMS_MAX_MEMBERS: "99999" }).maxMembers, 1000);

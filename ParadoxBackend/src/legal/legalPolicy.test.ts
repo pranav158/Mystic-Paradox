@@ -43,3 +43,12 @@ test("the retention periods are the ones the Privacy Policy states", () => {
     assert.equal(UPLOADED_LAUNCHER_LOG_RETENTION_DAYS, 90);
     assert.equal(RetentionDateAfter("2026-10-14T00:00:00.000Z", 2).toISOString(), "2026-10-16T00:00:00.000Z");
 });
+
+// [2026-10-15] The previous privacy version stays accepted during its transition (0.1.66 launchers carry 2026-10-14.2).
+test("the previous privacy version still counts as accepted, other versions do not", async () => {
+    const { IsAcceptedPrivacyVersion, PRIVACY_VERSION } = await import("./legalPolicy");
+    assert.equal(IsAcceptedPrivacyVersion(PRIVACY_VERSION), true);
+    assert.equal(IsAcceptedPrivacyVersion("2026-10-14.2"), true);
+    assert.equal(IsAcceptedPrivacyVersion("2026-10-14"), false);
+    assert.equal(IsAcceptedPrivacyVersion(undefined), false);
+});

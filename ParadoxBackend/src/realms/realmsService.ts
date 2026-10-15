@@ -32,6 +32,7 @@ import {
     PRESENCE_TTL_MS,
     PresenceTouchNeedsWrite,
     RealmNameReleaseAt,
+    SortJoinRequestsNewestFirst,
     ValidateHostingPatch
 } from "./realmRules";
 import { DisplayNameResolver, RealmPresenceRepository, RealmsRepository } from "./persistence/RealmsRepository";
@@ -87,6 +88,15 @@ export interface RealmHostView extends RealmPublicInfo {
     nameReleaseAt: string | null;
     members: Array<{ accountId: string; displayName: string | null; role: RealmMemberRole; joinedAt: string }>;
     bans: Array<{ accountId: string; displayName: string | null; reason: string | null; at: string }>;
+    /** [2026-10-15] Players waiting for the host's approval (GET .../mine/requests lists them). */
+    joinRequestCount: number;
+}
+
+/** [2026-10-15] One waiting player, as the host's request list shows it. */
+export interface JoinRequestView {
+    accountId: string;
+    displayName: string | null;
+    at: string;
 }
 
 export interface InviteView {
@@ -137,6 +147,9 @@ export const SWEEP_LOOKBACK_MS = 10 * MINUTE;
 const SWEEP_BATCH = 100;
 const PRESENCE_CACHE_LIMIT = 10_000;
 
+/** [2026-10-15] What a join request answered: the account is already in (a race with the host), or it is refused with this code. */
+type JoinRequestOutcome = { member: true } | { member: false; code: "REALM_JOIN_REQUESTED" | "REALM_BANNED" | "REALM_REQUESTS_FULL" | "REALM_NOT_FOUND" };
+
 /** Why DecideJoin refused, as the launcher error code (shared by join and authorizeEntry). */
 const JOIN_DENIAL_CODES = {
     BANNED: "REALM_BANNED",
@@ -159,6 +172,11 @@ export interface RealmsServiceDeps {
      * error (or a hang is the sink's own problem) is logged and never fails the request that caused the event.
      */
     events?: (event: RealmEvent) => Promise<void>;
+    /**
+     * [2026-10-15] The account whose launcher username is `username` (the caller's text, trimmed; the match is case-insensitive and
+     * exact), or undefined when no account has it. Used only by the host's "add player" route. Absent = no username is found.
+     */
+    resolveUsername?: (username: string) => Promise<string | undefined>;
 }
 
 export type RealmsService = ReturnType<typeof CreateRealmsService>;
@@ -268,7 +286,8 @@ export function CreateRealmsService(deps: RealmsServiceDeps) {
                 displayName: names.get(ban.accountId) ?? null,
                 reason: ban.reason ?? null,
                 at: ban.at
-            }))
+            })),
+            joinRequestCount: realm.joinRequests?.length ?? 0
         };
     }
 
@@ -465,6 +484,25 @@ export function CreateRealmsService(deps: RealmsServiceDeps) {
         return { ok: true, added: added === "ADDED" };
     }
 
+    /**
+     * [2026-10-15] An invite-only realm refused this account without an invite (DecideJoin INVITE_REQUIRED): the request is recorded
+     * (once; asking again changes nothing) and the caller is told to wait. A ban or a full list is refused instead; a member who asks
+     * after all (a race with the host's approval) is simply in.
+     */
+    async function RequestJoin(realmId: string, accountId: string): Promise<JoinRequestOutcome> {
+        const result = await repo.addJoinRequest(realmId, { accountId, at: Iso(Now()) }, Limits.maxJoinRequests);
+        switch (result) {
+            case "ADDED":
+                logger.info(`[Realms] join requested realmId=${realmId}`);
+                return { member: false, code: "REALM_JOIN_REQUESTED" };
+            case "ALREADY_REQUESTED": return { member: false, code: "REALM_JOIN_REQUESTED" };
+            case "ALREADY_MEMBER": return { member: true };
+            case "BANNED": return { member: false, code: "REALM_BANNED" };
+            case "FULL": return { member: false, code: "REALM_REQUESTS_FULL" };
+            case "NOT_FOUND": return { member: false, code: "REALM_NOT_FOUND" };
+        }
+    }
+
     return {
         /** Claims a realm name for the caller's account (one realm per host account). */
         async createRealm(accountId: string, input: CreateRealmInput): Promise<{ realm: RealmHostView }> {
@@ -625,7 +663,14 @@ export function CreateRealmsService(deps: RealmsServiceDeps) {
                 throw RealmEntryError("REALM_OWNER_CHANGED");
             }
 
-            const decision = DecideJoin(realm, accountId, invite, Now());
+            let decision = DecideJoin(realm, accountId, invite, Now());
+            if (!decision.allow && decision.reason === "INVITE_REQUIRED") {
+                // [2026-10-15] No invite on an invite-only realm: ask the host. Approved in the meantime counts as a member's join.
+                const requested = await RequestJoin(realm.realmId, accountId);
+                if (!requested.member) throw RealmEntryError(requested.code);
+                realm = (await repo.findById(realm.realmId)) ?? realm;
+                decision = { allow: true, via: "MEMBER" };
+            }
             if (!decision.allow) throw RealmEntryError(JOIN_DENIAL_CODES[decision.reason]);
             if (decision.via === "MEMBER") return { realm: (await PublicInfos([realm], accountId))[0], joined: false };
 
@@ -655,7 +700,13 @@ export function CreateRealmsService(deps: RealmsServiceDeps) {
             if (input.knownHostKey !== undefined && DetectOwnershipChange({ name: realm.name, hostPublicKey: input.knownHostKey }, realm)) {
                 return { ok: false, code: "REALM_OWNER_CHANGED" };
             }
-            const decision = DecideJoin(realm, accountId, invite, Now());
+            let decision = DecideJoin(realm, accountId, invite, Now());
+            if (!decision.allow && decision.reason === "INVITE_REQUIRED") {
+                // [2026-10-15] Play on an invite-only realm without an invite: the request is recorded and Play says so.
+                const requested = await RequestJoin(realm.realmId, accountId);
+                if (!requested.member) return { ok: false, code: requested.code };
+                decision = { allow: true, via: "MEMBER" };
+            }
             if (!decision.allow) return { ok: false, code: JOIN_DENIAL_CODES[decision.reason] };
 
             const isHost = realm.hostAccountId === accountId;
@@ -723,6 +774,82 @@ export function CreateRealmsService(deps: RealmsServiceDeps) {
             const changed = await repo.removeBan(realm.realmId, targetAccountId);
             if (changed) logger.info(`[Realms] ban lifted realmId=${realm.realmId}`);
             return { accountId: targetAccountId, status: "UNBANNED", changed };
+        },
+
+        // -------------------------------------------------------------------------------------------------------
+        // Join requests and adding players, the host's side [2026-10-15]
+        // -------------------------------------------------------------------------------------------------------
+
+        /** The players waiting for the host, newest request first. */
+        async listJoinRequests(accountId: string): Promise<{ requests: JoinRequestView[] }> {
+            Throttle("read", accountId);
+            const realm = await RequireHostedRealm(accountId);
+            const requests = SortJoinRequestsNewestFirst(realm.joinRequests ?? []);
+            const names = await NamesFor(requests.map((request) => request.accountId));
+            return {
+                requests: requests.map((request) => ({
+                    accountId: request.accountId,
+                    displayName: names.get(request.accountId) ?? null,
+                    at: request.at
+                }))
+            };
+        },
+
+        /**
+         * Approves a waiting player: the membership goes through the same addMember as an invite join (a ban or the member cap still
+         * apply, and the request stays when the cap refuses it), then the request is removed. REALM_REQUEST_NOT_FOUND when that
+         * account has no request.
+         */
+        async approveJoinRequest(accountId: string, targetAccountId: string): Promise<{ accountId: string; status: "APPROVED" }> {
+            Throttle("write", accountId);
+            const realm = await RequireHostedRealm(accountId);
+            if (!(realm.joinRequests ?? []).some((request) => request.accountId === targetAccountId)) {
+                throw new LauncherApiError("REALM_REQUEST_NOT_FOUND", "That player has not asked to join your realm.");
+            }
+            const added = await repo.addMember(realm.realmId, { accountId: targetAccountId, role: "MEMBER", joinedAt: Iso(Now()) }, Limits.maxMembers);
+            switch (added) {
+                case "NOT_FOUND": throw new LauncherApiError("REALM_NOT_FOUND", "You do not host a realm.");
+                case "BANNED":
+                    await repo.removeJoinRequest(realm.realmId, targetAccountId);
+                    throw new LauncherApiError("REALM_BANNED", "That player is banned from your realm.");
+                case "FULL": throw new LauncherApiError("REALM_FULL", "This realm cannot take more members.");
+            }
+            await repo.removeJoinRequest(realm.realmId, targetAccountId);
+            logger.info(`[Realms] join request approved realmId=${realm.realmId}`);
+            return { accountId: targetAccountId, status: "APPROVED" };
+        },
+
+        /** Denies a waiting player: the request is removed (the player may ask again). REALM_REQUEST_NOT_FOUND when there is none. */
+        async denyJoinRequest(accountId: string, targetAccountId: string): Promise<{ accountId: string; status: "DENIED" }> {
+            Throttle("write", accountId);
+            const realm = await RequireHostedRealm(accountId);
+            if (!(await repo.removeJoinRequest(realm.realmId, targetAccountId))) {
+                throw new LauncherApiError("REALM_REQUEST_NOT_FOUND", "That player has not asked to join your realm.");
+            }
+            logger.info(`[Realms] join request denied realmId=${realm.realmId}`);
+            return { accountId: targetAccountId, status: "DENIED" };
+        },
+
+        /**
+         * The host lets a player in by their launcher username (resolveUsername; case-insensitive). The membership goes through addMember
+         * (a ban and the member cap apply); any request the player had is removed. A player already in is answered with added:false.
+         */
+        async addMemberByUsername(accountId: string, username: string): Promise<{ accountId: string; displayName: string; added: boolean }> {
+            Throttle("write", accountId);
+            const realm = await RequireHostedRealm(accountId);
+            const trimmed = username.trim();
+            const target = deps.resolveUsername === undefined ? undefined : await deps.resolveUsername(trimmed);
+            if (target === undefined) throw new LauncherApiError("REALM_PLAYER_NOT_FOUND", "No player has that username.");
+            const added = await repo.addMember(realm.realmId, { accountId: target, role: "MEMBER", joinedAt: Iso(Now()) }, Limits.maxMembers);
+            switch (added) {
+                case "NOT_FOUND": throw new LauncherApiError("REALM_NOT_FOUND", "You do not host a realm.");
+                case "BANNED": throw new LauncherApiError("REALM_BANNED", "That player is banned from your realm. Lift the ban first.");
+                case "FULL": throw new LauncherApiError("REALM_FULL", "This realm cannot take more members.");
+            }
+            await repo.removeJoinRequest(realm.realmId, target);
+            if (added === "ADDED") logger.info(`[Realms] player added by the host realmId=${realm.realmId}`);
+            const displayName = (await NamesFor([target])).get(target) ?? trimmed;
+            return { accountId: target, displayName, added: added === "ADDED" };
         },
 
         /**

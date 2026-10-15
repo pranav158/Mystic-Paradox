@@ -7,6 +7,7 @@
  */
 
 import { logger } from "../logger";
+import { GetRepositories } from "../persistence";
 import { MongoRealmPresenceRepository, MongoRealmsRepository, ResolveDisplayNamesFromMongo } from "./persistence/mongo/MongoRealmsRepository";
 import { CreateRealmsService, RealmsService } from "./realmsService";
 import { ReadRealmLimits } from "./realmsConfig";
@@ -19,6 +20,18 @@ let CachedService: RealmsService | undefined;
 let EventSink: ((event: RealmEvent) => Promise<void>) | undefined;
 
 /**
+ * [2026-10-15] The account a launcher username belongs to (the host's "add player" route). Launcher usernames are stored normalized
+ * (trimmed, lower case) as displayNameNormalized, which the account repository matches exactly; the caller's text is normalized here.
+ * Works on either persistence provider.
+ */
+async function ResolveUsernameAccount(username: string): Promise<string | undefined> {
+    const normalized = username.trim().toLowerCase();
+    if (normalized.length === 0) return undefined;
+    const account = await GetRepositories().launcherAccounts.findByDisplayNameNormalized(normalized);
+    return account?.userId;
+}
+
+/**
  * The module's service on the shared MongoDB (created on first use; connecting and creating the indexes happen on the first
  * request). The p2p module reaches the realms only through this accessor and the sink below.
  */
@@ -28,7 +41,8 @@ export function GetRealmsService(): RealmsService {
         presence: new MongoRealmPresenceRepository(),
         displayNames: ResolveDisplayNamesFromMongo,
         limits: ReadRealmLimits(),
-        events: (event) => (EventSink === undefined ? Promise.resolve() : EventSink(event))
+        events: (event) => (EventSink === undefined ? Promise.resolve() : EventSink(event)),
+        resolveUsername: ResolveUsernameAccount
     });
     return CachedService;
 }

@@ -24,7 +24,8 @@ import {
     ParseKnownHostKeyQuery,
     ParseListQuery,
     ParseNameParam,
-    ParseSettingsBody
+    ParseSettingsBody,
+    ParseUsernameBody
 } from "../realmInput";
 import { LauncherApiError, SendLauncherError } from "../realmErrors";
 import { RealmsService } from "../realmsService";
@@ -50,6 +51,10 @@ import { RealmsService } from "../realmsService";
 //   POST /launcher/v1/realms/mine/members/:accountId/unban      {accountId, status, changed}
 //   POST /launcher/v1/realms/mine/heartbeat                     {online?, version?, hosting?: {maxServers, maxPlayers, afkSeconds?}} -> {online, lastOnlineAt, onlineUntil, ttlSeconds, version}
 //   POST /launcher/v1/realms/mine/release                       {released:true}       (the host gives the realm up)
+//   GET  /launcher/v1/realms/mine/requests                      {requests: [{accountId, displayName, at}]}  (newest first; [2026-10-15])
+//   POST /launcher/v1/realms/mine/requests/:accountId/approve   {accountId, status: "APPROVED"}  (member added, request removed)
+//   POST /launcher/v1/realms/mine/requests/:accountId/deny      {accountId, status: "DENIED"}    (request removed)
+//   POST /launcher/v1/realms/mine/members/add                   {username} -> {accountId, displayName, added}  (let a player in by name)
 //   POST /launcher/v1/realms/presence/heartbeat                 {} -> {realm: {name, serving, hubReady, hostOnline} | null, expiresAt}  (every 30 s while the game runs)
 //   POST /launcher/v1/realms/presence/leave                     {} -> {left:true}      (the game exited)
 //   GET  /launcher/v1/realms/presence                           {realm: {...} | null, expiresAt}
@@ -171,6 +176,21 @@ export function CreateRealmsRouter(deps: RealmsRouterDeps): Router {
     );
 
     router.post(`${BASE}/mine/release`, hosting, (req, res) => Handle(res, async () => service.release(AccountIdOf(req))));
+
+    // [2026-10-15] Join requests and adding players by username: the host's side, like kick and ban.
+    router.get(`${BASE}/mine/requests`, (req, res) => Handle(res, async () => service.listJoinRequests(AccountIdOf(req))));
+
+    router.post(`${BASE}/mine/requests/:accountId/approve`, hosting, (req, res) =>
+        Handle(res, async () => service.approveJoinRequest(AccountIdOf(req), MemberParam(req)))
+    );
+
+    router.post(`${BASE}/mine/requests/:accountId/deny`, hosting, (req, res) =>
+        Handle(res, async () => service.denyJoinRequest(AccountIdOf(req), MemberParam(req)))
+    );
+
+    router.post(`${BASE}/mine/members/add`, hosting, (req, res) =>
+        Handle(res, async () => service.addMemberByUsername(AccountIdOf(req), Unwrap(ParseUsernameBody(req.body)).username))
+    );
 
     // [2026-10-13 hub design section 2.2] The member's realm context: kept alive by the launcher, cleared when the game exits.
     router.post(`${BASE}/presence/heartbeat`, active, (req, res) => Handle(res, async () => {

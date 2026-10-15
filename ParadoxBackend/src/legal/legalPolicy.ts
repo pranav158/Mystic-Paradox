@@ -21,6 +21,19 @@ export interface LegalRequirements {
     minimumAge: number;
 }
 
+// [2026-10-15] Earlier privacy versions still counted as accepted, for a transition. 2026-10-15 only adds the tester log-upload
+// text (tester accounts only). A 0.1.66 launcher carries 2026-10-14.2: with an exact match its players were stopped at the consent
+// screen, unable to accept the new text and unable to reach their update. Drop an entry once the Guard minimum launcher shows the
+// current version (0.1.67 for 2026-10-15).
+export const PRIVACY_VERSIONS_STILL_ACCEPTED: readonly string[] = ["2026-10-14.2"];
+
+/** Whether a privacy version counts as accepted: the current one, or one still accepted during its transition. */
+export function IsAcceptedPrivacyVersion(version: unknown, required: LegalRequirements = CurrentLegalRequirements()): boolean {
+    if (typeof version !== "string") return false;
+    if (version === required.privacyVersion) return true;
+    return required.privacyVersion === PRIVACY_VERSION && PRIVACY_VERSIONS_STILL_ACCEPTED.includes(version);
+}
+
 export function CurrentLegalRequirements(): LegalRequirements {
     return { termsVersion: TERMS_VERSION, privacyVersion: PRIVACY_VERSION, minimumAge: MINIMUM_AGE };
 }

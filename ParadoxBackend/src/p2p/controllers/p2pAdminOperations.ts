@@ -133,18 +133,22 @@ export async function P2POperationsOverview(): Promise<OperationsOverviewExtensi
         const observedEventCount = receivedBatches.reduce((sum, batch) => sum + (Array.isArray(batch.events) ? batch.events.length : 0), 0);
         const lastTelemetryAt = receivedBatches.map((batch) => batch.receivedAt).filter((at) => typeof at === "string").sort().at(-1) ?? null;
         const defeats = new Map<string, number>();
+        let identifiedDefeats = 0;
         for (const batch of receivedBatches) for (const event of Array.isArray(batch.events) ? batch.events : []) {
             if (event?.type !== "BEHEMOTH_DEFEATED") continue;
-            // Current runtime events carry only source=HandleBehemothKilled (or a terminal
-            // fallback), not a validated Behemoth identifier. Do not infer identity from the map.
-            defeats.set("unknown", (defeats.get("unknown") ?? 0) + 1);
+            // [2026-10-15] Runtime 0.2.139+ names the defeated Behemoth's class (payload.behemoth, host-reported, e.g.
+            // lerawr_alpha_bp_C); older runtimes and the EndOfHuntStarted fallback send none. Never inferred from the map.
+            const behemoth = typeof event?.payload?.behemoth === "string" && /^[A-Za-z0-9_]{1,96}$/.test(event.payload.behemoth)
+                ? event.payload.behemoth as string : "unknown";
+            if (behemoth !== "unknown") identifiedDefeats++;
+            defeats.set(behemoth, (defeats.get(behemoth) ?? 0) + 1);
         }
         const createdMs = Date.parse(hunt.createdAt ?? "");
         const endedMs = Date.parse(hunt.terminalAt ?? "");
         const elapsedMs = Number.isFinite(createdMs) ? Math.max(0, (Number.isFinite(endedMs) ? endedMs : Date.now()) - createdMs) : null;
         const timing = MonitorHuntTiming({ sessionId, generation: hunt.generation, state: hunt.state, terminalAt: hunt.terminalAt ?? null },
             runningTransitions);
-        const unknownFields = [...timing.unknownFields];
+        const unknownFields = timing.unknownFields.filter((field) => field !== "behemothIdentity" || identifiedDefeats === 0);
         if (receivedBatches.length === 0) unknownFields.push("guardDefeatEvents");
         return {
             sessionId, generation: hunt.generation, huntDefinitionId: hunt.huntDefinitionId,
