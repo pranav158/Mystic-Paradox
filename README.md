@@ -38,7 +38,7 @@
 
 | Game version | State |
 |---|---|
-| **Dauntless 1.14.7** (CL `647472`) | 🚧 Alpha on `main`: every component targets 1.14.7. Hubs, dedicated hunts and saved hunt rewards work — [progress notes](docs/DAUNTLESS_1_14_7_PORT.md) |
+| **Dauntless 1.14.7** (CL `647472`) | 🚧 Alpha on `main`: every component targets 1.14.7. Hubs, dedicated hunts and saved hunt rewards work; co-op hunts and Paradox realms (hubs and hunts hosted on a player's PC, connected through Mystic Relay on the official servers) are in, off by default — [progress notes](docs/DAUNTLESS_1_14_7_PORT.md) · [co-op and realms](docs/SELF_HOSTING.md#co-op-hunts-and-paradox-realms) |
 | **Dauntless 1.12.0** (CL `392819`) | ✅ Alpha, self-hostable — build it from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag |
 
 Expect active development, not production-grade uptime.
@@ -74,10 +74,12 @@ Expect active development, not production-grade uptime.
 
 | Folder | What it is |
 |---|---|
-| [`ParadoxBackend`](ParadoxBackend) | Account and metagame backend (login, characters, inventory, progression, store, party…) — Node/TypeScript + MongoDB |
+| [`ParadoxBackend`](ParadoxBackend) | Account and metagame backend (login, characters, inventory, progression, store, party, co-op hunts, Paradox realms…) — Node/TypeScript + MongoDB (or SQLite for a local realm) |
 | [`ParadoxDirector`](ParadoxDirector) | Starts and supervises the dedicated game servers for hubs and hunts |
 | [`ParadoxRuntime`](ParadoxRuntime) | C++ DLL injected into the client and servers to adapt them to the private backend (MSVC + MinHook) |
-| [`ParadoxLauncher`](ParadoxLauncher) | Windows launcher: sign-in, install checks, signed runtime updates, game sessions (Tauri) |
+| [`ParadoxLauncher`](ParadoxLauncher) | Windows launcher: sign-in, servers and realms, install checks, signed runtime updates, game sessions, realm hosting (Tauri) |
+| [`ParadoxTransport`](ParadoxTransport) | Co-op transport module: ICE connections with STUN/TURN relays (libjuice) for player-hosted hubs and hunts; Mystic Relay on the official servers |
+| [`shared/hunt-manifest`](shared/hunt-manifest) | Hunt manifest resolution shared by the backend and the Director |
 | [`tools/RuntimeLoader`](tools/RuntimeLoader) | `winmm.dll` proxy that loads the runtime at startup |
 | [`tools/CatalogExporter`](tools/CatalogExporter) | Exports compatibility data from your own installation |
 

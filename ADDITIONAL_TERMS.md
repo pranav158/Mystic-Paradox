@@ -7,7 +7,7 @@ License, version 3 (AGPL-3.0-only), a copy of which is provided in the
 As permitted by Section 7 of the AGPLv3, the following additional terms apply.
 These terms apply **only** to material identified as:
 
-> Copyright (C) 2026 Pranav Karande
+> Copyright (C) 2026 MysticFox / Pranav Karande
 > Mystic Paradox Project
 
 They do **not** apply to the original upstream Undaunted material, which remains
@@ -23,9 +23,9 @@ The following reasonable legal notice must be preserved in source
 distributions and in the Appropriate Legal Notices of works containing
 this material:
 
-> "Mystic Paradox's Dauntless 1.12.0 port and related modifications were
-> developed by Pranav Karande. See NOTICE.md for contribution
-> and provenance information."
+> "Mystic Paradox's Dauntless 1.12.0 and 1.14.7 ports and related
+> modifications were developed by MysticFox / Pranav Karande. See
+> NOTICE.md for contribution and provenance information."
 
 ## 2. Origin and Modification Notice
 

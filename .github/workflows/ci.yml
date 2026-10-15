@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: ParadoxBackend/package-lock.json
       - run: npm ci
@@ -38,10 +38,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: ParadoxDirector/package-lock.json
       - run: npm ci
+      - run: npm test
       - run: npm run build
 
   launcher:
@@ -53,7 +54,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: ParadoxLauncher/package-lock.json
       - uses: dtolnay/rust-toolchain@stable

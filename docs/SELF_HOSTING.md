@@ -60,7 +60,7 @@ Keep TCP 3000, TCP 3001, and MongoDB private. Expose TCP 443 and the configured 
 Install or prepare:
 
 - Windows 10 or 11 x64.
-- Node.js 20 or newer and npm.
+- Node.js 22 (22.5 or newer; local realms use the built-in `node:sqlite`) and npm.
 - MongoDB 7 or a compatible MongoDB Atlas deployment.
 - Current stable Rust with the x86_64-pc-windows-msvc target.
 - Visual Studio C++ Build Tools, a Windows SDK, and the Desktop development with C++ workload.
@@ -516,6 +516,95 @@ Known 1.14.7 issues are listed in the [port notes](DAUNTLESS_1_14_7_PORT.md#stil
 
 Use matching current Backend, Director, Runtime, and Launcher builds. The replication and
 disconnected-party fixes span multiple components.
+
+## Optional features
+
+These are off by default. A backend started from the steps above runs without any of them.
+
+### Admin API
+
+`MYSTICPARADOX_ADMIN_API` decides whether the backend serves its admin API under `/admin`. That covers players, bans,
+registration approvals, activity, Guard findings, co-op operations and launcher logs.
+
+- It is off by default: every `/admin` path answers 404.
+- Set it to `on` to use the API with the backend's own admin sign-in (the `ADMIN_*` keys in `.env.example`).
+- No dashboard is required to run a server.
+
+### Linux behind nginx
+
+The backend also runs on Linux behind a reverse proxy. nginx terminates TLS and forwards to the backend on loopback.
+
+1. In `.env` set:
+
+   ```
+   MYSTICPARADOX_TLS_TERMINATED_BY_PROXY=on
+   BIND_HOST=127.0.0.1
+   PORT=3000
+   QOS_PORT=off
+   REALTIME_XMPP_ALLOWED_HOSTS=paradox.example.net
+   ```
+
+2. Add a site like this, with your own name and certificate paths:
+
+   ```nginx
+   map $http_upgrade $paradox_connection_upgrade { default upgrade; '' close; }
+
+   server {
+       listen 80;
+       server_name paradox.example.net;
+       # The game measures regions with a plain GET on port 80 and expects this exact body. Do not redirect it.
+       location / { default_type text/html; return 200 "<!DOCTYPE html><html><body>pong</body></html>"; }
+   }
+
+   server {
+       listen 443 ssl http2;
+       server_name paradox.example.net;
+       ssl_certificate     /etc/letsencrypt/live/paradox.example.net/fullchain.pem;
+       ssl_certificate_key /etc/letsencrypt/live/paradox.example.net/privkey.pem;
+       client_max_body_size 64m;
+       location / {
+           proxy_pass http://127.0.0.1:3000;
+           proxy_http_version 1.1;
+           proxy_set_header Host $host;
+           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+           proxy_set_header X-Forwarded-Proto $scheme;
+           proxy_set_header Upgrade $http_upgrade;               # XMPP chat over WebSocket
+           proxy_set_header Connection $paradox_connection_upgrade;
+           proxy_read_timeout 3600s;
+       }
+   }
+   ```
+
+3. Run the backend under any service manager, for example a systemd unit:
+   - `WorkingDirectory` set to `ParadoxBackend`;
+   - `EnvironmentFile` set to your `.env` (save it with LF line endings);
+   - `ExecStart=/usr/bin/node build/server.js` after `npm ci && npm run build`;
+   - `Restart=on-failure`.
+
+### Co-op hunts and Paradox realms
+
+These features have players host hubs and hunts on their own PCs. Players connect through the co-op transport
+(`ParadoxTransport`: ICE, with STUN/TURN relays).
+
+On the official servers, co-op connects through **Mystic Relay**, so players never see each other's IP address. A
+self-hosted backend brings its own TURN relay (step 4).
+
+To switch them on:
+
+1. Copy the keys you need from `ParadoxBackend/.env.p2p.example` into `.env`. Everything there is off by default; the
+   comments explain each switch.
+2. Generate the admission key set with
+   `node scripts/p2p/generate-admission-key.mjs --output <dir> --key-id <id>` (run it in `ParadoxBackend`).
+   - Keep the private key and its env lines on the backend host only.
+   - Publish `p2p-admission-public.xy` with your runtime as an extra file.
+3. Build `ParadoxTransport` (`ParadoxTransport/build.ps1`) and publish `ParadoxTransport.dll` with your runtime feed.
+4. Configure your own TURN relay (the `P2P_TURN_*` and `P2P_ICE_*` keys):
+   - Cloudflare TURN by default (`P2P_TURN_PROVIDER=cloudflare` with your own `P2P_CLOUDFLARE_TURN_*` keys);
+   - or any TURN server with a shared secret, such as coturn (`P2P_TURN_PROVIDER=turn-rest`).
+   - Keep `P2P_FORCE_SDR=true`, so players never see each other's addresses.
+
+The project's server-side anti-cheat module and its Steam transport are not part of this repository. Co-op and realms
+run without them: the backend uses stubs, and Guard runs in observe mode.
 
 ## Operations and updates
 
