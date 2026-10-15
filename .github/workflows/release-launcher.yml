@@ -92,10 +92,28 @@ jobs:
           @("### Launcher $env:VERSION", '```', "$sha  $name", '```') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
           "$sha  $name"
 
+      # The launcher.exe the installer installs (Tauri marks the packed copy, so it differs from the build folder's): its hash
+      # goes into the release as INSTALLED-SHA256SUMS, and its provenance is recorded too, so a player can check the file on disk
+      # (gh attestation verify "%LOCALAPPDATA%\Mystic Paradox Launcher\launcher.exe" --repo <this repository>).
+      - name: Extract and hash the installed launcher.exe
+        id: installed
+        env:
+          INSTALLER: ${{ steps.collect.outputs.installer }}
+        run: |
+          New-Item -ItemType Directory -Force installed | Out-Null
+          node scripts/extract-installed-launcher.mjs --installer "out\$env:INSTALLER" --output installed\launcher.exe --replace
+          if ($LASTEXITCODE -ne 0) { throw "payload extraction failed (exit $LASTEXITCODE)" }
+          $sha = (Get-FileHash installed\launcher.exe).Hash.ToLower()
+          [IO.File]::WriteAllText("$PWD\out\INSTALLED-SHA256SUMS", "$sha  launcher.exe`n")
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          @("Installed launcher.exe:", '```', "$sha  launcher.exe", '```') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
       - name: Record the build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ParadoxLauncher/out/${{ steps.collect.outputs.installer }}
+          subject-path: |
+            ParadoxLauncher/out/${{ steps.collect.outputs.installer }}
+            ParadoxLauncher/installed/launcher.exe
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -138,8 +156,10 @@ jobs:
           SHA256: ${{ needs.build.outputs.sha256 }}
         run: |
           set -euo pipefail
-          [ "$(ls -A release)" = "$INSTALLER" ] || { echo "release/ must hold exactly $INSTALLER"; ls -la release; exit 1; }
+          [ "$(ls -A release | sort | tr '\n' ' ')" = "$(printf '%s\n' "$INSTALLER" INSTALLED-SHA256SUMS | sort | tr '\n' ' ')" ] \
+            || { echo "release/ must hold exactly $INSTALLER and INSTALLED-SHA256SUMS"; ls -la release; exit 1; }
           echo "$SHA256  release/$INSTALLER" | sha256sum -c -
+          grep -Eq '^[0-9a-f]{64}  launcher\.exe$' release/INSTALLED-SHA256SUMS || { echo "INSTALLED-SHA256SUMS is malformed"; exit 1; }
 
       - name: Test the signer
         run: node --test ParadoxLauncher/scripts/sign-launcher-update.test.mjs
@@ -174,6 +194,9 @@ jobs:
           Check a download:
           - \`sha256sum -c SHA256SUMS\`
           - \`gh attestation verify ${INSTALLER} --repo ${GITHUB_REPOSITORY}\` (build provenance)
+          - \`INSTALLED-SHA256SUMS\` is the hash of the launcher.exe this installer installs; check the installed file with
+            \`gh attestation verify "%LOCALAPPDATA%\\Mystic Paradox Launcher\\launcher.exe" --repo ${GITHUB_REPOSITORY}\`
+            or the launcher's About page ("Check against GitHub").
           - \`${INSTALLER}.sig\` is the updater signature (minisign key 30ADC58308BDAEAD; public key in \`ParadoxLauncher/src-tauri/tauri.conf.json\`).
           EOF
           gh release create "$TAG" release/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Launcher ${VERSION}" --notes-file notes.md --latest
