@@ -4,8 +4,10 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidatePattern("^[A-Za-z0-9_-]+$")]
   [string]$BuildProfile,
-  [string]$SigningKey = "$PSScriptRoot\..\.secrets\mystic-launcher.key",
-  [string]$SigningPasswordFile = "$PSScriptRoot\..\.secrets\mystic-launcher.password",
+  # Default: .secrets\mystic-launcher.key / .password next to the launcher, resolved in the body - Windows PowerShell 5.1
+  # leaves $PSScriptRoot empty in parameter defaults once a parameter is mandatory (16 Oct: "\..\.secrets\..." paths).
+  [string]$SigningKey = "",
+  [string]$SigningPasswordFile = "",
   # Reports where the signing inputs come from and stops before the build. No value is printed.
   [switch]$CheckSigningInputs
 )
@@ -14,6 +16,8 @@ param(
 # dedicated-only launcher with Guard Lite.
 
 $ErrorActionPreference = "Stop"
+if (-not $SigningKey) { $SigningKey = Join-Path $PSScriptRoot "..\.secrets\mystic-launcher.key" }
+if (-not $SigningPasswordFile) { $SigningPasswordFile = Join-Path $PSScriptRoot "..\.secrets\mystic-launcher.password" }
 
 # CI (GitHub Actions secrets) provides the signing key in the environment. When TAURI_SIGNING_PRIVATE_KEY is already set, that
 # key and TAURI_SIGNING_PRIVATE_KEY_PASSWORD are used and the .secrets files are not read. A missing password variable counts as
