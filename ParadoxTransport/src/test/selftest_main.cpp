@@ -41,7 +41,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -61,6 +63,27 @@ using namespace mystic::bridge;
 namespace {
 
 int gFailures = 0;
+
+// [2026-10-15] A deadline for the whole run. A deadlock (CI, 15 Oct: IceLink held its lock across a libjuice call, see
+// ice_link.hpp) froze every link and then the run itself until the CI step timed out, and the runner's Ctrl+Break left
+// PowerShell at a debugger prompt. Now the run fails with the section that hung. PARADOX_SELFTEST_TIMEOUT_SECONDS
+// overrides the default; 0 turns the watchdog off.
+std::atomic<const char*> gSection{ "start" };
+
+void StartWatchdog() {
+    int seconds = 300;
+    char value[16]{};
+    if (GetEnvironmentVariableA("PARADOX_SELFTEST_TIMEOUT_SECONDS", value, sizeof(value)) > 0) seconds = std::atoi(value);
+    if (seconds <= 0) return;
+    std::thread([seconds]() {
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        std::cout << "  FAIL watchdog: the self-test did not finish within " << seconds << " s (stuck in: " << gSection.load()
+                  << ")\nFAIL (watchdog)\n";
+        std::cout.flush();
+        // Other threads may be deadlocked: end the process without running their destructors or DLL detach code.
+        TerminateProcess(GetCurrentProcess(), 3);
+    }).detach();
+}
 
 void Check(bool condition, const char* what) {
     std::cout << (condition ? "  ok   " : "  FAIL ") << what << '\n';
@@ -599,7 +622,8 @@ int RunSession() {
     // Next to the exe (build output): on some PCs new binaries may not write under %TEMP%.
     wchar_t exe_path[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-    const std::filesystem::path key_path = std::filesystem::path(exe_path).parent_path() / L"selftest-admission-public.xy";
+    const std::filesystem::path key_path = std::filesystem::path(exe_path).parent_path() /
+        (L"selftest-admission-public-" + std::to_wstring(GetCurrentProcessId()) + L".xy");
     Check(signer.write_public_key(key_path), "writes the test signing key");
     AdmissionTicketVerifier host_verifier;
     AdmissionTicketVerifier join_verifier;
@@ -766,7 +790,10 @@ AdmissionClientFactory SharedBackend(FakeBackend& backend) {
 
 class ModuleRig final {
 public:
-    explicit ModuleRig(const std::string& name) : dir_(ExeDirectory() / ("selftest-" + name)) {
+    // [2026-10-15] One folder per process: two self-tests running at once (a loop and a full run) shared selftest-hub, and
+    // the second one's key replaced the first one's mid-run (its joiners then failed with bad_signature).
+    explicit ModuleRig(const std::string& name)
+        : dir_(ExeDirectory() / ("selftest-" + name + "-" + std::to_string(GetCurrentProcessId()))) {
         std::error_code ignored;
         std::filesystem::remove_all(dir_, ignored);
         std::filesystem::create_directories(dir_, ignored);
@@ -1600,6 +1627,7 @@ int RunHub(bool relay_local) {
             "an add and a remove queued together run in order");
 
         // 1. Six players join one after another: the host adds each, then the joiner connects and is admitted.
+        gSection = "hub: six joiners join";
         std::vector<Member> members;
         for (std::size_t index = 1; index <= kRoster; ++index) members.push_back(make_member("member-" + std::to_string(index), 5000 + index));
         bool all_joined = true;
@@ -1640,6 +1668,7 @@ int RunHub(bool relay_local) {
         Check(add_to_host(duplicate_account) == 0 && add_to_host(duplicate_peer) == 0, "duplicate account and duplicate peer id are refused");
 
         // 3. Remove a player: the link closes, the backend hears about it, the events say who.
+        gSection = "hub: removing a player";
         const int disconnects_before = rig.backend.disconnect_count();
         Check(host_module.remove_peer(host, "member-3", "kicked") == 1, "RemovePeerH queues the removal");
         Check(PumpUntil(std::chrono::seconds(5), pump, [&]() {
@@ -1653,18 +1682,24 @@ int RunHub(bool relay_local) {
         stop_join(members[2]);
 
         // 4. A joiner that starts before its AddPeer: its signals are held and replayed.
+        //    [2026-10-15] Counted from here and for this peer: the check used to accept any earlier ICE_SIGNAL_HELD line and
+        //    waited a fixed 1.5 s, so on a slow runner it could pass before the seventh joiner's description had arrived.
+        gSection = "hub: a joiner that starts before its AddPeer";
+        const int held_before = feed.count_diagnostics("ICE_SIGNAL_HELD");
         Check(start_join(seventh, "member-7-a"), "the seventh joiner starts before the host knows it");
-        PumpUntil(std::chrono::milliseconds(1500), pump, [&]() { return false; });
+        const bool held = PumpUntil(std::chrono::seconds(10), pump, [&]() { return feed.count_diagnostics("ICE_SIGNAL_HELD") > held_before; });
         char ready[512]{};
-        Check(join_module.wait_ready(seventh.join_handle, 0, ready, sizeof(ready)) == 0 && feed.count_diagnostics("ICE_SIGNAL_HELD") >= 1,
+        Check(held && join_module.wait_ready(seventh.join_handle, 0, ready, sizeof(ready)) == 0,
             "the host holds its description instead of rejecting it");
         Check(add_to_host(seventh) == 1, "AddPeerH then adds it");
         Check(wait_joined(seventh, std::chrono::seconds(30)), "the held description is replayed and the joiner connects");
-        Check(feed.count_diagnostics("ICE_SIGNAL_REPLAYED") >= 1, "the host reported the replay");
+        Check(feed.count_diagnostics("ICE_SIGNAL_REPLAYED role=host peer=" + std::to_string(seventh.peer_id)) == 1,
+            "the host reported the replay");
         Check(echo_ok(seventh, 7) && echo.sources().size() == kRoster + 1,
             "the seventh player's traffic flows: the removed player's bridge slot was freed");
 
         // 5. The same account joins again after a remove (fresh link, fresh request ids).
+        gSection = "hub: the same account joins again";
         const std::uint64_t second_id = members[1].peer_id;
         stop_join(members[1]);
         Check(host_module.remove_peer(host, "member-2", "rejoin") == 1, "member-2 is removed");
@@ -1677,6 +1712,7 @@ int RunHub(bool relay_local) {
         Check(echo_ok(members[1], 22), "traffic flows after the rejoin");
 
         // 6. A joiner that restarts without being removed (a relaunch): the host replaces its link.
+        gSection = "hub: a restarting joiner";
         stop_join(members[4]);
         Check(start_join(members[4], "member-5-b") && wait_joined(members[4], std::chrono::seconds(30)),
             "a restarting joiner replaces its old link");
@@ -1703,6 +1739,7 @@ int RunHub(bool relay_local) {
             "the heartbeat reports six admitted peers");
 
         // 8. Stopping the hub: the admitted peers are reported lost and the events stay readable.
+        gSection = "hub: stopping the hub";
         for (Member& member : members) if (member.join_handle > 0) stop_join(member);
         stop_join(seventh);
         Check(host_module.stop_session(host) == 1 && host_module.session_running(host) == 0 &&
@@ -1809,25 +1846,43 @@ int main(int argc, char** argv) {
     // --verbose prints libjuice's own log, which names local and relay addresses: local debugging only.
     juice_set_log_level(verbose ? JUICE_LOG_LEVEL_DEBUG : JUICE_LOG_LEVEL_NONE);
     if (verbose) juice_set_log_handler([](juice_log_level_t, const char* message) { std::cerr << "  [juice] " << message << '\n'; });
+    StartWatchdog();
+    // Names the running section for the watchdog's message.
+    const auto section = [](const char* name) { gSection = name; };
     if (command == "crypto") RunCrypto();
     else if (command == "parse") RunParse();
     else if (command == "abi") RunAbi();
     else if (command == "ice") RunIce(argc, argv);
     else if (command == "session") {
+        section("session");
         RunSession();
+        section("session through the module");
         RunModuleSessions();
-    } else if (command == "hub") RunHub(relay_local);
-    else if (command == "localbridge") RunLocalBridge();
+    } else if (command == "hub") {
+        section(relay_local ? "hub (relay)" : "hub (direct)");
+        RunHub(relay_local);
+    } else if (command == "localbridge") RunLocalBridge();
     else if (command == "all") {
+        section("localbridge");
         RunLocalBridge();
+        section("crypto");
         RunCrypto();
+        section("parse");
         RunParse();
+        section("abi");
         RunAbi();
+        section("ice");
         RunIce(argc, argv);
+        section("session");
         RunSession();
+        section("session through the module");
         RunModuleSessions();
+        section("hub (direct)");
         RunHub(false);
-        if (relay_local) RunHub(true);
+        if (relay_local) {
+            section("hub (relay)");
+            RunHub(true);
+        }
     } else {
         std::cout << "usage: ParadoxTransportTest crypto|parse|abi|session|localbridge|hub [--relay-local]|ice [--relay-local | --relay-file <path>]|all\n";
         return 2;

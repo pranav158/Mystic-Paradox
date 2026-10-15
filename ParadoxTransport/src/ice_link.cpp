@@ -164,7 +164,7 @@ bool IceLink::start(std::span<const std::uint8_t> pair_key, std::string& error, 
             error = "remote description rejected";
             return false;
         }
-        std::lock_guard lock(mutex_);
+        std::lock_guard lock(remote_mutex_);
         remote_description_ = true;
     }
     // The description (credentials only) goes out before gathering; candidates follow one by one.
@@ -214,7 +214,7 @@ std::vector<IceSignal> IceLink::take_signals() {
 }
 
 bool IceLink::has_remote_description() const {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(remote_mutex_);
     return remote_description_;
 }
 
@@ -234,7 +234,8 @@ bool IceLink::apply_remote_signal(std::string_view kind, std::string_view data, 
         // A non-relay candidate is not an error: it is simply never used.
         if (text.empty()) return kind == "CANDIDATE";
     }
-    std::lock_guard lock(mutex_);
+    // remote_mutex_, never mutex_: the juice_* calls below take libjuice's registry lock (see ice_link.hpp).
+    std::lock_guard lock(remote_mutex_);
     if (kind == "DESCRIPTION") {
         if (remote_description_) {
             error = "remote description already set";

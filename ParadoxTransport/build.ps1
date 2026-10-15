@@ -1,6 +1,10 @@
 param(
     [ValidateSet("Debug", "Release")]
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    # Empty: the projects' own toolset (v145). "v143" tries the README's fallback without editing the projects (CI uses it to
+    # learn whether a runner without v145 can still build the module).
+    [ValidatePattern("^(v1[0-9]{2})?$")]
+    [string]$PlatformToolset = ""
 )
 
 # Builds libjuice (static), ParadoxTransport.dll (the ICE co-op transport, ABI 3) and ParadoxTransportTest.exe.
@@ -32,8 +36,13 @@ try {
     $MsBuild = Find-MsBuild
     Write-Host "MSBuild: $MsBuild"
 
+    $ToolsetArgs = @()
+    if ($PlatformToolset) {
+        Write-Host "Platform toolset override: $PlatformToolset"
+        $ToolsetArgs = @("/p:PlatformToolset=$PlatformToolset")
+    }
     foreach ($Project in @("ParadoxTransport.vcxproj", "ParadoxTransportTest.vcxproj")) {
-        & $MsBuild (Join-Path $ProjectRoot $Project) /m /t:Build "/p:Configuration=$Configuration" /p:Platform=x64 /nologo /v:minimal
+        & $MsBuild (Join-Path $ProjectRoot $Project) /m /t:Build "/p:Configuration=$Configuration" /p:Platform=x64 /nologo /v:minimal @ToolsetArgs
         if ($LASTEXITCODE -ne 0) { throw "MSBuild failed for $Project (exit $LASTEXITCODE)" }
     }
 

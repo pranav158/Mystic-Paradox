@@ -26,9 +26,10 @@ the SHA-256 of `build\<Configuration>\ParadoxTransport.dll`. Exit code 0 only wh
 ### CI (GitHub-hosted Windows runner): what it needs
 
 - **Toolset v145** in both `.vcxproj` files (`ParadoxTransport.vcxproj`, `libjuice.vcxproj`) and a Windows 10/11 SDK
-  (`WindowsTargetPlatformVersion` 10.0). Check the runner image's installed MSBuild toolsets before the first run; a hosted image
-  may carry only older toolsets. If it lacks v145, use a self-hosted Windows runner with the owner's Build Tools (launch plan P6.2).
-- **Fallback, not applied:** retarget both projects to `v143` (Visual Studio 2022), then rebuild and re-verify on the owner's PC.
+  (`WindowsTargetPlatformVersion` 10.0). **Checked 15 October 2026:** GitHub's `windows-latest` image carries Visual Studio
+  Enterprise 2026 with toolsets v142, v143 and v145; the module builds as is and `all --relay-local` passes there.
+- **Fallback, not needed:** `build.ps1 -PlatformToolset v143` builds with Visual Studio 2022's toolset without editing the
+  projects (the MSBuild override also reaches libjuice); it also built and passed the self-test on that runner.
 - **Network** to github.com for the pinned libjuice archive (`prepare-dependencies.ps1` checks its SHA-256 `02CCA696…78FD`). The
   download is skipped when `third_party\libjuice-1.7.4\include\juice\juice.h` exists, so a cached `third_party` folder avoids it.
 - **MSBuild:** `vswhere` ships with the Visual Studio installer on hosted images; `microsoft/setup-msbuild` puts `MSBuild.exe` on
@@ -54,8 +55,12 @@ Self-test commands (`ParadoxTransportTest.exe`):
 | `--verbose` | Adds libjuice's own log (it names local and relay addresses: local debugging only) |
 
 The admission backend is a fake in these tests (the real client speaks HTTPS only); session files go into folders
-next to the exe (`selftest-*`, removed afterwards) because binaries under this checkout may not write `%TEMP%`.
-`all` runs `hub` direct, and `all --relay-local` adds `hub --relay-local`.
+next to the exe (`selftest-<name>-<pid>`, one per process, removed afterwards) because binaries under this checkout may
+not write `%TEMP%`. Before 15 October the folders were shared, so two self-tests running at once overwrote each other's
+test key and failed with `bad_signature`.
+`all` runs `hub` direct, and `all --relay-local` adds `hub --relay-local`. A watchdog ends any run after 300 s with
+`FAIL watchdog ... (stuck in: <section>)` and exit code 3 (`PARADOX_SELFTEST_TIMEOUT_SECONDS` changes it, 0 turns it off),
+so a deadlock fails CI quickly instead of waiting for the step timeout.
 
 13 October 2026: `all --relay-local` passes every check; **step 3 passed through Mystic Relay** (`run-relay-selftest.ps1`,
 two runs, both sides relay-only): connected in 283-320 ms, round trip 10-13 ms for 1-2000 byte datagrams (both
@@ -81,6 +86,15 @@ fragmentation, lost every 1400- and 2000-byte datagram (1200 passed): hence the 
 - **Large datagrams.** Messages over 1100 bytes go as up to four sealed pieces and are rebuilt before delivery (a lost
   piece loses the datagram, like IP fragmentation; reassembly waits at most 1 s). Pieces stay under 1280 bytes on the
   wire, the IPv6 minimum MTU, including TURN and IP/UDP overhead.
+- **Locking (fixed 15 October 2026).** libjuice (`JUICE_CONCURRENCY_MODE_POLL`) runs every agent's callbacks on one poll
+  thread while holding a registry lock shared by all agents in the process, and `juice_set_remote_description`,
+  `juice_add_remote_candidate`, `juice_set_remote_gathering_done`, `juice_send` and `juice_destroy` take that lock too.
+  `IceLink` therefore never holds `mutex_` (the lock its callbacks take) across a `juice_*` call; the remote-signal state
+  has its own `remote_mutex_`. Before the fix `apply_remote_signal` did, and a candidate arriving while the link's own
+  candidate or data callback ran deadlocked the session thread against the poll thread: every link in the process froze
+  and every later `juice_destroy` (session stop) waited forever. On a 2-core machine the relay hub self-test hung in about
+  1 run in 5 (3 of 15 before the fix, 0 of 60 after); the shipped module up to runtime feed 0.2.135 (`823BBCF1…`)
+  has the bug.
 - **Admission.** As in the Steam bridge: once connected, the joiner sends its admission ticket (MPC1 control frame)
   every 750 ms until answered; the host verifies the ES256 ticket, requires that it belongs to the pair's account,
   consumes it centrally once (repeated requests get the stored answer), then attaches the peer to the UDP bridge.

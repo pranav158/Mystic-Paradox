@@ -140,9 +140,18 @@ private:
     bool is_host_ = false;
     juice_agent* agent_ = nullptr;
     PairCipher cipher_;
+    // [2026-10-15] Two locks, one rule: never hold mutex_ across a juice_* call.
+    // mutex_ is taken by the libjuice callbacks (OnCandidate, OnGatheringDone, OnReceive), and in
+    // JUICE_CONCURRENCY_MODE_POLL libjuice runs every callback while holding its registry lock - one lock shared by all
+    // agents in the process - which juice_set_remote_description, juice_add_remote_candidate and
+    // juice_set_remote_gathering_done (and juice_destroy) take as well. Holding mutex_ across such a call deadlocked the
+    // calling session thread against the poll thread, which froze every link in the process and made every later
+    // juice_destroy (session stop) wait forever (CI 15 Oct: a relay hub joiner never connected, then the run hung).
+    // remote_mutex_ guards the remote-signal state; no callback takes it, so it may be held across juice_* calls.
     mutable std::mutex mutex_;
     std::deque<IceSignal> signals_;
     std::deque<Received> received_;
+    mutable std::mutex remote_mutex_;
     std::vector<std::string> pending_candidates_;
     bool pending_gathering_done_ = false;
     bool remote_description_ = false;
