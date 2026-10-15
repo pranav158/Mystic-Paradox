@@ -148,6 +148,8 @@ export async function setRealmHostKey(serverId: string, hostPublicKey: string): 
  */
 export const REALM_OWNER_CHANGED = "REALM_OWNER_CHANGED";
 export const REALM_HOST_KEY_REQUIRED = "REALM_HOST_KEY_REQUIRED";
+/** [2026-10-15] Play asked the realm's host for approval (invite-only, no invite): information, not a failure. */
+export const REALM_JOIN_REQUESTED = "REALM_JOIN_REQUESTED";
 
 /** A member's realm session ended for a reason worth a banner. The game keeps running. */
 export interface RealmNotice {

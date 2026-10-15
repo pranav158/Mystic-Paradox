@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { Button } from "../components/Button";
+import { Dropdown, type DropdownOption } from "../components/Dropdown";
 import { Modal } from "../components/Modal";
 import { RealmTrustNote } from "../components/RealmTrustNote";
 import { TextField } from "../components/TextField";
@@ -8,8 +9,13 @@ import { AlertIcon, ServersIcon, ShieldIcon } from "../components/icons";
 import { formatClock, formatDuration, formatWhen } from "../lib/sessions";
 import { useServer } from "../servers/ServerContext";
 import {
+  realmHostAddPlayer,
+  realmHostApproveRequest,
   realmHostBan,
+  realmHostDenyRequest,
+  realmHostJoinRequests,
   realmHostKick,
+  realmHostSetJoinPolicy,
   realmHostSetLimits,
   realmHostStart,
   realmHostStatus,
@@ -19,6 +25,8 @@ import {
   type RealmHostPlayer,
   type RealmHostState,
   type RealmHostStatus,
+  type RealmJoinPolicy,
+  type RealmJoinRequest,
 } from "./realmHostApi";
 import {
   EMPTY_DRAFT,
@@ -46,6 +54,12 @@ import "./realmHost.css";
 // that folder has no hosting UI at all.
 
 const POLL_MS = 5_000;
+
+// [2026-10-15] Who may join. "Approved players only" is the realm's default (invite-only): others send a request.
+const JOIN_POLICY_OPTIONS: DropdownOption[] = [
+  { value: "INVITE_ONLY", label: "Approved players only", detail: "Others send a request, and you approve it below." },
+  { value: "PUBLIC", label: "Anyone", detail: "Anyone signed in joins without asking." },
+];
 
 // The native messages are written for the player and are shown as they are. They are not run through sanitizeError,
 // which would turn an address or a path in them into "the update server" or "a game file".
@@ -109,6 +123,14 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [confirmError, setConfirmError] = useState<string | null>(null);
   const [banReason, setBanReason] = useState("");
+  // [2026-10-15] Join requests (read with the status), the add-by-username field and the policy's choice.
+  const [requests, setRequests] = useState<RealmJoinRequest[]>([]);
+  // The list's own read error, and the error of an approve or deny (kept apart: a refresh must not clear the latter).
+  const [requestsError, setRequestsError] = useState<string | null>(null);
+  const [requestError, setRequestError] = useState<string | null>(null);
+  const [addName, setAddName] = useState("");
+  const [addError, setAddError] = useState<string | null>(null);
+  const [addDone, setAddDone] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const busyRef = useRef(false);
   const dirtyRef = useRef(false);
@@ -133,15 +155,31 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
     if (force || !dirtyRef.current) setDraft(draftFromCapacity(next.capacity));
   }, []);
 
+  // [2026-10-15] The host's waiting players. A failed read is shown in the section, not in the status error.
+  const loadRequests = useCallback(async () => {
+    try {
+      const next = await realmHostJoinRequests();
+      if (!mountedRef.current) return;
+      setRequests(next.requests);
+      setRequestsError(next.error);
+    } catch (err) {
+      if (mountedRef.current) setRequestsError(friendly(err));
+    }
+  }, []);
+
   const poll = useCallback(async () => {
     const epoch = epochRef.current;
+    let hasRealm = false;
     try {
       const next = await realmHostStatus();
+      hasRealm = next.realm !== null;
       if (mountedRef.current && epoch === epochRef.current) applyStatus(next);
     } catch (err) {
       if (mountedRef.current && epoch === epochRef.current) setStatusError(friendly(err));
     }
-  }, [applyStatus]);
+    // [2026-10-15] The waiting players are read only for an account that has a realm (the list is not shown otherwise).
+    if (hasRealm) void loadRequests();
+  }, [applyStatus, loadRequests]);
 
   // Poll while the panel is on screen. Leaving the page unmounts it; a hidden window (minimised) pauses it too, and
   // coming back reads the status at once.
@@ -255,6 +293,45 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
     closeConfirm();
   };
 
+  // [2026-10-15] Approve or deny a waiting player. A refusal comes back as the status's error notice, shown in the section.
+  const decideRequest = async (player: RealmJoinRequest, approve: boolean) => {
+    setRequestError(null);
+    const id = player.accountId;
+    const answer = await run(
+      `${approve ? "approve" : "deny"}:${id}`,
+      () => (approve ? realmHostApproveRequest(id) : realmHostDenyRequest(id)),
+      { onError: setRequestError },
+    );
+    if (answer && answer.noticeKind === "error") setRequestError(answer.notice ?? "The launcher refused the request.");
+    void loadRequests();
+  };
+
+  // [2026-10-15] Lets a player in by username. The native notice names them ("<name> can now join your realm directly.").
+  const addPlayer = async () => {
+    const username = addName.trim();
+    setAddDone(null);
+    if (username === "") {
+      setAddError("Enter the player's username.");
+      return;
+    }
+    setAddError(null);
+    const answer = await run("add", () => realmHostAddPlayer(username), { onError: setAddError });
+    if (!answer || !mountedRef.current) return;
+    if (answer.noticeKind === "error") {
+      setAddError(answer.notice ?? "The launcher refused the request.");
+      return;
+    }
+    setAddDone(answer.notice ?? `${username} can now join your realm directly.`);
+    setAddName("");
+    void loadRequests();
+  };
+
+  const changeJoinPolicy = (value: string) => {
+    const policy: RealmJoinPolicy | null = value === "PUBLIC" ? "PUBLIC" : value === "INVITE_ONLY" ? "INVITE_ONLY" : null;
+    if (!realm || policy === null || policy === realm.joinPolicy) return;
+    void run("policy", () => realmHostSetJoinPolicy(policy));
+  };
+
   const chip = state ? STATE_CHIP[state] : null;
   const realm = status?.realm ?? null;
   const uptime = state === "online" && status?.hub?.startedAt ? formatDuration(status.hub.startedAt, null) : null;
@@ -341,6 +418,109 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
         {statusError && <p className="feedback bad" role="alert">Couldn't read the realm status. {statusError}</p>}
         {!status && !statusError && <div className="loader-bar rh-loading" />}
       </div>
+
+      {/* [2026-10-15] Who may join, the players waiting for approval, and adding a player by name. Shown once the realm exists. */}
+      {realm && (
+        <div className="section">
+          <div className="rh-head">
+            <h3 className="rh-heading">Who can join</h3>
+            <span className="rh-sub">You can change this at any time.</span>
+          </div>
+          <div className="rh-policy">
+            <Dropdown
+              label="Who can join"
+              value={realm.joinPolicy || null}
+              options={JOIN_POLICY_OPTIONS}
+              onChange={changeJoinPolicy}
+              disabled={working}
+            />
+          </div>
+        </div>
+      )}
+
+      {realm && (
+        <div className="section">
+          <div className="rh-head">
+            <h3 className="rh-heading">Join requests</h3>
+            {requests.length > 0 && <span className="chip warn">{requests.length} waiting</span>}
+            <Button variant="ghost" size="sm" onClick={() => void loadRequests()} disabled={working}>Refresh</Button>
+          </div>
+          {requests.length === 0 ? (
+            <p className="note">No pending requests.</p>
+          ) : (
+            <ul className="rh-list">
+              {requests.map((player) => (
+                <li className="rh-row" key={player.accountId}>
+                  <div className="rh-who">
+                    <div className="rh-name"><span className="rh-name-text" title={player.accountId}>{playerName(player)}</span></div>
+                    <div className="rh-meta">
+                      {player.at && <span className="rh-sub">Asked {formatWhen(player.at)}</span>}
+                    </div>
+                  </div>
+                  <div className="rh-actions">
+                    <Button
+                      size="sm"
+                      disabled={working}
+                      loading={busy === `approve:${player.accountId}`}
+                      loadingLabel="Approving…"
+                      onClick={() => void decideRequest(player, true)}
+                    >
+                      Approve
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={working}
+                      loading={busy === `deny:${player.accountId}`}
+                      loadingLabel="Denying…"
+                      onClick={() => void decideRequest(player, false)}
+                    >
+                      Deny
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          {requestsError && <p className="feedback bad" role="alert">{requestsError}</p>}
+          {requestError && <p className="feedback bad" role="alert">{requestError}</p>}
+        </div>
+      )}
+
+      {realm && (
+        <div className="section">
+          <div className="rh-head">
+            <h3 className="rh-heading">Add a player</h3>
+            <span className="rh-sub">They join without sending a request.</span>
+          </div>
+          <form
+            className="rh-add"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void addPlayer();
+            }}
+          >
+            <TextField
+              label="Username"
+              value={addName}
+              onChange={(event) => {
+                setAddName(event.target.value);
+                setAddDone(null);
+              }}
+              error={addError ?? undefined}
+              hint="Their launcher username. Letter case does not matter."
+              disabled={working}
+              maxLength={64}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <Button type="submit" disabled={working || addName.trim() === ""} loading={busy === "add"} loadingLabel="Adding…">
+              Allow
+            </Button>
+          </form>
+          {addDone && <p className="feedback ok" role="status">{addDone}</p>}
+        </div>
+      )}
 
       <div className="section">
         <div className="rh-head">

@@ -8,7 +8,16 @@
  * native rules (1-64 players, 1-8 servers, 0-7200 s; set_limits works while stopped too).
  * URL switches: ?realmonline (the realm is already online), ?realmfail (Start is refused), ?realmnotice (a restart notice).
  */
-import type { RealmHostBan, RealmHostLimits, RealmHostNoticeKind, RealmHostPlayer, RealmHostState, RealmHostStatus } from "./realmHostApi";
+import type {
+  RealmHostBan,
+  RealmHostLimits,
+  RealmHostNoticeKind,
+  RealmHostPlayer,
+  RealmHostState,
+  RealmHostStatus,
+  RealmJoinPolicy,
+  RealmJoinRequest,
+} from "./realmHostApi";
 
 const params = new URLSearchParams(window.location.search);
 const now = Date.now();
@@ -31,6 +40,12 @@ let players: RealmHostPlayer[] = state === "stopped" ? [] : seedPlayers();
 let bans: RealmHostBan[] = [
   { accountId: "acc-grim", displayName: "GrimTester", reason: "Griefing in Ramsgate", at: iso(-3 * 24 * 60) },
 ];
+// [2026-10-15] Who may join, and the players waiting for approval (newest first, as the native side lists them).
+let joinPolicy: RealmJoinPolicy = "INVITE_ONLY";
+let requests: RealmJoinRequest[] = [
+  { accountId: "acc-lyra", displayName: "LyraSpark", at: iso(-12) },
+  { accountId: "acc-brann", displayName: "BrannOak", at: iso(-95) },
+];
 
 function status(): RealmHostStatus {
   const up = state === "online" || state === "restarting";
@@ -51,7 +66,7 @@ function status(): RealmHostStatus {
     state,
     notice,
     noticeKind,
-    realm: { name: "ember-hold", serving: state === "online" },
+    realm: { name: "ember-hold", serving: state === "online", joinPolicy, joinRequestCount: requests.length },
     hub,
     training,
     hunts,
@@ -91,8 +106,31 @@ function say(message: string | null, ms = 250, kind: RealmHostNoticeKind = "info
 
 /** Answers a realm host command, or returns `undefined` for any other command. */
 export default function realmHostPreview(cmd: string, args: unknown): Promise<unknown> | undefined {
-  const payload = (args ?? {}) as { options?: RealmHostLimits; accountId?: string; reason?: string | null };
+  const payload = (args ?? {}) as { options?: RealmHostLimits; accountId?: string; reason?: string | null; username?: string; joinPolicy?: string };
   switch (cmd) {
+    case "realm_host_join_requests":
+      return delay({ requests: [...requests], error: null }, 120);
+    case "realm_host_approve_request":
+    case "realm_host_deny_request": {
+      if (!validAccountId(payload.accountId)) return say("That is not a player id.", 250, "error");
+      if (!requests.some((request) => request.accountId === payload.accountId)) {
+        return say("That player has not asked to join your realm.", 250, "error");
+      }
+      requests = requests.filter((request) => request.accountId !== payload.accountId);
+      return say(cmd === "realm_host_approve_request" ? "The player can join your realm now." : "The request was denied.", 300);
+    }
+    case "realm_host_add_player": {
+      const name = (payload.username ?? "").trim();
+      if (name === "" || name.length > 64) return say("Enter a username of 1 to 64 characters.", 250, "error");
+      if (name.toLowerCase() === "nobody") return say("No player has that username.", 300, "error");
+      requests = requests.filter((request) => request.displayName?.toLowerCase() !== name.toLowerCase());
+      return say(`${name} can now join your realm directly.`, 300);
+    }
+    case "realm_host_set_join_policy": {
+      if (payload.joinPolicy !== "INVITE_ONLY" && payload.joinPolicy !== "PUBLIC") return say("Choose who can join: approved players or anyone.", 250, "error");
+      joinPolicy = payload.joinPolicy;
+      return say(joinPolicy === "PUBLIC" ? "Anyone can join your realm now." : "Only players you approve can join your realm now.", 300);
+    }
     case "realm_host_status":
       return delay(status(), 120);
     case "realm_host_start": {

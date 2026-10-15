@@ -148,6 +148,11 @@ pub fn run() {
         p2p::realm_host_ban,
         p2p::realm_host_unban,
         p2p::realm_host_set_limits,
+        p2p::realm_host_join_requests,
+        p2p::realm_host_approve_request,
+        p2p::realm_host_deny_request,
+        p2p::realm_host_add_player,
+        p2p::realm_host_set_join_policy,
     ));
     #[cfg(not(mystic_p2p))]
     let builder = builder.invoke_handler(launcher_commands!());

@@ -276,6 +276,13 @@
   font-size: 13px;
 }
 
+/* [2026-10-15] Information after Play (a request sent to the realm's host): the aether blue, never the error red. */
+.launch-notice {
+  margin-top: 10px;
+  color: var(--aether-hi);
+  font-size: 13px;
+}
+
 .launch-actions {
   display: flex;
   flex-direction: column;

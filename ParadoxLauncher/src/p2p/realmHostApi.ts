@@ -71,13 +71,37 @@ export interface RealmHostCapacity {
 /** `info` tells the host what happened; `error` is a refusal or failure (shown in the error style). */
 export type RealmHostNoticeKind = "info" | "error";
 
+/** [2026-10-15] Who may join: approved players only, or anyone signed in. */
+export type RealmJoinPolicy = "INVITE_ONLY" | "PUBLIC";
+
+/** [2026-10-15] A player waiting for the host's approval. `displayName` is null when the account has none to show. */
+export interface RealmJoinRequest {
+  accountId: string;
+  displayName: string | null;
+  /** When the player asked (ISO-8601, UTC). */
+  at: string | null;
+}
+
+/** [2026-10-15] The host's request list. `error` says why it could not be read (then `requests` is empty). */
+export interface RealmJoinRequests {
+  requests: RealmJoinRequest[];
+  error: string | null;
+}
+
 export interface RealmHostStatus {
   state: RealmHostState;
   /** A line for the host: why the realm is restarting, why it stopped by itself, or why a request was refused. */
   notice: string | null;
   /** [2026-10-14] What kind of notice this is. A kick, ban or unban refused as "error" keeps its dialog open. */
   noticeKind: RealmHostNoticeKind;
-  realm: { name: string; serving: boolean } | null;
+  realm: {
+    name: string;
+    serving: boolean;
+    /** [2026-10-15] Who may join now; "" when the server did not say. */
+    joinPolicy: RealmJoinPolicy | "";
+    /** [2026-10-15] Players waiting for the host's approval. */
+    joinRequestCount: number;
+  } | null;
   hub: RealmHostHub | null;
   training: RealmHostTraining | null;
   hunts: RealmHostHunt[];
@@ -113,4 +137,29 @@ export function realmHostUnban(accountId: string): Promise<RealmHostStatus> {
 
 export function realmHostSetLimits(options: RealmHostLimits): Promise<RealmHostStatus> {
   return invoke<RealmHostStatus>("realm_host_set_limits", { options });
+}
+
+/** [2026-10-15] The players waiting for the host (GET /launcher/v1/realms/mine/requests). A refusal is `error`, not a rejection. */
+export function realmHostJoinRequests(): Promise<RealmJoinRequests> {
+  return invoke<RealmJoinRequests>("realm_host_join_requests");
+}
+
+/** [2026-10-15] Approves a waiting player: they become a member and the request goes. Answers the whole status. */
+export function realmHostApproveRequest(accountId: string): Promise<RealmHostStatus> {
+  return invoke<RealmHostStatus>("realm_host_approve_request", { accountId });
+}
+
+/** [2026-10-15] Denies a waiting player: the request goes; they may ask again. Answers the whole status. */
+export function realmHostDenyRequest(accountId: string): Promise<RealmHostStatus> {
+  return invoke<RealmHostStatus>("realm_host_deny_request", { accountId });
+}
+
+/** [2026-10-15] Lets a player in by launcher username. The notice names them; a name nobody has is an error notice. */
+export function realmHostAddPlayer(username: string): Promise<RealmHostStatus> {
+  return invoke<RealmHostStatus>("realm_host_add_player", { username });
+}
+
+/** [2026-10-15] Sets who may join (the realm's join policy). Answers the whole status. */
+export function realmHostSetJoinPolicy(joinPolicy: RealmJoinPolicy): Promise<RealmHostStatus> {
+  return invoke<RealmHostStatus>("realm_host_set_join_policy", { joinPolicy });
 }

@@ -105,6 +105,27 @@ pub struct Location {
 pub struct RealmSummary {
     pub name: String,
     pub serving: bool,
+    /// [2026-10-15] "INVITE_ONLY" (approved players only) or "PUBLIC" (anyone); "" when the server did not say.
+    pub join_policy: String,
+    /// [2026-10-15] Players waiting for the host's approval.
+    pub join_request_count: u32,
+}
+
+/// [2026-10-15] A player waiting for the host's approval (`GET .../mine/requests`, newest first).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinRequestSummary {
+    pub account_id: String,
+    pub display_name: Option<String>,
+    pub at: Option<String>,
+}
+
+/// The host's request list, or why it could not be read (then `requests` is empty and `error` says why).
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinRequestsStatus {
+    pub requests: Vec<JoinRequestSummary>,
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -433,6 +454,19 @@ struct HostedRealm {
     members: Vec<MemberView>,
     #[serde(default)]
     bans: Vec<BanView>,
+    /// [2026-10-15] "INVITE_ONLY" or "PUBLIC"; "" when the server did not say.
+    #[serde(default)]
+    join_policy: String,
+    /// [2026-10-15] Players waiting for the host's approval.
+    #[serde(default)]
+    join_request_count: u32,
+}
+
+/// [2026-10-15] The answer of `GET .../mine/requests`.
+#[derive(Deserialize)]
+struct JoinRequestsView {
+    #[serde(default)]
+    requests: Vec<JoinRequestSummary>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -999,6 +1033,8 @@ pub(super) fn snapshot(app: Option<&AppHandle>, refresh: bool) -> RealmHostStatu
         realm: hosted.as_ref().map(|realm| RealmSummary {
             name: realm.name.clone(),
             serving,
+            join_policy: realm.join_policy.clone(),
+            join_request_count: realm.join_request_count,
         }),
         hub: hub_summary,
         training,
@@ -1170,6 +1206,156 @@ pub async fn realm_host_set_limits(app: AppHandle, options: RealmHostOptions) ->
         snapshot(Some(app), true)
     })
     .await
+}
+
+// ---- join requests and adding players [2026-10-15] -------------------------------------------------------------------
+
+/// The longest username the host may type (the backend's limit).
+const USERNAME_LIMIT: usize = 64;
+
+/// The players waiting for the host (`GET .../mine/requests`). Its own answer: a failed read is `error`, not a panel notice.
+#[tauri::command]
+pub async fn realm_host_join_requests(app: AppHandle) -> JoinRequestsStatus {
+    match tauri::async_runtime::spawn_blocking(move || join_requests(&app)).await {
+        Ok(status) => status,
+        Err(_) => JoinRequestsStatus {
+            requests: Vec::new(),
+            error: Some("The request list stopped unexpectedly.".to_string()),
+        },
+    }
+}
+
+fn join_requests(app: &AppHandle) -> JoinRequestsStatus {
+    let read = get(app, &format!("{MINE}/requests")).and_then(|response| {
+        response
+            .json::<JoinRequestsView>()
+            .map_err(|_| Failure::local("The server's answer could not be read.".to_string()))
+    });
+    match read {
+        Ok(view) => JoinRequestsStatus {
+            requests: view.requests,
+            error: None,
+        },
+        Err(failure) => JoinRequestsStatus {
+            requests: Vec::new(),
+            error: Some(failure.readable()),
+        },
+    }
+}
+
+#[tauri::command]
+pub async fn realm_host_approve_request(app: AppHandle, account_id: String) -> RealmHostStatus {
+    run(app, move |app| {
+        request_action(
+            app,
+            &account_id,
+            "approve",
+            "The player can join your realm now.",
+        );
+        snapshot(Some(app), true)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn realm_host_deny_request(app: AppHandle, account_id: String) -> RealmHostStatus {
+    run(app, move |app| {
+        request_action(app, &account_id, "deny", "The request was denied.");
+        snapshot(Some(app), true)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn realm_host_add_player(app: AppHandle, username: String) -> RealmHostStatus {
+    run(app, move |app| {
+        add_player(app, &username);
+        snapshot(Some(app), true)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn realm_host_set_join_policy(app: AppHandle, join_policy: String) -> RealmHostStatus {
+    run(app, move |app| {
+        set_join_policy(app, &join_policy);
+        snapshot(Some(app), true)
+    })
+    .await
+}
+
+/// Approves or denies a waiting player. The account id is checked before it reaches a URL; no name is logged.
+fn request_action(app: &AppHandle, account_id: &str, action: &str, done: &str) {
+    if !valid_account_id(account_id) {
+        set_error("That is not a player id.".to_string());
+        return;
+    }
+    let path = format!("{MINE}/requests/{account_id}/{action}");
+    match post(app, &path, &json!({})) {
+        Ok(_) => {
+            realm_log(&format!("realm join request {action} done"));
+            set_notice(Some(done.to_string()));
+        }
+        Err(failure) => set_error(failure.readable()),
+    }
+}
+
+/// Lets a player in by launcher username; the backend looks the name up. The notice names the player as the server knows them.
+fn add_player(app: &AppHandle, username: &str) {
+    let name = username.trim();
+    if name.is_empty()
+        || name.chars().count() > USERNAME_LIMIT
+        || name.chars().any(char::is_control)
+    {
+        set_error(format!(
+            "Enter a username of 1 to {USERNAME_LIMIT} characters."
+        ));
+        return;
+    }
+    match post(
+        app,
+        &format!("{MINE}/members/add"),
+        &json!({ "username": name }),
+    ) {
+        Ok(response) => {
+            let answer: Value = response.json().unwrap_or(Value::Null);
+            let shown = answer["displayName"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .unwrap_or(name);
+            let sentence = if answer["added"].as_bool() == Some(false) {
+                format!("{shown} can already join your realm.")
+            } else {
+                format!("{shown} can now join your realm directly.")
+            };
+            realm_log("realm player added by username");
+            set_notice(Some(sentence));
+        }
+        Err(failure) => set_error(failure.readable()),
+    }
+}
+
+/// Who may join: `INVITE_ONLY` ("Approved players only") or `PUBLIC` ("Anyone"), through the backend's settings route.
+fn set_join_policy(app: &AppHandle, join_policy: &str) {
+    let sentence = match join_policy {
+        "PUBLIC" => "Anyone can join your realm now.",
+        "INVITE_ONLY" => "Only players you approve can join your realm now.",
+        _ => {
+            set_error("Choose who can join: approved players or anyone.".to_string());
+            return;
+        }
+    };
+    match post(
+        app,
+        &format!("{MINE}/settings"),
+        &json!({ "joinPolicy": join_policy }),
+    ) {
+        Ok(_) => {
+            realm_log(&format!("realm join policy set to {join_policy}"));
+            set_notice(Some(sentence.to_string()));
+        }
+        Err(failure) => set_error(failure.readable()),
+    }
 }
 
 fn member_action(app: &AppHandle, account_id: &str, action: &str, body: Value, done: &str) {
@@ -1991,6 +2177,8 @@ mod tests {
             realm: Some(RealmSummary {
                 name: "tempest".into(),
                 serving: true,
+                join_policy: "INVITE_ONLY".into(),
+                join_request_count: 2,
             }),
             hub: Some(HubSummary {
                 session_id: "s".into(),

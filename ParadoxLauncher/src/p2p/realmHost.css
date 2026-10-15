@@ -154,6 +154,26 @@
 
 /* ---- Player and ban lists --------------------------------------------------- */
 
+/* [2026-10-15] Who can join: one dropdown, not wider than a limit field. */
+.rh-policy {
+  margin-top: 14px;
+  max-width: 320px;
+}
+
+/* [2026-10-15] Add a player: the username field and its button on one line (they wrap on a narrow window). */
+.rh-add {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.rh-add .field {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
 .rh-list {
   display: grid;
   gap: 8px;

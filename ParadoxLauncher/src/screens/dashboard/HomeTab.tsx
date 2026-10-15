@@ -12,6 +12,7 @@ import {
   onGameExited,
   pickInstallPath,
   REALM_HOST_KEY_REQUIRED,
+  REALM_JOIN_REQUESTED,
   REALM_OWNER_CHANGED,
   secureLaunch,
   type InstallStatus,
@@ -27,7 +28,7 @@ import { Banner } from "../../components/Banner";
 import { DeactivationBanner } from "../../components/DeactivationBanner";
 import { LocalServerBadge } from "../../components/LocalServerWarning";
 import { useServer } from "../../servers/ServerContext";
-import { statusNaming } from "../../servers/serverNames";
+import { serverNaming, statusNaming } from "../../servers/serverNames";
 import { officialUnavailable, officialUnavailableNote, serverStatusBadge } from "../../servers/officialPlay";
 import { getVersion } from "@tauri-apps/api/app";
 import { useRealmTrust } from "../../servers/RealmTrust";
@@ -98,6 +99,8 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   }, []);
   const [install, setInstall] = useState<InstallStatus | null>(null);
   const [phase, setPhase] = useState<PlayPhase>({ status: "idle" });
+  // [2026-10-15] Play asked a realm's host for approval: this is information (the player waits), not an error.
+  const [playNotice, setPlayNotice] = useState<string | null>(null);
   const [runtime, setRuntime] = useState<RuntimeView>({ state: "idle" });
   const [runtimeNonce, setRuntimeNonce] = useState(0);
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
@@ -249,6 +252,7 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     if (!install || !account || playLockRef.current || (phase.status !== "idle" && phase.status !== "error")) return;
     if (rules.deactivatedUntil !== null || rules.deletionChecking) return;
     playLockRef.current = true;
+    setPlayNotice(null);
     setPhase({ status: "requestingSession" });
 
     try {
@@ -281,6 +285,17 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
         invalidateRuntime();
       }
     } catch (err) {
+      // [2026-10-15] The request to the host is sent: the player waits for an answer and presses Play again after it.
+      if (err === REALM_JOIN_REQUESTED) {
+        if (mountedRef.current) {
+          const realmName = selected ? serverNaming(selected).primary : "";
+          setPlayNotice(realmName
+            ? `Request sent to ${realmName}. Wait for the host to approve it, then press Play again.`
+            : "Request sent to the host. Wait for the host to approve it, then press Play again.");
+          setPhase({ status: "idle" });
+        }
+        return;
+      }
       // [2026-10-14] A refusal for a deactivated account: the sentence names the day, and the banner is read again.
       const deactivated = isDeactivationRefusal(err);
       if (deactivated) void rules.reloadDeletion().catch(() => {});
@@ -527,6 +542,7 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
               )}
               {busy && <div className="loader-bar" role="progressbar" aria-label="Launcher task in progress" aria-valuetext={progressLabel ?? "Working"} />}
               {phase.status === "error" && <p className="launch-error" role="alert">{phase.message}</p>}
+              {playNotice && phase.status !== "error" && <p className="launch-notice" role="status">{playNotice}</p>}
             </div>
             <div className="launch-actions">
               {/* [2026-10-14] The server Play will use, named in words (kind and name), so it is never a surprise. */}

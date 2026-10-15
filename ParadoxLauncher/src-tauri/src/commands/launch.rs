@@ -67,6 +67,9 @@ struct RealmEntryRequest<'a> {
 /// first). The UI matches these exact tokens (src/servers/RealmTrust.tsx).
 pub(crate) const REALM_OWNER_CHANGED: &str = "REALM_OWNER_CHANGED";
 pub(crate) const REALM_HOST_KEY_REQUIRED: &str = "REALM_HOST_KEY_REQUIRED";
+/// [2026-10-15] Play asked the host for approval (an invite-only realm, no invite): the request is sent and the player waits. Not a
+/// failure; the UI matches this token and says so (src/screens/dashboard/HomeTab.tsx).
+pub(crate) const REALM_JOIN_REQUESTED: &str = "REALM_JOIN_REQUESTED";
 
 /// [2026-10-14 realms] Play's host check, before anything is verified or signed in: a Paradox realm is entered only with the
 /// host key the player agreed to. Pure, so the rule is tested without a window.
@@ -92,7 +95,11 @@ fn realm_refusal_message(body: &[u8]) -> Option<String> {
         "REALM_OFFLINE" => "The realm host is offline.",
         "REALM_BANNED" => "You cannot join this realm.",
         REALM_OWNER_CHANGED => REALM_OWNER_CHANGED,
-        "REALM_INVITE_REQUIRED" => "This realm is invite-only. You need an invite code.",
+        REALM_JOIN_REQUESTED => REALM_JOIN_REQUESTED,
+        // [2026-10-15] The backend asks for a request now; this sentence is the fallback for a server that still refuses outright.
+        "REALM_INVITE_REQUIRED" => {
+            "This realm is invite-only. Ask its host to approve you, or use an invite code."
+        }
         "REALMS_DISABLED" => "Realms are not available on this server.",
         _ if code.starts_with("REALM") => return backend_message.map(str::to_string),
         _ => return None,
@@ -787,6 +794,19 @@ mod tests {
             realm_refusal_message(&refusal("REALM_INVITE_EXPIRED", "That invite has expired."))
                 .as_deref(),
             Some("That invite has expired.")
+        );
+        // [2026-10-15] A join request is a token (the UI shows it as information); a full list is the backend's own sentence.
+        assert_eq!(
+            realm_refusal_message(&refusal(
+                "REALM_JOIN_REQUESTED",
+                "Request sent to the host."
+            ))
+            .as_deref(),
+            Some(REALM_JOIN_REQUESTED)
+        );
+        assert_eq!(
+            realm_refusal_message(&refusal("REALM_REQUESTS_FULL", "Too many requests.")).as_deref(),
+            Some("Too many requests.")
         );
         // Not a realm code: the caller keeps safe_api_error's message.
         assert_eq!(realm_refusal_message(&refusal("GUARD_REQUIRED", "x")), None);

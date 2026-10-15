@@ -1003,14 +1003,14 @@ const ashPlayer = { accountId: 'acc-ash', displayName: 'AshWarden', where: { kin
 const grimBan = { accountId: 'acc-grim', displayName: 'GrimTester', reason: 'Griefing in Ramsgate', at: minutesAgo(3 * 24 * 60) };
 function realmStatus(patch = {}) {
   return {
-    state: 'stopped', notice: null, noticeKind: 'info', realm: { name: 'ember-hold', serving: false },
+    state: 'stopped', notice: null, noticeKind: 'info', realm: { name: 'ember-hold', serving: false, joinPolicy: 'INVITE_ONLY', joinRequestCount: 0 },
     hub: null, training: null, hunts: [], players: [], bans: [],
     capacity: { maxPlayers: 16, maxServers: 3, activeServers: 0, afkSeconds: 1200, freeMemMiB: 9800, totalMemMiB: 16384 },
     ...patch,
   };
 }
 const onlineStatus = (patch = {}) => realmStatus({
-  state: 'online', realm: { name: 'ember-hold', serving: true },
+  state: 'online', realm: { name: 'ember-hold', serving: true, joinPolicy: 'INVITE_ONLY', joinRequestCount: 0 },
   hub: { sessionId: 'hub-1', state: 'RUNNING', startedAt: minutesAgo(84), players: 1 },
   training: { sessionId: 'train-1', state: 'RUNNING', players: 0 },
   hunts: [{ sessionId: 'hunt-1', huntId: 'IslandA', state: 'RUNNING', players: 1 }],
@@ -1021,7 +1021,8 @@ const onlineStatus = (patch = {}) => realmStatus({
 
 // A small fake of the launcher's realm host: every command answers the whole refreshed status, like the real ones.
 function fakeNative(initial) {
-  const native = { status: initial, fail: {}, refuse: {}, calls: [] };
+  // [2026-10-15] The waiting players (newest first) and the answer of the request list (`requestsError` for a failed read).
+  const native = { status: initial, fail: {}, refuse: {}, calls: [], requests: [] };
   const patch = (changes) => (native.status = { ...native.status, ...changes });
   native.invoke = (command, args) => {
     native.calls.push([command, args]);
@@ -1047,6 +1048,22 @@ function fakeNative(initial) {
         }
         case 'realm_host_unban': return patch({ bans: status.bans.filter((ban) => ban.accountId !== args.accountId), notice: 'The ban was lifted.', noticeKind: 'info' });
         case 'realm_host_set_limits': return patch({ capacity: { ...status.capacity, ...args.options } });
+        case 'realm_host_join_requests': return { requests: native.requests, error: native.requestsError ?? null };
+        case 'realm_host_approve_request':
+        case 'realm_host_deny_request': {
+          native.requests = native.requests.filter((request) => request.accountId !== args.accountId);
+          return patch({
+            notice: command === 'realm_host_approve_request' ? 'The player can join your realm now.' : 'The request was denied.',
+            noticeKind: 'info',
+            realm: { ...status.realm, joinRequestCount: native.requests.length },
+          });
+        }
+        case 'realm_host_add_player': return patch({ notice: `${args.username} can now join your realm directly.`, noticeKind: 'info' });
+        case 'realm_host_set_join_policy': return patch({
+          realm: { ...status.realm, joinPolicy: args.joinPolicy },
+          notice: args.joinPolicy === 'PUBLIC' ? 'Anyone can join your realm now.' : 'Only players you approve can join your realm now.',
+          noticeKind: 'info',
+        });
         default: throw `unknown command ${command}`;
       }
     });
@@ -1070,6 +1087,8 @@ function realmPanel(native, { server = officialSelected, self = 'host-account' }
     './realmHostApi': api,
     './realmHostModel': realmModel,
     './realmHost.css': {},
+    // [2026-10-15] "Who can join" uses the launcher's dropdown (src/components/Dropdown.tsx).
+    '../components/Dropdown': dropdownLib,
   }).default;
 }
 
@@ -1307,6 +1326,105 @@ test('capacity meters show servers, players and free memory, and warn when they 
     native.status = onlineStatus({ capacity: { ...onlineStatus().capacity, freeMemMiB: 900 } });
     await tick(5000);
     assert.equal(meterOf('Free memory').closest('.rh-meter').dataset.tone, 'bad');
+  });
+});
+
+// [2026-10-15] Lets the calls the panel started (a status read, then the request list) finish before the next check.
+const flushAsync = () => act(async () => new Promise((resolve) => setImmediate(resolve)));
+
+test('Join requests: newest first, Approve and Deny send the request and drop the row, and an empty list says so', async () => {
+  const native = fakeNative(onlineStatus({ realm: { name: 'ember-hold', serving: true, joinPolicy: 'INVITE_ONLY', joinRequestCount: 2 } }));
+  native.requests = [
+    { accountId: 'acc-lyra', displayName: 'LyraSpark', at: minutesAgo(2) },
+    { accountId: 'acc-brann', displayName: null, at: minutesAgo(40) },
+  ];
+  await withMockTimers(async () => {
+    await mount(realmPanel(native));
+    await flushAsync();
+    let text = realmText();
+    assert.match(text, /Join requests/);
+    assert.match(text, /2 waiting/);
+    assert.ok(rowFor('LyraSpark'));
+    assert.ok(rowFor('acc-brann'), 'a player without a display name is shown by id');
+    assert.ok(text.indexOf('LyraSpark') < text.indexOf('acc-brann'), 'newest first, as the launcher lists them');
+
+    await act(async () => rowButton('LyraSpark', 'Approve').click());
+    await flushAsync();
+    assert.deepEqual(native.sent('realm_host_approve_request'), [['realm_host_approve_request', { accountId: 'acc-lyra' }]]);
+    assert.equal(rowFor('LyraSpark'), undefined, 'the approved request leaves the list');
+    assert.match(realmText(), /The player can join your realm now\./);
+
+    await act(async () => rowButton('acc-brann', 'Deny').click());
+    await flushAsync();
+    assert.deepEqual(native.sent('realm_host_deny_request'), [['realm_host_deny_request', { accountId: 'acc-brann' }]]);
+    assert.match(realmText(), /No pending requests\./);
+  });
+});
+
+test('Join requests: a list that cannot be read says why, and a refused approval stays in the section', async () => {
+  const native = fakeNative(onlineStatus());
+  native.requestsError = 'The server could not find your realm.';
+  await withMockTimers(async () => {
+    await mount(realmPanel(native));
+    await flushAsync();
+    assert.match(realmText(), /The server could not find your realm\./);
+    delete native.requestsError;
+    native.requests = [{ accountId: 'acc-lyra', displayName: 'LyraSpark', at: minutesAgo(2) }];
+    await tick(5000);
+    await flushAsync();
+    assert.ok(rowFor('LyraSpark'));
+    assert.doesNotMatch(realmText(), /The server could not find your realm\./, 'a good read clears the read error');
+    native.fail.realm_host_approve_request = 'That player has not asked to join your realm.';
+    await act(async () => rowButton('LyraSpark', 'Approve').click());
+    await flushAsync();
+    assert.ok(rowFor('LyraSpark'), 'a failed approval keeps the request');
+    assert.match(realmText(), /That player has not asked to join your realm\./);
+    await tick(5000);
+    await flushAsync();
+    assert.match(realmText(), /That player has not asked to join your realm\./, 'the next refresh keeps the refusal');
+  });
+});
+
+test('Who can join: choosing Anyone sends the policy, and the control shows the answer', async () => {
+  const native = fakeNative(onlineStatus());
+  await withMockTimers(async () => {
+    await mount(realmPanel(native));
+    const control = document.querySelector('.rh-policy [role="combobox"]');
+    assert.ok(control, 'the policy dropdown is there once the realm exists');
+    assert.match(control.textContent, /Approved players only/);
+    await act(async () => control.click());
+    const anyone = [...document.querySelectorAll('[role="option"]')].find((row) => row.textContent.includes('Anyone'));
+    assert.ok(anyone);
+    await act(async () => anyone.click());
+    await flushAsync();
+    assert.deepEqual(native.sent('realm_host_set_join_policy'), [['realm_host_set_join_policy', { joinPolicy: 'PUBLIC' }]]);
+    assert.match(document.querySelector('.rh-policy [role="combobox"]').textContent, /Anyone/);
+  });
+});
+
+test('Add a player: the username is sent as typed, the success line names the player, and an unknown name is refused in the field', async () => {
+  const native = fakeNative(onlineStatus());
+  await withMockTimers(async () => {
+    await mount(realmPanel(native));
+    const field = inputOf('Username');
+    assert.ok(field);
+    const allow = () => [...document.querySelectorAll('.rh-add button')][0];
+    assert.equal(allow().disabled, true, 'nothing to allow until a name is typed');
+
+    await act(async () => typeInto(field, '  LyraSpark '));
+    await flushAsync();
+    await act(async () => allow().click());
+    await flushAsync();
+    assert.deepEqual(native.sent('realm_host_add_player'), [['realm_host_add_player', { username: 'LyraSpark' }]]);
+    assert.match(realmText(), /LyraSpark can now join your realm directly\./);
+    assert.equal(inputOf('Username').value, '', 'the field is cleared once the player is in');
+
+    await act(async () => typeInto(field, 'nobody'));
+    native.fail.realm_host_add_player = 'No player has that username.';
+    await flushAsync();
+    await act(async () => allow().click());
+    await flushAsync();
+    assert.match(realmText(), /No player has that username\./);
   });
 });
 
