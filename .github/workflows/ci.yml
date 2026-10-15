@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch: # a manual run; gitleaks then scans the whole history
 
 permissions:
   contents: read

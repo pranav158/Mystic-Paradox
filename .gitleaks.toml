@@ -1,0 +1,17 @@
+# gitleaks (CI secret-scan): the default rules, plus the made-up values that tests and fixtures use as keys.
+# Each entry is one exact fake value, so a real key in the same files is still reported.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Made-up keys in tests and fixtures"
+regexTarget = "secret"
+regexes = [
+  '''KEY(-[A-Z])?-0123456789abcdef''',           # realms and launcher test keys (KEY-A-…, KEY-B-…, KEY-…)
+  '''Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2Rl''',    # base64 of "foobarbazqux1234567890abcde(f)" (realm host keys in tests)
+  '''01234567-89ab-4def-8123-456789abcdef''',    # the transport self-test's session binding id
+  '''8E91700491B00FA7DB373809E250E4''',          # a gatherable-cooldown id and its near misses (cooldownState test)
+  '''tok-SECRET-123''',                          # the hunt-search cancel test's body
+  '''dGhlIHNhbXBsZSBub25jZQ==''',                # the sample Sec-WebSocket-Key from RFC 6455
+]
