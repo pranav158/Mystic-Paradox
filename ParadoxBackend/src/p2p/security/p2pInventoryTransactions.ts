@@ -34,8 +34,9 @@ export function P2PInventoryTransactionDenialReason(
     if (auth?.IsPlayerHostRuntime !== true || auth.IsGameserver !== false ||
         typeof auth.userId !== "string" || typeof auth.p2pSessionId !== "string" ||
         !Number.isSafeInteger(auth.p2pGeneration)) return "PLAYER_HOST_AUTH_REQUIRED";
+    // [2026-10-15] A drained hunt's server still serves its players until it ends: their loot saves as in the running hunt.
     if (hunt == undefined || hunt.sessionId !== auth.p2pSessionId ||
-        hunt.generation !== auth.p2pGeneration || hunt.state !== "RUNNING") return "HUNT_NOT_RUNNING";
+        hunt.generation !== auth.p2pGeneration || (hunt.state !== "RUNNING" && hunt.state !== "DRAINING")) return "HUNT_NOT_RUNNING";
     if (IsRealmHubSession(hunt)) {
         if (!IsHubRuntimeAccount(hunt.hostAccountId, presence?.presentAccountIds ?? [], auth.userId)) return "PARTICIPANT_NOT_ADMITTED";
         if (body.accountId != undefined && body.accountId !== auth.userId) return "ACCOUNT_MISMATCH";

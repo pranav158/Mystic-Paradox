@@ -8,6 +8,8 @@ export type P2PHuntState =
     | "HOST_READY"
     | "ADMITTING"
     | "RUNNING"
+    // [2026-10-15] A superseded Tier 0 hunt whose server still serves the players in it until the server ends (BeginDrainPartySession).
+    | "DRAINING"
     | "SUSPECT"
     | "FENCED"
     | "ABORTING"
@@ -115,6 +117,11 @@ export interface P2PHuntSessionRecord {
     terminalAt?: string;
     /** [2026-10-11] Why a clean end (EndP2PHuntSession) closed the session; failureReason stays for failures. */
     completionReason?: string;
+    /**
+     * [2026-10-15] DRAINING only, and only when a drain cap is configured (P2P_HUNT_DRAIN_GRACE_MS): when the drained server is fenced
+     * if it has not ended by itself (BeginDrainPartySession). Absent with no cap. Cleared by the clean end.
+     */
+    drainDeadline?: string;
     /**
      * [2026-10-14 cancel] The roster member whose Cancel ended a forming hunt (failureReason PLAYER_CANCELED). The others of the
      * hunt are told PARTY_MEMBER_CANCELED; the canceller keeps PLAYER_CANCELED.
@@ -498,9 +505,14 @@ export interface P2PHuntRepository {
     countActiveHostSessions(accountId: string, session?: ClientSession): Promise<number>;
     /**
      * [2026-10-13 realms S1] Live sessions (the hub, the Training hub and realm hunts together) the realm's host runs: the
-     * number a realm's server limit is checked against.
+     * number a realm's server limit is checked against. [2026-10-15] A draining session is not counted (it has no activePartyKey).
      */
     countActiveRealmServers(realmId: string, session?: ClientSession): Promise<number>;
+    /**
+     * [2026-10-15] The realm's sessions whose server still runs on its host's PC, a DRAINING one included. Not a limit: the
+     * host's presence is only accepted without a client when such a server runs (ConfirmsRealmHost).
+     */
+    countRunningRealmServers(realmId: string, session?: ClientSession): Promise<number>;
     /** Live realm hunts (never hubs) of this realm and host: what ending the realm's Ramsgate also ends. */
     listLiveRealmHunts(realmId: string, hostAccountId: string, session?: ClientSession): Promise<P2PHuntSessionRecord[]>;
     /**

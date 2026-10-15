@@ -121,7 +121,13 @@ export function CoreAccountDeletionSteps(): AccountDeletionStep[] {
         { kind: "delete", collection: Collections.AuthIdentities, description: "linked sign-in identities", match: (c) => ({ userId: c.userId }) },
         { kind: "delete", collection: Collections.RefreshSessions, description: "launcher sign-in sessions", match: (c) => ({ userId: c.userId }) },
         { kind: "delete", collection: Collections.GameExchangeCodes, description: "game exchange codes", match: (c) => ({ userId: c.userId }) },
-        { kind: "delete", collection: Collections.DiscordOAuthTransactions, description: "Discord sign-in transactions", match: (c) => ({ userId: c.userId }) },
+        // [2026-10-15] A link transaction carries linkUserId (the account it links to), not userId: both are the account's.
+        {
+            kind: "delete", collection: Collections.DiscordOAuthTransactions, description: "Discord sign-in and link transactions",
+            match: (c) => ({ $or: [{ userId: c.userId }, { linkUserId: c.userId }] })
+        },
+        // [2026-10-15] The one-time email codes of the account (verification and reset): an HMAC each, removed with the account.
+        { kind: "delete", collection: Collections.EmailCodes, description: "email verification and reset codes", match: (c) => ({ userId: c.userId }) },
         { kind: "delete", collection: Collections.AdminSessions, description: "operator sessions of the account", match: (c) => ({ userId: c.userId }) },
         {
             kind: "delete", collection: Collections.UserApiKeys, description: "user API keys",

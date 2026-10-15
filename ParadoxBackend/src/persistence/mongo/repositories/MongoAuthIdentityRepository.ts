@@ -44,4 +44,11 @@ export class MongoAuthIdentityRepository implements AuthIdentityRepository {
         const Db = await GetMongoDb();
         await Db.collection(Collections.AuthIdentities).insertOne({ ...identity }, { session });
     }
+
+    // [2026-10-15] The unlink (DELETE /launcher/v1/account/discord).
+    async deleteForUser(provider: "discord", userId: string): Promise<number> {
+        const Db = await GetMongoDb();
+        const Result = await Db.collection(Collections.AuthIdentities).deleteMany({ provider, userId });
+        return Result.deletedCount;
+    }
 }

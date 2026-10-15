@@ -31,6 +31,13 @@ type CoreLauncherErrorCode =
     | "AUTH_DISCORD_NOT_CONFIGURED"
     | "AUTH_DISCORD_CANCELLED"
     | "AUTH_DISCORD_ALREADY_LINKED"
+    // [2026-10-15] Email verification and password reset by code (controllers/launcherEmail.ts), and the Discord link and unlink.
+    | "AUTH_EMAIL_UNVERIFIED"
+    | "AUTH_CODE_INVALID"
+    | "AUTH_EMAIL_UNAVAILABLE"
+    | "AUTH_DISCORD_NOT_LINKED"
+    | "AUTH_DISCORD_ACCOUNT_HAS_LINK"
+    | "AUTH_DISCORD_ONLY_LOGIN"
     | "AUTH_TESTER_REQUIRED"
     | "AUTH_CHANNEL_MISMATCH"
     // [2026-10-14] Terms of Use / Privacy Policy consent and the account deletion hold (launcherAuth routes, accountConsent.ts).
@@ -49,6 +56,8 @@ type CoreLauncherErrorCode =
     | "GUARD_SESSION_INVALID"
     | "GUARD_SIGNATURE_INVALID"
     | "GUARD_SEQUENCE_CONFLICT"
+    // [2026-10-15] A launch with no realm while MYSTICPARADOX_OFFICIAL_PLAY is off (config/officialPlay.ts).
+    | "OFFICIAL_PLAY_UNAVAILABLE"
     | "NOT_FOUND"
     | "INTERNAL";
 
@@ -84,6 +93,14 @@ const StatusByCode: Record<CoreLauncherErrorCode, number> = {
     AUTH_DISCORD_NOT_CONFIGURED: 503,
     AUTH_DISCORD_CANCELLED: 400,
     AUTH_DISCORD_ALREADY_LINKED: 409,
+    // [2026-10-15] A sign-in whose email is not verified is refused (403) until a code is entered; a wrong, expired, used-up or
+    // already-used code is one generic answer (400); the mail settings missing is a 503, like the other "not set up here" codes.
+    AUTH_EMAIL_UNVERIFIED: 403,
+    AUTH_CODE_INVALID: 400,
+    AUTH_EMAIL_UNAVAILABLE: 503,
+    AUTH_DISCORD_NOT_LINKED: 403,
+    AUTH_DISCORD_ACCOUNT_HAS_LINK: 409,
+    AUTH_DISCORD_ONLY_LOGIN: 409,
     AUTH_TESTER_REQUIRED: 403,
     AUTH_CHANNEL_MISMATCH: 409,
     // [2026-10-14] CONSENT_REQUIRED defaults to 400 (registration); a refusal of a game session or realm hosting sends 403 with
@@ -103,6 +120,8 @@ const StatusByCode: Record<CoreLauncherErrorCode, number> = {
     GUARD_SESSION_INVALID: 401,
     GUARD_SIGNATURE_INVALID: 401,
     GUARD_SEQUENCE_CONFLICT: 409,
+    // [2026-10-15] Official play is off on this server (the same 503 as the other "not available here" codes).
+    OFFICIAL_PLAY_UNAVAILABLE: 503,
     NOT_FOUND: 404,
     INTERNAL: 500
 };

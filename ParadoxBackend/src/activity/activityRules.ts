@@ -7,6 +7,7 @@
  */
 
 import { IsPlatinumMovement, ReadEconomyMonitorSettings, SEASONAL_COIN_CURRENCY } from "../diagnostics/economyLedgerMonitor";
+import { VersionAtLeast } from "../security/launcherVersion";
 
 // [2026-10-14] Activity monitor rules (pure: no database, no clock except the arguments). The stateful part is activityMonitor.ts.
 //
@@ -281,6 +282,40 @@ export function DailyFlagCandidates(row: Record<string, any>, settings: Activity
         }
     }
     return Flags;
+}
+
+// ---- launcher builds (UNOFFICIAL_LAUNCHER) ----
+
+/** [2026-10-15] What the launcher says about itself at Play: its version and the SHA-256 of its own launcher.exe. */
+export interface LauncherBuildReport {
+    version: string;
+    sha256: string;
+}
+
+/**
+ * - official: the hash Guard's manifest pins for the LAUNCHER role;
+ * - outdated: another hash on an older version than the served one (an earlier official build, until it updates itself);
+ * - unofficial: another hash on the served version or newer (self-built or repackaged), the flag;
+ * - unknown: no report, or no pinned launcher (a server without a Guard manifest).
+ */
+export type LauncherBuildVerdict = "official" | "outdated" | "unofficial" | "unknown";
+
+/** The report from a request body, or undefined when absent or malformed (never refuses the request). */
+export function ParseLauncherBuildReport(value: unknown): LauncherBuildReport | undefined {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    const Input = value as Record<string, unknown>;
+    if (typeof Input.version !== "string" || !/^\d{1,5}\.\d{1,5}\.\d{1,5}(?:-[0-9A-Za-z.-]{1,32})?$/.test(Input.version)) return undefined;
+    if (typeof Input.sha256 !== "string" || !/^[0-9a-fA-F]{64}$/.test(Input.sha256)) return undefined;
+    return { version: Input.version, sha256: Input.sha256.toLowerCase() };
+}
+
+/** The verdict for a report against the pinned launcher hash and the served launcher version (see LauncherBuildVerdict). */
+export function ClassifyLauncherBuild(report: LauncherBuildReport | undefined, pinnedSha256: string | undefined,
+    servedVersion: string | undefined): LauncherBuildVerdict {
+    if (report === undefined || pinnedSha256 === undefined) return "unknown";
+    if (report.sha256 === pinnedSha256.toLowerCase()) return "official";
+    if (servedVersion !== undefined && !VersionAtLeast(report.version, servedVersion)) return "outdated";
+    return "unofficial";
 }
 
 /** The window in which a kill grant at `atMs` may belong to a dedicated hunt: started within the hunt maximum, ended within the grace. */

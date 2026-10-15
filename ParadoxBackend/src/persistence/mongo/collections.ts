@@ -61,6 +61,9 @@ export const Collections = {
     RefreshSessions: "refreshSessions",
     GameExchangeCodes: "gameExchangeCodes",
     DiscordOAuthTransactions: "discordOAuthTransactions",
+    // [2026-10-15] The live one-time codes of email verification and password reset. _id = "<userId>:<purpose>"; only an HMAC of the
+    // code is stored; a row is removed when used, expired or out of tries, and ttlAt (the expiry) purges the rest.
+    EmailCodes: "emailCodes",
     AdminSessions: "adminSessions",
     AdminAudit: "adminAudit",
     // [2026-10-14] One pseudonymous tombstone per erased account (scripts/process_account_deletions.ts). _id = pseudonymousId.

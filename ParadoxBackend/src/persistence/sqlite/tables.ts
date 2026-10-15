@@ -40,6 +40,7 @@ export const Tables = {
     refreshSessions: new DocTable("refreshSessions"),
     gameExchangeCodes: new DocTable("gameExchangeCodes"),
     discordOAuthTransactions: new DocTable("discordOAuthTransactions"),
+    emailCodes: new DocTable("emailCodes"),
     adminSessions: new DocTable("adminSessions"),
     adminAudit: new DocTable("adminAudit"),
     friendships: new DocTable("friendships"),

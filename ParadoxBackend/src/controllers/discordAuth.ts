@@ -13,10 +13,14 @@ import crypto from "crypto";
 import { GetRepositories } from "../persistence";
 import { GenerateOpaqueToken, HashOpaqueToken } from "../security/launcherTokens";
 import { LauncherApiError } from "../security/launcherErrors";
-import { CreateSessionForUser, ToAccountView, LauncherSessionResult } from "./launcherAuth";
+import { CreateSessionForUser, ToAccountView, LauncherAccountView, LauncherSessionResult } from "./launcherAuth";
 import { logger } from "../logger";
 import { AssertAccountAdmitted } from "../security/accountEligibility";
-import { ResolveRegistrationApproval } from "../config/registrationApproval";
+import { IsDuplicateKeyError } from "../persistence/sqlite/errors";
+
+// [2026-10-15] Discord never creates an account. Sign-in resolves a linked Discord user to its account (AUTH_DISCORD_NOT_LINKED
+// otherwise). An account is linked from Settings (StartDiscordLink): the same OAuth, the transaction carries the signed-in account, and
+// the callback links instead of signing in. The Discord user is asked for identify only, so no email comes from Discord.
 
 const STATE_TTL_MS = 5 * 60 * 1000; // 5 minutes to complete the Discord consent screen
 const COMPLETION_CODE_TTL_MS = 60 * 1000; // matches the game exchange code's spec-driven lifetime
@@ -44,7 +48,10 @@ function Base64Url(input: Buffer): string {
     return input.toString("base64url");
 }
 
-export async function StartDiscordAuth(): Promise<{ authorizeUrl: string }> {
+/**
+ * [2026-10-15] Starts one OAuth transaction. Without linkUserId it is a sign-in; with it the callback links the Discord user to that account.
+ */
+async function CreateDiscordTransaction(linkUserId: string | undefined): Promise<{ authorizeUrl: string }> {
     const { clientId, redirectUri } = RequireDiscordConfig();
 
     const State = crypto.randomBytes(24).toString("hex");
@@ -57,7 +64,8 @@ export async function StartDiscordAuth(): Promise<{ authorizeUrl: string }> {
         state: State,
         codeVerifier: CodeVerifier,
         createdAt: Now.toISOString(),
-        expiresAt: new Date(Now.getTime() + STATE_TTL_MS).toISOString()
+        expiresAt: new Date(Now.getTime() + STATE_TTL_MS).toISOString(),
+        ...(linkUserId === undefined ? {} : { linkUserId })
     });
 
     const Params = new URLSearchParams({
@@ -74,6 +82,26 @@ export async function StartDiscordAuth(): Promise<{ authorizeUrl: string }> {
     });
 
     return { authorizeUrl: `https://discord.com/api/oauth2/authorize?${Params.toString()}` };
+}
+
+export async function StartDiscordAuth(): Promise<{ authorizeUrl: string }> {
+    return CreateDiscordTransaction(undefined);
+}
+
+/**
+ * [2026-10-15] POST /launcher/v1/account/discord/link/start (signed in): the Discord OAuth bound to the signed-in account, to link Discord in
+ * Settings. An account that already has a Discord link is refused here as well as at the callback.
+ */
+export async function StartDiscordLink(userId: string): Promise<{ authorizeUrl: string }> {
+    RequireDiscordConfig();
+    const Repos = GetRepositories();
+    if ((await Repos.launcherAccounts.findByUserId(userId)) == undefined) {
+        throw new LauncherApiError("NOT_FOUND", "Account not found.");
+    }
+    if ((await Repos.authIdentities.findByUserId("discord", userId)) != undefined) {
+        throw new LauncherApiError("AUTH_DISCORD_ACCOUNT_HAS_LINK", "This account already has a Discord account linked.");
+    }
+    return CreateDiscordTransaction(userId);
 }
 
 interface DiscordUser {
@@ -118,83 +146,110 @@ async function ExchangeDiscordCode(code: string, codeVerifier: string): Promise<
     return (await UserResponse.json()) as DiscordUser;
 }
 
+/**
+ * [2026-10-15] Resolves a Discord user to the account it is linked to, and never creates one: an unlinked Discord user is refused with
+ * AUTH_DISCORD_NOT_LINKED. The name is kept from the plan (SteamDocs/DRAIN_EMAIL_GUARD_PLAN_2026_10_15.md), which calls it this; accounts
+ * are made by registering with an email and then linking Discord in Settings. Accounts created through Discord before this keep signing in.
+ */
 export async function ResolveOrCreateAccountForDiscordUser(discordUser: DiscordUser): Promise<string> {
-    const Repos = GetRepositories();
+    const Identity = await GetRepositories().authIdentities.findByProviderSubject("discord", discordUser.id);
 
-    const ExistingIdentity = await Repos.authIdentities.findByProviderSubject("discord", discordUser.id);
-
-    if (ExistingIdentity != undefined) {
-        // Spec: "if a Discord identity is already linked, sign into that account."
-        return ExistingIdentity.userId;
+    if (Identity == undefined) {
+        throw new LauncherApiError(
+            "AUTH_DISCORD_NOT_LINKED",
+            "Your Discord isn't linked to a Mystic Paradox account. Register with your email, then link Discord on the Account page."
+        );
     }
 
-    const UserId = crypto.randomUUID();
-    const Now = new Date().toISOString();
-    // [2026-10-14] The same switch as launcher sign-up (MYSTICPARADOX_REGISTRATION_APPROVAL), on every provider.
-    const approvalStatus = ResolveRegistrationApproval(process.env).approvalStatus;
-
-    // Create the account WITHOUT a chosen username. The launcher forces a set-username step after
-    // Discord sign-in (account.needsUsername === true). Use the opaque userId as a unique placeholder
-    // displayName until the player picks their real one; usernameSet:false drives the prompt.
-    await Repos.launcherAccounts.create({
-        userId: UserId,
-        displayNameNormalized: UserId.toLowerCase(),
-        displayName: UserId,
-        status: "active",
-        approvalStatus,
-        roles: ["player"],
-        createdAt: Now,
-        usernameSet: false
-        // No email/passwordHash — spec: never auto-merge accounts by email, and this
-        // build doesn't request Discord's email scope in the first place.
-    });
-
-    await Repos.authIdentities.create({
-        provider: "discord",
-        providerSubject: discordUser.id,
-        userId: UserId,
-        providerUsername: discordUser.username,
-        providerAvatarUrl: discordUser.avatar
-            ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`
-            : undefined,
-        linkedAt: Now
-    });
-
-    logger.info(`Launcher account created via Discord: ${UserId}`);
-
-    return UserId;
+    return Identity.userId;
 }
 
-/** Route handler calls this after Discord redirects back with ?code&state, then
- *  302-redirects the BROWSER to whatever URL this returns (a deep link on success,
- *  the launcher's error deep link on failure — see routes/launcherAuth.ts). */
+/**
+ * [2026-10-15] The callback of a link transaction: links the Discord user to the account the transaction was started for. An account has at
+ * most one Discord link, and a Discord user belongs to at most one account (the unique index also refuses a parallel second link).
+ */
+async function LinkDiscordIdentity(linkUserId: string, discordUser: DiscordUser): Promise<void> {
+    const Repos = GetRepositories();
+
+    if ((await Repos.launcherAccounts.findByUserId(linkUserId)) == undefined) {
+        throw new LauncherApiError("AUTH_DISCORD_CANCELLED", "Discord sign-in didn't complete. Please try again.");
+    }
+    if ((await Repos.authIdentities.findByUserId("discord", linkUserId)) != undefined) {
+        throw new LauncherApiError("AUTH_DISCORD_ACCOUNT_HAS_LINK", "This account already has a Discord account linked.");
+    }
+    if ((await Repos.authIdentities.findByProviderSubject("discord", discordUser.id)) != undefined) {
+        throw new LauncherApiError("AUTH_DISCORD_ALREADY_LINKED", "That Discord account is linked to another Mystic Paradox account.");
+    }
+
+    try {
+        await Repos.authIdentities.create({
+            provider: "discord",
+            providerSubject: discordUser.id,
+            userId: linkUserId,
+            providerUsername: discordUser.username,
+            providerAvatarUrl: discordUser.avatar
+                ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`
+                : undefined,
+            linkedAt: new Date().toISOString()
+        });
+    } catch (error) {
+        if (IsDuplicateKeyError(error)) {
+            throw new LauncherApiError("AUTH_DISCORD_ALREADY_LINKED", "That Discord account is linked to another Mystic Paradox account.");
+        }
+        throw error;
+    }
+
+    logger.info(`Discord linked to account ${linkUserId}`);
+}
+
+/**
+ * Route handler calls this after Discord redirects back with ?code&state, then 302-redirects the BROWSER to the URL it returns. It never throws:
+ * a sign-in answers auth/complete or auth/error, and a link answers link/done or link/error (the routes wrap it as before). A failure before the
+ * transaction is known answers auth/error.
+ */
 export async function HandleDiscordCallback(code: string | undefined, state: string | undefined): Promise<string> {
     const Scheme = GetDeepLinkScheme();
+    let Channel: "auth" | "link" = "auth";
 
-    if (typeof code !== "string" || typeof state !== "string") {
-        throw new LauncherApiError("AUTH_DISCORD_CANCELLED", "Discord sign-in was cancelled.");
+    try {
+        if (typeof code !== "string" || typeof state !== "string") {
+            throw new LauncherApiError("AUTH_DISCORD_CANCELLED", "Discord sign-in was cancelled.");
+        }
+
+        const Transaction = await GetRepositories().discordOAuthTransactions.consumeByState(state);
+
+        if (Transaction == undefined) {
+            throw new LauncherApiError("AUTH_DISCORD_CANCELLED", "That Discord sign-in link has expired.");
+        }
+
+        if (Transaction.linkUserId !== undefined) {
+            Channel = "link";
+            const DiscordUser = await ExchangeDiscordCode(code, Transaction.codeVerifier);
+            await LinkDiscordIdentity(Transaction.linkUserId, DiscordUser);
+            return `${Scheme}://link/done`;
+        }
+
+        const DiscordUser = await ExchangeDiscordCode(code, Transaction.codeVerifier);
+        const UserId = await ResolveOrCreateAccountForDiscordUser(DiscordUser);
+
+        const CompletionCode = GenerateOpaqueToken();
+        const CompletionExpiresAt = new Date(Date.now() + COMPLETION_CODE_TTL_MS).toISOString();
+
+        await GetRepositories().discordOAuthTransactions.attachCompletionCode(
+            state,
+            HashOpaqueToken(CompletionCode),
+            CompletionExpiresAt,
+            UserId
+        );
+
+        return `${Scheme}://auth/complete?code=${CompletionCode}`;
+    } catch (error) {
+        if (!(error instanceof LauncherApiError)) {
+            logger.error(`Unhandled error in Discord callback: ${error}`);
+        }
+        const Failure = error instanceof LauncherApiError ? error.code : "INTERNAL";
+        return `${Scheme}://${Channel}/error?code=${encodeURIComponent(Failure)}`;
     }
-
-    const Transaction = await GetRepositories().discordOAuthTransactions.consumeByState(state);
-
-    if (Transaction == undefined) {
-        throw new LauncherApiError("AUTH_DISCORD_CANCELLED", "That Discord sign-in link has expired.");
-    }
-
-    const DiscordUser = await ExchangeDiscordCode(code, Transaction.codeVerifier);
-    const UserId = await ResolveOrCreateAccountForDiscordUser(DiscordUser);
-
-    const CompletionCode = GenerateOpaqueToken();
-    const CompletionExpiresAt = new Date(Date.now() + COMPLETION_CODE_TTL_MS).toISOString();
-
-    await GetRepositories().discordOAuthTransactions.attachCompletionCode(
-        state,
-        HashOpaqueToken(CompletionCode),
-        CompletionExpiresAt,
-        UserId
-    );
-
-    return `${Scheme}://auth/complete?code=${CompletionCode}`;
 }
 
 export async function CompleteDiscordLogin(rawCompletionCode: string, deviceId: string, deviceName: string): Promise<LauncherSessionResult> {
@@ -219,4 +274,26 @@ export async function CompleteDiscordLogin(rawCompletionCode: string, deviceId: 
     const Session = await CreateSessionForUser(Account.userId, deviceId, deviceName);
 
     return { ...Session, account: await ToAccountView(Account) };
+}
+
+/**
+ * [2026-10-15] DELETE /launcher/v1/account/discord (signed in): unlinks the Discord user from the account. An account without a password
+ * has Discord as its only sign-in, so its link stays (AUTH_DISCORD_ONLY_LOGIN). An account with no link is answered as it is.
+ */
+export async function UnlinkDiscordAccount(userId: string): Promise<{ account: LauncherAccountView }> {
+    const Repos = GetRepositories();
+    const Account = await Repos.launcherAccounts.findByUserId(userId);
+    if (Account == undefined) {
+        throw new LauncherApiError("NOT_FOUND", "Account not found.");
+    }
+
+    if ((await Repos.authIdentities.findByUserId("discord", userId)) != undefined) {
+        if (Account.passwordHash == undefined) {
+            throw new LauncherApiError("AUTH_DISCORD_ONLY_LOGIN", "Discord is this account's only sign-in, so it can't be unlinked.");
+        }
+        await Repos.authIdentities.deleteForUser("discord", userId);
+        logger.info(`Discord unlinked from account ${userId}`);
+    }
+
+    return { account: await ToAccountView(Account) };
 }

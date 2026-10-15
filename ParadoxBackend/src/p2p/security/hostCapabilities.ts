@@ -103,7 +103,9 @@ const DEFAULT_CONTEXT_DEPENDENCIES: HostRuntimeContextDependencies = {
     listPresent: ListHubPresentAccounts
 };
 
-const HUNT_RUNTIME_STATES = ["STARTING", "HOST_READY", "ADMITTING", "RUNNING"];
+// [2026-10-15] A drained hunt's server keeps serving the players still in it until it ends; its capability is not revoked
+// (BeginDrainPartySession). No new admission needs this state: TICKETABLE_STATES (p2pAdmission.ts) still refuses it.
+const HUNT_RUNTIME_STATES = ["STARTING", "HOST_READY", "ADMITTING", "RUNNING", "DRAINING"];
 // A hub keeps serving through a missed lease (SUSPECT): its members are still connected, and the lifecycle monitor ends it
 // after the suspect window if the host does not come back.
 const HUB_RUNTIME_STATES = ["STARTING", "HOST_READY", "ADMITTING", "RUNNING", "SUSPECT"];

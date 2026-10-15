@@ -64,6 +64,12 @@ export interface LauncherAccountRecord {
     /** [2026-10-14] A deletion request (routes/launcherAuth.ts). While present the account is deactivated: it can sign in
      *  and restore it, but it cannot play, host or join. scripts/process_account_deletions.ts erases it after scheduledFor. */
     deletion?: LauncherDeletionRecord;
+    /** [2026-10-15] When the email was verified (a code entered, or a password reset by code). Absent until then, and for accounts
+     *  from before email verification (they verify at their next sign-in under MYSTICPARADOX_EMAIL_VERIFICATION=required). */
+    emailVerifiedAt?: string;
+    /** [2026-10-15] Set on a registration made under MYSTICPARADOX_EMAIL_VERIFICATION=required, cleared when the email is verified. A
+     *  registration still unverified 48 h after this time is removed by the sweep in controllers/launcherEmail.ts. */
+    emailVerificationPendingSince?: string;
 }
 
 export interface LauncherConsentRecord {
@@ -104,6 +110,24 @@ export interface LauncherAccountRepository {
 
     /** [2026-10-14] Launcher accounts whose deletion hold has ended by `nowIso` (oldest first, at most `limit`). */
     listDeletionsDue(nowIso: string, limit: number): Promise<LauncherAccountRecord[]>;
+
+    /** [2026-10-15] Records the email as verified and clears the pending mark (the account record is otherwise unchanged). */
+    setEmailVerified(userId: string, verifiedAt: string): Promise<void>;
+
+    /** [2026-10-15] Replaces the password hash (a password reset by code). */
+    setPasswordHash(userId: string, passwordHash: string): Promise<void>;
+
+    /**
+     * [2026-10-15] Launcher accounts whose email is still unverified and whose registration has been pending since before
+     * `pendingBeforeIso` (oldest first, at most `limit`). Accounts that never were pending (existing accounts) are never listed.
+     */
+    listUnverifiedRegistrations(pendingBeforeIso: string, limit: number): Promise<LauncherAccountRecord[]>;
+
+    /**
+     * [2026-10-15] Removes a launcher account, but only while it is still an unverified registration pending since before
+     * `pendingBeforeIso`. Returns whether this call removed it (an account verified meanwhile is kept).
+     */
+    deleteUnverifiedRegistration(userId: string, pendingBeforeIso: string): Promise<boolean>;
 
     listForAdmin(filters: {
         approvalStatus?: AccountApprovalStatus;

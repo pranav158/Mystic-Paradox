@@ -38,7 +38,8 @@ export interface TableSpec {
 }
 
 /** Collections whose rows carry a storage-only `ttlAt` (ISO) mirror, purged once it is in the past. */
-export const TTL_TABLES = ["refreshSessions", "gameExchangeCodes", "discordOAuthTransactions", "adminSessions", "economyDaily",
+// [2026-10-15] emailCodes: the one-time email codes, purged past their expiry (contracts/EmailCodeRepository.ts).
+export const TTL_TABLES = ["refreshSessions", "gameExchangeCodes", "discordOAuthTransactions", "emailCodes", "adminSessions", "economyDaily",
     // [2026-10-14] Activity monitor rows, kept about 400 days (persistence/mongo/indexes.ts has the matching TTL indexes).
     "playerActivityDaily", "activityHunts", "slayersPathUnlocks", "activityFlags"] as const;
 
@@ -137,6 +138,16 @@ export const TABLES: TableSpec[] = [
             { name: "discordOAuthTransactions_completionCodeHash", columns: ["completionCodeHash"] },
             { name: "discordOAuthTransactions_userId", columns: ["userId"] },
             { name: "discordOAuthTransactions_ttlAt", columns: ["ttlAt"] }
+        ]
+    },
+    // [2026-10-15] The one-time email codes (one row per account and purpose). Added without a schema version change: EnsureTablesExist
+    // creates it on existing databases, as guardFindings was added.
+    {
+        name: "emailCodes",
+        columns: { userId: "userId", ttlAt: "ttlAt" },
+        indexes: [
+            { name: "emailCodes_userId", columns: ["userId"] },
+            { name: "emailCodes_ttlAt", columns: ["ttlAt"] }
         ]
     },
     {

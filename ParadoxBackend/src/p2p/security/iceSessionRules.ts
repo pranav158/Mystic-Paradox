@@ -33,8 +33,11 @@ export type IcePresenceRow = Pick<RealmHubPresenceRecord, "accountId" | "peerId"
 /** Most joiners a hub host's peer set carries (the runtime's hub ceiling). */
 export const MAXIMUM_HUB_PEERS = 64;
 
-/** Hunt states in which participants may (re)build their connections. */
-export const ICE_ACTIVE_STATES: readonly P2PHuntState[] = ["STARTING", "HOST_READY", "ADMITTING", "RUNNING", "SUSPECT"];
+/**
+ * Hunt states in which participants may (re)build their connections. [2026-10-15] DRAINING: the members still on a drained
+ * server keep their transport; admission is still refused there (TICKETABLE_STATES), so no one new joins by signalling alone.
+ */
+export const ICE_ACTIVE_STATES: readonly P2PHuntState[] = ["STARTING", "HOST_READY", "ADMITTING", "RUNNING", "DRAINING", "SUSPECT"];
 
 const SIGNAL_KINDS: readonly IceSignalKind[] = ["DESCRIPTION", "CANDIDATE", "GATHERING_DONE"];
 const ACCOUNT_ID = /^[A-Za-z0-9-]{8,64}$/;

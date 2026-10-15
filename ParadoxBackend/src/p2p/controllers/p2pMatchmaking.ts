@@ -5,6 +5,7 @@ import { GetOrCreateParty } from "../../controllers/party";
 import { logger } from "../../logger";
 import { GAUNTLET_DISABLED_REASON, RefusesGauntletRequest } from "../../matchmakingHuntPolicy";
 import { DecideHuntRoute, IsP2PTrainingRequest, P2PPolicySummary, ReadP2PPolicy } from "../config/p2pPolicy";
+import { DedicatedServersConfigured } from "../../config/dedicatedServers";
 import { GetP2PRepositories, P2PHuntSessionRecord, WithP2PTransaction } from "../persistence";
 import { GetAntiCheatExtension } from "../antiCheat";
 import { FenceP2PEmergencyStop, GetP2POperationsPolicy } from "../services/p2pOperationsPolicy";
@@ -13,6 +14,7 @@ import { IsRealmHostingEnabled } from "../realm/realmHubPolicy";
 import { IsHubLive, IsPresenceLive, IsRealmHub } from "../realm/realmHubRules";
 import { GetRealmsPort, RealmPresenceView } from "../realm/realmsPort";
 import {
+    BeginDrainPartySession,
     BeginHostSelection,
     CancelFormingHunt,
     ClassifyExistingPartySession,
@@ -310,6 +312,12 @@ export function DedicatedFallbackAction(isHub: boolean, dedicatedHuntsDisabled: 
  */
 export async function ResolveHuntLaunchManifest(HuntId: string, ExpectedPlayers: string[]): Promise<HuntLaunchManifest | undefined> {
     if (ReadHuntManifestSource() === "local") return ResolveLocalHuntLaunchManifest(HuntId, ExpectedPlayers);
+    // [2026-10-15] No DeployServer (DEPLOYSERVER_URL unset): no manifest can come from one, so none is requested and the caller
+    // reports HUNT_MANIFEST_UNAVAILABLE (its route then falls back to the cancel of a hunt with no dedicated route).
+    if (!DedicatedServersConfigured()) {
+        logger.warn(`[P2P] hunt launch manifest not requested for ${HuntId}: no DeployServer (DEPLOYSERVER_URL is unset)`);
+        return undefined;
+    }
     const response = await fetch("http://" + process.env.DEPLOYSERVER_URL + DEPLOYSERVER_MANIFEST_PATH, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -378,9 +386,16 @@ async function CreatePlayerHostedMatchmaking(
             }
             return { created: true };
         }
-        const superseded = await SupersedePartySession(existing, disposition.reason, Context.playerId);
-        logger.info(`[P2P] party ${PartyId} request for ${HuntId} supersedes session ${existing.sessionId} ` +
-            `state=${existing.state} reason=${disposition.reason} ended=${superseded != undefined ? superseded.record.state : "already-moved-on"}`);
+        // [2026-10-15] A running Tier 0 hunt is drained, not fenced: its players keep their server until it ends (BeginDrainPartySession).
+        const superseded = disposition.action === "DRAIN"
+            ? await BeginDrainPartySession(existing, disposition.reason, Context.playerId)
+            : await SupersedePartySession(existing, disposition.reason, Context.playerId);
+        const outcome = superseded != undefined ? superseded.record.state : "already-moved-on";
+        logger.info(disposition.action === "DRAIN"
+            ? `[P2P] party ${PartyId} request for ${HuntId} drains session ${existing.sessionId} ` +
+                `state=${existing.state} reason=${disposition.reason} outcome=${outcome}`
+            : `[P2P] party ${PartyId} request for ${HuntId} supersedes session ${existing.sessionId} ` +
+                `state=${existing.state} reason=${disposition.reason} ended=${outcome}`);
         if (superseded?.partyRevision != undefined) PartyRevision = superseded.partyRevision;
         else {
             // The session moved on concurrently; take the party's current revision for the new session.

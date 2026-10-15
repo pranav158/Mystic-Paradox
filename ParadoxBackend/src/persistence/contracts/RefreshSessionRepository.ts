@@ -35,5 +35,7 @@ export interface RefreshSessionRepository {
     revokeById(id: string): Promise<void>;
     revokeFamily(familyId: string): Promise<void>;
     revokeAllForUser(userId: string): Promise<void>;
+    /** [2026-10-15] Removes every session row of the account (the registration sweep). Accounts that never got a session have none. */
+    deleteAllForUser(userId: string): Promise<void>;
     isFamilyActive(familyId: string, userId: string): Promise<boolean>;
 }

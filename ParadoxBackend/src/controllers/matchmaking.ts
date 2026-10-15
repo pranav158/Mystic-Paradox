@@ -16,10 +16,26 @@ import crypto from "node:crypto";
 import { CandidateLeaveOutcome, GetP2PExtension } from "../extensions/p2p";
 import { GAUNTLET_DISABLED_REASON, RefusesGauntletRequest } from "../matchmakingHuntPolicy";
 import { GetPartyForPlayer } from "./party";
+import { DedicatedServersConfigured } from "../config/dedicatedServers";
 
 const MATCHMAKING_MODE = process.env.MATCHMAKING_MODE;
 const DEPLOYSERVER_URL = process.env.DEPLOYSERVER_URL;
+// [2026-10-15] Unset or blank (the VPS has no DeployServer): nothing is requested from one, and a hub or hunt that needs one is
+// cancelled with NO_DEDICATED_SERVERS. Read from the same value as the address, so the check and the request cannot disagree.
+const DEPLOYSERVER_CONFIGURED = DedicatedServersConfigured({ DEPLOYSERVER_URL });
+const NO_DEDICATED_SERVERS_REASON = "NO_DEDICATED_SERVERS";
 const DEPLOYSERVER_MATCHMAKING_PATH = "/api/matchmaker/handle-matchmaking-for-player";
+
+/** A DeployServer launch. `reason` is set when no launch was requested because no DeployServer is configured. */
+interface DeployServerLaunch {
+    succeeded: boolean;
+    readyNow: boolean;
+    host: string;
+    port: number;
+    reason?: string;
+}
+
+let HubStatusUnavailableLogged = false;
 
 type MatchmakingQueueData = {
     Players: string[],
@@ -205,7 +221,12 @@ function CancelHuntMatchmaking(HuntId: string, PlayerIds: readonly string[], Rea
     return true;
 }
 
-async function LaunchGameOnDeployserver(GameMode: string, GameArgs: string, HuntId: string, ExpectedPlayers: string[] | undefined){
+async function LaunchGameOnDeployserver(GameMode: string, GameArgs: string, HuntId: string, ExpectedPlayers: string[] | undefined): Promise<DeployServerLaunch> {
+    // [2026-10-15] No DeployServer: no request is made, for a hub or a hunt alike; the caller cancels with the reason.
+    if (!DEPLOYSERVER_CONFIGURED) {
+        logger.warn(`[HuntRoute] no dedicated server (DEPLOYSERVER_URL is unset): refused ${IsHubDestination(GameMode, HuntId) ? "hub" : "hunt"} huntId=${HuntId}`);
+        return { succeeded: false, readyNow: false, host: "", port: 0, reason: NO_DEDICATED_SERVERS_REASON };
+    }
     if (!IsHubDestination(GameMode, HuntId) && GetP2PExtension().matchmaking.dedicatedHuntsDisabled()) {
         logger.error(`[HuntRoute] blocked dedicated hunt launch (dedicated hunts are disabled) huntId=${HuntId}`);
         return { succeeded: false, readyNow: false, host: "", port: 0 };
@@ -272,7 +293,7 @@ async function PopQueue(HuntId: string){
     
     const GameOnDeployServer = await LaunchGameOnDeployserver("ISLAND", "", HuntId, MatchmakingQueue!.Players);
     if (!GameOnDeployServer.succeeded) {
-        CancelHuntMatchmaking(HuntId, MatchmakingQueue!.Players, "DEDICATED_HUNT_DISABLED");
+        CancelHuntMatchmaking(HuntId, MatchmakingQueue!.Players, GameOnDeployServer.reason ?? "DEDICATED_HUNT_DISABLED");
         MatchmakingQueueMap.delete(HuntId);
         return;
     }
@@ -386,7 +407,8 @@ async function HandlePartyMatchmaking(HuntId: string, PlayerId: string, PartyId:
     const GameOnDeployServer = await LaunchGameOnDeployserver("ISLAND", "", HuntId, PartyMembers);
 
     if(!GameOnDeployServer.succeeded){
-        return false;
+        // [2026-10-15] Without a DeployServer the party's members are cancelled with the reason, not left waiting.
+        return GameOnDeployServer.reason != undefined ? CancelHuntMatchmaking(HuntId, PartyMembers, GameOnDeployServer.reason) : false;
     }
 
     const CandidateId = crypto.randomUUID();
@@ -427,6 +449,15 @@ export interface LiveHubStatus {
 }
 
 export async function FetchLiveHubStatus(): Promise<LiveHubStatus | undefined> {
+    // [2026-10-15] No DeployServer: the hubs are reported unavailable and nothing is requested. The candidate status polls this
+    // every second or so, so the reason is logged once for the process.
+    if (!DEPLOYSERVER_CONFIGURED) {
+        if (!HubStatusUnavailableLogged) {
+            HubStatusUnavailableLogged = true;
+            logger.warn("[HuntRoute] hub-status not requested: no DeployServer (DEPLOYSERVER_URL is unset); the hubs are reported unavailable");
+        }
+        return undefined;
+    }
     try {
         const Response = await fetch("http://" + DEPLOYSERVER_URL + "/api/hub-status");
         if (!Response.ok) {
@@ -590,7 +621,10 @@ export async function HandlePlayerMatchmaking(GameMode: string, GameArgs: string
             const GameOnDeployServer = await LaunchGameOnDeployserver(GameMode, GameArgs, EffectiveHuntId, PartyMembers ?? [PlayerId]);
 
             if(!GameOnDeployServer.succeeded){
-                return false;
+                // [2026-10-15] Without a DeployServer the requester (and its party) is cancelled with the reason, not left waiting.
+                return GameOnDeployServer.reason != undefined
+                    ? CancelHuntMatchmaking(EffectiveHuntId, PartyMembers ?? [PlayerId], GameOnDeployServer.reason)
+                    : false;
             }
 
             const IsHub = IsHubDestination(GameMode, EffectiveHuntId);

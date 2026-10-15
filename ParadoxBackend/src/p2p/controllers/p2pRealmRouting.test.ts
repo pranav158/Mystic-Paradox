@@ -22,6 +22,10 @@ import { EndRealmHub, HandleRealmEvent } from "./realmHubLifecycle";
 import { HashHostCapabilitySecret } from "../security/hostCapabilities";
 import { DeriveIcePeerId } from "../security/transportPeerIds";
 import { roomService } from "../../realtime/RoomService";
+import { WithEnvironment } from "../huntManifest/huntTablesTestKit";
+
+// [2026-10-15] The dedicated route exists only with a DeployServer (DEPLOYSERVER_URL); the two official-route tests below need it.
+const DEPLOYSERVER = "deployserver.invalid:8080";
 
 /*
  * A realm member's matchmaking requests (RouteP2PHunt -> RouteRealmRequest) on the in-memory repositories: the Ramsgate and Training
@@ -407,7 +411,7 @@ test("Gauntlet is refused for realm members with MYSTICPARADOX_GAUNTLET off (GAU
 test("Gauntlet is refused on the player-hosted route for a player with no realm (GAUNTLET_DISABLED); with the switch on it stays on the dedicated route", async () => {
     const saved = process.env.MYSTICPARADOX_GAUNTLET;
     try {
-        await WithKit(async (kit) => {
+        await WithEnvironment({ DEPLOYSERVER_URL: DEPLOYSERVER }, () => WithKit(async (kit) => {
             kit.addParty("party-p2p-gauntlet", [STRANGER]);
             kit.linkAccount(STRANGER);
             const request = () => Harness(STRANGER, { gameMode: "ISLAND", huntId: "CR19_PlayerHunt_Gauntlet", isHub: false,
@@ -423,7 +427,7 @@ test("Gauntlet is refused on the player-hosted route for a player with no realm 
             const allowed = request();
             assert.deepEqual(await RouteP2PHunt(allowed.context), { handled: false });
             assert.deepEqual(allowed.cancels, []);
-        });
+        }));
     } finally {
         if (saved === undefined) delete process.env.MYSTICPARADOX_GAUNTLET;
         else process.env.MYSTICPARADOX_GAUNTLET = saved;
@@ -431,7 +435,7 @@ test("Gauntlet is refused on the player-hosted route for a player with no realm 
 });
 
 test("official routing is unchanged for a player with no realm: a solo request and a Trials request stay on the dedicated route", async () => {
-    await WithKit(async (kit) => {
+    await WithEnvironment({ DEPLOYSERVER_URL: DEPLOYSERVER }, () => WithKit(async (kit) => {
         kit.linkAccount(STRANGER);
         const solo = Harness(STRANGER, { gameMode: "ISLAND", huntId: "ShatteredIsles_IslandA", isHub: false });
         assert.deepEqual(await RouteP2PHunt(solo.context), { handled: false });
@@ -442,7 +446,7 @@ test("official routing is unchanged for a player with no realm: a solo request a
             partyId: "party-official-trial", partyMembers: [STRANGER], partyRevision: 1 });
         assert.deepEqual(await RouteP2PHunt(trial.context), { handled: false });
         assert.deepEqual(trial.cancels, []);
-    });
+    }));
 });
 
 test("a realm member's request with no party state becomes a realm hunt with a one-member roster, on its own solo party", async () => {

@@ -20,7 +20,7 @@ import {
 } from "../../contracts/LauncherAccountRepository";
 import { Conn, SqliteDatabase } from "../database";
 import { Doc, StoredRow } from "../docTable";
-import { IsAbsent, IsPresent, Tables } from "../tables";
+import { IsAbsent, IsNullOrMissing, IsPresent, Tables } from "../tables";
 
 function ToRecord(Doc: Doc): LauncherAccountRecord {
     return {
@@ -41,7 +41,9 @@ function ToRecord(Doc: Doc): LauncherAccountRecord {
         lastLoginAt: Doc.lastLoginAt ?? undefined,
         usernameSet: Doc.usernameSet ?? undefined,
         consent: Doc.consent ?? undefined,
-        deletion: Doc.deletion ?? undefined
+        deletion: Doc.deletion ?? undefined,
+        emailVerifiedAt: Doc.emailVerifiedAt ?? undefined,
+        emailVerificationPendingSince: Doc.emailVerificationPendingSince ?? undefined
     };
 }
 
@@ -95,6 +97,9 @@ export class SqliteLauncherAccountRepository implements LauncherAccountRepositor
                 usernameSet: account.usernameSet,
                 consent: account.consent,
                 deletion: account.deletion,
+                // [2026-10-15] Written only when set, as in the MongoDB repository (an absent field is what the "not verified" queries look for).
+                ...(account.emailVerifiedAt === undefined ? {} : { emailVerifiedAt: account.emailVerifiedAt }),
+                ...(account.emailVerificationPendingSince === undefined ? {} : { emailVerificationPendingSince: account.emailVerificationPendingSince }),
                 // Game-owned fields (AccountRepository): a launcher account needs them too.
                 name: account.displayName,
                 notes: 0
@@ -229,6 +234,48 @@ export class SqliteLauncherAccountRepository implements LauncherAccountRepositor
                 rolesUpdatedAt: changes.rolesUpdatedAt,
                 rolesUpdatedBy: changes.rolesUpdatedBy
             }));
+        });
+    }
+
+    // [2026-10-15] Verified: the verification time is set and the pending mark goes (as the MongoDB update does).
+    async setEmailVerified(userId: string, verifiedAt: string): Promise<void> {
+        await this.db.write(undefined, (c) => {
+            const Row = this.launcherRow(c, userId);
+            if (Row !== undefined) Tables.accounts.patch(c, Row, { emailVerifiedAt: verifiedAt }, ["emailVerificationPendingSince"]);
+        });
+    }
+
+    // [2026-10-15] A password reset by code replaces the hash.
+    async setPasswordHash(userId: string, passwordHash: string): Promise<void> {
+        await this.db.write(undefined, (c) => {
+            const Row = this.launcherRow(c, userId);
+            if (Row !== undefined) Tables.accounts.patch(c, Row, { passwordHash });
+        });
+    }
+
+    // [2026-10-15] Unverified registrations pending since before the cut-off, oldest first. ISO text compares in time order.
+    async listUnverifiedRegistrations(pendingBeforeIso: string, limit: number): Promise<LauncherAccountRecord[]> {
+        return this.db.read(undefined, (c) => {
+            const Docs = Tables.accounts.find(
+                c,
+                `${IS_LAUNCHER_ACCOUNT} AND json_extract(doc, '$.emailVerificationPendingSince') < ? AND ${IsNullOrMissing("emailVerifiedAt")}`,
+                [pendingBeforeIso],
+                { orderBy: "json_extract(doc, '$.emailVerificationPendingSince') ASC", limit: limit > 0 ? limit : undefined }
+            );
+            return Docs.map(ToRecord);
+        });
+    }
+
+    // [2026-10-15] Removes the account only while it is still an unverified registration pending since before the cut-off.
+    async deleteUnverifiedRegistration(userId: string, pendingBeforeIso: string): Promise<boolean> {
+        return this.db.write(undefined, (c) => {
+            const Row = Tables.accounts.findOneRow(
+                c,
+                `_id = ? AND ${IS_LAUNCHER_ACCOUNT} AND json_extract(doc, '$.emailVerificationPendingSince') < ? AND ${IsNullOrMissing("emailVerifiedAt")}`,
+                [userId, pendingBeforeIso]
+            );
+            if (Row === undefined) return false;
+            return Tables.accounts.deleteById(c, userId) === 1;
         });
     }
 

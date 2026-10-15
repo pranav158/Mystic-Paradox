@@ -33,6 +33,7 @@ import { EscalationProgressRepository } from "./EscalationProgressRepository";
 import { BountyStateRepository } from "./BountyStateRepository";
 import { CooldownStateRepository } from "./CooldownStateRepository";
 import { EntitlementRepository } from "./EntitlementRepository";
+import { EmailCodeRepository } from "./EmailCodeRepository";
 import { PartyRepository } from "./PartyRepository";
 import { LauncherGuardRepository } from "./LauncherGuardRepository";
 import { EconomyRollupRepository } from "./EconomyRollupRepository";
@@ -69,6 +70,8 @@ export interface RepositoryProvider {
     refreshSessions: RefreshSessionRepository;
     gameExchangeCodes: GameExchangeCodeRepository;
     discordOAuthTransactions: DiscordOAuthTransactionRepository;
+    // [2026-10-15] The live one-time codes of email verification and password reset (contracts/EmailCodeRepository.ts).
+    emailCodes: EmailCodeRepository;
 
     // [hardening] Idempotency ledger for POST /inventory (see InventoryTransactionRepository.ts).
     inventoryTransactions: InventoryTransactionRepository;

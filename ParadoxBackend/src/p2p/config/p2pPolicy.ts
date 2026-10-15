@@ -7,6 +7,7 @@
  */
 
 import crypto from "node:crypto";
+import { DedicatedServersConfigured } from "../../config/dedicatedServers";
 
 export type HuntRoute = "DEDICATED" | "PLAYER_HOSTED";
 export type P2PTrustTier = 0 | 1;
@@ -140,7 +141,9 @@ export function ReadP2PPolicy(Environment: NodeJS.ProcessEnv = process.env): P2P
         tier1AllowedHunts: ReadCsvSet(Environment.P2P_TIER1_ALLOWED_HUNTS),
         // This disables only non-hub dedicated instances. Ramsgate and Training Dojo remain
         // persistent dedicated infrastructure, and active P2P failures may still recover there.
-        dedicatedHuntsDisabled: IsStrictTrue(Environment.P2P_DISABLE_DEDICATED_HUNTS),
+        // [2026-10-15] Without a DeployServer (DEPLOYSERVER_URL unset or blank, as on the VPS) there is no dedicated route at all, so the
+        // same rail applies: a hunt that cannot be player-hosted is cancelled instead of sent to a server that does not exist.
+        dedicatedHuntsDisabled: IsStrictTrue(Environment.P2P_DISABLE_DEDICATED_HUNTS) || !DedicatedServersConfigured(Environment),
         // [2026-10-11 P2P on 1.14.7, plan 39_ §13.1 B7] The owner's target hosts Training on players' PCs as a
         // no-reward session type (decision 3 of 39_ §13). Literal "true" only; the dedicated Training hub stays the
         // fallback (and is still what every request uses while this is off).

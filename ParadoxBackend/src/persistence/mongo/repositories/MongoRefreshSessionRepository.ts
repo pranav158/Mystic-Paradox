@@ -82,6 +82,12 @@ export class MongoRefreshSessionRepository implements RefreshSessionRepository {
         );
     }
 
+    // [2026-10-15] The registration sweep removes an unverified registration's rows (accounts that never got a session have none).
+    async deleteAllForUser(userId: string): Promise<void> {
+        const Db = await GetMongoDb();
+        await Db.collection(Collections.RefreshSessions).deleteMany({ userId });
+    }
+
     async isFamilyActive(familyId: string, userId: string): Promise<boolean> {
         const Db = await GetMongoDb();
         const Count = await Db.collection(Collections.RefreshSessions).countDocuments({

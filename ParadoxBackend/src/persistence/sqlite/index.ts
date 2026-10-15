@@ -19,6 +19,7 @@ import { SqliteAuthIdentityRepository } from "./repositories/SqliteAuthIdentityR
 import { SqliteBreadcrumbRepository } from "./repositories/SqliteBreadcrumbRepository";
 import { SqliteCharacterRepository } from "./repositories/SqliteCharacterRepository";
 import { SqliteDiscordOAuthTransactionRepository } from "./repositories/SqliteDiscordOAuthTransactionRepository";
+import { SqliteEmailCodeRepository } from "./repositories/SqliteEmailCodeRepository";
 import { SqliteEconomyRollupRepository } from "./repositories/SqliteEconomyRollupRepository";
 import { SqliteActivityRepository } from "./repositories/SqliteActivityRepository";
 import { SqliteEncounteredContentRepository } from "./repositories/SqliteEncounteredContentRepository";
@@ -74,6 +75,7 @@ export function CreateSqliteRepositoryProvider(db: SqliteDatabase): RepositoryPr
         refreshSessions: new SqliteRefreshSessionRepository(db),
         gameExchangeCodes: new SqliteGameExchangeCodeRepository(db),
         discordOAuthTransactions: new SqliteDiscordOAuthTransactionRepository(db),
+        emailCodes: new SqliteEmailCodeRepository(db),
         inventoryTransactions: new SqliteInventoryTransactionRepository(db),
         friendships: new SqliteFriendshipRepository(db),
         admin: new SqliteAdminRepository(db),

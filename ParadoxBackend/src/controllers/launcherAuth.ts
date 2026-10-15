@@ -9,7 +9,8 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-import { TouchGameSession } from "../activity/activityMonitor";
+import { RecordLauncherBuild, TouchGameSession } from "../activity/activityMonitor";
+import { ParseLauncherBuildReport } from "../activity/activityRules";
 import crypto from "crypto";
 import { GetRepositories, LauncherAccountRecord } from "../persistence";
 import { ResolveRegistrationApproval } from "../config/registrationApproval";
@@ -17,9 +18,14 @@ import { HashPassword, VerifyPassword } from "../security/passwords";
 import { GenerateOpaqueToken, HashOpaqueToken, SignLauncherAccessToken } from "../security/launcherTokens";
 import { LauncherApiError } from "../security/launcherErrors";
 import { IsRateLimited } from "../security/rateLimit";
+import { MaskEmail } from "../security/emailCodes";
+import { EmailVerificationRequired } from "../config/emailVerification";
+import { DescribeMailError } from "../mail/mailSender";
+import { IssueEmailCode, RequireEmailSending } from "./emailCodes";
 import { logger } from "../logger";
 import { AuthorizeGameSessionRealm } from "../realms/entry";
 import { MongoServerError } from "mongodb";
+import { OFFICIAL_PLAY_UNAVAILABLE_MESSAGE, ReadOfficialPlay } from "../config/officialPlay";
 import { AssertAccountAdmitted, AssertAccountEligible, EffectiveApprovalStatus } from "../security/accountEligibility";
 import { AssertAccountNotDeactivated, AssertConsentCurrentWhenEnforced, ValidateRegistrationConsent } from "../security/accountConsent";
 import {
@@ -57,6 +63,10 @@ export interface LauncherAccountView {
     displayName: string;
     email: string;
     discordLinked: boolean;
+    /** [2026-10-15] The Discord identity linked in Settings (the name only: the sign-in asks for identify, no email). */
+    discord: { linked: boolean; username?: string };
+    /** [2026-10-15] True once the email was verified by a code (or a password reset by code). */
+    emailVerified: boolean;
     status: "active" | "banned" | "disabled";
     approvalStatus: "pending" | "approved" | "rejected";
     /** True when the account has no chosen username yet (fresh Discord account) — the
@@ -74,6 +84,9 @@ export interface PendingRegistrationResult {
     /** False when the account was approved at once (MYSTICPARADOX_REGISTRATION_APPROVAL=off, the default). */
     approvalRequired: boolean;
     account: LauncherAccountView;
+    /** [2026-10-15] Present (true, with the normalized address) when a code was mailed and the launcher must ask for it (EMAIL_VERIFICATION=required). */
+    verificationRequired?: true;
+    email?: string;
 }
 
 function NormalizeEmail(email: string): string {
@@ -156,6 +169,8 @@ export async function ToAccountView(account: LauncherAccountRecord): Promise<Lau
         displayName: account.displayName,
         email: account.email ?? "",
         discordLinked: DiscordIdentity != undefined,
+        discord: DiscordIdentity == undefined ? { linked: false } : { linked: true, username: DiscordIdentity.providerUsername },
+        emailVerified: account.emailVerifiedAt != undefined,
         status: account.status,
         approvalStatus: EffectiveApprovalStatus(account),
         needsUsername: account.usernameSet === false
@@ -186,8 +201,40 @@ export async function CreateSessionForUser(userId: string, deviceId: string, dev
     };
 }
 
+/**
+ * [2026-10-15] Refuses a banned or disabled account with its own error. The approval state is not looked at here: the sign-in checks it
+ * afterwards, so a banned account never gets a code.
+ */
+export function AssertAccountNotBlocked(account: LauncherAccountRecord): void {
+    if (account.status === "banned" || account.status === "disabled") AssertAccountAdmitted(account);
+}
+
+/**
+ * [2026-10-15] The answer of a sign-in that proved the email with a code (verify or reset): the session a password sign-in gives when the
+ * account is admitted, or, while the approval is pending, the registration's approval answer (no session). Banned, disabled and rejected
+ * accounts are refused as at password sign-in.
+ */
+export async function SignInAfterEmailProof(account: LauncherAccountRecord, deviceId: string, deviceName: string):
+    Promise<LauncherSessionResult | { approvalRequired: true; account: LauncherAccountView }> {
+    try {
+        AssertAccountAdmitted(account);
+    } catch (error) {
+        if (error instanceof LauncherApiError && error.code === "AUTH_APPROVAL_PENDING") {
+            return { approvalRequired: true, account: await ToAccountView(account) };
+        }
+        throw error;
+    }
+
+    const Now = new Date().toISOString();
+    await GetRepositories().launcherAccounts.updateLastLogin(account.userId, Now);
+
+    const Session = await CreateSessionForUser(account.userId, deviceId, deviceName);
+
+    return { ...Session, account: await ToAccountView({ ...account, lastLoginAt: Now }) };
+}
+
 export async function RegisterAccount(
-    displayName: string,
+    displayName: unknown,
     email: string,
     password: string,
     deviceName: string,
@@ -200,20 +247,29 @@ export async function RegisterAccount(
         throw new LauncherApiError("AUTH_RATE_LIMITED", "Too many registration attempts. Try again later.");
     }
 
-    const CleanUsername = ValidateUsername(displayName);
+    // [2026-10-15] displayName is optional. Without one (absent, null or blank) the account carries its userId as its placeholder name and
+    // usernameSet false, exactly as Discord accounts do; the launcher then asks for the name (account.needsUsername). A name that is sent is
+    // validated as before.
+    const GivenName = displayName === undefined || displayName === null || (typeof displayName === "string" && displayName.trim() === "")
+        ? undefined
+        : ValidateUsername(displayName);
     ValidateRegistrationInput(email, password);
     const AcceptedConsent = ValidateRegistrationConsent(consent, new Date().toISOString());
 
     const NormalizedEmail = NormalizeEmail(email);
-    const NormalizedDisplayName = NormalizeDisplayName(CleanUsername);
+    const NormalizedDisplayName = GivenName === undefined ? undefined : NormalizeDisplayName(GivenName);
 
     const Repos = GetRepositories();
+    // [2026-10-15] Under MYSTICPARADOX_EMAIL_VERIFICATION=required the code mail must be set up before an account is created: an account
+    // that can never be verified would only wait for the 48 h sweep.
+    const VerificationRequired = EmailVerificationRequired();
+    if (VerificationRequired) RequireEmailSending();
 
     if ((await Repos.launcherAccounts.findByEmail(NormalizedEmail)) != undefined) {
         throw new LauncherApiError("AUTH_EMAIL_TAKEN", "That email is already registered.");
     }
 
-    if ((await Repos.launcherAccounts.findByDisplayNameNormalized(NormalizedDisplayName)) != undefined) {
+    if (NormalizedDisplayName !== undefined && (await Repos.launcherAccounts.findByDisplayNameNormalized(NormalizedDisplayName)) != undefined) {
         throw new LauncherApiError("AUTH_DISPLAY_NAME_TAKEN", "That display name is already taken.");
     }
 
@@ -221,19 +277,23 @@ export async function RegisterAccount(
     const PasswordHash = await HashPassword(password);
     // [2026-10-14] MYSTICPARADOX_REGISTRATION_APPROVAL: off (the default) approves at once on every provider; required keeps pending.
     const approvalStatus = ResolveRegistrationApproval(process.env).approvalStatus;
+    const CreatedAt = new Date().toISOString();
 
     const Account: LauncherAccountRecord = {
         userId: UserId,
         email: NormalizedEmail,
-        displayNameNormalized: NormalizedDisplayName,
-        displayName: CleanUsername,
+        // The placeholder is the userId, lower-cased for the unique index, as Discord accounts use it.
+        displayNameNormalized: (NormalizedDisplayName ?? UserId).toLowerCase(),
+        displayName: GivenName ?? UserId,
         passwordHash: PasswordHash,
         status: "active",
         approvalStatus,
         roles: ["player"],
-        createdAt: new Date().toISOString(),
-        usernameSet: true,
-        ...(AcceptedConsent === undefined ? {} : { consent: AcceptedConsent })
+        createdAt: CreatedAt,
+        usernameSet: GivenName !== undefined,
+        ...(AcceptedConsent === undefined ? {} : { consent: AcceptedConsent }),
+        // [2026-10-15] The sweep (controllers/launcherEmail.ts) removes this registration if it is not verified within 48 h.
+        ...(VerificationRequired ? { emailVerificationPendingSince: CreatedAt } : {})
     };
 
     try {
@@ -254,7 +314,18 @@ export async function RegisterAccount(
 
     // Pending accounts deliberately receive no access/refresh token. Possession
     // of the open-source launcher cannot bypass server-side admission.
-    return { approvalRequired: approvalStatus === "pending", account: await ToAccountView(Account) };
+    const approvalRequired = approvalStatus === "pending";
+    const View = await ToAccountView(Account);
+    if (!VerificationRequired) return { approvalRequired, account: View };
+
+    // [2026-10-15] The first code is mailed now (no send limit applies yet). A failure leaves the account in place: the launcher can ask
+    // for a code again, and the sweep removes the account if it never verifies. Still no token is issued here.
+    try {
+        await IssueEmailCode(UserId, NormalizedEmail, "verify", ip);
+    } catch (error) {
+        logger.warn(`[Email] the first code for user ${UserId} could not be stored (${DescribeMailError(error)})`);
+    }
+    return { approvalRequired, verificationRequired: true, email: NormalizedEmail, account: View };
 }
 
 export async function LoginWithPassword(email: string, password: string, deviceId: string, deviceName: string, ip: string): Promise<LauncherSessionResult> {
@@ -271,6 +342,21 @@ export async function LoginWithPassword(email: string, password: string, deviceI
 
     if (Account == undefined || !PasswordOk) {
         throw new LauncherApiError("AUTH_INVALID_CREDENTIALS", "The email or password is incorrect.");
+    }
+
+    // [2026-10-15] A banned or disabled account is refused first: no code is mailed to it.
+    AssertAccountNotBlocked(Account);
+
+    // [2026-10-15] MYSTICPARADOX_EMAIL_VERIFICATION=required: the right password is not enough while the email is unverified (accounts from
+    // before the switch included). A code is mailed within the send limits (when they are reached none is mailed, and the answer is the
+    // same) and the sign-in waits for it. A wrong password never gets here.
+    if (EmailVerificationRequired() && Account.emailVerifiedAt == undefined) {
+        RequireEmailSending();
+        await IssueEmailCode(Account.userId, Account.email ?? "", "verify", ip);
+        throw new LauncherApiError(
+            "AUTH_EMAIL_UNVERIFIED",
+            `Enter the 6-digit code we sent to ${MaskEmail(Account.email ?? "")}. Older launchers: update the launcher to verify your email.`
+        );
     }
 
     AssertAccountAdmitted(Account);
@@ -364,7 +450,9 @@ export async function RequestGameExchangeCode(
     runtimeArtifacts: unknown,
     // [2026-10-13 realms hub design section 2.1] The optional `realm` of the request body, untouched. Absent (or null) = official
     // play, exactly as before; present = the realms module decides, and the code then carries the realm it was authorized for.
-    realm?: unknown
+    realm?: unknown,
+    // [2026-10-15] The body's `launcher` ({version, sha256} of the launcher's own exe; launchers from 0.1.65). Malformed = absent.
+    launcherBuild?: unknown
 ): Promise<{ exchangeCode: string; expiresInSeconds: number }> {
     if (IsRateLimited(`game-session:${userId}`, 10, 5 * 60 * 1000)) {
         throw new LauncherApiError("AUTH_RATE_LIMITED", "Too many launch attempts. Try again in a few minutes.");
@@ -378,6 +466,11 @@ export async function RequestGameExchangeCode(
     // [2026-10-14] A deletion request deactivates the account (ACCOUNT_DEACTIVATED); MYSTICPARADOX_CONSENT_ENFORCE gates the consent.
     AssertAccountNotDeactivated(Account);
     AssertConsentCurrentWhenEnforced(Account);
+    // [2026-10-15] Official play (no realm) is refused while MYSTICPARADOX_OFFICIAL_PLAY is off. A realm launch is not refused here: the
+    // realm decides at the end of this function, as before.
+    if ((realm === undefined || realm === null) && !ReadOfficialPlay().available) {
+        throw new LauncherApiError("OFFICIAL_PLAY_UNAVAILABLE", OFFICIAL_PLAY_UNAVAILABLE_MESSAGE);
+    }
 
     // The server derives the channel from CURRENT roles and verifies the exact runtime DLL hash
     // against that channel's signed release manifest. The launcher cannot retain a cached beta
@@ -423,6 +516,8 @@ export async function RequestGameExchangeCode(
 
     // [2026-10-14] A game session starts here (the activity monitor's playtime; presence touches extend it).
     TouchGameSession(userId);
+    // [2026-10-15] The launcher build this Play came from (UNOFFICIAL_LAUNCHER flag; a monitor, never awaited, never throws).
+    void RecordLauncherBuild(userId, runtimeChannel, ParseLauncherBuildReport(launcherBuild));
     return { exchangeCode: Code, expiresInSeconds: EXCHANGE_CODE_TTL_MS / 1000 };
 }
 

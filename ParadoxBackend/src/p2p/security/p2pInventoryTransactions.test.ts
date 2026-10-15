@@ -37,6 +37,11 @@ test("P2P native inventory requests bind runtime, running generation, admitted a
     assert.equal(P2PInventoryTransactionDenialReason(auth, hunt, normalTransaction), undefined);
 });
 
+test("a drained hunt's native loot still saves for its admitted member; a fenced hunt's does not (2026-10-15)", () => {
+    assert.equal(P2PInventoryTransactionDenialReason(auth, { ...hunt, state: "DRAINING" }, normalTransaction), undefined);
+    assert.equal(P2PInventoryTransactionDenialReason(auth, { ...hunt, state: "FENCED" }, normalTransaction), "HUNT_NOT_RUNNING");
+});
+
 test("P2P native inventory requests preserve normal bundled transaction fields", () => {
     assert.equal(P2PInventoryTransactionDenialReason(auth, hunt, normalTransaction), undefined);
     assert.equal(P2PInventoryTransactionDenialReason(auth, hunt, { characterId: "character-a", transactionId: "save-only" }), undefined);

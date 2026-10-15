@@ -134,7 +134,7 @@ export class InMemoryP2PHuntRepository implements P2PHuntRepository {
     }, _session?: ClientSession): Promise<P2PHuntSessionRecord | undefined> {
         const hunt = this.hunts.get(input.sessionId);
         if (hunt == undefined || hunt.generation !== input.generation || hunt.hostSteamId !== input.hostSteamId ||
-            hunt.bridgeInstanceId !== input.bridgeInstanceId || !["HOST_READY", "ADMITTING", "RUNNING", "SUSPECT"].includes(hunt.state) ||
+            hunt.bridgeInstanceId !== input.bridgeInstanceId || !["HOST_READY", "ADMITTING", "RUNNING", "DRAINING", "SUSPECT"].includes(hunt.state) ||
             !(hunt.lastLeaseSequence === undefined || hunt.lastLeaseSequence < input.leaseSequence)) return undefined;
         hunt.lastLeaseSequence = input.leaseSequence;
         hunt.lastHeartbeatAt = input.heartbeatAt;
@@ -270,7 +270,7 @@ export class InMemoryP2PHuntRepository implements P2PHuntRepository {
         const hunt = this.hunts.get(input.sessionId);
         const participant = hunt?.roster.find((entry) => entry.accountId === input.accountId);
         if (hunt == undefined || participant == undefined || hunt.generation !== input.generation ||
-            !["HOST_READY", "ADMITTING", "RUNNING", "SUSPECT"].includes(hunt.state)) return undefined;
+            !["HOST_READY", "ADMITTING", "RUNNING", "DRAINING", "SUSPECT"].includes(hunt.state)) return undefined;
         participant.admissionState = "LOST";
         participant.disconnectedAt = input.disconnectedAt;
         participant.rejoinDeadline = input.rejoinDeadline;
@@ -354,6 +354,8 @@ export class InMemoryP2PHuntRepository implements P2PHuntRepository {
             presence != undefined && presence.observedAt >= observedAfter && presence.expiresAt > this.nowIso()).map(Copy);
     }
 
+    // [2026-10-15] A drained hunt has no activePartyKey, so these filters leave it out: it is inactive for its host's one-hunt rule
+    // and for its realm's server limit, and it is not listed as a realm hunt. ConfirmsRealmHost uses countRunningRealmServers.
     async countActiveHostSessions(accountId: string, _session?: ClientSession): Promise<number> {
         return [...this.hunts.values()].filter((hunt) => hunt.hostAccountId === accountId && typeof hunt.activePartyKey === "string" &&
             LIVE_HOST_STATES.includes(hunt.state)).length;
@@ -362,6 +364,13 @@ export class InMemoryP2PHuntRepository implements P2PHuntRepository {
     async countActiveRealmServers(realmId: string, _session?: ClientSession): Promise<number> {
         return [...this.hunts.values()].filter((hunt) => hunt.realmId === realmId && typeof hunt.activePartyKey === "string" &&
             ["HOST_SELECTING", ...LIVE_HOST_STATES].includes(hunt.state)).length;
+    }
+
+    // [2026-10-15] Every realm session whose server still runs on the host's PC, a draining one included (Mongo: $or).
+    async countRunningRealmServers(realmId: string, _session?: ClientSession): Promise<number> {
+        return [...this.hunts.values()].filter((hunt) => hunt.realmId === realmId &&
+            ((typeof hunt.activePartyKey === "string" && ["HOST_SELECTING", ...LIVE_HOST_STATES].includes(hunt.state)) ||
+                hunt.state === "DRAINING")).length;
     }
 
     async listLiveRealmHunts(realmId: string, hostAccountId: string, _session?: ClientSession): Promise<P2PHuntSessionRecord[]> {

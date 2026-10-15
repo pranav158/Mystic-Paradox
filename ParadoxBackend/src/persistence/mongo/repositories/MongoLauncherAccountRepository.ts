@@ -45,7 +45,9 @@ function ToRecord(Doc: any): LauncherAccountRecord {
         lastLoginAt: Doc.lastLoginAt ?? undefined,
         usernameSet: Doc.usernameSet ?? undefined,
         consent: Doc.consent ?? undefined,
-        deletion: Doc.deletion ?? undefined
+        deletion: Doc.deletion ?? undefined,
+        emailVerifiedAt: Doc.emailVerifiedAt ?? undefined,
+        emailVerificationPendingSince: Doc.emailVerificationPendingSince ?? undefined
     };
 }
 
@@ -96,11 +98,60 @@ export class MongoLauncherAccountRepository implements LauncherAccountRepository
             usernameSet: account.usernameSet,
             consent: account.consent,
             deletion: account.deletion,
+            // [2026-10-15] Written only when set: an absent field is what the "not verified" queries look for (null matches it too).
+            ...(account.emailVerifiedAt === undefined ? {} : { emailVerifiedAt: account.emailVerifiedAt }),
+            ...(account.emailVerificationPendingSince === undefined ? {} : { emailVerificationPendingSince: account.emailVerificationPendingSince }),
             // Game-owned fields (AccountRepository/AccountRecord) — see this file's
             // header comment for why a launcher-created account needs these too.
             name: account.displayName,
             notes: 0
         }, { session });
+    }
+
+    // [2026-10-15] Verified: the verification time is set and the pending mark goes.
+    async setEmailVerified(userId: string, verifiedAt: string): Promise<void> {
+        const Db = await GetMongoDb();
+        await Db.collection(Collections.Accounts).updateOne(
+            { _id: userId as any, displayNameNormalized: { $exists: true } },
+            { $set: { emailVerifiedAt: verifiedAt }, $unset: { emailVerificationPendingSince: "" } }
+        );
+    }
+
+    // [2026-10-15] A password reset by code replaces the hash.
+    async setPasswordHash(userId: string, passwordHash: string): Promise<void> {
+        const Db = await GetMongoDb();
+        await Db.collection(Collections.Accounts).updateOne(
+            { _id: userId as any, displayNameNormalized: { $exists: true } },
+            { $set: { passwordHash } }
+        );
+    }
+
+    // [2026-10-15] Unverified registrations pending since before the cut-off (oldest first). emailVerifiedAt: null matches a missing field too.
+    async listUnverifiedRegistrations(pendingBeforeIso: string, limit: number): Promise<LauncherAccountRecord[]> {
+        const Db = await GetMongoDb();
+        const Docs = await Db.collection(Collections.Accounts)
+            .find({
+                displayNameNormalized: { $exists: true },
+                emailVerificationPendingSince: { $lt: pendingBeforeIso },
+                emailVerifiedAt: null
+            })
+            .sort({ emailVerificationPendingSince: 1 })
+            .limit(limit)
+            .toArray();
+        return Docs.map(ToRecord);
+    }
+
+    // [2026-10-15] Removes the account only while it is still an unverified registration pending since before the cut-off: an account
+    // verified meanwhile, or any account that was never pending, stays.
+    async deleteUnverifiedRegistration(userId: string, pendingBeforeIso: string): Promise<boolean> {
+        const Db = await GetMongoDb();
+        const Result = await Db.collection(Collections.Accounts).deleteOne({
+            _id: userId as any,
+            displayNameNormalized: { $exists: true },
+            emailVerificationPendingSince: { $lt: pendingBeforeIso },
+            emailVerifiedAt: null
+        });
+        return Result.deletedCount === 1;
     }
 
     async setConsent(userId: string, consent: LauncherConsentRecord): Promise<void> {

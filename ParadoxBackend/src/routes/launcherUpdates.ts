@@ -18,8 +18,12 @@ const UPDATE_PUBLIC_BASE_URL = (process.env.UPDATE_PUBLIC_BASE_URL ?? "https://p
 // values become NaN and make manifest acceptance/publication fail closed.
 const TARGET_CHANGELIST = Number(process.env.TARGET_CHANGELIST ?? Number.NaN);
 const RUNTIME_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc=\n-----END PUBLIC KEY-----`;
+// [2026-10-15] Guard's own signing key (launch plan P6.1, the key split): launchers from 0.1.65 accept it next to the runtime
+// key; Guard manifests move to it once older launchers are gone (GITHUB_RELEASES.md).
+const GUARD_PUBLIC_KEY_2026_10 = `-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAcqOh1F/NOXtZ4ZSyefheKk0Md//2L85OgMiQH8Jyi/U=\n-----END PUBLIC KEY-----`;
 const GUARD_MANIFEST_KEYS: Readonly<Record<string, string>> = Object.freeze({
     "runtime-2026-01": RUNTIME_PUBLIC_KEY,
+    "guard-2026-10": GUARD_PUBLIC_KEY_2026_10,
 });
 const MAX_GUARD_MANIFEST_BYTES = 256 * 1024;
 const GUARD_MANIFEST_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
@@ -665,6 +669,16 @@ export function LauncherUpdateUrlPrefixes(env: NodeJS.ProcessEnv = process.env, 
         .map((prefix) => prefix.trim())
         .filter((prefix) => prefix.startsWith("https://") && prefix.endsWith("/") && !/[?#]/.test(prefix));
     return [`${publicBaseUrl}/launcher/v1/updates/`, ...configured];
+}
+
+/** [2026-10-15] The launcher version this server offers (launcher/<target>/<arch>/latest.json), or undefined without one. */
+export function ReadServedLauncherVersion(target = "windows", arch = "x86_64"): string | undefined {
+    try {
+        const version = readJson(path.join(UPDATE_ROOT, "launcher", segment(target, "target"), segment(arch, "architecture"), "latest.json"))?.version;
+        return typeof version === "string" && LAUNCHER_VERSION.test(version) ? version : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 function compareLauncherVersions(a: string, b: string): number {

@@ -39,6 +39,14 @@ test("roles: the host, joiners still in the hunt, and nobody else", () => {
     assert.equal(IsIceActiveState("ABORTING"), false);
 });
 
+test("a drained hunt's members keep their connections (DRAINING); its roster gains no admission from signalling (2026-10-15)", () => {
+    // The members still on the drained server may rebuild their transport; admission is the ticket's (TICKETABLE_STATES).
+    assert.equal(IsIceActiveState("DRAINING"), true);
+    assert.equal(ResolveIceRole({ ...Hunt(), state: "DRAINING" }, JOIN_A), "JOIN");
+    assert.equal(IsIceActiveState("FENCED"), false);
+    assert.equal(IsIceActiveState("RECOVERING"), false);
+});
+
 test("pair keys: host and joiner get the same key, other pairs and generations differ", () => {
     const hostPeers = IcePeersFor(Hunt(), HOST, "HOST", SECRET);
     assert.deepEqual(hostPeers.map((peer) => peer.accountId), [JOIN_A, JOIN_B]);

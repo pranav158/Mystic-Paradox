@@ -50,4 +50,9 @@ export class SqliteAuthIdentityRepository implements AuthIdentityRepository {
             Tables.authIdentities.insert(c, crypto.randomUUID(), { ...identity });
         });
     }
+
+    // [2026-10-15] The unlink (DELETE /launcher/v1/account/discord).
+    async deleteForUser(provider: "discord", userId: string): Promise<number> {
+        return this.db.write(undefined, (c) => Tables.authIdentities.delete(c, "provider = ? AND userId = ?", [provider, userId]));
+    }
 }

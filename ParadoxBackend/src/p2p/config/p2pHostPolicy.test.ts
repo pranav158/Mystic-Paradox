@@ -16,6 +16,7 @@ import {
     P2PArtifactSources,
     ReadP2PArtifactPolicy,
     ReadP2PHostEligibilityPolicy,
+    ReadP2PHuntDrainCapMs,
     ScoreHost
 } from "./p2pHostPolicy";
 
@@ -83,6 +84,20 @@ test("artifact policy still reads the transport hashes under their older key nam
         P2P_ADMISSION_PUBLIC_XY_SHA256: HASHES.admissionPublicKey
     }, NO_FEED);
     assert.equal(ArtifactHashesMatch(HASHES, legacy), true);
+});
+
+test("the drain cap defaults to no cap; 0 says no cap; 30 s to 10 min sets one; anything else is the default (2026-10-15)", () => {
+    assert.equal(ReadP2PHuntDrainCapMs({}), undefined, "unset: no cap");
+    assert.equal(ReadP2PHuntDrainCapMs({ P2P_HUNT_DRAIN_GRACE_MS: "" }), undefined, "blank: no cap");
+    assert.equal(ReadP2PHuntDrainCapMs({ P2P_HUNT_DRAIN_GRACE_MS: "0" }), undefined, "0 is explicitly no cap");
+    assert.equal(ReadP2PHuntDrainCapMs({ P2P_HUNT_DRAIN_GRACE_MS: " 60000 " }), 60_000, "a cap in range is read, trimmed");
+    assert.equal(ReadP2PHuntDrainCapMs({ P2P_HUNT_DRAIN_GRACE_MS: "30000" }), 30_000, "the floor is in range");
+    assert.equal(ReadP2PHuntDrainCapMs({ P2P_HUNT_DRAIN_GRACE_MS: "600000" }), 600_000, "the ceiling is in range");
+    assert.equal(ReadP2PHuntDrainCapMs({ P2P_HUNT_DRAIN_GRACE_MS: "5000" }), undefined, "below the floor: no cap");
+    assert.equal(ReadP2PHuntDrainCapMs({ P2P_HUNT_DRAIN_GRACE_MS: "900000" }), undefined, "above the ceiling: no cap");
+    assert.equal(ReadP2PHuntDrainCapMs({ P2P_HUNT_DRAIN_GRACE_MS: "-60000" }), undefined, "negative: no cap");
+    assert.equal(ReadP2PHuntDrainCapMs({ P2P_HUNT_DRAIN_GRACE_MS: "soon" }), undefined, "not a number: no cap");
+    assert.equal(ReadP2PHuntDrainCapMs({ P2P_HUNT_DRAIN_GRACE_MS: "Infinity" }), undefined, "not finite: no cap");
 });
 
 test("host eligibility fails closed for consent, integrity, resources, and concurrent hosting", () => {

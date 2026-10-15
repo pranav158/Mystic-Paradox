@@ -17,10 +17,12 @@ import {
     RecordDedicatedHuntEnds,
     RecordDedicatedHuntStarts,
     RecordInventoryActivity,
+    RecordLauncherBuild,
     RecordP2PHuntActivity,
     RecordReforgeActivity,
     RecordSlayersPathUnlocksActivity,
     RecordXpActivity,
+    RecentlyActiveAccountIds,
     StepFlushLog,
     TouchGameSession,
     UseActivityStoreForTest,
@@ -372,5 +374,50 @@ test("a store that throws on a hunt insert does not reject the caller", async ()
     Monitor(Store);
     await assert.doesNotReject(RecordDedicatedHuntStarts(["u-throw-1"], "ShatteredIsles_IslandA", "ref-throw-1", T0));
     assert.equal(Store.hunts.size, 0);
+    await WaitForActivityWrites();
+});
+
+test("an unofficial launcher build raises UNOFFICIAL_LAUNCHER once a day; official, outdated and unknown builds raise nothing", async () => {
+    const Store = new FakeActivityStore();
+    Monitor(Store);
+    const Pinned = "d3".repeat(32);
+    const Sources = { pinnedLauncherSha256: (channel: string) => (channel === "stable" ? Pinned : undefined), servedLauncherVersion: () => "0.1.64" };
+    const Other = "ff".repeat(32);
+    assert.equal(await RecordLauncherBuild("u-launcher-1", "stable", { version: "0.1.64", sha256: Pinned }, Sources, T0), "official");
+    assert.equal(await RecordLauncherBuild("u-launcher-1", "stable", { version: "0.1.63", sha256: Other }, Sources, T0), "outdated");
+    assert.equal(await RecordLauncherBuild("u-launcher-1", "beta", { version: "0.1.64", sha256: Other }, Sources, T0), "unknown");
+    assert.equal(await RecordLauncherBuild("u-launcher-1", "stable", undefined, Sources, T0), "unknown");
+    assert.equal([...Store.flags.values()].filter((Flag) => Flag.userId === "u-launcher-1").length, 0);
+
+    assert.equal(await RecordLauncherBuild("u-launcher-1", "stable", { version: "0.1.64", sha256: Other }, Sources, T0), "unofficial");
+    assert.equal(await RecordLauncherBuild("u-launcher-1", "stable", { version: "0.1.64", sha256: Other }, Sources, T0 + MINUTE), "unofficial");
+    const Flags = [...Store.flags.values()].filter((Flag) => Flag.userId === "u-launcher-1");
+    assert.equal(Flags.length, 1);
+    assert.equal(Flags[0]._id, `UNOFFICIAL_LAUNCHER:u-launcher-1:${DAY}`);
+    assert.equal(Flags[0].severity, "high");
+    assert.ok(String(Flags[0].detail).includes("launcher 0.1.64 sha256 ffffffffffffffff..."), Flags[0].detail);
+    assert.ok(String(Flags[0].detail).includes("pins d3d3d3d3d3d3d3d3..."), Flags[0].detail);
+});
+
+test("with the monitor switched off a launcher build is not looked at", async () => {
+    UseActivitySettingsForTest({ ...ReadActivitySettings({ MYSTICPARADOX_ACTIVITY_MONITOR: "off" }) });
+    const Store = new FakeActivityStore();
+    Monitor(Store);
+    let Asked = 0;
+    const Sources = { pinnedLauncherSha256: () => { Asked += 1; return "d3".repeat(32); }, servedLauncherVersion: () => "0.1.64" };
+    assert.equal(await RecordLauncherBuild("u-launcher-off", "stable", { version: "0.1.64", sha256: "ff".repeat(32) }, Sources, T0), "unknown");
+    assert.equal(Asked, 0);
+    assert.equal(Store.flags.size, 0);
+    UseActivitySettingsForTest(undefined);
+});
+
+test("the accounts whose game reported in within a window count as online", async () => {
+    const Store = new FakeActivityStore();
+    Monitor(Store);
+    TouchGameSession("u-online-old", T0);
+    TouchGameSession("u-online-new", T0 + 90 * 1000);
+    const Online = RecentlyActiveAccountIds(60 * 1000, T0 + 100 * 1000);
+    assert.ok(Online.includes("u-online-new"), "reported in 10 s ago");
+    assert.ok(!Online.includes("u-online-old"), "reported in 100 s ago");
     await WaitForActivityWrites();
 });

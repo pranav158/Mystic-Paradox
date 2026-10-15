@@ -260,37 +260,55 @@ test("mongodb (fake database): required inserts the account as pending and no se
     assert.equal(Accounts[0]!.doc.approvalStatus, "pending");
 });
 
-// ---- Discord sign-up on both providers ----
+// ---- Discord on both providers: sign-in never creates an account [2026-10-15] ----
 
 function DiscordUser(id: string) {
     return { id, username: `discord${id}`, global_name: null, avatar: null };
 }
 
-test("sqlite: Discord sign-up follows the switch: off approves, required keeps pending", async () => {
-    const Realm = SqliteProvider("discord-approval");
-    const OffId = "100000000000000001";
-    const RequiredId = "100000000000000002";
-    await WithEnvironment({ MYSTICPARADOX_REGISTRATION_APPROVAL: "off", PERSISTENCE_PROVIDER: "sqlite" }, async () => {
-        const UserId = await ResolveOrCreateAccountForDiscordUser(DiscordUser(OffId));
-        const Stored = await Realm.repos.launcherAccounts.findByUserId(UserId) as LauncherAccountRecord;
-        assert.equal(Stored.approvalStatus, "approved");
-        assert.doesNotThrow(() => AssertAccountAdmitted(Stored));
-    });
-    await WithEnvironment({ MYSTICPARADOX_REGISTRATION_APPROVAL: "required", PERSISTENCE_PROVIDER: "sqlite" }, async () => {
-        const UserId = await ResolveOrCreateAccountForDiscordUser(DiscordUser(RequiredId));
-        const Stored = await Realm.repos.launcherAccounts.findByUserId(UserId) as LauncherAccountRecord;
-        assert.equal(Stored.approvalStatus, "pending");
-        assert.throws(() => AssertAccountAdmitted(Stored), (error: unknown) =>
-            error instanceof LauncherApiError && error.code === "AUTH_APPROVAL_PENDING");
-    });
+// Discord sign-in only resolves a linked Discord user now. No Discord account is created, so the approval switch does not apply to it:
+// an unlinked Discord user is refused under either value, and a linked one keeps the account's own approval.
+test("sqlite: an unlinked Discord user is refused under either switch, and no account or identity is created", async () => {
+    const Realm = SqliteProvider("discord-no-create");
+    for (const mode of ["off", "required"]) {
+        await WithEnvironment({ MYSTICPARADOX_REGISTRATION_APPROVAL: mode, PERSISTENCE_PROVIDER: "sqlite" }, async () => {
+            const Id = mode === "off" ? "100000000000000001" : "100000000000000002";
+            await assert.rejects(ResolveOrCreateAccountForDiscordUser(DiscordUser(Id)), (error: unknown) =>
+                error instanceof LauncherApiError && error.code === "AUTH_DISCORD_NOT_LINKED");
+        });
+    }
+    const Accounts = await Realm.db.read(undefined, (c) => Number(c.get("SELECT COUNT(*) AS n FROM accounts")?.n ?? 0));
+    assert.equal(Accounts, 0, "no account was created");
+    assert.equal(await Realm.repos.authIdentities.findByProviderSubject("discord", "100000000000000001"), undefined);
 });
 
-test("mongodb (fake database): Discord sign-up follows the switch: unset approves, required keeps pending", async () => {
+test("sqlite: a linked Discord user resolves to its account, and the account keeps its own approval", async () => {
+    const Realm = SqliteProvider("discord-linked");
+    const CreatedAt = new Date().toISOString();
+    const Account: LauncherAccountRecord = {
+        userId: "linked-account-1", displayNameNormalized: "linkedslayer", displayName: "LinkedSlayer", status: "active",
+        approvalStatus: "pending", roles: ["player"], createdAt: CreatedAt, usernameSet: true
+    };
+    await Realm.repos.launcherAccounts.create(Account);
+    await Realm.repos.authIdentities.create({
+        provider: "discord", providerSubject: "100000000000000003", userId: Account.userId, providerUsername: "linked", linkedAt: CreatedAt
+    });
+    await WithEnvironment({ MYSTICPARADOX_REGISTRATION_APPROVAL: "off", PERSISTENCE_PROVIDER: "sqlite" }, async () => {
+        assert.equal(await ResolveOrCreateAccountForDiscordUser(DiscordUser("100000000000000003")), Account.userId);
+    });
+    const Stored = await Realm.repos.launcherAccounts.findByUserId(Account.userId) as LauncherAccountRecord;
+    assert.equal(Stored.approvalStatus, "pending", "resolving never changes the approval");
+    assert.throws(() => AssertAccountAdmitted(Stored), (error: unknown) =>
+        error instanceof LauncherApiError && error.code === "AUTH_APPROVAL_PENDING");
+});
+
+test("mongodb (fake database): Discord never creates an account, under either switch", async () => {
     const Mongo = InstallFakeMongo();
     UsePersistenceForTest(undefined);
-    await WithEnvironment(MongoEnvironment(undefined), () => ResolveOrCreateAccountForDiscordUser(DiscordUser("200000000000000001")));
-    await WithEnvironment(MongoEnvironment("required"), () => ResolveOrCreateAccountForDiscordUser(DiscordUser("200000000000000002")));
-    const Accounts = Mongo.Inserted.filter((entry) => entry.collection === "accounts");
-    assert.deepEqual(Accounts.map((entry) => entry.doc.approvalStatus), ["approved", "pending"]);
-    assert.ok(Mongo.Inserted.some((entry) => entry.collection !== "accounts"), "the Discord identity row is written too");
+    for (const mode of [undefined, "required"]) {
+        const Id = mode === undefined ? "200000000000000001" : "200000000000000002";
+        await assert.rejects(WithEnvironment(MongoEnvironment(mode), () => ResolveOrCreateAccountForDiscordUser(DiscordUser(Id))), (error: unknown) =>
+            error instanceof LauncherApiError && error.code === "AUTH_DISCORD_NOT_LINKED");
+    }
+    assert.equal(Mongo.Inserted.length, 0, "no account and no identity row was written");
 });

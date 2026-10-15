@@ -8,6 +8,7 @@ import {
     GenerateHostCapabilitySecret,
     ParseOptionalHostRuntimeBearerToken,
     ResetHostRateLimitBucketCacheForTest,
+    ResolveActiveHostRuntimeContext,
     ResolveHostRateLimitBucket,
     ResolvePlayerHostRuntimeRequestIdentity
 } from "./hostCapabilities";
@@ -210,4 +211,18 @@ test("only a live, validated host capability gets its own request-budget bucket 
     assert.equal(await ResolveHostRateLimitBucket(undefined, find), undefined);
     const failing = async () => { throw new Error("mongo down"); };
     assert.equal(await ResolveHostRateLimitBucket(GenerateHostCapabilitySecret().secret, failing), undefined);
+});
+
+test("a drained hunt's server keeps its runtime capability; a suspect or completed hunt's does not (2026-10-15)", async () => {
+    const context = runtimeContext();
+    const { secret, digest } = GenerateHostCapabilitySecret();
+    const resolve = (state: P2PHuntSessionRecord["state"]) => ResolveActiveHostRuntimeContext(secret, {
+        findCapability: async () => ({ ...context.capability, secretDigest: digest }),
+        findHunt: async () => ({ ...context.hunt, state }),
+        listPresent: async () => []
+    }, Date.now());
+    assert.ok(await resolve("DRAINING"), "the drained server keeps serving the players still in it");
+    assert.ok(await resolve("RUNNING"));
+    assert.equal(await resolve("SUSPECT"), undefined, "a suspect hunt keeps no runtime: only a drain does");
+    assert.equal(await resolve("COMPLETED"), undefined);
 });

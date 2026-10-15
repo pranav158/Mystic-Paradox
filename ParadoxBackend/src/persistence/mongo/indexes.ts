@@ -115,6 +115,12 @@ export async function EnsureMongoIndexes(Db: Db): Promise<void> {
         { displayNameNormalized: 1 },
         { unique: true, partialFilterExpression: { displayNameNormalized: { $type: "string" } } }
     );
+    // [2026-10-15] The registration sweep (controllers/launcherEmail.ts) finds the unverified registrations pending since a time. Partial,
+    // like the two indexes above: existing accounts have no such field and are not indexed.
+    await Db.collection(Collections.Accounts).createIndex(
+        { emailVerificationPendingSince: 1 },
+        { partialFilterExpression: { emailVerificationPendingSince: { $type: "string" } } }
+    );
 
     await Db.collection(Collections.AuthIdentities).createIndex({ provider: 1, providerSubject: 1 }, { unique: true });
     await Db.collection(Collections.AuthIdentities).createIndex({ userId: 1 });
@@ -160,6 +166,9 @@ export async function EnsureMongoIndexes(Db: Db): Promise<void> {
     await Db.collection(Collections.RefreshSessions).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
     await Db.collection(Collections.GameExchangeCodes).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
     await Db.collection(Collections.DiscordOAuthTransactions).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
+    // [2026-10-15] One-time email codes: found by account (the erasure and the registration sweep delete them) and purged past their expiry.
+    await Db.collection(Collections.EmailCodes).createIndex({ userId: 1 });
+    await Db.collection(Collections.EmailCodes).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });
 
     // [2026-10-14] Daily economy rollups (diagnostics/economyLedgerMonitor.ts): kept about 400 days, then purged by TTL.
     await Db.collection(Collections.EconomyDaily).createIndex({ ttlAt: 1 }, { expireAfterSeconds: 0 });

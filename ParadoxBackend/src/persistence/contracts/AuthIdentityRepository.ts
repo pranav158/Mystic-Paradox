@@ -27,4 +27,6 @@ export interface AuthIdentityRepository {
     /** Used for the account view's `discordLinked` flag — one userId links to at most one row per provider. */
     findByUserId(provider: "discord", userId: string, session?: ClientSession): Promise<AuthIdentityRecord | undefined>;
     create(identity: AuthIdentityRecord, session?: ClientSession): Promise<void>;
+    /** [2026-10-15] Unlinks the account's identity of the provider (DELETE /launcher/v1/account/discord). Returns the rows removed. */
+    deleteForUser(provider: "discord", userId: string): Promise<number>;
 }

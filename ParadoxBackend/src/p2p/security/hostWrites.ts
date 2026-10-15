@@ -25,7 +25,8 @@ export function HostWritesEnabled(environment: NodeJS.ProcessEnv = process.env):
     return !/^(0|false|off|no)$/i.test(environment.P2P_HOST_WRITES?.trim() ?? "");
 }
 
-const RUNNING_STATES = new Set(["RUNNING"]);
+// [2026-10-15] A drained hunt still serves its players until its server ends, so their saves keep working (BeginDrainPartySession).
+const RUNNING_STATES = new Set(["RUNNING", "DRAINING"]);
 
 /**
  * Why a host write of `kind` for `targetUserId` is refused, or undefined when it may proceed. `presence` is the hub's

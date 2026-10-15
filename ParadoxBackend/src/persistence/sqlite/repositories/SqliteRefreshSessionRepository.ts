@@ -82,6 +82,13 @@ export class SqliteRefreshSessionRepository implements RefreshSessionRepository 
         });
     }
 
+    // [2026-10-15] The registration sweep removes an unverified registration's rows (accounts that never got a session have none).
+    async deleteAllForUser(userId: string): Promise<void> {
+        await this.db.write(undefined, (c) => {
+            Tables.refreshSessions.delete(c, "userId = ?", [userId]);
+        });
+    }
+
     async isFamilyActive(familyId: string, userId: string): Promise<boolean> {
         return this.db.read(undefined, (c) => Tables.refreshSessions.count(
             c,

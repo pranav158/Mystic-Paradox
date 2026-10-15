@@ -13,7 +13,11 @@
 // also not forward this path at all (P4.1 nginx site).
 
 import express, { Request, Response } from "express";
+import fs from "node:fs";
+import path from "node:path";
+import { RecentlyActiveAccountIds } from "../activity/activityMonitor";
 import { GetP2PExtension } from "../extensions/p2p";
+import { sessionRegistry } from "../realtime/SessionRegistry";
 import { BuildReleaseGatesBody, CoreReleaseGates, IsLoopbackAddress, ReleaseGate } from "../observability/releaseGates";
 
 const FORWARDING_HEADERS = ["x-forwarded-for", "x-real-ip", "forwarded"] as const;
@@ -24,6 +28,36 @@ export function HasForwardingHeader(headers: Record<string, unknown>): boolean {
 }
 
 /** The gates in manager order: the P2P module's (if loaded), then the core's. A module that throws makes one gate not ok. */
+/** [2026-10-15] How recently a game must have reported in to count as playing for the release hold. */
+const ACTIVE_PLAY_WINDOW_MS = 2 * 60_000;
+/** The emergency override: this file in the backend's shared folder (next to the update feed) lets a release through anyway. */
+const RELEASE_DURING_PLAY_FILE = "RELEASE_DURING_PLAY.allow";
+
+/**
+ * [2026-10-15] Owner's rule: never restart the backend mid-hunt. A release (or a start) is refused while anyone played within
+ * ACTIVE_PLAY_WINDOW_MS, so the running version stays up and the release is pushed again later. 15 Oct: a release pushed 1.9
+ * min into a realm Escalation dropped the player to the login screen. No account is named in the detail.
+ */
+export function ActivePlayGate(playing: number, overridden: boolean): ReleaseGate {
+    if (playing === 0) return { name: "no_active_play", ok: true, detail: "nobody in game" };
+    if (overridden) return { name: "no_active_play", ok: true, detail: `${playing} in game; held release let through by ${RELEASE_DURING_PLAY_FILE}` };
+    return {
+        name: "no_active_play",
+        ok: false,
+        detail: `${playing} player(s) in game within the last ${ACTIVE_PLAY_WINDOW_MS / 60_000} minutes: release held until they stop ` +
+            `(emergency override: ${RELEASE_DURING_PLAY_FILE} in the backend's shared folder)`
+    };
+}
+
+function ActivePlayers(): number {
+    return new Set([...sessionRegistry.onlineAccountIds(), ...RecentlyActiveAccountIds(ACTIVE_PLAY_WINDOW_MS)]).size;
+}
+
+function ReleaseDuringPlayAllowed(environment: NodeJS.ProcessEnv): boolean {
+    const UpdateRoot = path.resolve(environment.LAUNCHER_UPDATE_ROOT ?? path.join(process.cwd(), "updates"));
+    return fs.existsSync(path.join(path.dirname(UpdateRoot), RELEASE_DURING_PLAY_FILE));
+}
+
 export async function CollectReleaseGates(environment: NodeJS.ProcessEnv = process.env): Promise<ReleaseGate[]> {
     let moduleGates: ReleaseGate[];
     try {
@@ -31,7 +65,13 @@ export async function CollectReleaseGates(environment: NodeJS.ProcessEnv = proce
     } catch {
         moduleGates = [{ name: "p2p_module_gates", ok: false, detail: "unreadable" }];
     }
-    return [...moduleGates, ...CoreReleaseGates(environment)];
+    let playGate: ReleaseGate;
+    try {
+        playGate = ActivePlayGate(ActivePlayers(), ReleaseDuringPlayAllowed(environment));
+    } catch {
+        playGate = { name: "no_active_play", ok: false, detail: "unreadable" };
+    }
+    return [...moduleGates, playGate, ...CoreReleaseGates(environment)];
 }
 
 type GateCollector = () => Promise<ReleaseGate[]>;

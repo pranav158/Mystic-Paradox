@@ -21,6 +21,8 @@ import { DrainAndRegisterUserAPIKeys } from "./controllers/auth";
 import { AssertApiKeyHashSecret } from "./security/apiKeyHash";
 import { GetPersistenceLifecycle } from "./persistence";
 import { LogRegistrationApprovalPolicy, ResolveRegistrationApproval } from "./config/registrationApproval";
+import { AssertEmailVerificationConfig, EmailVerificationRequired, LogEmailVerificationPolicy, ResolveEmailVerification } from "./config/emailVerification";
+import { StartUnverifiedRegistrationSweeper } from "./controllers/launcherEmail";
 import { LogGuardModePolicy, ResolveGuardMode } from "./services/guardMode";
 import { initRealtime, shutdownRealtime } from "./realtime";
 import { logger } from "./logger";
@@ -114,7 +116,12 @@ async function Main(): Promise<void> {
     // API keys are HMAC-hashed under API_KEY_HASH_SECRET; refuse to start without it rather than reject every
     // gameserver request later.
     AssertApiKeyHashSecret();
+    // [2026-10-15] MYSTICPARADOX_EMAIL_VERIFICATION=required needs working SMTP settings: the same refusal to start as the line above. One
+    // line logs the mode (and the warning for an unrecognised value, once).
+    AssertEmailVerificationConfig(process.env);
+    LogEmailVerificationPolicy(ResolveEmailVerification(process.env));
     await GetPersistenceLifecycle().start();
+    if (EmailVerificationRequired(process.env)) StartUnverifiedRegistrationSweeper();
 
     await DrainAndRegisterAPIKeys();
     await DrainAndRegisterUserAPIKeys();

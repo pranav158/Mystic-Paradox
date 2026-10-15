@@ -20,7 +20,7 @@ import { launcherAuthRouter } from "./launcherAuth";
 const CURRENT = CurrentLegalRequirements();
 const CURRENT_CONSENT = { termsVersion: CURRENT.termsVersion, privacyVersion: CURRENT.privacyVersion, ageConfirmed: true };
 const ENV_KEYS = ["AUTH_SIGNING_PRIVKEY_B64", "AUTH_SIGNING_PUBKEY_B64", "PERSISTENCE_PROVIDER", "MYSTICPARADOX_CONSENT_REQUIRED",
-    "MYSTICPARADOX_CONSENT_ENFORCE"] as const;
+    "MYSTICPARADOX_CONSENT_ENFORCE", "DEPLOYSERVER_URL", "MYSTICPARADOX_OFFICIAL_PLAY"] as const;
 const SAVED_ENV = new Map<string, string | undefined>();
 
 let Realm: TestRealm;
@@ -295,4 +295,64 @@ test("the erasure's list returns the accounts whose hold has ended, oldest first
     assert.ok(Ids.indexOf(Earlier.userId) >= 0 && Ids.indexOf(Later.userId) >= 0);
     assert.ok(Ids.indexOf(Earlier.userId) < Ids.indexOf(Later.userId), "oldest scheduledFor first");
     assert.ok(Due.every((account) => (account.deletion?.scheduledFor ?? "") <= "2026-10-14T12:00:00.000Z"));
+});
+
+// [2026-10-15] Official play (MYSTICPARADOX_OFFICIAL_PLAY, config/officialPlay.ts) over HTTP: the status answer, and the refusal of a launch
+// with no realm. A realm launch is not refused by the switch; the checks after it decide that launch.
+const OFFICIAL_PLAY_MESSAGE = "The official server is currently unavailable. Join or host a realm.";
+
+/** Sets the variables (undefined removes one) and returns the function that puts them back. */
+function SetEnvironment(values: Record<string, string | undefined>): () => void {
+    const saved = Object.keys(values).map((key) => [key, process.env[key]] as const);
+    for (const [key, value] of Object.entries(values)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+    }
+    return () => {
+        for (const [key, value] of saved) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    };
+}
+
+test("GET /launcher/v1/status says whether official play is offered, with the message when it is not (2026-10-15)", async () => {
+    const restore = SetEnvironment({ DEPLOYSERVER_URL: undefined, MYSTICPARADOX_OFFICIAL_PLAY: undefined });
+    try {
+        const Unset = await Call("GET", "/launcher/v1/status", undefined);
+        assert.equal(Unset.status, 200, JSON.stringify(Unset.json));
+        assert.deepEqual(Unset.json.officialPlay, { available: false, message: OFFICIAL_PLAY_MESSAGE }, "no DeployServer: off by default");
+        assert.equal(typeof Unset.json.supportedBuildChangelist, "number", "the existing fields are still there");
+        process.env.DEPLOYSERVER_URL = "deployserver.invalid:8080";
+        const Configured = await Call("GET", "/launcher/v1/status", undefined);
+        assert.deepEqual(Configured.json.officialPlay, { available: true }, "a DeployServer: on by default, and no message");
+        process.env.MYSTICPARADOX_OFFICIAL_PLAY = "off";
+        const Off = await Call("GET", "/launcher/v1/status", undefined);
+        assert.deepEqual(Off.json.officialPlay, { available: false, message: OFFICIAL_PLAY_MESSAGE });
+    } finally {
+        restore();
+    }
+});
+
+test("a launch with no realm is refused with 503 OFFICIAL_PLAY_UNAVAILABLE while official play is off; a realm launch is not refused by it (2026-10-15)", async () => {
+    const restore = SetEnvironment({ DEPLOYSERVER_URL: undefined, MYSTICPARADOX_OFFICIAL_PLAY: undefined });
+    try {
+        const Account = await NewAccount();
+        const Body = { buildChangelist: 647472, executableSha256: "a".repeat(64), runtimeChannel: "stable", runtimeManifestVersion: 1,
+            runtimeArtifacts: [] };
+        const Refused = await Call("POST", "/launcher/v1/game-sessions", Account.token, Body);
+        ExpectError(Refused, 503, "OFFICIAL_PLAY_UNAVAILABLE");
+        assert.equal(Refused.json.error.message, OFFICIAL_PLAY_MESSAGE);
+
+        // The switch lets a realm launch through; the runtime and build checks after it refuse this fake one for their own reasons.
+        const RealmLaunch = await Call("POST", "/launcher/v1/game-sessions", Account.token, { ...Body, realm: { realmId: "realm-x" } });
+        assert.notEqual(RealmLaunch.json?.error?.code, "OFFICIAL_PLAY_UNAVAILABLE", JSON.stringify(RealmLaunch.json));
+
+        // Turned on, an official launch is not refused by the switch either.
+        process.env.MYSTICPARADOX_OFFICIAL_PLAY = "on";
+        const Allowed = await Call("POST", "/launcher/v1/game-sessions", Account.token, Body);
+        assert.notEqual(Allowed.json?.error?.code, "OFFICIAL_PLAY_UNAVAILABLE", JSON.stringify(Allowed.json));
+    } finally {
+        restore();
+    }
 });

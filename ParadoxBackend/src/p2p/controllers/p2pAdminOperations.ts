@@ -19,7 +19,43 @@ import {
 } from "../services/p2pOperationsPolicy";
 
 const ACTIVE_STATES: P2PHuntState[] = ["HOST_SELECTING", "HOST_OFFERED", "STARTING", "HOST_READY", "ADMITTING",
-    "RUNNING", "SUSPECT", "FENCED", "ABORTING", "RECOVERING"];
+    "RUNNING", "DRAINING", "SUSPECT", "FENCED", "ABORTING", "RECOVERING"];
+
+/** [2026-10-15] Monitor telemetry the Guard feed cannot supply; startedAt and activePlaytime are removed once filled. */
+const MONITOR_TIMING_UNKNOWN_FIELDS = ["startedAt", "activePlaytime", "repeatedRespawnKills", "behemothIdentity"];
+
+export interface MonitorHuntTiming {
+    startedAt: string | null;
+    activePlaytimeMs: number | null;
+    unknownFields: string[];
+}
+
+/**
+ * [2026-10-15] Hunt start and active playtime for one monitor session. startedAt is the earliest RUNNING transition
+ * of this session and generation: a SUSPECT -> RUNNING return is a later one, and other generations are ignored.
+ * activePlaytimeMs runs from that start to the hunt's terminalAt, or to nowMs while it is still live; it is null when
+ * the hunt never ran or has no end yet. transitions may hold any transition rows; only RUNNING rows are read.
+ */
+export function MonitorHuntTiming(
+    hunt: { sessionId: string; generation: number; state?: string | null; terminalAt?: string | null },
+    transitions: ReadonlyArray<{ sessionId: string; generation: number; toState: string; at: string }>,
+    nowMs: number = Date.now()
+): MonitorHuntTiming {
+    let startMs = Number.NaN;
+    for (const row of transitions) {
+        if (row.sessionId !== hunt.sessionId || row.generation !== hunt.generation || row.toState !== "RUNNING") continue;
+        const atMs = Date.parse(row.at);
+        if (Number.isFinite(atMs) && (!Number.isFinite(startMs) || atMs < startMs)) startMs = atMs;
+    }
+    const startedAt = Number.isFinite(startMs) ? new Date(startMs).toISOString() : null;
+    const endedMs = Date.parse(hunt.terminalAt ?? "");
+    const live = (ACTIVE_STATES as string[]).includes(hunt.state ?? "");
+    const endMs = Number.isFinite(endedMs) ? endedMs : live ? nowMs : Number.NaN;
+    const activePlaytimeMs = startedAt == null || !Number.isFinite(endMs) ? null : Math.max(0, endMs - startMs);
+    const unknownFields = MONITOR_TIMING_UNKNOWN_FIELDS.filter((field) =>
+        !(field === "startedAt" && startedAt != null) && !(field === "activePlaytime" && activePlaytimeMs != null));
+    return { startedAt, activePlaytimeMs, unknownFields };
+}
 
 /** The module's part of GET /admin/v1/operations/overview. */
 export async function P2POperationsOverview(): Promise<OperationsOverviewExtension> {
@@ -48,8 +84,8 @@ export async function P2POperationsOverview(): Promise<OperationsOverviewExtensi
     ).slice(0, 100);
     const monitorSessionIds = monitorHunts.map((hunt: any) => String(hunt.sessionId ?? hunt._id));
     const sessionGenerationFilter = monitorHunts.map((hunt: any) => ({ sessionId: String(hunt.sessionId ?? hunt._id), generation: hunt.generation }));
-    const [guardBatches, inventoryLedgers] = monitorSessionIds.length === 0
-        ? [{ active: [], archived: [] }, []] as any
+    const [guardBatches, inventoryLedgers, runningStarts] = monitorSessionIds.length === 0
+        ? [{ active: [], archived: [] }, [], []] as any
         : await Promise.all([
             antiCheat.operations.evidenceBatches(sessionGenerationFilter, 128),
             // Exact session/generation pairs prevent an older incarnation from consuming this
@@ -66,8 +102,17 @@ export async function P2POperationsOverview(): Promise<OperationsOverviewExtensi
                     sessionId: "$p2pMonitor.sessionId", generation: "$p2pMonitor.generation",
                     itemId: "$p2pMonitor.items.itemId", quantity: "$p2pMonitor.items.quantity",
                     createdAt: "$p2pMonitor.createdAt" } }
+            ]).toArray(),
+            // [2026-10-15] One row per session and generation: the earliest RUNNING transition, which is the hunt's
+            // start (MonitorHuntTiming drops other generations). Uses the { sessionId, at, stateVersion } index.
+            db.collection(P2PCollections.P2PHuntTransitions).aggregate([
+                { $match: { sessionId: { $in: monitorSessionIds }, toState: "RUNNING" } },
+                { $group: { _id: { sessionId: "$sessionId", generation: "$generation" }, startedAt: { $min: "$at" } } }
             ]).toArray()
         ]);
+    // [2026-10-15] Shape the grouped rows as transition rows for MonitorHuntTiming (each is already the earliest).
+    const runningTransitions = runningStarts.map((row: any) => ({ sessionId: String(row._id.sessionId),
+        generation: row._id.generation, toState: "RUNNING", at: row.startedAt }));
     const activeGuardBatches: EvidenceBatchSummary[] = guardBatches.active;
     const archivedGuardBatches: EvidenceBatchSummary[] = guardBatches.archived;
     const batchesBySession = new Map<string, any[]>();
@@ -97,13 +142,16 @@ export async function P2POperationsOverview(): Promise<OperationsOverviewExtensi
         const createdMs = Date.parse(hunt.createdAt ?? "");
         const endedMs = Date.parse(hunt.terminalAt ?? "");
         const elapsedMs = Number.isFinite(createdMs) ? Math.max(0, (Number.isFinite(endedMs) ? endedMs : Date.now()) - createdMs) : null;
-        const unknownFields = ["startedAt", "activePlaytime", "repeatedRespawnKills", "behemothIdentity"];
+        const timing = MonitorHuntTiming({ sessionId, generation: hunt.generation, state: hunt.state, terminalAt: hunt.terminalAt ?? null },
+            runningTransitions);
+        const unknownFields = [...timing.unknownFields];
         if (receivedBatches.length === 0) unknownFields.push("guardDefeatEvents");
         return {
             sessionId, generation: hunt.generation, huntDefinitionId: hunt.huntDefinitionId,
             mapPath: hunt.mapPath ?? null, state: hunt.state, hostUserId: hunt.hostAccountId,
             participantUserIds: Array.isArray(hunt.roster) ? hunt.roster.map((entry: any) => entry.accountId).filter((id: unknown) => typeof id === "string") : [],
-            startedAt: null, endedAt: hunt.terminalAt ?? null, sessionCreatedAt: hunt.createdAt ?? null,
+            startedAt: timing.startedAt, activePlaytimeMs: timing.activePlaytimeMs, endedAt: hunt.terminalAt ?? null,
+            sessionCreatedAt: hunt.createdAt ?? null,
             elapsedMs, elapsedBasis: "session-created", lastTelemetryAt,
             defeatsByBehemoth: [...defeats.entries()].map(([behemothId, count]) => ({ behemothId, count, source: "guard-reported", complete: false })),
             guardCoverage: { expectedEventCount: hunt.guardEventCount ?? null, observedEventCount,

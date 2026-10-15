@@ -8,10 +8,18 @@ import { EndRealmHub } from "./realmHubLifecycle";
 /** The host reports an aborted hunt: start recovery of its generation. Nothing is credited. */
 export async function AbortHunt(capability: P2PHostCapabilityRecord, body: any) {
     const reason = typeof body?.reason === "string" && body.reason.length <= 96 ? body.reason : "HOST_REPORTED_ABORT";
+    const hunt = await GetP2PRepositories().p2pHunts.findHunt(capability.sessionId);
     // [2026-10-13 realms S1] A realm hub has no recovery: its host reporting an abort ends it ABORTED, and the launcher starts a new one.
-    if (IsRealmHub(await GetP2PRepositories().p2pHunts.findHunt(capability.sessionId))) {
+    if (IsRealmHub(hunt)) {
         const ended = await EndRealmHub(capability.sessionId, capability.generation, `HOST_ABORT_${reason}`.slice(0, 96), "ABORTED",
             { actorType: "HOST", actorAccountId: capability.hostAccountId });
+        return { accepted: true, recoveryStarted: false, ended: ended != undefined, progressionApplied: false, rewardsApplied: false };
+    }
+    // [2026-10-15] A drained hunt's players are already on their way to another hunt: the abort ends the drain, without recovery.
+    if (hunt?.state === "DRAINING") {
+        const ended = await EndP2PHuntSession(capability.sessionId, capability.generation, `DRAIN_HOST_ABORT_${reason}`, {
+            allowedStates: ["DRAINING"], actorType: "HOST", actorAccountId: capability.hostAccountId
+        });
         return { accepted: true, recoveryStarted: false, ended: ended != undefined, progressionApplied: false, rewardsApplied: false };
     }
     await PrepareRecovery(capability.sessionId, capability.generation, `GUARD_ABORT_${reason}`, false);
@@ -38,6 +46,15 @@ export async function EndHunt(capability: P2PHostCapabilityRecord, body: any) {
         const ended = await EndRealmHub(capability.sessionId, capability.generation, `HOST_END_${reason}`.slice(0, 96), "COMPLETED",
             { actorType: "HOST", actorAccountId: capability.hostAccountId });
         if (ended == undefined) throw new LauncherApiError("P2P_GENERATION_FENCED", "The hub generation no longer accepts a clean end.");
+        return { accepted: true, cleanEnd: true, state: ended.record.state, recoveryStarted: false,
+            progressionApplied: false, rewardsApplied: false };
+    }
+    // [2026-10-15] A drained hunt's host ends its server: the drain ends cleanly (its players left; nothing is recovered).
+    if (hunt.state === "DRAINING") {
+        const ended = await EndP2PHuntSession(capability.sessionId, capability.generation, `DRAIN_HOST_END_${reason}`, {
+            allowedStates: ["DRAINING"], actorType: "HOST", actorAccountId: capability.hostAccountId
+        });
+        if (ended == undefined) throw new LauncherApiError("P2P_GENERATION_FENCED", "The hunt generation no longer accepts a clean end.");
         return { accepted: true, cleanEnd: true, state: ended.record.state, recoveryStarted: false,
             progressionApplied: false, rewardsApplied: false };
     }

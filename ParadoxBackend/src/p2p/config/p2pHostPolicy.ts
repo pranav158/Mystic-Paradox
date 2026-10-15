@@ -192,6 +192,20 @@ export function ReadP2PHostEligibilityPolicy(environment: NodeJS.ProcessEnv = pr
     };
 }
 
+/**
+ * [2026-10-15] The cap on how long a superseded Tier 0 hunt keeps its server for the players still in it (BeginDrainPartySession), in
+ * ms, or undefined for no cap. The default is no cap: a drained server runs while a player is in it and ends when it empties (the game
+ * server exits 50 s after its last client leaves). 0 is no cap too, said explicitly. 30000 to 600000 sets the cap; any other value (blank,
+ * garbage, out of range) is the default, no cap.
+ */
+export function ReadP2PHuntDrainCapMs(environment: NodeJS.ProcessEnv = process.env): number | undefined {
+    const raw = (environment.P2P_HUNT_DRAIN_GRACE_MS ?? "").trim();
+    if (raw.length === 0) return undefined;
+    const value = Number(raw);
+    if (value === 0 || !Number.isFinite(value) || value < 30_000 || value > 600_000) return undefined;
+    return Math.floor(value);
+}
+
 export function HostIneligibilityReason(
     presence: P2PHostPresenceRecord,
     reliability: P2PHostReliabilityRecord | undefined,

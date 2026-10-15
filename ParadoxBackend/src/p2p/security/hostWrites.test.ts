@@ -31,6 +31,12 @@ test("a host may write for itself and its admitted members of a running hunt", (
     assert.equal(HostWriteDenialReason(auth, hunt({ state: "SUSPECT", preSuspectState: "RUNNING" } as any), "friend"), undefined);
 });
 
+test("a drained hunt keeps its members' saves while its server serves them; its stranger and its fenced hunt are still refused (2026-10-15)", () => {
+    assert.equal(HostWriteDenialReason(auth, hunt({ state: "DRAINING" } as any), "friend"), undefined);
+    assert.equal(HostWriteDenialReason(auth, hunt({ state: "DRAINING" } as any), "stranger"), "NOT_A_MEMBER");
+    assert.equal(HostWriteDenialReason(auth, hunt({ state: "FENCED" } as any), "friend"), "HUNT_NOT_RUNNING");
+});
+
 test("a host write is refused outside its running hunt and its admitted members", () => {
     assert.equal(HostWriteDenialReason(undefined, hunt(), "host"), "PLAYER_HOST_AUTH_REQUIRED");
     assert.equal(HostWriteDenialReason({ ...auth, IsGameserver: true as any }, hunt(), "host"), "PLAYER_HOST_AUTH_REQUIRED");

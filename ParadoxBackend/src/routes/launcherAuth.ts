@@ -26,10 +26,13 @@ import {
     CheckUsernameAvailable,
     SetUsername
 } from "../controllers/launcherAuth";
-import { StartDiscordAuth, HandleDiscordCallback, CompleteDiscordLogin } from "../controllers/discordAuth";
+import { StartDiscordAuth, StartDiscordLink, HandleDiscordCallback, CompleteDiscordLogin, UnlinkDiscordAccount } from "../controllers/discordAuth";
+// [2026-10-15] The email routes (email verification, resend, password reset by code) and their code flow (controllers/emailCodes.ts).
+import { ResendEmailCode, RequestPasswordResetCode, ResetPasswordWithCode, VerifyEmailWithPassword } from "../controllers/launcherEmail";
 import { GetLauncherPolicy } from "../controllers/launcherPolicy";
 import { AcceptConsent, CancelAccountDeletion, GetConsentState, GetDeletionState, RequestAccountDeletion } from "../controllers/launcherAccount";
 import { CurrentLegalRequirements } from "../legal/legalPolicy";
+import { ReadOfficialPlay } from "../config/officialPlay";
 import { ParseRuntimeChannel } from "../security/runtimeAuthorization";
 
 // Implements the /launcher/v1 contract from Plans/LAUNCHER_BACKEND_AUTH_REQUIREMENTS.md.
@@ -189,6 +192,39 @@ launcherAuthRouter.post("/launcher/v1/auth/discord/complete", (req, res) =>
     })
 );
 
+// [2026-10-15] Email verification and password reset by code. Verify takes the password and the code; resend and forgot always answer
+// { sent: true }; reset takes the code and the new password. Each route is limited per address and per IP (controllers/launcherEmail.ts).
+launcherAuthRouter.post("/launcher/v1/auth/email/verify", (req, res) =>
+    Handle(req, res, () => {
+        const { deviceId, deviceName } = GetDeviceFields(req);
+        return VerifyEmailWithPassword(req.body?.email, req.body?.password, req.body?.code, deviceId, deviceName, GetClientIp(req));
+    })
+);
+
+launcherAuthRouter.post("/launcher/v1/auth/email/resend", (req, res) =>
+    Handle(req, res, () => ResendEmailCode(req.body?.email, GetClientIp(req)))
+);
+
+launcherAuthRouter.post("/launcher/v1/auth/password/forgot", (req, res) =>
+    Handle(req, res, () => RequestPasswordResetCode(req.body?.email, GetClientIp(req)))
+);
+
+launcherAuthRouter.post("/launcher/v1/auth/password/reset", (req, res) =>
+    Handle(req, res, () => {
+        const { deviceId, deviceName } = GetDeviceFields(req);
+        return ResetPasswordWithCode(req.body?.email, req.body?.code, req.body?.newPassword, deviceId, deviceName, GetClientIp(req));
+    })
+);
+
+// [2026-10-15] Link Discord to the signed-in account in Settings (the OAuth comes back to mysticparadox://link/done or link/error), and unlink it.
+launcherAuthRouter.post("/launcher/v1/account/discord/link/start", HasLauncherAuth, (req, res) =>
+    Handle(req, res, () => StartDiscordLink((req as any).LauncherAuthData.userId))
+);
+
+launcherAuthRouter.delete("/launcher/v1/account/discord", HasLauncherAuth, (req, res) =>
+    Handle(req, res, () => UnlinkDiscordAccount((req as any).LauncherAuthData.userId))
+);
+
 launcherAuthRouter.get("/launcher/v1/me", HasLauncherAuth, (req, res) =>
     Handle(req, res, () => GetAccountView((req as any).LauncherAuthData.userId))
 );
@@ -228,7 +264,8 @@ launcherAuthRouter.post("/launcher/v1/game-sessions", HasLauncherAuth, (req, res
             RuntimeChannel,
             RuntimeManifestVersion,
             RuntimeArtifacts,
-            req.body?.realm
+            req.body?.realm,
+            req.body?.launcher
         );
     })
 );
@@ -240,7 +277,10 @@ launcherAuthRouter.get("/launcher/v1/policy", HasLauncherAuth, (req, res) =>
 launcherAuthRouter.get("/launcher/v1/status", (req, res) =>
     Handle(req, res, async () => ({
         online: await GetPersistenceLifecycle().isHealthy(),
-        supportedBuildChangelist: Number(process.env.TARGET_CHANGELIST ?? 0)
+        supportedBuildChangelist: Number(process.env.TARGET_CHANGELIST ?? 0),
+        // [2026-10-15] Whether official play (no realm) is offered, and the message the launcher shows when it is not. Older launchers
+        // ignore the field.
+        officialPlay: ReadOfficialPlay()
     }))
 );
 

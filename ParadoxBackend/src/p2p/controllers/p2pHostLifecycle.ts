@@ -4,9 +4,11 @@ import {
     HostIneligibilityReason,
     ReadP2PArtifactPolicy,
     ReadP2PHostEligibilityPolicy,
+    ReadP2PHuntDrainCapMs,
     ScoreHost
 } from "../config/p2pHostPolicy";
 import { IsTrainingHuntId, ReadP2PPolicy } from "../config/p2pPolicy";
+import { DedicatedServersConfigured } from "../../config/dedicatedServers";
 import { logger } from "../../logger";
 import { GetHubGameSessionId } from "../../controllers/matchmaking";
 import {
@@ -31,11 +33,10 @@ import { EndRealmHub, TickRealmHub } from "./realmHubLifecycle";
 import { ScheduleHuntXpMonitor } from "../observability/huntXpMonitor";
 import { GuardRuleRequires, GuardVerdictRefuses, GuardWouldRefuse, NoteGuardWouldRefuse } from "../../services/guardMode";
 
-const DEPLOYSERVER_URL = process.env.DEPLOYSERVER_URL;
 const DEPLOYSERVER_MATCHMAKING_PATH = "/api/matchmaker/handle-matchmaking-for-player";
 export const P2P_LIFECYCLE_STATES: P2PHuntState[] = [
     "HOST_SELECTING", "HOST_OFFERED", "STARTING", "HOST_READY", "ADMITTING", "RUNNING",
-    "SUSPECT", "ABORTING", "RECOVERING"
+    "DRAINING", "SUSPECT", "ABORTING", "RECOVERING"
 ];
 const LIFECYCLE_SCAN_LIMIT = 100;
 const HOST_PRESENCE_MAX_BODY_AGE_MS = 30_000;
@@ -140,7 +141,8 @@ export async function ConfirmsRealmHost(accountId: string): Promise<boolean> {
     if (!IsRealmHostingEnabled()) return false;
     try {
         const realm = await GetRealmsPort().findHostedRealm(accountId);
-        return realm != undefined && await GetP2PRepositories().p2pHunts.countActiveRealmServers(realm.realmId) > 0;
+        // [2026-10-15] A running server counts here even when it is draining: the PC is still running it, so it is no limit.
+        return realm != undefined && await GetP2PRepositories().p2pHunts.countRunningRealmServers(realm.realmId) > 0;
     } catch (error) {
         logger.warn(`[P2P] realm host check for ${accountId} failed; the client role stays required: ${error}`);
         return false;
@@ -395,7 +397,8 @@ interface RankedHost {
     breakdown: P2PHostOfferRecord["scoreBreakdown"];
 }
 
-async function RankHosts(hunt: P2PHuntSessionRecord): Promise<RankedHost[]> {
+/** The official ranking of a hunt's roster (exported for the tests: a draining host is ranked again). */
+export async function RankHosts(hunt: P2PHuntSessionRecord): Promise<RankedHost[]> {
     const policy = ReadP2PHostEligibilityPolicy();
     const operationsPolicy = await GetP2POperationsPolicy();
     // [2026-10-14] Observe mode (MYSTICPARADOX_GUARD_MODE): no candidate is excluded for its Guard; the exclusion is logged.
@@ -710,8 +713,11 @@ export function RecoveryGameSessionId(persistentHub: boolean, host: string, port
 }
 
 async function RequestRecoveryDestination(hunt: P2PHuntSessionRecord) {
+    // [2026-10-15] No DeployServer (DEPLOYSERVER_URL unset): there is no dedicated destination, and nothing is requested from one.
+    // ResumeRecovery ends such a hunt before it gets here.
+    if (!DedicatedServersConfigured()) throw new Error("NO_DEDICATED_SERVERS");
     const destination = RecoveryDestinationRequest(hunt);
-    const response = await fetch(`http://${DEPLOYSERVER_URL}${DEPLOYSERVER_MATCHMAKING_PATH}`, {
+    const response = await fetch(`http://${process.env.DEPLOYSERVER_URL}${DEPLOYSERVER_MATCHMAKING_PATH}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -766,7 +772,9 @@ export async function PrepareRecovery(sessionId: string, generation: number, rea
     let CancelledHere = false;
     const aborting = await WithP2PTransaction(async (repos, mongoSession) => {
         const hunt = await repos.p2pHunts.findHunt(sessionId, mongoSession);
-        if (hunt == undefined || hunt.generation !== generation || ["COMPLETED", "ABORTED", "RECOVERING"].includes(hunt.state)) return undefined;
+        // [2026-10-15] A drained hunt is never recovered: its players are on their way to another hunt, and recovery would move
+        // them to a dedicated fallback. It ends through the monitor, RenewHostLease, AbortHunt or EndHunt instead.
+        if (hunt == undefined || hunt.generation !== generation || ["COMPLETED", "ABORTED", "RECOVERING", "DRAINING"].includes(hunt.state)) return undefined;
         // Checked before anything is revoked: a hunt that is running, or whose member is already travelling, is left alone.
         if (cancel != undefined && !IsCancellableForming(hunt)) return undefined;
         if (hunt.state === "ABORTING") return hunt;
@@ -867,7 +875,9 @@ export async function PrepareRecovery(sessionId: string, generation: number, rea
         // [2026-10-14 realms S2, section 3.4] An active realm hunt that fails ends at once: ABORTED with the reason, every member
         // fenced, the party freed. No RECOVERING and no recovery destination: the members land at the menu or login, and their
         // next request goes to the realm's hub (the realm's Ramsgate keeps running on the host's PC).
-        if (!beforeActive && realmHunt) {
+        // [2026-10-15] Without a DeployServer an active hunt that is not a realm's has no recovery destination either, so it ends the same way.
+        const noDedicatedServer = !DedicatedServersConfigured();
+        if (!beforeActive && (realmHunt || noDedicatedServer)) {
             const terminal = await repos.p2pHunts.compareAndSetHunt({
                 sessionId,
                 generation,
@@ -919,7 +929,9 @@ export async function PrepareRecovery(sessionId: string, generation: number, rea
                     mongoSession
                 );
             }
-            logger.warn(`[P2P] active realm hunt failed; ended without recovery session=${sessionId} reason=${reason}`);
+            logger.warn(realmHunt
+                ? `[P2P] active realm hunt failed; ended without recovery session=${sessionId} reason=${reason}`
+                : `[P2P] active hunt failed with no dedicated server (DEPLOYSERVER_URL is unset); ended without recovery session=${sessionId} reason=${reason}`);
             return undefined;
         }
         const aborting = await repos.p2pHunts.compareAndSetHunt({
@@ -974,6 +986,15 @@ export async function PrepareRecovery(sessionId: string, generation: number, rea
 
 async function ResumeRecovery(aborting: P2PHuntSessionRecord): Promise<void> {
     if (aborting.state !== "ABORTING") return;
+    // [2026-10-15] No DeployServer: a hunt still ABORTING (recorded before the server had none) has no recovery destination. It ends
+    // here through the same end path as any session, instead of retrying a request that can never be answered.
+    if (!DedicatedServersConfigured()) {
+        logger.warn(`[P2P] ending ${aborting.sessionId} instead of recovering it: no dedicated server (DEPLOYSERVER_URL is unset) reason=${aborting.failureReason ?? "HOST_FAILED"}`);
+        await EndP2PHuntSession(aborting.sessionId, aborting.generation, "NO_DEDICATED_SERVERS", {
+            allowedStates: ["ABORTING"], actorType: "SYSTEM"
+        });
+        return;
+    }
     let fallback: Awaited<ReturnType<typeof RequestRecoveryDestination>>;
     try {
         fallback = await RequestRecoveryDestination(aborting);
@@ -1152,9 +1173,12 @@ export const SUPERSEDE_STATES: P2PHuntState[] = [
     "HOST_SELECTING", "HOST_OFFERED", "STARTING", "HOST_READY", "ADMITTING", "RUNNING", "SUSPECT", "ABORTING"
 ];
 const STARTED_STATES: P2PHuntState[] = ["HOST_READY", "ADMITTING", "RUNNING", "SUSPECT"];
+/** [2026-10-15] The completion reason of a drained session with no more specific one (BeginDrainPartySession writes it). */
+export const DRAIN_COMPLETION_REASON = "SUPERSEDED_REQUESTER_LEFT_HUNT";
 
 function HuntRan(hunt: Pick<P2PHuntSessionRecord, "state" | "preSuspectState">): boolean {
-    return hunt.state === "RUNNING" || (hunt.state === "SUSPECT" && hunt.preSuspectState === "RUNNING");
+    // [2026-10-15] A drained hunt ran: its players were in it until they left, so its clean end is COMPLETED.
+    return hunt.state === "RUNNING" || hunt.state === "DRAINING" || (hunt.state === "SUSPECT" && hunt.preSuspectState === "RUNNING");
 }
 
 /**
@@ -1200,13 +1224,16 @@ export function MarkParticipantReturnedToHub(roster: readonly P2PHuntParticipant
 export type ExistingPartySessionAction =
     | { action: "REUSE"; reason: "PARTY_FAN_OUT" }
     | { action: "SUPERSEDE"; reason: string }
+    // [2026-10-15] A running Tier 0 hunt the requester left keeps its server for the players still in it (BeginDrainPartySession).
+    | { action: "DRAIN"; reason: string }
     | { action: "CONFLICT"; reason: string };
 
 /**
  * What a party's new player-hosted request does with the party's current session. REUSE is the fan-out of a session
  * still forming (members follow the leader into the same hunt seconds later). A finished, ending or abandoned session
- * is superseded; so is one the requester has already left. A running hunt the requester was never part of (a member
- * who joined the party after the roster froze) is a conflict, routed to a dedicated server.
+ * is superseded; so is one the requester has already left, except that a running Tier 0 hunt is drained rather than
+ * fenced. A running hunt the requester was never part of (a member who joined the party after the roster froze) is a
+ * conflict, routed to a dedicated server.
  */
 export function ClassifyExistingPartySession(existing: P2PHuntSessionRecord, huntId: string, requesterId: string, now = Date.now()): ExistingPartySessionAction {
     if (existing.state === "ABORTING" || existing.state === "SUSPECT") return { action: "SUPERSEDE", reason: "SESSION_ENDING" };
@@ -1222,6 +1249,11 @@ export function ClassifyExistingPartySession(existing: P2PHuntSessionRecord, hun
     if (started && participant != undefined && (participant.admissionState === "ADMITTED" ||
         participant.admissionState === "LOST" || participant.returnedToHubAt != undefined ||
         (existing.state === "RUNNING" && requesterId === existing.hostAccountId))) {
+        // [2026-10-15] The players still in a running Tier 0 hunt keep their server until it ends (the drain), not a fence.
+        // A realm hub is never drained (it has its own lifecycle).
+        if (existing.state === "RUNNING" && (existing.trustTier ?? 0) === 0 && existing.sessionKind !== "REALM_HUB") {
+            return { action: "DRAIN", reason: "REQUESTER_LEFT_HUNT" };
+        }
         return { action: "SUPERSEDE", reason: "REQUESTER_LEFT_HUNT" };
     }
     if (existing.huntDefinitionId !== huntId) return { action: "SUPERSEDE", reason: "PARTY_CHANGED_HUNT" };
@@ -1265,7 +1297,7 @@ export async function EndP2PHuntSession(sessionId: string, generation: number, r
                 ...(terminalState === "ABORTED" ? { failureReason: reason } : {})
             },
             unset: ["activePartyKey", "leaseExpiresAt", "suspectSince", "suspectDeadline", "preSuspectState",
-                "offerExpiresAt", "startupDeadline", "recoveryRetryAt"]
+                "offerExpiresAt", "startupDeadline", "recoveryRetryAt", "drainDeadline"]
         }, mongoSession);
         if (terminal == undefined) return undefined;
         await repos.p2pHunts.appendHuntTransition({
@@ -1388,6 +1420,80 @@ export async function SupersedePartySession(existing: P2PHuntSessionRecord, reas
     });
 }
 
+/**
+ * [2026-10-15] Drains a party's running Tier 0 session for its new request (ClassifyExistingPartySession said DRAIN). The
+ * session admits nobody new (its tickets are revoked) and frees the party, but nothing is fenced: the generation stays live,
+ * the host's lease keeps renewing and its server serves the players still in it. The server ends by itself (its lease
+ * lapses, or the host reports it stopped), or the drain ends at its cap when one is configured (P2P_HUNT_DRAIN_GRACE_MS). With no
+ * cap no deadline is set, so the drain runs as long as the server does. Same return as EndP2PHuntSession; undefined when the session
+ * had already moved on.
+ */
+export async function BeginDrainPartySession(existing: P2PHuntSessionRecord, reason: string, requesterId: string):
+    Promise<{ record: P2PHuntSessionRecord; partyRevision?: number } | undefined> {
+    const now = new Date();
+    // [2026-10-15] A deadline only when a cap is configured: the default drain has none (see ReadP2PHuntDrainCapMs).
+    const capMs = ReadP2PHuntDrainCapMs();
+    const drainDeadline = capMs === undefined ? undefined : new Date(now.getTime() + capMs).toISOString();
+    const drained = await WithP2PTransaction(async (repos, mongoSession) => {
+        const hunt = await repos.p2pHunts.findHunt(existing.sessionId, mongoSession);
+        if (hunt == undefined || hunt.generation !== existing.generation || hunt.state !== "RUNNING") return undefined;
+        // activePartyKey goes too: the party's new request and findActiveHuntForAccount no longer see this session, and the
+        // unique index on activePartyKey lets the party's next hunt start.
+        const draining = await repos.p2pHunts.compareAndSetHunt({
+            sessionId: existing.sessionId,
+            generation: existing.generation,
+            expectedStates: ["RUNNING"],
+            expectedStateVersion: hunt.stateVersion,
+            set: {
+                state: "DRAINING",
+                ...(drainDeadline !== undefined ? { drainDeadline } : {}),
+                completionReason: `SUPERSEDED_${reason}`
+            },
+            unset: ["activePartyKey"]
+        }, mongoSession);
+        if (draining == undefined) return undefined;
+        await repos.p2pHunts.revokeAdmissionTickets(existing.sessionId, existing.generation, mongoSession);
+        await repos.p2pHunts.appendHuntTransition({
+            sessionId: existing.sessionId,
+            generation: existing.generation,
+            fromState: "RUNNING",
+            toState: "DRAINING",
+            stateVersion: draining.stateVersion,
+            reason: `DRAIN_${reason}`,
+            actorType: "PARTICIPANT",
+            actorAccountId: requesterId,
+            at: now.toISOString()
+        }, mongoSession);
+        // The party is freed as EndP2PHuntSession frees it.
+        let partyRevision: number | undefined;
+        const party = await repos.parties.findById(hunt.partyId, mongoSession);
+        if (party != undefined) {
+            partyRevision = party.revision;
+            if (party.activeHuntSessionId === existing.sessionId) {
+                const idle = await repos.parties.setActivity({
+                    partyId: party.partyId,
+                    expectedRevision: party.revision,
+                    activity: "IDLE",
+                    now: now.toISOString()
+                }, mongoSession);
+                partyRevision = idle?.revision ?? partyRevision;
+            }
+        }
+        return { record: draining, partyRevision };
+    });
+    if (drained != undefined) {
+        logger.info({
+            event: "p2p_hunt_draining",
+            sessionId: existing.sessionId,
+            generation: existing.generation,
+            reason,
+            drainDeadline
+        }, `[P2P] session ${existing.sessionId} generation=${existing.generation} draining reason=${reason} ` +
+            `deadline=${drainDeadline ?? "none"}`);
+    }
+    return drained;
+}
+
 /** Admitted peers a hunt's host may report, and a realm hub's (a hub takes up to 64 players). */
 const HUNT_ADMITTED_PEER_LIMIT = 4;
 const HUB_ADMITTED_PEER_LIMIT = 64;
@@ -1412,6 +1518,14 @@ export async function RenewHostLease(capability: P2PHostCapabilityRecord, body: 
         if (IsRealmHub(current)) {
             await EndRealmHub(capability.sessionId, capability.generation, "HOST_PROCESS_UNHEALTHY", "ABORTED",
                 { actorType: "HOST", actorAccountId: capability.hostAccountId });
+            throw new LauncherApiError("P2P_GENERATION_FENCED", "The host process reported a fatal failure.");
+        }
+        // [2026-10-15] A drained hunt whose server stopped (its empty-server reap, or a crash) ends cleanly. Its players are on
+        // their way to another hunt, so nothing is recovered.
+        if (current?.state === "DRAINING" && current.generation === capability.generation) {
+            await EndP2PHuntSession(capability.sessionId, capability.generation, current.completionReason ?? DRAIN_COMPLETION_REASON, {
+                allowedStates: ["DRAINING"], actorType: "HOST", actorAccountId: capability.hostAccountId
+            });
             throw new LauncherApiError("P2P_GENERATION_FENCED", "The host process reported a fatal failure.");
         }
         const cleanEnd = current != undefined && current.generation === capability.generation ? HostLossIsCleanEnd(current) : undefined;
@@ -1459,6 +1573,14 @@ export async function RecordParticipantObservation(accountId: string, sessionId:
             throw new LauncherApiError("P2P_GENERATION_FENCED", "The observation is not bound to the active hub generation.");
         }
         return { accepted: true, sessionId, generation: hunt!.generation, stored: false };
+    }
+    // [2026-10-15] A drained hunt keeps no participant quorum (the monitor never marks it SUSPECT): a member's observation is
+    // accepted and dropped, so its launcher is not told the session was fenced while the players are still on its server.
+    if (hunt?.state === "DRAINING") {
+        if (hunt.generation !== body?.generation || !hunt.roster.some((entry) => entry.accountId === accountId)) {
+            throw new LauncherApiError("P2P_GENERATION_FENCED", "The observation is not bound to the active roster generation.");
+        }
+        return { accepted: true, sessionId, generation: hunt.generation, stored: false };
     }
     const participant = hunt?.roster.find((entry) => entry.accountId === accountId);
     if (hunt == undefined || participant == undefined || hunt.generation !== body?.generation) {
@@ -1630,6 +1752,27 @@ async function MarkSuspect(hunt: P2PHuntSessionRecord, reason: string): Promise<
     });
 }
 
+/**
+ * [2026-10-15] One lifecycle tick of a drained hunt (BeginDrainPartySession). A lease lapsed for longer than the suspect window
+ * means its server has ended by itself, so the session ends without a fence (no server is left to fence); a shorter gap (a
+ * network blip) is waited out as a running hunt's SUSPECT window would be, since the lease renews from DRAINING. Otherwise the drain
+ * runs while its server does: it ends by the host's own report (RenewHostLease, AbortHunt, EndHunt), at an operator stop (fenced
+ * now), or at its cap when one is set (drainDeadline; fenced). A drain with no cap has no deadline and holds while its lease renews.
+ * A drained hunt is never marked SUSPECT or recovered.
+ */
+async function TickDrainingHunt(hunt: P2PHuntSessionRecord, now: number, emergencyStop: boolean): Promise<void> {
+    const reason = hunt.completionReason ?? DRAIN_COMPLETION_REASON;
+    const leaseLapsed = hunt.leaseExpiresAt == undefined ||
+        Date.parse(hunt.leaseExpiresAt) + ReadP2PHostEligibilityPolicy().suspectLifetimeMs <= now;
+    if (leaseLapsed && !emergencyStop) {
+        await EndP2PHuntSession(hunt.sessionId, hunt.generation, reason, {
+            allowedStates: ["DRAINING"], actorType: "SYSTEM", fence: false
+        });
+    } else if (emergencyStop || (hunt.drainDeadline != undefined && Date.parse(hunt.drainDeadline) <= now)) {
+        await EndP2PHuntSession(hunt.sessionId, hunt.generation, reason, { allowedStates: ["DRAINING"], actorType: "SYSTEM" });
+    }
+}
+
 export class P2PHuntLifecycleMonitor {
     private timer: NodeJS.Timeout | undefined;
     private running = false;
@@ -1665,6 +1808,12 @@ export class P2PHuntLifecycleMonitor {
                     } catch (error) {
                         logger.error(`[P2P Lifecycle] realm hub ${hunt.sessionId} tick failed: ${error}`);
                     }
+                    continue;
+                }
+                // [2026-10-15] A drained hunt (BeginDrainPartySession) never goes SUSPECT and never recovers: its players are on their
+                // way to another hunt. This branch comes before the operator-stop branch below, which would recover it.
+                if (hunt.state === "DRAINING") {
+                    await TickDrainingHunt(hunt, now, emergencyStop);
                     continue;
                 }
                 if (emergencyStop && !["ABORTING", "RECOVERING"].includes(hunt.state)) {

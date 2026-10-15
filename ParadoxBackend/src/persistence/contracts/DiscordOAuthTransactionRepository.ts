@@ -16,6 +16,8 @@
 //   2. callback (on success): the same row gains {completionCodeHash, userId}
 //      so the one-time deep-link completion code can be consumed separately
 //      via consumeByCompletionCodeHash, without a second collection.
+// [2026-10-15] A link transaction (POST /launcher/v1/account/discord/link/start) carries linkUserId from the start: the callback then
+// links the Discord user to that account instead of signing in, and no completion code is attached.
 export interface DiscordOAuthTransactionRecord {
     state: string;
     codeVerifier: string;
@@ -26,6 +28,7 @@ export interface DiscordOAuthTransactionRecord {
     completionExpiresAt?: string;
     completionConsumedAt?: string;
     userId?: string;
+    linkUserId?: string;
 }
 
 export interface DiscordOAuthTransactionRepository {

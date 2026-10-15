@@ -14,6 +14,7 @@ import {
     ACTIVITY_HUNT_MAX_MS,
     ActivityTtlAt,
     AdvancePlaytime,
+    ClassifyLauncherBuild,
     CurrentActivitySettings,
     DailyFlagCandidates,
     DayOf,
@@ -24,6 +25,7 @@ import {
     MinutesBetween,
     SafeKey
 } from "./activityRules";
+import type { LauncherBuildReport, LauncherBuildVerdict } from "./activityRules";
 
 /*
  * [2026-10-14] Activity monitor (in-game activity for fairness and exploit review; the Privacy Policy describes it). Monitoring only:
@@ -215,6 +217,20 @@ export function TouchGameSession(userId: string, nowMs: number = Date.now()): vo
     } catch (Err) {
         logger.warn(`[ActivityMon] playtime not recorded user=${LogToken(userId)}: ${String(Err)}`);
     }
+}
+
+/**
+ * [2026-10-15] The accounts whose running game touched the backend within `withinMs` (the presence touches above: the
+ * matchmaking heartbeat about every 5 s, the realm presence heartbeat every 30 s, a game session's start). The operator
+ * dashboard counts them as online: a game on a realm or player-hosted server holds no XMPP socket. Empty while the monitor
+ * is off.
+ */
+export function RecentlyActiveAccountIds(withinMs: number, nowMs: number = Date.now()): string[] {
+    const Active: string[] = [];
+    for (const [UserId, LastTouch] of PlaytimeLastTouch) {
+        if (nowMs - LastTouch <= withinMs) Active.push(UserId);
+    }
+    return Active;
 }
 
 // ---- inventory (loot, currency, Platinum) ----
@@ -427,4 +443,47 @@ export async function RecordP2PHuntActivity(input: P2PHuntActivityInput): Promis
             AddDaily(input.hostAccountId, EndDay, { huntsHosted: 1, hostingMinutes: MinutesBetween(input.runningAtIso, input.endedAtIso) });
         });
     }
+}
+
+// ---- launcher builds ----
+
+/** [2026-10-15] Where the official launcher build is read from (tests pass their own). */
+export interface LauncherBuildSources {
+    /** The SHA-256 the served Guard manifest of `channel` pins for the LAUNCHER role, or undefined without one. */
+    pinnedLauncherSha256(channel: string): string | undefined;
+    /** The launcher version this server offers, or undefined without a launcher feed. */
+    servedLauncherVersion(): string | undefined;
+}
+
+// Loaded on first use (as p2pHostPolicy does): the feed layout belongs to the launcher update routes.
+const UpdateFeed = () => require("../routes/launcherUpdates") as typeof import("../routes/launcherUpdates");
+const DefaultLauncherBuildSources: LauncherBuildSources = {
+    pinnedLauncherSha256: (channel) => UpdateFeed().ReadPublishedGuardArtifacts(channel)?.find((artifact) => artifact.role === "LAUNCHER")?.sha256,
+    servedLauncherVersion: () => UpdateFeed().ReadServedLauncherVersion(),
+};
+
+/**
+ * The launcher build a Play reported (POST /launcher/v1/game-sessions). A build that is not the one Guard pins, on the served
+ * version or newer, raises UNOFFICIAL_LAUNCHER (once per account and day); an older official build updates itself and is not
+ * flagged. Self-reported, so a monitor only: nothing is refused. Returns the verdict; never throws.
+ */
+export async function RecordLauncherBuild(userId: string, channel: string, report: LauncherBuildReport | undefined,
+    sources: LauncherBuildSources = DefaultLauncherBuildSources, nowMs: number = Date.now()): Promise<LauncherBuildVerdict> {
+    if (!CurrentActivitySettings().enabled || report === undefined) return "unknown";
+    let Verdict: LauncherBuildVerdict = "unknown";
+    await Quietly("launcher build", userId, async () => {
+        const Pinned = sources.pinnedLauncherSha256(channel);
+        const Served = sources.servedLauncherVersion();
+        Verdict = ClassifyLauncherBuild(report, Pinned, Served);
+        if (Verdict !== "unofficial" || Pinned === undefined) return;
+        await RaiseFlag({
+            kind: "UNOFFICIAL_LAUNCHER",
+            severity: "high",
+            userId,
+            day: DayOf(nowMs),
+            detail: `launcher ${report.version} sha256 ${report.sha256.slice(0, 16)}... is not the official build `
+                + `(Guard ${channel} pins ${Pinned.slice(0, 16)}...; served version ${Served ?? "none"})`
+        });
+    });
+    return Verdict;
 }

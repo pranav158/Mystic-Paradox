@@ -26,6 +26,7 @@ import { MongoAuthIdentityRepository } from "./repositories/MongoAuthIdentityRep
 import { MongoRefreshSessionRepository } from "./repositories/MongoRefreshSessionRepository";
 import { MongoGameExchangeCodeRepository } from "./repositories/MongoGameExchangeCodeRepository";
 import { MongoDiscordOAuthTransactionRepository } from "./repositories/MongoDiscordOAuthTransactionRepository";
+import { MongoEmailCodeRepository } from "./repositories/MongoEmailCodeRepository";
 import { MongoInventoryTransactionRepository } from "./repositories/MongoInventoryTransactionRepository";
 import { MongoFriendshipRepository } from "./repositories/MongoFriendshipRepository";
 import { MongoAdminRepository } from "./repositories/MongoAdminRepository";
@@ -63,6 +64,7 @@ export function CreateMongoRepositoryProvider(): RepositoryProvider {
         refreshSessions: new MongoRefreshSessionRepository(),
         gameExchangeCodes: new MongoGameExchangeCodeRepository(),
         discordOAuthTransactions: new MongoDiscordOAuthTransactionRepository(),
+        emailCodes: new MongoEmailCodeRepository(),
         inventoryTransactions: new MongoInventoryTransactionRepository(),
         friendships: new MongoFriendshipRepository(),
         admin: new MongoAdminRepository(),

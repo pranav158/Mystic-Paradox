@@ -35,7 +35,8 @@ test("P2P policy fails closed when all environment values are absent", () => {
     assert.equal(Policy.trustTier, 0);
     assert.equal(Policy.tier1RewardsEnabled, false);
     assert.equal(Policy.tier1ShadowApproved, false);
-    assert.equal(Policy.dedicatedHuntsDisabled, false);
+    // [2026-10-15] No DeployServer in this environment: there is no dedicated route to take.
+    assert.equal(Policy.dedicatedHuntsDisabled, true);
     assert.deepEqual(
         DecideHuntRoute(BaseInput, Policy, { playerHostedImplemented: false }),
         { route: "DEDICATED", reason: "FEATURE_DISABLED", rolloutBucket: null }
@@ -206,10 +207,21 @@ test("automatic primary rollout can explicitly admit all accounts", () => {
 });
 
 test("dedicated hunt disable rail recognizes only literal true", () => {
+    // [2026-10-15] With a DeployServer configured, the rail alone decides.
+    const WithDeployServer = { DEPLOYSERVER_URL: "deployserver.invalid:8080" };
     for (const Value of [undefined, "1", "yes", "on", "TRUE-ish"]) {
-        assert.equal(ReadP2PPolicy({ P2P_DISABLE_DEDICATED_HUNTS: Value }).dedicatedHuntsDisabled, false);
+        assert.equal(ReadP2PPolicy({ ...WithDeployServer, P2P_DISABLE_DEDICATED_HUNTS: Value }).dedicatedHuntsDisabled, false);
     }
-    assert.equal(ReadP2PPolicy({ P2P_DISABLE_DEDICATED_HUNTS: " true " }).dedicatedHuntsDisabled, true);
+    assert.equal(ReadP2PPolicy({ ...WithDeployServer, P2P_DISABLE_DEDICATED_HUNTS: " true " }).dedicatedHuntsDisabled, true);
+});
+
+test("no DeployServer (DEPLOYSERVER_URL unset or blank) disables the dedicated route whatever the rail says (2026-10-15)", () => {
+    const Unconfigured: NodeJS.ProcessEnv[] = [{}, { DEPLOYSERVER_URL: "" }, { DEPLOYSERVER_URL: "   " }];
+    for (const Environment of Unconfigured) {
+        assert.equal(ReadP2PPolicy(Environment).dedicatedHuntsDisabled, true, JSON.stringify(Environment));
+        assert.equal(ReadP2PPolicy({ ...Environment, P2P_DISABLE_DEDICATED_HUNTS: "false" }).dedicatedHuntsDisabled, true);
+    }
+    assert.equal(ReadP2PPolicy({ DEPLOYSERVER_URL: "deployserver.invalid:8080" }).dedicatedHuntsDisabled, false);
 });
 
 test("high-risk classes require a second explicit switch", () => {

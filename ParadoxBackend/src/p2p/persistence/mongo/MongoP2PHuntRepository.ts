@@ -192,7 +192,8 @@ export class MongoP2PHuntRepository implements P2PHuntRepository {
                 generation: input.generation,
                 hostSteamId: input.hostSteamId,
                 bridgeInstanceId: input.bridgeInstanceId,
-                state: { $in: ["HOST_READY", "ADMITTING", "RUNNING", "SUSPECT"] },
+                // [2026-10-15] A drained session's server keeps its lease until it ends (BeginDrainPartySession).
+                state: { $in: ["HOST_READY", "ADMITTING", "RUNNING", "DRAINING", "SUSPECT"] },
                 $or: [
                     { lastLeaseSequence: { $lt: input.leaseSequence } },
                     { lastLeaseSequence: { $exists: false } }
@@ -399,7 +400,8 @@ export class MongoP2PHuntRepository implements P2PHuntRepository {
             {
                 _id: input.sessionId as any,
                 generation: input.generation,
-                state: { $in: ["HOST_READY", "ADMITTING", "RUNNING", "SUSPECT"] },
+                // [2026-10-15] A drained session still records its members' disconnects (no ticket is issued to them).
+                state: { $in: ["HOST_READY", "ADMITTING", "RUNNING", "DRAINING", "SUSPECT"] },
                 "roster.accountId": input.accountId
             },
             {
@@ -575,6 +577,8 @@ export class MongoP2PHuntRepository implements P2PHuntRepository {
         return docs.map((doc) => ({ ...doc, accountId: String(doc._id) } as unknown as P2PHostPresenceRecord));
     }
 
+    // [2026-10-15] A drained hunt has no activePartyKey, so these filters leave it out: it is inactive for its host's one-hunt rule
+    // and for its realm's server limit, and it is not listed as a realm hunt. ConfirmsRealmHost uses countRunningRealmServers.
     async countActiveHostSessions(accountId: string, session?: ClientSession): Promise<number> {
         const db = await GetMongoDb();
         return db.collection(P2PCollections.P2PHuntSessions).countDocuments({
@@ -590,6 +594,21 @@ export class MongoP2PHuntRepository implements P2PHuntRepository {
             realmId,
             activePartyKey: { $type: "string" },
             state: { $in: ["HOST_SELECTING", "HOST_OFFERED", "STARTING", "HOST_READY", "ADMITTING", "RUNNING", "SUSPECT"] }
+        }, { session });
+    }
+
+    // [2026-10-15] Every realm session whose server still runs on the host's PC, a draining one included (ConfirmsRealmHost).
+    async countRunningRealmServers(realmId: string, session?: ClientSession): Promise<number> {
+        const db = await GetMongoDb();
+        return db.collection(P2PCollections.P2PHuntSessions).countDocuments({
+            realmId,
+            $or: [
+                {
+                    activePartyKey: { $type: "string" },
+                    state: { $in: ["HOST_SELECTING", "HOST_OFFERED", "STARTING", "HOST_READY", "ADMITTING", "RUNNING", "SUSPECT"] }
+                },
+                { state: "DRAINING" }
+            ]
         }, { session });
     }
 

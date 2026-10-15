@@ -34,7 +34,8 @@ function HostServerUdpPort(): number {
 
 /** How many consecutive ports, from P2P_HOST_SERVER_UDP_PORT (8791), a host's game servers may use. */
 export const HOST_SERVER_PORT_SPAN = 32;
-const LIVE_HOST_STATES: P2PHuntState[] = ["STARTING", "HOST_READY", "ADMITTING", "RUNNING", "SUSPECT"];
+// [2026-10-15] DRAINING: a drained server still holds its port (the new server must pick another).
+const LIVE_HOST_STATES: P2PHuntState[] = ["STARTING", "HOST_READY", "ADMITTING", "RUNNING", "DRAINING", "SUSPECT"];
 
 /**
  * [2026-10-14 repro] The UDP port for a host's new game server: the first port from `base` that none of the host's other live

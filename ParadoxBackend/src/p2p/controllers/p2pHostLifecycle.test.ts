@@ -6,6 +6,7 @@ import {
     CleanEndTerminalState,
     HostGuardStillStarting,
     HostLossIsCleanEnd,
+    HOST_END_STATES,
     HOST_GUARD_START_GRACE_MS,
     MarkParticipantReturnedToHub,
     ParseGuardPresenceSessions,
@@ -16,7 +17,8 @@ import {
     RecoveryDestinationRequest,
     RecoveryGameSessionId,
     SelectRecoveryParticipants,
-    ShouldUseDedicatedPreActiveFallback
+    ShouldUseDedicatedPreActiveFallback,
+    SUPERSEDE_STATES
 } from "./p2pHostLifecycle";
 import { GetHubGameSessionId } from "../../controllers/matchmaking";
 import { DedicatedFallbackAction, PlayerHostedSetupFailureReason } from "./p2pMatchmaking";
@@ -82,10 +84,13 @@ test("pre-active dedicated fallback still includes the complete roster", () => {
 });
 
 test("dedicated-hunt disable rail cancels pre-active failure but preserves active hub recovery", () => {
-    const p2pOnly = { P2P_DISABLE_DEDICATED_HUNTS: "true" };
+    const deployServer = { DEPLOYSERVER_URL: "deployserver.invalid:8080" };
+    const p2pOnly = { ...deployServer, P2P_DISABLE_DEDICATED_HUNTS: "true" };
     assert.equal(ShouldUseDedicatedPreActiveFallback(true, p2pOnly), false);
     assert.equal(ShouldUseDedicatedPreActiveFallback(false, p2pOnly), false);
-    assert.equal(ShouldUseDedicatedPreActiveFallback(true, {}), true);
+    assert.equal(ShouldUseDedicatedPreActiveFallback(true, deployServer), true);
+    // [2026-10-15] No DeployServer: the pre-active failure is cancelled, not sent to a dedicated server that does not exist.
+    assert.equal(ShouldUseDedicatedPreActiveFallback(true, {}), false);
 });
 
 test("Launcher Guard presence keeps client and host sessions independently bound", () => {
@@ -183,9 +188,41 @@ test("a party's new request reuses only a forming session and supersedes finishe
     assert.equal(ClassifyExistingPartySession(session({ state: "ABORTING" }), "ShatteredIsles_IslandB", "host").reason, "SESSION_ENDING");
     assert.equal(ClassifyExistingPartySession(session({ leaseExpiresAt: new Date(Date.now() - 1_000).toISOString() }),
         "ShatteredIsles_IslandA", "host").reason, "HOST_LEASE_EXPIRED");
-    assert.equal(ClassifyExistingPartySession(session(), "ShatteredIsles_IslandA", "joiner").reason, "REQUESTER_LEFT_HUNT");
+    // A running Tier 0 hunt the requester left is drained, not fenced (2026-10-15).
+    assert.deepEqual(ClassifyExistingPartySession(session(), "ShatteredIsles_IslandA", "joiner"), { action: "DRAIN", reason: "REQUESTER_LEFT_HUNT" });
     // A member who joined the party after the roster froze cannot end the others' running hunt.
     assert.deepEqual(ClassifyExistingPartySession(session(), "ShatteredIsles_IslandA", "newcomer"), { action: "CONFLICT", reason: "ROSTER_FROZEN" });
+});
+
+test("a running Tier 0 hunt the requester left is drained; every other superseded session is ended as before (2026-10-15)", () => {
+    // The host of a running hunt asking for one again has left its own server too.
+    assert.deepEqual(ClassifyExistingPartySession(session(), "ShatteredIsles_IslandA", "host"), { action: "DRAIN", reason: "REQUESTER_LEFT_HUNT" });
+    // A Tier 1 hunt is never drained: its completion belongs to the Guard.
+    assert.deepEqual(ClassifyExistingPartySession(session({ trustTier: 1 }), "ShatteredIsles_IslandA", "joiner"),
+        { action: "SUPERSEDE", reason: "REQUESTER_LEFT_HUNT" });
+    // A hunt still starting is superseded (its server has not run the hunt).
+    for (const state of ["ADMITTING", "HOST_READY"] as const) {
+        assert.deepEqual(ClassifyExistingPartySession(session({ state }), "ShatteredIsles_IslandA", "joiner"),
+            { action: "SUPERSEDE", reason: "REQUESTER_LEFT_HUNT" }, state);
+    }
+    // A realm hub is never drained (it has its own lifecycle).
+    assert.deepEqual(ClassifyExistingPartySession(session({ sessionKind: "REALM_HUB" }), "ShatteredIsles_IslandA", "joiner"),
+        { action: "SUPERSEDE", reason: "REQUESTER_LEFT_HUNT" });
+    // The completion, abort, suspect and expired-lease states keep their own reasons.
+    assert.deepEqual(ClassifyExistingPartySession(session({ guardEncounterState: "COMPLETION_REQUESTED" }), "ShatteredIsles_IslandA", "joiner"),
+        { action: "SUPERSEDE", reason: "HUNT_FINISHED" });
+    assert.deepEqual(ClassifyExistingPartySession(session({ state: "SUSPECT", preSuspectState: "RUNNING" }), "ShatteredIsles_IslandA", "joiner"),
+        { action: "SUPERSEDE", reason: "SESSION_ENDING" });
+    assert.deepEqual(ClassifyExistingPartySession(session({ leaseExpiresAt: new Date(Date.now() - 1_000).toISOString() }), "ShatteredIsles_IslandA", "joiner"),
+        { action: "SUPERSEDE", reason: "HOST_LEASE_EXPIRED" });
+});
+
+test("a draining hunt is scanned by the lifecycle monitor, ends COMPLETED, and is no supersede or host-end state (2026-10-15)", () => {
+    assert.ok(P2P_LIFECYCLE_STATES.includes("DRAINING"));
+    assert.equal(CleanEndTerminalState({ state: "DRAINING" }), "COMPLETED");
+    assert.equal(CleanEndTerminalState({ state: "DRAINING", trustTier: 1 }), "ABORTED");
+    assert.equal(SUPERSEDE_STATES.includes("DRAINING"), false, "a new request never supersedes a drain again");
+    assert.equal(HOST_END_STATES.includes("DRAINING"), false, "the host's end is handled by its own drain branch");
 });
 
 test("recovery to a persistent hub carries the hub's own game session id (B6)", () => {

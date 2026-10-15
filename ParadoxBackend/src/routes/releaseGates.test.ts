@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import express from "express";
 import type { ReleaseGate } from "../observability/releaseGates";
-import { CreateReleaseGatesHandler, CreateReleaseGatesRouter, HasForwardingHeader } from "./releaseGates";
+import { ActivePlayGate, CreateReleaseGatesHandler, CreateReleaseGatesRouter, HasForwardingHeader } from "./releaseGates";
 
 const AllOk: ReleaseGate[] = [{ name: "guard_mode", ok: true, detail: "mode=observe (default)" }];
 const OneBad: ReleaseGate[] = [...AllOk, { name: "no_legacy_env_keys", ok: false, detail: "1 MYSTPAX_ key(s): MYSTPAX_X" }];
@@ -110,4 +110,15 @@ test("served on a real loopback socket: 200 for the local caller, 404 when a for
     } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+});
+
+// [2026-10-15] Never restart mid-hunt: a release is held while anyone is in game, unless the emergency file is there.
+test("the active-play gate holds a release while anyone is in game, unless the override file says otherwise", () => {
+    assert.deepEqual(ActivePlayGate(0, false), { name: "no_active_play", ok: true, detail: "nobody in game" });
+    const Held = ActivePlayGate(2, false);
+    assert.equal(Held.ok, false);
+    assert.ok(Held.detail.includes("2 player(s) in game") && Held.detail.includes("RELEASE_DURING_PLAY.allow"), Held.detail);
+    const Allowed = ActivePlayGate(1, true);
+    assert.equal(Allowed.ok, true);
+    assert.ok(Allowed.detail.includes("let through"), Allowed.detail);
 });

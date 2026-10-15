@@ -28,7 +28,8 @@ function ToRecord(Doc: Doc): DiscordOAuthTransactionRecord {
         completionCodeHash: Doc.completionCodeHash ?? undefined,
         completionExpiresAt: Doc.completionExpiresAt ?? undefined,
         completionConsumedAt: Doc.completionConsumedAt ?? undefined,
-        userId: Doc.userId ?? undefined
+        userId: Doc.userId ?? undefined,
+        linkUserId: Doc.linkUserId ?? undefined
     };
 }
 

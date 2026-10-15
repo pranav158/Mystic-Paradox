@@ -15,6 +15,7 @@ import {
     ActivitySettings,
     ActivityTtlAt,
     AdvancePlaytime,
+    ClassifyLauncherBuild,
     DailyFlagCandidates,
     DayOf,
     DayStartMs,
@@ -23,6 +24,7 @@ import {
     IsIgnoredActivitySource,
     KillTokenName,
     MinutesBetween,
+    ParseLauncherBuildReport,
     ReadActivitySettings,
     SafeKey
 } from "./activityRules";
@@ -200,4 +202,31 @@ test("settings from the environment: on by default, off only for an explicit off
     assert.equal(Tuned.killsPerHourFlag, 30);
     assert.equal(Tuned.platinumDailyCreditFlag, 123);
     assert.equal(Tuned.rewardsPerHourFlag, 600, "a bad value keeps the default");
+});
+
+// [2026-10-15] UNOFFICIAL_LAUNCHER: what the launcher reports about itself at Play, against the pinned build and the served version.
+test("a launcher build report needs a plain version and a 64-hex sha256; anything else is treated as absent", () => {
+    const Sha = "AB".repeat(32);
+    assert.deepEqual(ParseLauncherBuildReport({ version: "0.1.65", sha256: Sha }), { version: "0.1.65", sha256: "ab".repeat(32) });
+    for (const Bad of [undefined, null, "x", [], { version: "0.1", sha256: Sha }, { version: "0.1.65", sha256: "ab" },
+        { version: 165, sha256: Sha }, { version: "0.1.65 ", sha256: Sha }]) {
+        assert.equal(ParseLauncherBuildReport(Bad), undefined, JSON.stringify(Bad));
+    }
+});
+
+test("a launcher build is official when Guard pins its hash, outdated on an older version, unofficial otherwise", () => {
+    const Pinned = "d3".repeat(32);
+    const Report = (version: string, sha256: string) => ({ version, sha256 });
+    assert.equal(ClassifyLauncherBuild(Report("0.1.64", Pinned), Pinned, "0.1.64"), "official");
+    assert.equal(ClassifyLauncherBuild(Report("0.1.64", Pinned), Pinned.toUpperCase(), "0.1.64"), "official");
+    // An earlier official build until it updates itself.
+    assert.equal(ClassifyLauncherBuild(Report("0.1.63", "e1".repeat(32)), Pinned, "0.1.64"), "outdated");
+    // Self-built or repackaged: the served version or newer with another hash.
+    assert.equal(ClassifyLauncherBuild(Report("0.1.64", "ff".repeat(32)), Pinned, "0.1.64"), "unofficial");
+    assert.equal(ClassifyLauncherBuild(Report("0.1.70", "ff".repeat(32)), Pinned, "0.1.64"), "unofficial");
+    // Without a served launcher feed the version cannot excuse it.
+    assert.equal(ClassifyLauncherBuild(Report("0.1.63", "ff".repeat(32)), Pinned, undefined), "unofficial");
+    // Nothing reported, or nothing pinned (a server without a Guard manifest): unknown, never a flag.
+    assert.equal(ClassifyLauncherBuild(undefined, Pinned, "0.1.64"), "unknown");
+    assert.equal(ClassifyLauncherBuild(Report("0.1.64", "ff".repeat(32)), undefined, "0.1.64"), "unknown");
 });
