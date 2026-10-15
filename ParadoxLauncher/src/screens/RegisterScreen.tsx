@@ -11,12 +11,11 @@ import { LegalLinks, useLegalViewer } from "../components/LegalDocument";
 import { LEGAL } from "../legal/legalMeta";
 import { useServer } from "../servers/ServerContext";
 import { serverNaming } from "../servers/serverNames";
+import { EMAIL_PATTERN, passwordProblem } from "../auth/authRules";
 
 interface RegisterScreenProps {
   onBackToLogin: () => void;
 }
-
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
   const { register } = useAuth();
@@ -39,11 +38,16 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
   const consentReady = !askConsent || (ageConfirmed && termsAccepted);
 
   function validate(): string | null {
-    const usernameError = username.validate();
-    if (usernameError) return usernameError;
+    // [2026-10-15] The official account takes no name here: it asks for its username after the email code (the set-username
+    // step). A local server keeps its own form, with its name.
+    if (!askConsent) {
+      const usernameError = username.validate();
+      if (usernameError) return usernameError;
+    }
     if (!EMAIL_PATTERN.test(email)) return "Enter a valid email address.";
-    if (password.length < 8) return "Password must be at least 8 characters.";
-    if (password !== confirmPassword) return "Passwords don't match.";
+    // [2026-10-15] The rule is shared with the password reset (auth/authRules.ts).
+    const passwordError = passwordProblem(password, confirmPassword);
+    if (passwordError) return passwordError;
     if (!consentReady) return `Confirm that you are ${LEGAL.minimumAge} or older and accept the Terms of Use and Privacy Policy.`;
     return null;
   }
@@ -59,12 +63,12 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
     setSubmitting(true);
     try {
       await register(
-        username.value,
         email,
         password,
         askConsent
           ? { termsVersion: LEGAL.termsVersion, privacyVersion: LEGAL.privacyVersion, ageConfirmed: true }
           : undefined,
+        askConsent ? undefined : username.value,
       );
     } catch (err) {
       setError(describeAuthError(err));
@@ -85,7 +89,7 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
         <form onSubmit={handleSubmit} className="auth-form" noValidate>
           {error && <Banner>{error}</Banner>}
 
-          <UsernameField field={username} disabled={submitting} />
+          {!askConsent && <UsernameField field={username} disabled={submitting} />}
 
           <TextField
             label="Email"

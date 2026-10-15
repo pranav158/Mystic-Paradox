@@ -91,7 +91,7 @@
   transform: rotate(180deg);
 }
 
-/* Tags: the same colour recipe as the .chip tones; "local" is the local-server red. */
+/* Tags: the same colour recipe as the .chip tones; "local" is the local-server red and "danger" the unavailable red. */
 .dropdown-tag {
   --tone: var(--aether);
   flex: none;
@@ -113,6 +113,8 @@
 .dropdown-tag.tone-official { --tone: var(--ok); }
 .dropdown-tag.tone-realm { --tone: var(--aether); }
 .dropdown-tag.tone-local { --tone: var(--bad); }
+/* [2026-10-15] The official server while its play switch is off ("Unavailable"). */
+.dropdown-tag.tone-danger { --tone: var(--bad); }
 
 .dropdown-menu {
   position: fixed;

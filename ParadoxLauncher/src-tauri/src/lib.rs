@@ -29,6 +29,15 @@ macro_rules! launcher_commands {
             commands::auth::native_get_policy,
             commands::auth::native_refresh_account,
             commands::auth::native_check_username,
+            // [2026-10-15] The email code after sign-up or an unverified sign-in, password resets, and the official play switch.
+            commands::auth::native_verify_email,
+            commands::auth::native_resend_email_code,
+            commands::auth::native_forgot_password,
+            commands::auth::native_reset_password,
+            commands::auth::native_official_play,
+            // [2026-10-15] Link and unlink Discord on the Account page (the signed-in official account).
+            commands::auth::native_start_discord_link,
+            commands::auth::native_unlink_discord,
             // [2026-10-14] Terms of Use and Privacy Policy consent, and account deletion (official accounts only).
             commands::account::native_consent_status,
             commands::account::native_accept_consent,
@@ -44,6 +53,8 @@ macro_rules! launcher_commands {
             commands::launch::is_game_running,
             commands::launch::secure_launch,
             commands::updates::check_runtime_update,
+            // [2026-10-15] About -> Runtime: the installed DLL against the signed manifest (read-only).
+            commands::updates::verify_installed_runtime,
             commands::updates::install_runtime_update,
             commands::logs::native_get_log_paths,
             commands::logs::native_open_log_folder,

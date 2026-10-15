@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useServer } from "../servers/ServerContext";
 import { AddServerForm } from "../servers/AddServerForm";
 import { serverNaming } from "../servers/serverNames";
+import { serverUnavailable } from "../servers/officialPlay";
 import { LocalServerBadge } from "./LocalServerWarning";
 import { Dropdown, type DropdownOption } from "./Dropdown";
 import { ServersIcon } from "./icons";
@@ -38,7 +39,7 @@ function friendly(err: unknown): string {
  * its realm name, with the player's own name under it only when they differ (servers/serverNames.ts).
  */
 export function ServerSwitcher() {
-  const { servers, selected, select, openWarning } = useServer();
+  const { servers, selected, select, openWarning, officialPlay } = useServer();
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -78,11 +79,14 @@ export function ServerSwitcher() {
 
   const options: DropdownOption[] = servers.map((server) => {
     const naming = serverNaming(server);
+    // [2026-10-15] The official server while its play switch is off reads "Unavailable" in red, instead of "Official".
     const tag = server.kind === "local"
       ? { text: "Local", tone: "local" as const }
       : server.kind === "paradox_realm"
         ? { text: "Realm", tone: "realm" as const }
-        : { text: "Official", tone: "official" as const };
+        : serverUnavailable(server, officialPlay)
+          ? { text: "Unavailable", tone: "danger" as const }
+          : { text: "Official", tone: "official" as const };
     return { value: server.id, label: naming.primary, detail: naming.secondary, tag };
   });
 

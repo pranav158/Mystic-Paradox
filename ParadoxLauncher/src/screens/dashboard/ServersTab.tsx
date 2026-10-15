@@ -13,6 +13,7 @@ import { LocalServerBadge } from "../../components/LocalServerWarning";
 import { AlertIcon, FolderIcon, ServersIcon, ShieldIcon } from "../../components/icons";
 import { useServer } from "../../servers/ServerContext";
 import { serverNaming } from "../../servers/serverNames";
+import { serverUnavailable } from "../../servers/officialPlay";
 import { AddServerForm } from "../../servers/AddServerForm";
 
 // [2026-10-13 realms S1] The launcher's server list: the built-in official server, Paradox realms (our backend, playing
@@ -59,7 +60,7 @@ function signInDetail(kind: ServerView["kind"]): string {
 export function ServersTab() {
   // [2026-10-13 realms S5] Sign-in, the policy and the status chip follow the selected server, so every change made
   // here is also handed to the shared server state; the red badge of a local server opens its warning popup.
-  const { sync, openWarning } = useServer();
+  const { sync, openWarning, officialPlay } = useServer();
   const [servers, setServers] = useState<ServerView[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -166,6 +167,8 @@ export function ServersTab() {
                       <h2 className="section-title server-title">
                         <span className="server-name">{naming.primary}</span>
                         {server.kind === "official" && <span className="chip accent">Official</span>}
+                        {/* [2026-10-15] The official server's play switch is off: a red chip beside its Official one. */}
+                        {serverUnavailable(server, officialPlay) && <span className="chip bad">Currently unavailable</span>}
                         {server.kind === "paradox_realm" && <span className="chip live">Paradox realm</span>}
                         {server.kind === "local" && <LocalServerBadge onOpen={() => openWarning(server.id)} />}
                         {server.selected && <span className="chip good">In use</span>}

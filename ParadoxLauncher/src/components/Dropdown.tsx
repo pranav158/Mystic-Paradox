@@ -24,7 +24,8 @@ import { CheckIcon, ChevronDownIcon } from "./icons";
 // highlighted row while the arrows move. The list (role="listbox") is a portal on the body, so no card that clips its
 // overflow can cut it off. It opens below the control, or above when there is no room below.
 
-export type DropdownTone = "official" | "realm" | "local";
+/** [2026-10-15] "danger": the official server while its play switch is off (the red "Unavailable" tag). */
+export type DropdownTone = "official" | "realm" | "local" | "danger";
 
 export interface DropdownOption {
   value: string;

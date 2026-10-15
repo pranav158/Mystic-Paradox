@@ -399,16 +399,34 @@ button.link-row {
 .build-check-row[data-status="differs"] {
   border-color: color-mix(in srgb, var(--bad) 55%, var(--line));
 }
+/* [2026-10-15] The status chip sits on the title line (the chip is 26 px tall, the title line is 26 px), in every row. */
 .build-check-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
+}
+.build-check-title {
+  flex: 1;
+  min-width: 0;
+}
+.build-check-name {
+  display: block;
+  line-height: 26px;
+  font-weight: 600;
+}
+.build-check-head .chip {
+  flex: none;
 }
 .build-check-head .sub {
   display: block;
   color: var(--ink-3);
   font-size: 12px;
   font-weight: 500;
+}
+.build-check-reason {
+  margin: 6px 0 0;
+  color: var(--bad);
+  font-size: 12.5px;
 }
 .build-check-row .section-desc {
   margin: 6px 0 0;

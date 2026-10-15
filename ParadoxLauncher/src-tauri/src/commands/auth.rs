@@ -185,6 +185,16 @@ pub(crate) fn error_code_of(body: &[u8]) -> Option<String> {
 pub(crate) const LAUNCHER_UPDATE_REQUIRED: &str =
     "Update the launcher to read and accept the current Terms of Use and Privacy Policy, then try again.";
 
+/// [2026-10-15] The official server's play switch is off (`officialPlay.available` false, or a game session refused).
+pub(crate) const OFFICIAL_UNAVAILABLE: &str =
+    "The official server is currently unavailable. Join or host a realm.";
+
+/// [2026-10-15] A refusal the sign-in screens act on by its code: `CODE: sentence`. The screen reads the code, and the
+/// sentence is what any other screen shows.
+fn coded(code: &str, sentence: &str) -> String {
+    format!("{code}: {sentence}")
+}
+
 pub(crate) fn safe_api_error(response: reqwest::blocking::Response, fallback: &str) -> String {
     let status = response.status().as_u16();
     let body = response
@@ -218,6 +228,30 @@ pub(crate) fn api_error_message(status: u16, code: Option<&str>, fallback: &str)
         }
         Some("AUTH_TESTER_REQUIRED") => "Tester access is required for this.".to_string(),
         Some("AUTH_RATE_LIMITED") => "Too many attempts. Wait a moment and try again.".to_string(),
+        // [2026-10-15] The sign-in screens branch on these codes (the code screen, its retry, the reset notice).
+        Some("AUTH_EMAIL_UNVERIFIED") => coded(
+            "AUTH_EMAIL_UNVERIFIED",
+            "Check your email for the 6-digit code.",
+        ),
+        Some("AUTH_CODE_INVALID") => coded(
+            "AUTH_CODE_INVALID",
+            "That code is wrong or has expired. Check the latest email or resend the code.",
+        ),
+        Some("AUTH_EMAIL_UNAVAILABLE") => coded(
+            "AUTH_EMAIL_UNAVAILABLE",
+            "Email isn't available on this server right now.",
+        ),
+        Some("OFFICIAL_PLAY_UNAVAILABLE") => OFFICIAL_UNAVAILABLE.to_string(),
+        // [2026-10-15] Linking and unlinking Discord in Settings.
+        Some("AUTH_DISCORD_ONLY_LOGIN") => {
+            "Discord is this account's only sign-in, so it can't be unlinked.".to_string()
+        }
+        Some("AUTH_DISCORD_ALREADY_LINKED") => {
+            "That Discord account is already linked to another Mystic Paradox account.".to_string()
+        }
+        Some("AUTH_DISCORD_ACCOUNT_HAS_LINK") => {
+            "This account already has a Discord account linked.".to_string()
+        }
         Some("AUTH_USERNAME_REQUIRED") => {
             "Choose your launcher username before playing.".to_string()
         }
@@ -282,6 +316,18 @@ pub struct NativeAccount {
     pub status: String,
     pub approval_status: String,
     pub needs_username: bool,
+    /// [2026-10-15] The account's Discord link. Absent when the server does not send it: the status is then unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord: Option<NativeDiscordLink>,
+}
+
+/// [2026-10-15] `discord` of the account: whether a Discord user is linked, and its name when the server gives one.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeDiscordLink {
+    pub linked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -311,7 +357,10 @@ struct LoginRequest<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RegisterRequest<'a> {
-    display_name: &'a str,
+    /// [2026-10-15] Sent only where the server takes a name at sign-up (a local server's own form). The official server
+    /// does not take one: the account asks for its username after the code (`needsUsername`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<&'a str>,
     email: &'a str,
     password: &'a str,
     device_id: &'a str,
@@ -333,6 +382,64 @@ struct RefreshRequest<'a> {
 #[serde(rename_all = "camelCase")]
 struct PendingRegistration {
     account: NativeAccount,
+    /// [2026-10-15] A code was emailed; the account signs in once the code is entered (`native_verify_email`).
+    #[serde(default)]
+    verification_required: bool,
+}
+
+/// [2026-10-15] The registration answer the UI reads. `verification_required`: a code was emailed, so the code screen comes next.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeRegistration {
+    pub account: NativeAccount,
+    pub verification_required: bool,
+}
+
+/// [2026-10-15] What an email screen gets back: a signed-in account, or one the server holds for approval.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeEmailOutcome {
+    pub approval_required: bool,
+    pub account: NativeAccount,
+}
+
+/// [2026-10-15] `auth/email/verify` and `auth/password/reset` answer like login, or with `approvalRequired` and no tokens.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EmailAnswer {
+    account: NativeAccount,
+    #[serde(default)]
+    approval_required: bool,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmailVerifyRequest<'a> {
+    email: &'a str,
+    password: &'a str,
+    code: &'a str,
+    device_id: &'a str,
+    device_name: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmailRequest<'a> {
+    email: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasswordResetRequest<'a> {
+    email: &'a str,
+    code: &'a str,
+    new_password: &'a str,
+    device_id: &'a str,
+    device_name: &'a str,
 }
 
 // Access tokens are short-lived JWTs (12 minutes on the backend). Routine UI calls reuse the
@@ -688,6 +795,31 @@ pub async fn native_restore_session(
 pub struct NativeServerStatus {
     pub online: bool,
     pub supported_build_changelist: u32,
+    /// [2026-10-15] The official server's play switch. An older backend sends none, which means available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_play: Option<NativeOfficialPlay>,
+}
+
+/// [2026-10-15] `officialPlay` of `/launcher/v1/status`: the official server cannot be played while `available` is false.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeOfficialPlay {
+    #[serde(default = "default_available")]
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+fn default_available() -> bool {
+    true
+}
+
+/// [2026-10-15] The play switch to show: a status without the field (an older backend) is available.
+fn official_play_or_available(play: Option<NativeOfficialPlay>) -> NativeOfficialPlay {
+    play.unwrap_or(NativeOfficialPlay {
+        available: true,
+        message: None,
+    })
 }
 
 /// `GET /launcher/v1/status` of `scope`'s backend.
@@ -773,11 +905,11 @@ pub async fn native_login(
 pub async fn native_register(
     app: AppHandle,
     server_id: Option<String>,
-    display_name: String,
     email: String,
     password: String,
     consent: Option<NativeConsentInput>,
-) -> Result<NativeAccount, String> {
+    display_name: Option<String>,
+) -> Result<NativeRegistration, String> {
     run_auth_task(move || {
         let scope = command_scope(&app, server_id.as_deref())?;
         let expected_epoch = session_epoch::current(scope.key());
@@ -794,7 +926,7 @@ pub async fn native_register(
         let response = http_client_for(&scope)?
             .post(format!("{}/launcher/v1/auth/register", scope.base_url()))
             .json(&RegisterRequest {
-                display_name: &display_name,
+                display_name: display_name.as_deref(),
                 email: &email,
                 password: &password,
                 device_id: "native-windows-launcher",
@@ -811,13 +943,260 @@ pub async fn native_register(
                     .to_string()
             })?;
         let pending: PendingRegistration = parse_success(response, "Registration failed.")?;
-        let host = AppHost(&app);
-        let mut epoch = session_epoch::lock(scope.key());
-        session_epoch::check(expected_epoch, *epoch)?;
-        *epoch += 1;
-        let _ = host.clear_token(&scope);
-        host.session_ended(&scope);
-        Ok(pending.account)
+        // [2026-10-15] Only the official backend sends codes; a local server's answer is taken as it was before.
+        let verification_required = scope.is_official() && pending.verification_required;
+        end_pending_sign_in(&AppHost(&app), &scope, expected_epoch)?;
+        Ok(NativeRegistration {
+            account: pending.account,
+            verification_required,
+        })
+    })
+    .await
+}
+
+// ---- [2026-10-15] email codes, password resets and the official play switch ------------------------------------------
+// The email routes belong to the official backend (the official server and Paradox realms), as account deletion does: a
+// local server keeps its own accounts and is refused before any request. A verify or reset that succeeds signs in exactly
+// as login does (same device, same base URL, same epoch check and saved refresh token).
+
+const EMAIL_CODES_ON_OFFICIAL_ONLY: &str = "Email codes and password resets belong to Mystic Paradox accounts. This server keeps its own accounts.";
+
+/// Ends a sign-in the server holds for approval: nothing stays signed in and the scope's epoch moves on.
+fn end_pending_sign_in(
+    host: &dyn SessionHost,
+    scope: &AuthScope,
+    expected_epoch: u64,
+) -> Result<(), String> {
+    let mut epoch = session_epoch::lock(scope.key());
+    session_epoch::check(expected_epoch, *epoch)?;
+    *epoch += 1;
+    let _ = host.clear_token(scope);
+    host.session_ended(scope);
+    Ok(())
+}
+
+/// The scope of the email routes: the official one only.
+fn require_official_email(scope: AuthScope) -> Result<AuthScope, String> {
+    if scope.is_official() {
+        Ok(scope)
+    } else {
+        Err(EMAIL_CODES_ON_OFFICIAL_ONLY.to_string())
+    }
+}
+
+fn official_email_scope(app: &AppHandle, server_id: Option<&str>) -> Result<AuthScope, String> {
+    require_official_email(selected_scope(app, server_id)?)
+}
+
+fn unreachable_account_server(scope: &AuthScope) -> String {
+    scope
+        .pick(
+            "Can't reach the Mystic Paradox server right now.",
+            "Can't reach this server right now.",
+        )
+        .to_string()
+}
+
+/// Signs in from a verify or reset answer, as login does. An answer that waits for approval ends the attempt instead.
+fn settle_email_answer(
+    host: &dyn SessionHost,
+    scope: &AuthScope,
+    expected_epoch: u64,
+    answer: EmailAnswer,
+) -> Result<NativeEmailOutcome, String> {
+    if answer.approval_required {
+        end_pending_sign_in(host, scope, expected_epoch)?;
+        return Ok(NativeEmailOutcome {
+            approval_required: true,
+            account: answer.account,
+        });
+    }
+    let (Some(access_token), Some(refresh_token)) = (answer.access_token, answer.refresh_token)
+    else {
+        return Err("The account server returned an invalid response.".to_string());
+    };
+    let session = NativeSession {
+        access_token,
+        refresh_token,
+        account: answer.account,
+    };
+    let account = commit_sign_in(host, scope, expected_epoch, session)?;
+    Ok(NativeEmailOutcome {
+        approval_required: false,
+        account,
+    })
+}
+
+/// `POST /launcher/v1/auth/email/verify`: the password AND the emailed code must match.
+pub(crate) fn verify_email_with(
+    host: &dyn SessionHost,
+    scope: &AuthScope,
+    expected_epoch: u64,
+    email: &str,
+    password: &str,
+    code: &str,
+) -> Result<NativeEmailOutcome, String> {
+    let response = http_client_for(scope)?
+        .post(format!(
+            "{}/launcher/v1/auth/email/verify",
+            scope.base_url()
+        ))
+        .json(&EmailVerifyRequest {
+            email,
+            password,
+            code,
+            device_id: "native-windows-launcher",
+            device_name: "Windows PC",
+        })
+        .send()
+        .map_err(|_| unreachable_account_server(scope))?;
+    let answer: EmailAnswer = parse_success(response, "Couldn't verify your email.")?;
+    settle_email_answer(host, scope, expected_epoch, answer)
+}
+
+/// `POST /launcher/v1/auth/password/reset`: a new password with the emailed code. It verifies the address as well.
+pub(crate) fn reset_password_with(
+    host: &dyn SessionHost,
+    scope: &AuthScope,
+    expected_epoch: u64,
+    email: &str,
+    code: &str,
+    new_password: &str,
+) -> Result<NativeEmailOutcome, String> {
+    let response = http_client_for(scope)?
+        .post(format!(
+            "{}/launcher/v1/auth/password/reset",
+            scope.base_url()
+        ))
+        .json(&PasswordResetRequest {
+            email,
+            code,
+            new_password,
+            device_id: "native-windows-launcher",
+            device_name: "Windows PC",
+        })
+        .send()
+        .map_err(|_| unreachable_account_server(scope))?;
+    let answer: EmailAnswer = parse_success(response, "Couldn't set your new password.")?;
+    settle_email_answer(host, scope, expected_epoch, answer)
+}
+
+/// The routes that send only the address (a new code, a forgotten password). A success is a generic answer.
+fn send_email_request(
+    scope: &AuthScope,
+    path: &str,
+    email: &str,
+    fallback: &str,
+) -> Result<(), String> {
+    let response = http_client_for(scope)?
+        .post(format!("{}{}", scope.base_url(), path))
+        .json(&EmailRequest { email })
+        .send()
+        .map_err(|_| unreachable_account_server(scope))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(safe_api_error(response, fallback))
+    }
+}
+
+pub(crate) fn resend_email_code_with(scope: &AuthScope, email: &str) -> Result<(), String> {
+    send_email_request(
+        scope,
+        "/launcher/v1/auth/email/resend",
+        email,
+        "Couldn't send a new code.",
+    )
+}
+
+pub(crate) fn forgot_password_with(scope: &AuthScope, email: &str) -> Result<(), String> {
+    send_email_request(
+        scope,
+        "/launcher/v1/auth/password/forgot",
+        email,
+        "Couldn't send a code.",
+    )
+}
+
+#[tauri::command]
+pub async fn native_verify_email(
+    app: AppHandle,
+    server_id: Option<String>,
+    email: String,
+    password: String,
+    code: String,
+) -> Result<NativeEmailOutcome, String> {
+    run_auth_task(move || {
+        let scope = official_email_scope(&app, server_id.as_deref())?;
+        let expected_epoch = session_epoch::current(scope.key());
+        verify_email_with(
+            &AppHost(&app),
+            &scope,
+            expected_epoch,
+            &email,
+            &password,
+            &code,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn native_resend_email_code(
+    app: AppHandle,
+    server_id: Option<String>,
+    email: String,
+) -> Result<(), String> {
+    run_auth_task(move || {
+        let scope = official_email_scope(&app, server_id.as_deref())?;
+        resend_email_code_with(&scope, &email)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn native_forgot_password(
+    app: AppHandle,
+    server_id: Option<String>,
+    email: String,
+) -> Result<(), String> {
+    run_auth_task(move || {
+        let scope = official_email_scope(&app, server_id.as_deref())?;
+        forgot_password_with(&scope, &email)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn native_reset_password(
+    app: AppHandle,
+    server_id: Option<String>,
+    email: String,
+    code: String,
+    new_password: String,
+) -> Result<NativeEmailOutcome, String> {
+    run_auth_task(move || {
+        let scope = official_email_scope(&app, server_id.as_deref())?;
+        let expected_epoch = session_epoch::current(scope.key());
+        reset_password_with(
+            &AppHost(&app),
+            &scope,
+            expected_epoch,
+            &email,
+            &code,
+            &new_password,
+        )
+    })
+    .await
+}
+
+/// [2026-10-15] The official server's play switch, read from its own status whichever server is selected (the server list
+/// marks the official server while another is chosen). No token is sent; an unreadable status is an error the UI ignores.
+#[tauri::command]
+pub async fn native_official_play() -> Result<NativeOfficialPlay, String> {
+    run_auth_task(|| {
+        fetch_status(&AuthScope::Official)
+            .map(|status| official_play_or_available(status.official_play))
     })
     .await
 }
@@ -885,6 +1264,84 @@ pub async fn native_start_discord_login(app: AppHandle) -> Result<(), String> {
             .map_err(|_| "Couldn't open Discord in your browser.".to_string())
     })
     .await
+}
+
+// ---- [2026-10-15] linking and unlinking Discord in Settings (the official account) ---------------------------------
+// Discord never creates an account: sign-in with an unlinked Discord user is refused by the backend (the callback's
+// `auth/error` deep link), and linking happens here, for the signed-in account. The callback comes back as
+// `mysticparadox://link/done` or `mysticparadox://link/error?code=...` (auth/deep_link.rs).
+
+/// The Discord address the browser is sent to: https on discord.com only, as the sign-in checks it.
+pub(crate) fn checked_discord_url(url: &str) -> Result<String, String> {
+    let parsed = Url::parse(url).map_err(|_| "Discord returned an invalid URL.".to_string())?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some("discord.com") {
+        return Err("Refusing to open a non-Discord URL.".to_string());
+    }
+    Ok(url.to_string())
+}
+
+/// `POST /launcher/v1/account/discord/link/start` with the signed-in session: the authorise address for this account.
+pub(crate) fn discord_link_start_with(
+    host: &dyn SessionHost,
+    scope: &AuthScope,
+) -> Result<String, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LinkStart {
+        authorize_url: String,
+    }
+
+    let response = send_authorized_with(host, scope, |token| {
+        http_client_for(scope)?
+            .post(format!(
+                "{}/launcher/v1/account/discord/link/start",
+                scope.base_url()
+            ))
+            .bearer_auth(token)
+            .send()
+            .map_err(|_| "Couldn't start linking Discord.".to_string())
+    })?;
+    let start: LinkStart = parse_success(response, "Couldn't start linking Discord.")?;
+    checked_discord_url(&start.authorize_url)
+}
+
+/// `DELETE /launcher/v1/account/discord` with the signed-in session: the account without its Discord link.
+pub(crate) fn unlink_discord_with(
+    host: &dyn SessionHost,
+    scope: &AuthScope,
+) -> Result<NativeAccount, String> {
+    #[derive(Deserialize)]
+    struct Unlinked {
+        account: NativeAccount,
+    }
+
+    let response = send_authorized_with(host, scope, |token| {
+        http_client_for(scope)?
+            .delete(format!("{}/launcher/v1/account/discord", scope.base_url()))
+            .bearer_auth(token)
+            .send()
+            .map_err(|_| "Couldn't reach the account server.".to_string())
+    })?;
+    let unlinked: Unlinked = parse_success(response, "Couldn't unlink Discord.")?;
+    Ok(unlinked.account)
+}
+
+/// Opens Discord's authorise page for linking this account. The result comes back by deep link.
+#[tauri::command]
+pub async fn native_start_discord_link(app: AppHandle) -> Result<(), String> {
+    run_auth_task(move || {
+        let url = discord_link_start_with(&AppHost(&app), &AuthScope::Official)?;
+        app.opener()
+            .open_url(url, None::<&str>)
+            .map_err(|_| "Couldn't open Discord in your browser.".to_string())
+    })
+    .await
+}
+
+/// Removes this account's Discord link. Refused (`AUTH_DISCORD_ONLY_LOGIN`) when Discord is its only sign-in.
+#[tauri::command]
+pub async fn native_unlink_discord(app: AppHandle) -> Result<NativeAccount, String> {
+    run_auth_task(move || unlink_discord_with(&AppHost(&app), &AuthScope::Official)).await
 }
 
 #[tauri::command]
@@ -1526,7 +1983,7 @@ mod tests {
     #[test]
     fn the_register_body_carries_consent_only_when_it_is_given() {
         let plain = RegisterRequest {
-            display_name: "Slayer",
+            display_name: Some("Slayer"),
             email: "slayer@example.com",
             password: "a long password",
             device_id: "native-windows-launcher",
@@ -1538,6 +1995,18 @@ mod tests {
             json.get("consent").is_none(),
             "a local server gets no consent field"
         );
+        assert_eq!(
+            json["displayName"], "Slayer",
+            "a local server's own form names the account"
+        );
+
+        // [2026-10-15] The official server takes no name at sign-up: the field is left out, not sent empty.
+        let unnamed = RegisterRequest {
+            display_name: None,
+            ..plain
+        };
+        let json = serde_json::to_value(&unnamed).unwrap();
+        assert!(json.get("displayName").is_none(), "no displayName is sent");
 
         let accepted = ConsentRequest {
             terms_version: "2026-10-14".into(),
@@ -1571,5 +2040,329 @@ mod tests {
         // No client: only the official scope can have a P2P host in the job.
         assert!(ends_running_game(&official, None));
         assert!(!ends_running_game(&local, None));
+    }
+
+    // ---- [2026-10-15] email codes, the approval answer, resets and the play switch ---------------------------
+
+    fn email_account(approval: &str) -> serde_json::Value {
+        serde_json::json!({
+            "userId": "user-mail", "displayName": "Slayer", "email": "slayer@example.com", "discordLinked": false,
+            "status": "active", "approvalStatus": approval, "needsUsername": false
+        })
+    }
+
+    #[test]
+    fn a_verified_email_signs_in_as_a_login_does() {
+        let (base, requests) =
+            mock_backend(vec![(200, session_json("verified", "verified-refresh"))]);
+        let scope = local("s-mail-verify", &base);
+        let host = TestHost::with(&[(&AuthScope::Official, "official-refresh-secret")]);
+        let expected = session_epoch::current(scope.key());
+
+        let outcome = verify_email_with(
+            &host,
+            &scope,
+            expected,
+            "slayer@example.com",
+            "hunter2-password",
+            "123456",
+        )
+        .unwrap();
+        assert!(!outcome.approval_required);
+        assert_eq!(outcome.account.user_id, "user-verified");
+
+        let request = requests.recv().unwrap();
+        assert_eq!(request.method, "post");
+        assert_eq!(request.path, "/launcher/v1/auth/email/verify");
+        assert!(request.text.contains("123456"));
+        assert!(request.text.contains("hunter2-password"));
+        assert!(request.text.contains("native-windows-launcher"));
+        assert!(!request.text.contains("official-refresh-secret"));
+        assert_eq!(host.token(&scope).as_deref(), Some("verified-refresh"));
+        assert_eq!(host.ended(), vec![scope.key().to_string()]);
+        assert_eq!(session_epoch::current(scope.key()), expected + 1);
+    }
+
+    #[test]
+    fn an_approval_pending_after_the_code_keeps_nothing_signed_in() {
+        let answer =
+            serde_json::json!({ "approvalRequired": true, "account": email_account("pending") });
+        let (base, requests) = mock_backend(vec![(200, answer.to_string())]);
+        let scope = local("s-mail-pending", &base);
+        let host = TestHost::with(&[(&scope, "old-local-refresh")]);
+        let expected = session_epoch::current(scope.key());
+
+        let outcome = verify_email_with(
+            &host,
+            &scope,
+            expected,
+            "slayer@example.com",
+            "pw-pw-pw-pw",
+            "123456",
+        )
+        .unwrap();
+        requests.recv().unwrap();
+        assert!(outcome.approval_required);
+        assert_eq!(outcome.account.approval_status, "pending");
+        assert_eq!(host.token(&scope), None, "no session is kept");
+        assert_eq!(host.ended(), vec![scope.key().to_string()]);
+        assert_eq!(session_epoch::current(scope.key()), expected + 1);
+    }
+
+    #[test]
+    fn a_wrong_code_reaches_the_caller_as_a_code_and_signs_nothing_out() {
+        let (base, requests) = mock_backend(vec![(400, error_json("AUTH_CODE_INVALID"))]);
+        let scope = local("s-mail-code", &base);
+        let host = TestHost::with(&[(&scope, "kept-refresh")]);
+        let error = verify_email_with(
+            &host,
+            &scope,
+            session_epoch::current(scope.key()),
+            "slayer@example.com",
+            "pw-pw-pw-pw",
+            "000000",
+        )
+        .err()
+        .unwrap();
+        requests.recv().unwrap();
+        assert!(error.starts_with("AUTH_CODE_INVALID: "), "{error}");
+        assert_eq!(host.token(&scope).as_deref(), Some("kept-refresh"));
+        assert!(host.ended().is_empty());
+    }
+
+    #[test]
+    fn an_unverified_login_reaches_the_caller_as_a_code() {
+        let (base, requests) = mock_backend(vec![(403, error_json("AUTH_EMAIL_UNVERIFIED"))]);
+        let scope = local("s-mail-login", &base);
+        let host = TestHost::default();
+        let error = login_with(
+            &host,
+            &scope,
+            session_epoch::current(scope.key()),
+            "slayer@example.com",
+            "pw-pw-pw-pw",
+        )
+        .err()
+        .unwrap();
+        requests.recv().unwrap();
+        assert!(error.starts_with("AUTH_EMAIL_UNVERIFIED: "), "{error}");
+        assert_eq!(host.token(&scope), None, "a refused sign-in saves nothing");
+    }
+
+    #[test]
+    fn a_new_code_and_a_forgotten_password_send_only_the_address() {
+        let sent = r#"{"sent":true}"#.to_string();
+        let (base, requests) = mock_backend(vec![(200, sent.clone()), (200, sent)]);
+        let scope = local("s-mail-send", &base);
+        resend_email_code_with(&scope, "slayer@example.com").unwrap();
+        let resend = requests.recv().unwrap();
+        forgot_password_with(&scope, "slayer@example.com").unwrap();
+        let forgot = requests.recv().unwrap();
+        assert_eq!(resend.path, "/launcher/v1/auth/email/resend");
+        assert_eq!(forgot.path, "/launcher/v1/auth/password/forgot");
+        for request in [&resend, &forgot] {
+            assert!(request.text.contains("slayer@example.com"));
+            assert!(!request.text.contains("authorization"), "no token is sent");
+        }
+    }
+
+    #[test]
+    fn a_server_that_cannot_send_email_says_so_as_a_code() {
+        let (base, requests) = mock_backend(vec![(503, error_json("AUTH_EMAIL_UNAVAILABLE"))]);
+        let scope = local("s-mail-down", &base);
+        let error = forgot_password_with(&scope, "slayer@example.com")
+            .err()
+            .unwrap();
+        requests.recv().unwrap();
+        assert!(error.starts_with("AUTH_EMAIL_UNAVAILABLE: "), "{error}");
+        assert!(error.contains("isn't available"), "{error}");
+    }
+
+    #[test]
+    fn a_reset_sends_the_code_and_the_new_password_and_signs_in() {
+        let (base, requests) = mock_backend(vec![(200, session_json("reset", "reset-refresh"))]);
+        let scope = local("s-mail-reset", &base);
+        let host = TestHost::default();
+        let expected = session_epoch::current(scope.key());
+
+        let outcome = reset_password_with(
+            &host,
+            &scope,
+            expected,
+            "slayer@example.com",
+            "654321",
+            "brand-new-pass",
+        )
+        .unwrap();
+        assert!(!outcome.approval_required);
+        let request = requests.recv().unwrap();
+        assert_eq!(request.path, "/launcher/v1/auth/password/reset");
+        assert!(request.text.contains("654321"));
+        assert!(request.text.contains("brand-new-pass"));
+        assert!(
+            request.text.contains("newpassword"),
+            "the body names newPassword"
+        );
+        assert_eq!(host.token(&scope).as_deref(), Some("reset-refresh"));
+        assert_eq!(session_epoch::current(scope.key()), expected + 1);
+    }
+
+    #[test]
+    fn the_email_routes_belong_to_the_official_backend_only() {
+        assert!(require_official_email(AuthScope::Official).is_ok());
+        assert_eq!(
+            require_official_email(local("s-mail-local", "http://127.0.0.1:9")),
+            Err(EMAIL_CODES_ON_OFFICIAL_ONLY.to_string())
+        );
+    }
+
+    #[test]
+    fn a_registration_that_emailed_a_code_says_so() {
+        let account = email_account("pending");
+        let coded: PendingRegistration = serde_json::from_str(
+            &serde_json::json!({ "approvalRequired": true, "verificationRequired": true, "email": "a@example.com", "account": account })
+                .to_string(),
+        )
+        .unwrap();
+        assert!(coded.verification_required);
+        let plain: PendingRegistration =
+            serde_json::from_str(&serde_json::json!({ "account": account }).to_string()).unwrap();
+        assert!(!plain.verification_required);
+    }
+
+    #[test]
+    fn the_official_play_switch_is_read_and_a_missing_one_is_available() {
+        let status = r#"{"online":true,"supportedBuildChangelist":647472,"officialPlay":{"available":false,"message":"Maintenance until 18:00."}}"#;
+        let (base, requests) = mock_backend(vec![(200, status.to_string())]);
+        let scope = local("s-mail-play", &base);
+        let read = fetch_status(&scope).unwrap();
+        requests.recv().unwrap();
+        assert_eq!(
+            read.official_play,
+            Some(NativeOfficialPlay {
+                available: false,
+                message: Some("Maintenance until 18:00.".to_string()),
+            })
+        );
+        assert!(!official_play_or_available(read.official_play).available);
+
+        // An older backend sends no field: the official server is available, with no note.
+        assert_eq!(
+            official_play_or_available(None),
+            NativeOfficialPlay {
+                available: true,
+                message: None,
+            }
+        );
+        // A field without `available` counts as available too.
+        let partial: NativeOfficialPlay = serde_json::from_str(r#"{"message":"x"}"#).unwrap();
+        assert!(partial.available);
+    }
+
+    #[test]
+    fn the_email_refusals_lead_with_their_code() {
+        assert_eq!(
+            api_error_message(403, Some("AUTH_EMAIL_UNVERIFIED"), "x"),
+            "AUTH_EMAIL_UNVERIFIED: Check your email for the 6-digit code."
+        );
+        assert!(api_error_message(400, Some("AUTH_CODE_INVALID"), "x")
+            .starts_with("AUTH_CODE_INVALID: That code is wrong or has expired."));
+        assert_eq!(
+            api_error_message(503, Some("AUTH_EMAIL_UNAVAILABLE"), "x"),
+            "AUTH_EMAIL_UNAVAILABLE: Email isn't available on this server right now."
+        );
+        assert_eq!(
+            api_error_message(409, Some("OFFICIAL_PLAY_UNAVAILABLE"), "x"),
+            OFFICIAL_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn linking_discord_starts_with_the_session_and_opens_only_discord() {
+        let (base, requests) = mock_backend(vec![(
+            200,
+            r#"{"authorizeUrl":"https://discord.com/oauth2/authorize?client_id=1&state=2"}"#
+                .to_string(),
+        )]);
+        let scope = local("s-discord-link", &base);
+        let host = TestHost::default();
+        // A cached access token, so the call goes straight out with the signed-in session.
+        let session = NativeSession {
+            access_token: access_token("linking"),
+            refresh_token: "r".into(),
+            account: serde_json::from_str::<NativeSession>(&session_json("linking", "r"))
+                .unwrap()
+                .account,
+        };
+        cache_access(&scope, session_epoch::current(scope.key()), &session);
+
+        let url = discord_link_start_with(&host, &scope).unwrap();
+        assert!(url.starts_with("https://discord.com/oauth2/authorize"));
+        let request = requests.recv().unwrap();
+        assert_eq!(request.method, "post");
+        assert_eq!(request.path, "/launcher/v1/account/discord/link/start");
+        assert!(request
+            .text
+            .contains(&access_token("linking").to_lowercase()));
+    }
+
+    #[test]
+    fn a_discord_address_is_opened_only_over_https_on_discord() {
+        assert!(checked_discord_url("https://discord.com/oauth2/authorize?x=1").is_ok());
+        assert!(checked_discord_url("http://discord.com/oauth2/authorize").is_err());
+        assert!(checked_discord_url("https://discord.example.com/oauth2").is_err());
+        assert!(checked_discord_url("https://evil.example/discord.com").is_err());
+        assert!(checked_discord_url("not a url").is_err());
+    }
+
+    #[test]
+    fn unlinking_returns_the_account_and_a_sole_sign_in_is_refused_as_a_sentence() {
+        let mut account = email_account("approved");
+        account["discord"] = serde_json::json!({ "linked": false });
+        let (base, requests) = mock_backend(vec![(
+            200,
+            serde_json::json!({ "account": account }).to_string(),
+        )]);
+        let scope = local("s-discord-unlink", &base);
+        let host = TestHost::default();
+        let session = NativeSession {
+            access_token: access_token("unlinking"),
+            refresh_token: "r".into(),
+            account: serde_json::from_str::<NativeSession>(&session_json("unlinking", "r"))
+                .unwrap()
+                .account,
+        };
+        cache_access(&scope, session_epoch::current(scope.key()), &session);
+
+        let unlinked = unlink_discord_with(&host, &scope).unwrap();
+        assert_eq!(
+            unlinked.discord,
+            Some(NativeDiscordLink {
+                linked: false,
+                username: None,
+            })
+        );
+        let request = requests.recv().unwrap();
+        assert_eq!(request.method, "delete");
+        assert_eq!(request.path, "/launcher/v1/account/discord");
+
+        let (base, requests) = mock_backend(vec![(409, error_json("AUTH_DISCORD_ONLY_LOGIN"))]);
+        let scope = local("s-discord-only", &base);
+        cache_access(&scope, session_epoch::current(scope.key()), &session);
+        let error = unlink_discord_with(&host, &scope).err().unwrap();
+        requests.recv().unwrap();
+        assert_eq!(
+            error,
+            "Discord is this account's only sign-in, so it can't be unlinked."
+        );
+    }
+
+    #[test]
+    fn an_account_without_the_discord_field_is_read_as_unknown() {
+        let account: NativeAccount = serde_json::from_value(email_account("approved")).unwrap();
+        assert_eq!(
+            account.discord, None,
+            "a missing field is unknown, not unlinked"
+        );
     }
 }

@@ -340,6 +340,65 @@ pub async fn check_runtime_update(
     })
 }
 
+/// [2026-10-15] About -> Runtime: whether the INSTALLED runtime DLL is the signed release. It goes through the same check
+/// the updater applies before it installs a file (`verify_manifest`: the size and sha256 of the signed manifest, and its
+/// Ed25519 signature under the built-in runtime key). Read-only: nothing is installed or written.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeVerification {
+    pub verified: bool,
+    /// One line for the About page when `verified` is false.
+    pub reason: Option<String>,
+    /// The version of the signed release the file was checked against.
+    pub version: Option<String>,
+}
+
+fn not_verified(reason: &str, version: Option<String>) -> RuntimeVerification {
+    RuntimeVerification {
+        verified: false,
+        reason: Some(reason.to_string()),
+        version,
+    }
+}
+
+#[tauri::command]
+pub async fn verify_installed_runtime(
+    app: AppHandle,
+    channel: String,
+) -> Result<RuntimeVerification, String> {
+    let target = servers::active_target(&app);
+    if !target.uses_official_feed() {
+        return Ok(not_verified(
+            "This server's runtime files are its own, not the signed release.",
+            None,
+        ));
+    }
+    let (manifest, _token) = fetch_channel_manifest(&app, &channel).await?;
+    let Some(manifest) = manifest else {
+        return Ok(not_verified(
+            "No signed runtime is published for this channel yet.",
+            None,
+        ));
+    };
+    let version = Some(manifest.version.clone());
+    let path = target.install_dir()?.join(RUNTIME_DLL_NAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(not_verified("The runtime file is not installed.", version)),
+    };
+    match verify_manifest(&manifest, &bytes) {
+        Ok(()) => Ok(RuntimeVerification {
+            verified: true,
+            reason: None,
+            version,
+        }),
+        Err(reason) => Ok(not_verified(
+            &format!("The installed runtime is not the signed release: {reason}"),
+            version,
+        )),
+    }
+}
+
 #[tauri::command]
 pub async fn install_runtime_update(
     app: AppHandle,
@@ -758,5 +817,29 @@ mod tests {
         assert!(!is_safe_extra_name(RUNTIME_DLL_NAME));
         assert!(!is_safe_extra_name("mysticparadox.dll"));
         assert!(!is_safe_extra_name("MYSTICPARADOX.DLL"));
+    }
+
+    #[test]
+    fn an_installed_runtime_that_is_not_the_signed_release_is_refused() {
+        // [2026-10-15] About -> Runtime checks the installed DLL with verify_manifest: a file of another size or hash
+        // is refused before any signature is read.
+        let installed = b"installed runtime bytes".to_vec();
+        let manifest = |size: usize, sha256: &str| RuntimeManifest {
+            version: "0.2.136".to_string(),
+            target_changelist: TARGET_CHANGELIST,
+            size,
+            sha256: sha256.to_string(),
+            signature: String::new(),
+            url: String::new(),
+            extra_files: Vec::new(),
+        };
+        let wrong_size =
+            verify_manifest(&manifest(installed.len() + 1, &"00".repeat(32)), &installed);
+        assert!(wrong_size
+            .unwrap_err()
+            .contains("does not match the supported game build"));
+
+        let wrong_hash = verify_manifest(&manifest(installed.len(), &"00".repeat(32)), &installed);
+        assert!(wrong_hash.unwrap_err().contains("hash verification failed"));
     }
 }

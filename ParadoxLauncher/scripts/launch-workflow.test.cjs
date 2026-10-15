@@ -63,6 +63,9 @@ const sessionsLib = load('src/lib/sessions.ts', {});
 // [2026-10-14] The realm naming rule (a pure module) and the launcher's dropdown, loaded for real. Every factory that
 // imports either one maps its import to these.
 const serverNames = load('src/servers/serverNames.ts', {});
+// [2026-10-15] The email-code and Discord rules, and the official server's play switch: pure modules, loaded for real.
+const authRules = load('src/auth/authRules.ts', {});
+const officialPlayLib = load('src/servers/officialPlay.ts', {});
 const dropdownLib = load('src/components/Dropdown.tsx', { './icons': icons });
 const services = { health: 'online', checkedAt: 0, refreshing: false, supportedChangelist: 647472, refresh: async () => {} };
 // [2026-10-13 realms S5] The selected-server state, as a screen under test sees it.
@@ -75,7 +78,7 @@ const install = { located: true, exeSha256: 'approved', runtimeRepairRequired: f
 const noTrust = () => ({ notice: null, dismissNotice() {}, ensureHost: async () => true, trustNewHost: async () => false });
 const Banner = ({ tone, children, onDismiss }) => React.createElement('div', { className: 'banner', 'data-tone': tone ?? 'danger' },
   children, onDismiss ? React.createElement('button', { type: 'button', onClick: onDismiss }, 'Dismiss') : null);
-function home(api, refreshPolicy = async () => policy, serviceState = services, { trust = noTrust(), selected, rules = accountRulesDefault() } = {}) {
+function home(api, refreshPolicy = async () => policy, serviceState = services, { trust = noTrust(), selected, rules = accountRulesDefault(), officialPlay = null } = {}) {
   return load('src/screens/dashboard/HomeTab.tsx', {
     '../../auth/AuthContext': { useAuth: () => ({ account }) },
     '../../auth/AccountRules': { useAccountRules: () => rules },
@@ -83,7 +86,7 @@ function home(api, refreshPolicy = async () => policy, serviceState = services, 
     '../../lib/accountDeletion': accountDeletionLib,
     '../../policy/PolicyContext': { usePolicy: () => ({ policy, refreshPolicy }) },
     '../../services/ServicesContext': { useServices: () => serviceState },
-    '../../servers/ServerContext': { useServer: () => ({ ...serverCtx, selected }) },
+    '../../servers/ServerContext': { useServer: () => ({ ...serverCtx, selected, officialPlay }) },
     '../../servers/RealmTrust': { useRealmTrust: () => trust },
     '../../components/Banner': { Banner },
     '../../components/LocalServerWarning': { LocalServerBadge },
@@ -103,6 +106,8 @@ function home(api, refreshPolicy = async () => policy, serviceState = services, 
     '../../components/AetherMark': { AetherMark: () => null },
     '../../components/ArtBackdrop': { ArtBackdrop: () => null, heroArt: 'art.webp' },
     '../../servers/serverNames': serverNames,
+    '../../servers/officialPlay': officialPlayLib,
+    '@tauri-apps/api/app': { getVersion: async () => '0.1.67' },
   }).HomeTab;
 }
 
@@ -283,8 +288,9 @@ test('late restore and cancelled Discord completion cannot sign the user back in
     '@tauri-apps/api/event': { listen: async (name, callback) => {
       listeners.set(name, callback); return () => listeners.delete(name);
     } },
-    '../api/client': { LauncherApiError: class extends Error {} },
+    '../api/client': { LauncherApiError: class LauncherApiErrorFake extends Error { constructor(code, message) { super(message); this.code = code; } } },
     '../servers/ServerContext': { useServer: () => ({ ready: true, serverId: undefined, needsAck: false, officialNetwork: true }) },
+    './authRules': authRules,
   });
   function Probe() { context = useAuth(); return null; }
   function App() { return React.createElement(AuthProvider, null, React.createElement(Probe)); }
@@ -448,6 +454,7 @@ function addServerForm(api, context, trust = noTrust()) {
 function serversTab(api, context = serverCtx, panels = [], trust = noTrust()) {
   return load('src/screens/dashboard/ServersTab.tsx', {
     '../../servers/serverNames': serverNames,
+    '../../servers/officialPlay': officialPlayLib,
     '../../api/tauri': { listServers: async () => [officialServer, localServer], ...api },
     '../../components/Button': { Button: TestButton },
     '../../components/ArtBackdrop': { ArtBackdrop: () => null },
@@ -607,7 +614,7 @@ const plainButton = ({ children, loading, loadingLabel, variant, size, block, ..
 function realServerContext(api) {
   const Modal = load('src/components/Modal.tsx', {});
   const warning = load('src/components/LocalServerWarning.tsx', { './Button': { Button: plainButton }, './Modal': Modal });
-  return load('src/servers/ServerContext.tsx', { '../api/tauri': api, '../components/LocalServerWarning': warning });
+  return load('src/servers/ServerContext.tsx', { '../api/tauri': { getOfficialPlay: async () => ({ available: true }), ...api }, '../components/LocalServerWarning': warning });
 }
 // ---- [2026-10-14] Terms of Use, consent and account deletion ----------------------------------------------------
 // The legal text is the owner's: these tests use short stand-ins for the viewer, and read the real files only for the
@@ -784,8 +791,9 @@ function authHarness(initial, handlers = {}) {
       return handlers[command] ? handlers[command](args) : Promise.resolve();
     } },
     '@tauri-apps/api/event': { listen: async (name, callback) => { listeners.set(name, callback); return () => listeners.delete(name); } },
-    '../api/client': { LauncherApiError: class extends Error {} },
+    '../api/client': { LauncherApiError: class LauncherApiErrorFake extends Error { constructor(code, message) { super(message); this.code = code; } } },
     '../servers/ServerContext': { useServer: () => server.current },
+    './authRules': authRules,
   });
   let context;
   function Probe() { context = useAuth(); return null; }
@@ -801,6 +809,7 @@ test('every account call names the server it is for, and a switch restores that 
   const harness = authHarness(officialServerState, {
     native_restore_session: ({ serverId }) => Promise.resolve(serverId === 'official' ? account : null),
     native_login: () => Promise.resolve(localAccount),
+    native_register: () => Promise.resolve({ account: { ...localAccount, approvalStatus: 'pending' }, verificationRequired: false }),
   });
   await mount(harness.App);
   assert.equal(harness.context.status, 'signedIn');
@@ -821,7 +830,7 @@ test('every account call names the server it is for, and a switch restores that 
   assert.equal(harness.context.status, 'signedIn');
   assert.equal(harness.context.account.userId, 'local-user');
 
-  await act(async () => harness.context.register('Friend', 'friend@example.com', 'a long password'));
+  await act(async () => harness.context.register('friend@example.com', 'a long password', undefined, 'Friend'));
   assert.deepEqual(harness.calls.at(-1), ['native_register', { serverId: 's-1', displayName: 'Friend', email: 'friend@example.com', password: 'a long password' }]);
   await act(async () => harness.context.logout());
   assert.deepEqual(harness.calls.at(-1), ['native_logout', { serverId: 's-1' }]);
@@ -893,7 +902,7 @@ test('the sign-in card names a local server and offers no Discord there', async 
   await mount(loginScreen({ selected: { ...localEntry, acknowledged: true, selected: true }, officialNetwork: false }), { onCreateAccount() {} });
   assert.match(document.querySelector('h1').textContent, /Sign in to My server/);
   assert.match(document.body.textContent, /never sees it/);
-  assert.equal(button('Continue with Discord'), undefined);
+  assert.equal(button('Sign in with Discord'), undefined);
   assert.ok(button('Sign in'));
   assert.match(document.body.textContent, /New to this server\?/);
   assert.ok(document.getElementById('switcher'), 'the card lets the player switch server');
@@ -902,7 +911,7 @@ test('the sign-in card names a local server and offers no Discord there', async 
 test('the official sign-in card is unchanged and keeps Discord', async () => {
   await mount(loginScreen({ selected: officialEntry, officialNetwork: true }), { onCreateAccount() {} });
   assert.match(document.querySelector('h1').textContent, /Welcome back, Slayer/);
-  assert.ok(button('Continue with Discord'));
+  assert.ok(button('Sign in with Discord'));
   assert.match(document.body.textContent, /New to Mystic Paradox\?/);
 });
 
@@ -937,6 +946,7 @@ test('the services chip checks the selected server and drops an answer for the o
   const { ServicesProvider, useServices } = load('src/services/ServicesContext.tsx', {
     '../api/tauri': { getServerStatus: (serverId) => { asked.push(serverId); return pending[asked.length - 1].promise; } },
     '../servers/ServerContext': { useServer: () => server.current },
+    './authRules': authRules,
   });
   let context;
   function Probe() { context = useServices(); return null; }
@@ -1826,6 +1836,7 @@ function switcherContext(servers, extra = {}) {
 }
 function serverSwitcher(api = {}, context = switcherContext([officialServer]), trust = noTrust()) {
   return load('src/components/ServerSwitcher.tsx', {
+    '../servers/officialPlay': officialPlayLib,
     '../servers/ServerContext': { useServer: () => context },
     '../servers/AddServerForm': { AddServerForm: addServerForm(api, context, trust) },
     '../servers/serverNames': serverNames,
@@ -1998,6 +2009,7 @@ test('Escape closes only the innermost dialog, so a document opened from a dialo
 
 function registerScreen(serverState, sent) {
   return load('src/screens/RegisterScreen.tsx', {
+    '../auth/authRules': authRules,
     '../servers/serverNames': serverNames,
     '../auth/AuthContext': { useAuth: () => ({ register: async (...args) => { sent.push(args); } }), describeAuthError: plainError },
     '../components/TextField': { TextField: TextFieldPlain, RevealToggle: () => null },
@@ -2033,7 +2045,9 @@ test('registration waits for the age and the documents, then sends the current v
   await act(async () => checkboxOf('I agree').click());
   assert.equal(button('Create account').disabled, false);
   await act(async () => button('Create account').click());
-  assert.deepEqual(sent[0], ['Slayer', 'slayer@example.com', 'a long password', { termsVersion: legalMeta.LEGAL.termsVersion, privacyVersion: legalMeta.LEGAL.privacyVersion, ageConfirmed: true }]);
+  // [2026-10-15] No name is asked for or sent on the official server: the account names itself after the code.
+  assert.deepEqual(sent[0].slice(0, 3), ['slayer@example.com', 'a long password', { termsVersion: legalMeta.LEGAL.termsVersion, privacyVersion: legalMeta.LEGAL.privacyVersion, ageConfirmed: true }]);
+  assert.equal(sent[0][3], undefined, 'the official sign-up sends no name');
 });
 
 test('the document names in the registration boxes open the documents and do not tick the box', async () => {
@@ -2058,15 +2072,17 @@ test('a local server registers as before: no document boxes, and nothing about t
     typeInto(field('Confirm password'), 'a long password');
   });
   await act(async () => button('Create account').click());
-  assert.equal(sent[0][3], undefined, 'the local server gets no consent');
+  assert.equal(sent[0][2], undefined, 'the local server gets no consent');
+  assert.equal(sent[0][3], 'Slayer', 'a local server takes the name on its own form');
 });
 
 test('the official register call carries the consent, and a local one does not', async () => {
-  const harness = authHarness(officialServerState, { native_register: () => Promise.resolve(localAccount) });
+  const harness = authHarness(officialServerState, { native_register: () => Promise.resolve({ account: localAccount, verificationRequired: false }) });
   await mount(harness.App);
   const consent = { termsVersion: '2026-10-14', privacyVersion: '2026-10-14', ageConfirmed: true };
-  await act(async () => harness.context.register('Slayer', 'slayer@example.com', 'a long password', consent));
-  assert.deepEqual(harness.calls.at(-1), ['native_register', { serverId: 'official', displayName: 'Slayer', email: 'slayer@example.com', password: 'a long password', consent }]);
+  await act(async () => harness.context.register('slayer@example.com', 'a long password', consent));
+  // [2026-10-15] The official account names itself after sign-in: no displayName is sent.
+  assert.deepEqual(harness.calls.at(-1), ['native_register', { serverId: 'official', email: 'slayer@example.com', password: 'a long password', consent }]);
 });
 
 function accountRulesHarness(api, serverState = officialServerState) {
@@ -2240,6 +2256,7 @@ function accountTab(rules, serverState = officialServerState) {
     '../../components/Button': { Button: plainButton },
     '../../components/DeactivationBanner': { DeactivationBanner },
     '../../components/DeleteAccountDialog': { DeleteAccountDialog },
+    '../../components/Banner': { Banner },
     '../../components/LegalDocument': LegalDocument,
     '../../legal/legalMeta': legalMeta,
   }).AccountTab;
@@ -2358,7 +2375,7 @@ test('About links the Terms of Use and the Privacy Policy, read in the launcher'
 });
 
 // [2026-10-15] About -> "Check against GitHub" (components/PublicBuildCheck.tsx).
-test('the build check asks GitHub only when the button is pressed, and shows each file\'s result', async () => {
+test('the build check runs once at startup, is kept for the session, and the button checks again', async () => {
   let calls = 0;
   const report = {
     repository: 'pranav158/Mystic-Paradox',
@@ -2369,15 +2386,20 @@ test('the build check asks GitHub only when the button is pressed, and shows eac
       { name: 'MysticParadox.dll', label: 'Runtime', installedSha256: 'c4'.repeat(32), status: 'operatorBuild', note: 'Built by the operator.' },
     ],
   };
-  const { PublicBuildCheck } = load('src/components/PublicBuildCheck.tsx', {
+  const buildCheck = load('src/components/PublicBuildCheck.tsx', {
     '../api/tauri': { checkPublicBuilds: async () => { calls += 1; return report; } },
+    '../api/updates': { verifyInstalledRuntime: async () => ({ verified: true, version: '0.2.136' }) },
+    '../policy/PolicyContext': { usePolicy: () => ({ policy: { channel: 'stable' } }) },
     './Button': { Button: plainButton },
   });
-  await mount(PublicBuildCheck);
-  assert.equal(calls, 0, 'nothing is asked of GitHub before the button');
-  await act(async () => button('Check against GitHub').click());
+  // [2026-10-15] The launcher asks GitHub once at startup; About shows that result and does not ask again by itself.
+  buildCheck.startPublicBuildCheckAtStartup();
   await act(async () => {});
-  assert.equal(calls, 1);
+  assert.equal(calls, 1, 'the check runs at startup, without a button press');
+  await mount(buildCheck.PublicBuildCheck);
+  await act(async () => {});
+  assert.equal(calls, 1, 'About shows the result kept for this session');
+  assert.ok(document.body.textContent.includes('The launcher checks at startup'));
   const rows = [...document.querySelectorAll('.build-check-row')];
   assert.deepEqual(rows.map((row) => row.dataset.status), ['differs', 'match', 'operatorBuild']);
   assert.ok(rows[0].textContent.includes('Differs'));
@@ -2385,6 +2407,12 @@ test('the build check asks GitHub only when the button is pressed, and shows eac
   assert.ok(!rows[1].textContent.includes('Published'), 'a match shows one hash');
   assert.ok(document.body.textContent.includes('gh attestation verify "C:\\L\\launcher.exe" --repo pranav158/Mystic-Paradox'));
   assert.ok(button('Check again'), 'the button offers a second check');
+  // The runtime row shows the signed-release check (Verified), not the grey operator-build chip.
+  assert.ok(rows[2].textContent.includes('Verified'));
+  assert.equal(rows[2].textContent.includes('Operator build'), false);
+  await act(async () => button('Check again').click());
+  await act(async () => {});
+  assert.equal(calls, 2, 'the button runs the check again');
 });
 
 // ---- [2026-10-14] The launcher's dropdown, and a realm named by its realm name --------------------------------------
@@ -2647,6 +2675,7 @@ test('choosing a server with the keyboard keeps focus on the server dropdown, no
     };
   };
   const switcher = load('src/components/ServerSwitcher.tsx', {
+    '../servers/officialPlay': officialPlayLib,
     '../servers/ServerContext': { useServer: serverState },
     '../servers/AddServerForm': { AddServerForm: () => null },
     '../servers/serverNames': serverNames,
@@ -2765,4 +2794,349 @@ test('Library names a realm by its realm name on the Installed line', async () =
   });
   await mount(LibraryTab);
   assert.match(document.body.textContent, /Installed · mysticfox/);
+});
+
+// ---- [2026-10-15] launcher 0.1.67: email codes, password resets, Discord linking, the official play switch ----------
+
+test('the official server is unavailable only when its own status says so, and the Home badge names the state', () => {
+  const { officialUnavailable, officialUnavailableNote, serverUnavailable, serverStatusBadge, OFFICIAL_UNAVAILABLE_NOTE } = officialPlayLib;
+  assert.equal(officialUnavailable(null), false, 'no status read is not unavailable');
+  assert.equal(officialUnavailable({ available: true }), false);
+  assert.equal(officialUnavailable({ available: false }), true);
+  assert.equal(officialUnavailableNote({ available: false, message: '  Back at 18:00.  ' }), 'Back at 18:00.');
+  assert.equal(officialUnavailableNote({ available: false }), OFFICIAL_UNAVAILABLE_NOTE);
+  assert.equal(OFFICIAL_UNAVAILABLE_NOTE, 'The official server is currently unavailable. Join or host a realm.');
+  assert.equal(serverUnavailable({ kind: 'paradox_realm' }, { available: false }), false, 'a realm is not the official server');
+  assert.equal(serverUnavailable({ kind: 'official' }, { available: false }), true);
+  assert.deepEqual(serverStatusBadge({ kind: 'official', health: 'online', officialPlay: { available: false } }), { text: 'Unavailable', tone: 'bad' });
+  assert.deepEqual(serverStatusBadge({ kind: 'official', health: 'degraded', officialPlay: null }), { text: 'Degraded', tone: 'warn' });
+  assert.deepEqual(serverStatusBadge({ kind: 'paradox_realm', health: 'unreachable', officialPlay: null }), { text: 'Unavailable', tone: 'bad' });
+  assert.deepEqual(serverStatusBadge({ kind: 'official', health: 'online', officialPlay: { available: true } }), { text: 'Online', tone: 'good' });
+  assert.equal(serverStatusBadge({ kind: 'official', health: 'checking', officialPlay: null }), null);
+});
+
+test('a refusal carries its code: the email screens read the code, other refusals keep their words', () => {
+  const { authErrorCode, stripAuthCode, codeDigits, isCodeComplete, passwordProblem, discordLinkErrorText, AUTH_CODE_COPY } = authRules;
+  assert.equal(authErrorCode('AUTH_CODE_INVALID: That code is wrong.'), 'AUTH_CODE_INVALID');
+  assert.equal(authErrorCode(new Error('AUTH_EMAIL_UNVERIFIED: Check your email.')), 'AUTH_EMAIL_UNVERIFIED');
+  assert.equal(authErrorCode('The email or password is incorrect.'), null);
+  assert.equal(stripAuthCode('AUTH_RATE_LIMITED: Too many attempts.'), 'Too many attempts.');
+  assert.equal(codeDigits(' 12-34 5x6789 '), '123456');
+  assert.equal(isCodeComplete('12345'), false);
+  assert.equal(isCodeComplete('123456'), true);
+  assert.equal(passwordProblem('short', 'short'), 'Password must be at least 8 characters.');
+  assert.equal(passwordProblem('a long password', 'a long passwore'), "Passwords don't match.");
+  assert.equal(passwordProblem('a long password', 'a long password'), null);
+  assert.equal(AUTH_CODE_COPY.AUTH_CODE_INVALID, 'That code is wrong or has expired. Check the latest email or resend the code.');
+  assert.equal(discordLinkErrorText('AUTH_DISCORD_ALREADY_LINKED'), 'That Discord account is already linked to another Mystic Paradox account.');
+  assert.equal(discordLinkErrorText('AUTH_DISCORD_ACCOUNT_HAS_LINK'), 'This account already has a Discord account linked.');
+  assert.equal(discordLinkErrorText('AUTH_DISCORD_CANCELLED'), "Discord linking didn't complete. Please try again.");
+});
+
+test('a sign-in refused as unverified opens the code screen, a wrong code stays there, and the right one signs in', async () => {
+  const verifications = [];
+  const harness = authHarness(officialServerState, {
+    native_login: () => Promise.reject('AUTH_EMAIL_UNVERIFIED: Check your email for the 6-digit code.'),
+    native_verify_email: (args) => {
+      verifications.push(args);
+      return args.code === '123456'
+        ? Promise.resolve({ approvalRequired: false, account })
+        : Promise.reject('AUTH_CODE_INVALID: That code is wrong or has expired. Check the latest email or resend the code.');
+    },
+  });
+  await mount(harness.App);
+  await act(async () => harness.context.login('slayer@example.com', 'a long password'));
+  assert.equal(harness.context.status, 'awaitingEmailCode');
+  assert.equal(harness.context.codeEmail, 'slayer@example.com');
+
+  let failure = null;
+  await act(async () => {
+    try {
+      await harness.context.verifyEmailCode('000000');
+    } catch (error) {
+      failure = error;
+    }
+  });
+  assert.match(failure, /^AUTH_CODE_INVALID: /);
+  assert.equal(harness.context.status, 'awaitingEmailCode', 'a wrong code keeps the code screen');
+
+  await act(async () => harness.context.verifyEmailCode('123456'));
+  assert.deepEqual(verifications.at(-1), { serverId: 'official', email: 'slayer@example.com', password: 'a long password', code: '123456' });
+  assert.equal(harness.context.status, 'signedIn');
+  assert.equal(harness.context.codeEmail, null, 'the password is not kept once signed in');
+});
+
+test('a sign-up on the official server sends no name, then the code, and the set-username step follows', async () => {
+  const harness = authHarness(officialServerState, {
+    native_register: () => Promise.resolve({ account: { ...account, approvalStatus: 'pending' }, verificationRequired: true }),
+    native_verify_email: () => Promise.resolve({ approvalRequired: false, account: { ...account, needsUsername: true } }),
+  });
+  await mount(harness.App);
+  const consent = { termsVersion: '2026-10-14', privacyVersion: '2026-10-14', ageConfirmed: true };
+  await act(async () => harness.context.register('new@example.com', 'a long password', consent));
+  assert.equal(harness.context.status, 'awaitingEmailCode');
+  const registration = harness.calls.find(([command]) => command === 'native_register');
+  assert.equal('displayName' in registration[1], false, 'no displayName is sent');
+  await act(async () => harness.context.verifyEmailCode('123456'));
+  assert.equal(harness.context.status, 'awaitingUsername', 'the existing set-username step shows next');
+});
+
+test('an account the server holds for approval after its code keeps no session and shows the approval screen', async () => {
+  const harness = authHarness(officialServerState, {
+    native_register: () => Promise.resolve({ account: { ...account, approvalStatus: 'pending' }, verificationRequired: true }),
+    native_verify_email: () => Promise.resolve({ approvalRequired: true, account: { ...account, approvalStatus: 'pending' } }),
+  });
+  await mount(harness.App);
+  await act(async () => harness.context.register('new@example.com', 'a long password', undefined, undefined));
+  await act(async () => harness.context.verifyEmailCode('123456'));
+  assert.equal(harness.context.status, 'pendingApproval');
+  assert.equal(harness.context.account.approvalStatus, 'pending');
+  assert.equal(harness.calls.some(([command]) => command === 'native_refresh_account'), false, 'no session is read');
+});
+
+test('forgot password sends a code, and the reset with that code signs the account in', async () => {
+  const harness = authHarness(officialServerState, {
+    native_forgot_password: () => Promise.resolve(),
+    native_reset_password: () => Promise.resolve({ approvalRequired: false, account }),
+  });
+  await mount(harness.App);
+  await act(async () => harness.context.startPasswordReset());
+  assert.equal(harness.context.status, 'passwordReset');
+  await act(async () => harness.context.sendPasswordResetCode('slayer@example.com'));
+  assert.deepEqual(harness.calls.at(-1), ['native_forgot_password', { serverId: 'official', email: 'slayer@example.com' }]);
+  await act(async () => harness.context.completePasswordReset('slayer@example.com', '123456', 'brand new pass'));
+  assert.deepEqual(harness.calls.at(-1), ['native_reset_password', { serverId: 'official', email: 'slayer@example.com', code: '123456', newPassword: 'brand new pass' }]);
+  assert.equal(harness.context.status, 'signedIn');
+});
+
+test('a Discord link ends by deep link: link/done refreshes the account, link/error reads its code, and a sign-in never creates an account', async () => {
+  const harness = authHarness(officialServerState, {
+    native_refresh_account: () => Promise.resolve({ ...account, discord: { linked: true, username: 'MysticFox' } }),
+  });
+  await mount(harness.App);
+  await act(async () => harness.listeners.get('discord-link-done')());
+  assert.equal(harness.context.discordLinkNotice.text, 'Discord linked.');
+  assert.equal(harness.context.account.discord.username, 'MysticFox', 'the account is read again');
+
+  await act(async () => harness.listeners.get('discord-link-error')({ payload: 'AUTH_DISCORD_ALREADY_LINKED' }));
+  assert.equal(harness.context.discordLinkNotice.tone, 'error');
+  assert.equal(harness.context.discordLinkNotice.text, 'That Discord account is already linked to another Mystic Paradox account.');
+
+  await act(async () => harness.listeners.get('discord-auth-error')({ payload: 'AUTH_DISCORD_NOT_LINKED' }));
+  assert.equal(harness.context.status, 'signedOut');
+  assert.equal(harness.context.authError, 'Your Discord isn\'t linked to a Mystic Paradox account. Register with your email, then link Discord on the Account page.');
+});
+
+// The code screens and the reset flow, loaded for real. describeAuthError is the real one from AuthContext.
+const authContextModule = load('src/auth/AuthContext.tsx', {
+  '@tauri-apps/api/core': { invoke: async () => {} },
+  '@tauri-apps/api/event': { listen: async () => () => {} },
+  '../api/client': { LauncherApiError: class extends Error {} },
+  '../servers/ServerContext': { useServer: () => officialServerState },
+  './authRules': authRules,
+});
+const screenAuthLayout = {
+  AuthLayout: ({ children }) => React.createElement('div', null, children),
+  AuthCard: ({ title, subtitle, children }) => React.createElement('section', null, React.createElement('h1', null, title), React.createElement('p', null, subtitle), children),
+};
+const alertBanner = ({ children, tone }) => React.createElement('div', { role: tone === 'success' ? 'status' : 'alert' }, children);
+function emailCodeScreen(auth) {
+  return load('src/screens/EmailCodeScreen.tsx', {
+    '../auth/AuthContext': { useAuth: () => auth, describeAuthError: authContextModule.describeAuthError },
+    '../components/TextField': { TextField: TextFieldPlain, RevealToggle: () => null },
+    '../components/Button': { Button: plainButton },
+    '../components/Banner': { Banner: alertBanner },
+    '../components/AuthLayout': screenAuthLayout,
+    '../auth/authRules': authRules,
+    '../auth/useResendCooldown': load('src/auth/useResendCooldown.ts', {}),
+  }).EmailCodeScreen;
+}
+function passwordResetScreen(auth) {
+  return load('src/screens/PasswordResetScreen.tsx', {
+    '../auth/AuthContext': { useAuth: () => auth, describeAuthError: authContextModule.describeAuthError },
+    '../components/TextField': { TextField: TextFieldPlain, RevealToggle: () => null },
+    '../components/Button': { Button: plainButton },
+    '../components/Banner': { Banner: alertBanner },
+    '../components/AuthLayout': screenAuthLayout,
+    '../auth/authRules': authRules,
+    '../auth/useResendCooldown': load('src/auth/useResendCooldown.ts', {}),
+  }).PasswordResetScreen;
+}
+
+test('the code screen takes six digits, waits a minute before a new code, and shows a wrong code as its copy', async () => {
+  const verified = [];
+  const auth = {
+    codeEmail: 'slayer@example.com',
+    verifyEmailCode: async (code) => {
+      verified.push(code);
+      if (code !== '123456') throw 'AUTH_CODE_INVALID: That code is wrong or has expired. Check the latest email or resend the code.';
+    },
+    resendEmailCode: async () => {},
+  };
+  let back = 0;
+  const EmailCodeScreen = emailCodeScreen(auth);
+  await mount(EmailCodeScreen, { onBack() { back += 1; } });
+  assert.equal(document.querySelector('h1').textContent, 'Check your email');
+  assert.ok(document.body.textContent.includes('Enter the 6-digit code we sent to slayer@example.com.'));
+  assert.equal(button('Resend code in 60 s').disabled, true, 'the first code was just sent, so the wait starts now');
+
+  await act(async () => typeInto(field('6-digit code'), 'ab12-34 56'));
+  assert.equal(field('6-digit code').value, '123456', 'digits only, and paste works');
+  await act(async () => button('Verify').click());
+  assert.deepEqual(verified, ['123456']);
+
+  await act(async () => typeInto(field('6-digit code'), '000000'));
+  await act(async () => button('Verify').click());
+  assert.equal(document.querySelector('[role="alert"]').textContent, 'That code is wrong or has expired. Check the latest email or resend the code.');
+
+  await act(async () => typeInto(field('6-digit code'), '12'));
+  await act(async () => button('Verify').click());
+  assert.equal(document.querySelector('[role="alert"]').textContent, 'Enter the 6-digit code we sent.');
+  assert.equal(verified.length, 2, 'an incomplete code is not sent');
+
+  await act(async () => button('Back to sign in').click());
+  assert.equal(back, 1);
+});
+
+test('forgot password asks for the email, then the code and a new password under the registration rule', async () => {
+  const sent = [];
+  const completed = [];
+  const auth = {
+    sendPasswordResetCode: async (email) => { sent.push(email); },
+    completePasswordReset: async (...args) => { completed.push(args); },
+    backToSignIn() {},
+  };
+  await mount(passwordResetScreen(auth));
+  assert.equal(document.querySelector('h1').textContent, 'Reset your password');
+  await act(async () => typeInto(field('Email'), 'not-an-email'));
+  await act(async () => button('Send code').click());
+  assert.equal(document.querySelector('[role="alert"]').textContent, 'Enter a valid email address.');
+  assert.equal(sent.length, 0);
+
+  await act(async () => typeInto(field('Email'), 'slayer@example.com'));
+  await act(async () => button('Send code').click());
+  assert.deepEqual(sent, ['slayer@example.com']);
+  assert.equal(document.querySelector('h1').textContent, 'Set a new password');
+
+  await act(async () => typeInto(field('6-digit code'), '123456'));
+  await act(async () => typeInto(field('New password'), 'short'));
+  await act(async () => typeInto(field('Confirm new password'), 'short'));
+  await act(async () => button('Set password').click());
+  assert.equal(document.querySelector('[role="alert"]').textContent, 'Password must be at least 8 characters.');
+
+  await act(async () => typeInto(field('New password'), 'brand new pass'));
+  await act(async () => typeInto(field('Confirm new password'), 'brand new pass!'));
+  await act(async () => button('Set password').click());
+  assert.equal(document.querySelector('[role="alert"]').textContent, "Passwords don't match.");
+  assert.equal(completed.length, 0);
+
+  await act(async () => typeInto(field('Confirm new password'), 'brand new pass'));
+  await act(async () => button('Set password').click());
+  assert.deepEqual(completed[0], ['slayer@example.com', '123456', 'brand new pass']);
+});
+
+test('the sign-in card offers Forgot password? on the official server only', async () => {
+  await mount(loginScreen(officialServerState), { onCreateAccount() {} });
+  assert.ok(button('Forgot password?'));
+  await unmountNow();
+  await mount(loginScreen(localServerState), { onCreateAccount() {} });
+  assert.equal(button('Forgot password?'), undefined, 'a local server keeps its own accounts');
+});
+
+test('Home: an unavailable official server waits for Play with its note, shows the red badge, the version and the new copy', async () => {
+  await mount(home({ getInstallStatus: async () => install }, undefined, undefined, { officialPlay: { available: false, message: 'Maintenance until 18:00.' } }));
+  await act(async () => {});
+  assert.equal(button('Unavailable').disabled, true, 'Play is disabled while the official server is off');
+  assert.ok(document.body.textContent.includes('Maintenance until 18:00.'));
+  const badge = document.querySelector('[data-testid="server-status"]');
+  assert.equal(badge.textContent, 'Unavailable');
+  assert.ok(badge.classList.contains('bad'));
+  assert.equal(document.querySelectorAll('[data-testid="server-status"]').length, 1, 'one badge, not two');
+  assert.ok(document.body.textContent.includes('Launcher v0.1.67'));
+  assert.ok(document.body.textContent.includes('The Shattered Isles await.\nGear up, Slayer. Your next hunt begins.'));
+});
+
+test('Home: a healthy official server shows Online and Play, with no note', async () => {
+  await mount(home({ getInstallStatus: async () => install }, undefined, undefined, { officialPlay: { available: true } }));
+  await act(async () => {});
+  const badge = document.querySelector('[data-testid="server-status"]');
+  assert.equal(badge.textContent, 'Online');
+  assert.ok(badge.classList.contains('good'));
+  assert.ok(button('Play'), 'Play is enabled');
+  assert.equal(document.body.textContent.includes('currently unavailable'), false);
+});
+
+test('Servers: the official server shows a red "Currently unavailable" chip beside its Official one', async () => {
+  await mount(serversTab({ listServers: async () => [officialServer, localServer] }, { ...serverCtx, officialPlay: { available: false } }));
+  await act(async () => {});
+  const chips = [...document.querySelectorAll('.chip')].map((chip) => chip.textContent);
+  assert.ok(chips.includes('Official'));
+  assert.ok(chips.includes('Currently unavailable'));
+  assert.ok(document.querySelector('.chip.bad').textContent === 'Currently unavailable');
+});
+
+test('the server switcher names the official server Unavailable, in the danger tone, while its play switch is off', async () => {
+  await mount(serverSwitcher({}, switcherContext([officialServer], { officialPlay: { available: false } })));
+  const tag = document.querySelector('.dropdown-tag');
+  assert.equal(tag.textContent, 'Unavailable');
+  assert.ok(tag.classList.contains('tone-danger'));
+});
+
+test('the server list reads the official play switch whichever server is selected', async () => {
+  const { ServerProvider, useServer } = realServerContext({
+    listServers: async () => [officialServer, localServer],
+    getOfficialPlay: async () => ({ available: false, message: 'Maintenance until 18:00.' }),
+  });
+  let state = null;
+  function Probe() { state = useServer(); return null; }
+  await mount(() => React.createElement(ServerProvider, null, React.createElement(Probe)));
+  await act(async () => {});
+  assert.deepEqual(state.officialPlay, { available: false, message: 'Maintenance until 18:00.' });
+});
+
+function accountTabWith(auth, rules = accountRulesDefault()) {
+  return load('src/screens/dashboard/AccountTab.tsx', {
+    '../../auth/AuthContext': {
+      useAuth: () => ({ account, logout: async () => {}, accountCheckedAt: 1700000000000, accountRefreshing: false, accountRefreshError: null, refreshAccount: async () => null, ...auth }),
+      describeAuthError: plainError,
+    },
+    '../../auth/AccountRules': { useAccountRules: () => rules },
+    '../../servers/ServerContext': { useServer: () => officialServerState },
+    '../../lib/sessions': sessionsLib,
+    '../../lib/accountDeletion': accountDeletionLib,
+    '../../components/icons': icons,
+    '../../components/ArtBackdrop': { ArtBackdrop: () => null },
+    '../../components/Button': { Button: plainButton },
+    '../../components/Banner': { Banner },
+    '../../components/DeactivationBanner': { DeactivationBanner },
+    '../../components/DeleteAccountDialog': { DeleteAccountDialog },
+    '../../components/LegalDocument': LegalDocument,
+    '../../legal/legalMeta': legalMeta,
+  }).AccountTab;
+}
+
+test('Settings: a linked Discord shows its name and Unlink, an unlinked one offers Link Discord, a missing status offers nothing', async () => {
+  const calls = [];
+  await mount(accountTabWith({ account: { ...account, discord: { linked: true, username: 'MysticFox' } }, unlinkDiscord: async () => { calls.push('unlink'); } }));
+  assert.ok(document.body.textContent.includes('Linked as MysticFox.'));
+  await act(async () => button('Unlink').click());
+  assert.deepEqual(calls, ['unlink']);
+  await unmountNow();
+
+  await mount(accountTabWith({ account: { ...account, discord: { linked: false } }, linkDiscord: async () => { calls.push('link'); } }));
+  assert.ok(document.body.textContent.includes('Not linked.'));
+  await act(async () => button('Link Discord').click());
+  assert.deepEqual(calls, ['unlink', 'link']);
+  assert.ok(document.body.textContent.includes('Finish linking in the browser window that opened.'));
+  await unmountNow();
+
+  await mount(accountTabWith({ account }));
+  assert.ok(document.body.textContent.includes('does not show the Discord link yet'));
+  assert.equal(button('Unlink'), undefined);
+  assert.equal(button('Link Discord'), undefined);
+});
+
+test('Settings: the result of a Discord link is shown under the row', async () => {
+  await mount(accountTabWith({ account: { ...account, discord: { linked: true, username: 'MysticFox' } }, discordLinkNotice: { tone: 'error', text: 'Discord linking didn\'t complete. Please try again.' } }));
+  assert.ok(document.body.textContent.includes('Discord linking didn\'t complete. Please try again.'));
 });

@@ -6,6 +6,8 @@ import { ServerProvider, useServer } from "./servers/ServerContext";
 import { RealmTrustProvider } from "./servers/RealmTrust";
 import { LoginScreen } from "./screens/LoginScreen";
 import { RegisterScreen } from "./screens/RegisterScreen";
+import { EmailCodeScreen } from "./screens/EmailCodeScreen";
+import { PasswordResetScreen } from "./screens/PasswordResetScreen";
 import { SetUsernameScreen } from "./screens/SetUsernameScreen";
 import { ConsentScreen, ConsentUnavailableScreen } from "./screens/ConsentScreen";
 import { DashboardShell } from "./screens/DashboardShell";
@@ -15,6 +17,7 @@ import { AuthCard, AuthLayout } from "./components/AuthLayout";
 import { AetherMark } from "./components/AetherMark";
 import { SparkIcon } from "./components/icons";
 import { checkLauncherUpdate, installLauncherUpdate, launcherUpdateHoldReason, type LauncherUpdate } from "./api/updates";
+import { startPublicBuildCheckAtStartup } from "./components/PublicBuildCheck";
 import { sanitizeError } from "./lib/sanitize";
 
 const DEV = import.meta.env.DEV;
@@ -124,7 +127,7 @@ function ServerConsentScreen() {
 }
 
 function AppShell() {
-  const { status, authError, retrySavedSession, forgetSavedSession } = useAuth();
+  const { status, authError, retrySavedSession, forgetSavedSession, backToSignIn } = useAuth();
   // [2026-10-14] Terms of Use and Privacy Policy: a Mystic Paradox account must accept the current ones before the dashboard.
   const rules = useAccountRules();
   const [showRegister, setShowRegister] = useState(false);
@@ -151,6 +154,11 @@ function AppShell() {
       cancelled = true;
       clearInterval(interval);
     };
+  }, []);
+
+  // [2026-10-15] The GitHub build check runs once at startup, in the background; About shows its cached result.
+  useEffect(() => {
+    startPublicBuildCheckAtStartup();
   }, []);
 
   const toast = launcherUpdate ? <UpdateToast update={launcherUpdate} /> : null;
@@ -187,7 +195,7 @@ function AppShell() {
       <StatusScreen title="Request received">
         <p className="auth-sub">
           {officialNetwork
-            ? "Your username is reserved. An administrator approves closed-test accounts; once yours is approved, sign in to play."
+            ? "Your account is waiting for an administrator's approval. Once it is approved, sign in to play and choose your username."
             : `Your username is reserved. The host of ${selected?.name ?? "this server"} may need to approve new accounts; once yours is approved, sign in to play.`}
         </p>
         <div className="status-actions single">
@@ -195,6 +203,11 @@ function AppShell() {
         </div>
       </StatusScreen>
     );
+  } else if (status === "awaitingEmailCode") {
+    // [2026-10-15] A code was emailed (sign-up, or an unverified sign-in). Back goes to the sign-in card, not sign-up.
+    screen = <EmailCodeScreen onBack={() => { setShowRegister(false); backToSignIn(); }} />;
+  } else if (status === "passwordReset") {
+    screen = <PasswordResetScreen />;
   } else if (status === "signedIn" && rules.gate === "checking") {
     screen = (
       <StatusScreen title="Checking your account" busy>

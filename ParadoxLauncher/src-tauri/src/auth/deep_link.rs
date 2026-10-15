@@ -4,6 +4,17 @@ use url::Url;
 
 const DISCORD_AUTH_COMPLETE_EVENT: &str = "discord-auth-complete";
 const DISCORD_AUTH_ERROR_EVENT: &str = "discord-auth-error";
+// [2026-10-15] Linking Discord in Settings comes back as `mysticparadox://link/done` or `link/error?code=...`.
+const DISCORD_LINK_DONE_EVENT: &str = "discord-link-done";
+const DISCORD_LINK_ERROR_EVENT: &str = "discord-link-error";
+
+/// How a Discord link started in Settings ended (`mysticparadox://link/...`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum LinkResult {
+    Done,
+    /// The launcher error code (`AUTH_DISCORD_ALREADY_LINKED`, ...), or "UNKNOWN" when the link carries none.
+    Failed(String),
+}
 
 /// Cold-start / macOS path: the deep-link plugin fires this directly when the
 /// app is launched (or already running, on macOS) via `mysticparadox://...`.
@@ -41,11 +52,42 @@ pub fn handle_url(app: &AppHandle, url: &Url) {
 
     if let Some(code) = extract_discord_error_code(url) {
         let _ = app.emit(DISCORD_AUTH_ERROR_EVENT, code);
+        return;
+    }
+
+    match extract_discord_link_result(url) {
+        Some(LinkResult::Done) => {
+            let _ = app.emit(DISCORD_LINK_DONE_EVENT, ());
+        }
+        Some(LinkResult::Failed(code)) => {
+            let _ = app.emit(DISCORD_LINK_ERROR_EVENT, code);
+        }
+        None => {}
     }
 }
 
 fn is_mysticparadox_auth_path(url: &Url, path: &str) -> bool {
     url.scheme() == "mysticparadox" && url.host_str() == Some("auth") && url.path() == path
+}
+
+fn is_mysticparadox_link_path(url: &Url, path: &str) -> bool {
+    url.scheme() == "mysticparadox" && url.host_str() == Some("link") && url.path() == path
+}
+
+/// `mysticparadox://link/done`, or `mysticparadox://link/error?code=<code>`: the end of a Discord link started in Settings.
+pub fn extract_discord_link_result(url: &Url) -> Option<LinkResult> {
+    if is_mysticparadox_link_path(url, "/done") {
+        return Some(LinkResult::Done);
+    }
+    if is_mysticparadox_link_path(url, "/error") {
+        let code = url
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        return Some(LinkResult::Failed(code));
+    }
+    None
 }
 
 pub fn extract_discord_completion_code(url: &Url) -> Option<String> {
@@ -116,5 +158,36 @@ mod tests {
     fn error_extractor_rejects_complete_path() {
         let url = Url::parse("mysticparadox://auth/complete?code=abc123").unwrap();
         assert_eq!(extract_discord_error_code(&url), None);
+    }
+
+    #[test]
+    fn a_finished_discord_link_is_read_from_its_deep_link() {
+        let done = Url::parse("mysticparadox://link/done").unwrap();
+        assert_eq!(extract_discord_link_result(&done), Some(LinkResult::Done));
+
+        let refused =
+            Url::parse("mysticparadox://link/error?code=AUTH_DISCORD_ALREADY_LINKED").unwrap();
+        assert_eq!(
+            extract_discord_link_result(&refused),
+            Some(LinkResult::Failed(
+                "AUTH_DISCORD_ALREADY_LINKED".to_string()
+            ))
+        );
+
+        let bare = Url::parse("mysticparadox://link/error").unwrap();
+        assert_eq!(
+            extract_discord_link_result(&bare),
+            Some(LinkResult::Failed("UNKNOWN".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_link_reader_ignores_other_paths_and_the_sign_in_routes() {
+        let sign_in = Url::parse("mysticparadox://auth/complete?code=abc123").unwrap();
+        assert_eq!(extract_discord_link_result(&sign_in), None);
+        let other = Url::parse("mysticparadox://link/other").unwrap();
+        assert_eq!(extract_discord_link_result(&other), None);
+        let wrong_scheme = Url::parse("https://link/done").unwrap();
+        assert_eq!(extract_discord_link_result(&wrong_scheme), None);
     }
 }

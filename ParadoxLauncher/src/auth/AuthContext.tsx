@@ -2,13 +2,22 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { LauncherApiError } from "../api/client";
-import type { LauncherAccount, LauncherErrorCode } from "../api/types";
+import type { EmailOutcome, LauncherAccount, LauncherErrorCode, RegistrationOutcome } from "../api/types";
 import type { ConsentInput } from "../api/tauri";
 import { useServer } from "../servers/ServerContext";
+import { AUTH_CODE_COPY, authErrorCode, discordLinkErrorText, stripAuthCode } from "./authRules";
+
+/** [2026-10-15] How a Discord link started in Settings ended: a note under the Discord row. */
+export interface DiscordLinkNotice {
+  tone: "ok" | "error";
+  text: string;
+}
 
 // "needsServerConsent": the selected server is a local one whose warning has not been accepted. Nothing is sent to it
 // (no session restore, no sign-in) until the player accepts.
-type AuthStatus = "checking" | "restoreFailed" | "signedOut" | "awaitingDiscord" | "awaitingUsername" | "pendingApproval" | "signedIn" | "needsServerConsent";
+// [2026-10-15] "awaitingEmailCode": a code was emailed (after sign-up, or a sign-in that the backend refused as unverified);
+// "passwordReset": the forgot-password flow. Both keep the account's email and password in memory only.
+type AuthStatus = "checking" | "restoreFailed" | "signedOut" | "awaitingDiscord" | "awaitingUsername" | "pendingApproval" | "signedIn" | "needsServerConsent" | "awaitingEmailCode" | "passwordReset";
 
 interface AuthContextValue {
   status: AuthStatus;
@@ -21,13 +30,37 @@ interface AuthContextValue {
   accountRefreshError: string | null;
   refreshAccount: () => Promise<LauncherAccount | null>;
   login: (email: string, password: string) => Promise<void>;
-  /** `consent` is the Terms of Use and Privacy Policy acceptance; the official server requires it, a local server never gets it. */
-  register: (displayName: string, email: string, password: string, consent?: ConsentInput) => Promise<void>;
+  /**
+   * `consent` is the Terms of Use and Privacy Policy acceptance; the official server requires it, a local server never gets
+   * it. [2026-10-15] `displayName` is sent only by a local server's own form: the official account names itself after sign-in.
+   */
+  register: (email: string, password: string, consent?: ConsentInput, displayName?: string) => Promise<void>;
   logout: () => Promise<void>;
   startDiscordLogin: () => Promise<void>;
   setUsername: (username: string) => Promise<void>;
   retrySavedSession: () => Promise<void>;
   forgetSavedSession: () => Promise<void>;
+  /** [2026-10-15] The email the code screen sent a code to (null when that screen is not up). */
+  codeEmail: string | null;
+  /** Enters the emailed code: signs in, or ends in approval pending. A wrong code rejects with AUTH_CODE_INVALID. */
+  verifyEmailCode: (code: string) => Promise<void>;
+  /** Sends a new code to the code screen's address. */
+  resendEmailCode: () => Promise<void>;
+  /** Opens the forgot-password flow from the sign-in screen. */
+  startPasswordReset: () => void;
+  /** Sends a reset code to an address (the first step of the forgot-password flow). */
+  sendPasswordResetCode: (email: string) => Promise<void>;
+  /** Sets the new password with the emailed code: signs in, or ends in approval pending. */
+  completePasswordReset: (email: string, code: string, newPassword: string) => Promise<void>;
+  /** Leaves the code screen or the forgot-password flow for the sign-in screen. */
+  backToSignIn: () => void;
+  /** [2026-10-15] The last Discord link result (`mysticparadox://link/...`), shown under the Settings Discord row. */
+  discordLinkNotice: DiscordLinkNotice | null;
+  /** Opens Discord's authorise page to link this account (the result comes back by deep link). */
+  linkDiscord: () => Promise<void>;
+  /** Removes this account's Discord link. Refused for an account whose only sign-in is Discord. */
+  unlinkDiscord: () => Promise<void>;
+  dismissDiscordLinkNotice: () => void;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -48,6 +81,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>("checking");
   const [account, setAccount] = useState<LauncherAccount | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  // [2026-10-15] The account waiting for its emailed code. The password is needed again to verify (the backend checks it
+  // with the code), so it is kept here in memory only: never stored, and cleared when the code screen is left.
+  const [emailCode, setEmailCode] = useState<{ email: string; password: string } | null>(null);
+  // [2026-10-15] The server the link listeners act for (they read it when a deep link arrives, not when they were set up).
+  const [discordLinkNotice, setDiscordLinkNotice] = useState<DiscordLinkNotice | null>(null);
+  const serverIdRef = useRef(serverId);
+  serverIdRef.current = serverId;
   const [accountSync, setAccountSync] = useState<{ checkedAt: number | null; refreshing: boolean; error: string | null }>({
     checkedAt: null,
     refreshing: false,
@@ -75,6 +115,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setAuthError(null);
     // A restore starts from nothing: it may be for another server, whose screens must not show this account.
     setAccount(null);
+    setEmailCode(null);
     setAccountSync({ checkedAt: null, refreshing: false, error: null });
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
@@ -159,6 +200,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       ++operationRef.current;
       discordPendingRef.current = false;
       setAccount(null);
+      setEmailCode(null);
       setAuthError(null);
       setAccountSync({ checkedAt: null, refreshing: false, error: null });
       setStatus("needsServerConsent");
@@ -199,30 +241,141 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => { void unlistenPromise.then((unlisten) => unlisten()); };
   }, []);
 
+  // [2026-10-15] A verify or reset answer: signed in like login, or waiting for approval (the same screen as a registration).
+  const settleEmailOutcome = useCallback((outcome: EmailOutcome) => {
+    if (!outcome.approvalRequired) {
+      applyAccount(outcome.account);
+      return;
+    }
+    const checkedAt = Date.now();
+    accountLastCheckedRef.current = checkedAt;
+    setAccount(outcome.account);
+    setAccountSync({ checkedAt, refreshing: false, error: null });
+    setStatus("pendingApproval");
+  }, [applyAccount]);
+
+  // [2026-10-15] A Discord link started in Settings ends by deep link. A link is for the official account only, so a result
+  // that arrives while a local server is selected is not applied. On success the account is read again (/launcher/v1/me).
+  useEffect(() => {
+    const unlistenDone = listen("discord-link-done", async () => {
+      if (!officialRef.current) return;
+      setDiscordLinkNotice({ tone: "ok", text: "Discord linked." });
+      try {
+        const refreshed = await invoke<LauncherAccount>("native_refresh_account", { serverId: serverIdRef.current });
+        if (officialRef.current) applyAccount(refreshed);
+      } catch {
+        // The row keeps the account it has; the next account check reads the link again.
+      }
+    });
+    const unlistenError = listen<string>("discord-link-error", (event) => {
+      if (!officialRef.current) return;
+      setDiscordLinkNotice({ tone: "error", text: discordLinkErrorText(event.payload) });
+    });
+    return () => {
+      void unlistenDone.then((unlisten) => unlisten());
+      void unlistenError.then((unlisten) => unlisten());
+    };
+  }, [applyAccount]);
+
   const login = useCallback(async (email: string, password: string) => {
     discordPendingRef.current = false;
     const operation = ++operationRef.current;
     setAuthError(null);
-    const next = await invoke<LauncherAccount>("native_login", { serverId, email, password });
-    if (operation === operationRef.current) applyAccount(next);
+    try {
+      const next = await invoke<LauncherAccount>("native_login", { serverId, email, password });
+      if (operation === operationRef.current) applyAccount(next);
+    } catch (error) {
+      // [2026-10-15] The password was right but the email is not verified yet: the backend has just emailed a code, so the
+      // code screen takes over. Any other refusal is thrown as before. Only the official server asks for codes.
+      if (operation !== operationRef.current || authErrorCode(error) !== "AUTH_EMAIL_UNVERIFIED" || !officialRef.current) {
+        throw error;
+      }
+      setEmailCode({ email, password });
+      setStatus("awaitingEmailCode");
+    }
   }, [applyAccount, serverId]);
 
-  const register = useCallback(async (displayName: string, email: string, password: string, consent?: ConsentInput) => {
+  // [2026-10-15] Discord linking in Settings: the deep link answers (`link/done`, `link/error`) and the two calls.
+  const linkDiscord = useCallback(async () => {
+    setDiscordLinkNotice(null);
+    await invoke("native_start_discord_link");
+  }, []);
+
+  const unlinkDiscord = useCallback(async () => {
+    setDiscordLinkNotice(null);
+    const next = await invoke<LauncherAccount>("native_unlink_discord");
+    applyAccount(next);
+  }, [applyAccount]);
+
+  const dismissDiscordLinkNotice = useCallback(() => setDiscordLinkNotice(null), []);
+
+  const register = useCallback(async (email: string, password: string, consent?: ConsentInput, displayName?: string) => {
     discordPendingRef.current = false;
     const operation = ++operationRef.current;
     setAuthError(null);
-    // The consent key is sent only when the player accepted (official servers); a local server's call is unchanged.
-    const args = consent
-      ? { serverId, displayName, email, password, consent }
-      : { serverId, displayName, email, password };
-    const pending = await invoke<LauncherAccount>("native_register", args);
+    // The consent key is sent only when the player accepted (official servers); a name only for a local server's own form.
+    const args: Record<string, unknown> = { serverId, email, password };
+    if (consent) args.consent = consent;
+    if (displayName !== undefined) args.displayName = displayName;
+    const registered = await invoke<RegistrationOutcome>("native_register", args);
     if (operation !== operationRef.current) return;
+    if (registered.verificationRequired) {
+      // [2026-10-15] A code was emailed: the account is not signed in yet, so the code screen comes next.
+      setEmailCode({ email, password });
+      setStatus("awaitingEmailCode");
+      return;
+    }
     const checkedAt = Date.now();
     accountLastCheckedRef.current = checkedAt;
-    setAccount(pending);
+    setAccount(registered.account);
     setAccountSync({ checkedAt, refreshing: false, error: null });
     setStatus("pendingApproval");
   }, [serverId]);
+
+  // ---- [2026-10-15] email codes and password resets (the official server) -------------------------------------------
+
+  const verifyEmailCode = useCallback(async (code: string) => {
+    const held = emailCode;
+    if (!held) return;
+    const operation = ++operationRef.current;
+    setAuthError(null);
+    const outcome = await invoke<EmailOutcome>("native_verify_email", { serverId, email: held.email, password: held.password, code });
+    if (operation !== operationRef.current) return;
+    setEmailCode(null);
+    settleEmailOutcome(outcome);
+  }, [emailCode, serverId, settleEmailOutcome]);
+
+  const resendEmailCode = useCallback(async () => {
+    const held = emailCode;
+    if (!held) return;
+    await invoke("native_resend_email_code", { serverId, email: held.email });
+  }, [emailCode, serverId]);
+
+  const startPasswordReset = useCallback(() => {
+    discordPendingRef.current = false;
+    ++operationRef.current;
+    setEmailCode(null);
+    setAuthError(null);
+    setStatus("passwordReset");
+  }, []);
+
+  const sendPasswordResetCode = useCallback(async (email: string) => {
+    await invoke("native_forgot_password", { serverId, email });
+  }, [serverId]);
+
+  const completePasswordReset = useCallback(async (email: string, code: string, newPassword: string) => {
+    const operation = ++operationRef.current;
+    const outcome = await invoke<EmailOutcome>("native_reset_password", { serverId, email, code, newPassword });
+    if (operation !== operationRef.current) return;
+    settleEmailOutcome(outcome);
+  }, [serverId, settleEmailOutcome]);
+
+  const backToSignIn = useCallback(() => {
+    ++operationRef.current;
+    setEmailCode(null);
+    setAuthError(null);
+    setStatus("signedOut");
+  }, []);
 
   const setUsername = useCallback(async (username: string) => {
     const operation = ++operationRef.current;
@@ -291,8 +444,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUsername,
       retrySavedSession: restoreSavedSession,
       forgetSavedSession,
+      codeEmail: emailCode?.email ?? null,
+      verifyEmailCode,
+      resendEmailCode,
+      startPasswordReset,
+      sendPasswordResetCode,
+      completePasswordReset,
+      backToSignIn,
+      discordLinkNotice,
+      linkDiscord,
+      unlinkDiscord,
+      dismissDiscordLinkNotice,
     }),
-    [status, serverId, account, authError, accountSync, refreshAccount, login, register, logout, startDiscordLogin, setUsername, restoreSavedSession, forgetSavedSession],
+    [status, serverId, account, authError, accountSync, refreshAccount, login, register, logout, startDiscordLogin, setUsername, restoreSavedSession, forgetSavedSession, emailCode, verifyEmailCode, resendEmailCode, startPasswordReset, sendPasswordResetCode, completePasswordReset, backToSignIn, discordLinkNotice, linkDiscord, unlinkDiscord, dismissDiscordLinkNotice],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
@@ -303,8 +467,11 @@ export function isLauncherApiError(error: unknown): error is LauncherApiError {
 }
 
 export function describeAuthError(error: unknown): string {
-  if (typeof error === "string" && error.trim()) return error;
-  if (error instanceof Error && !(error instanceof LauncherApiError) && error.message) return error.message;
+  // [2026-10-15] A coded refusal the email screens act on reads as its copy; any other code is left out of the sentence.
+  const copy = AUTH_CODE_COPY[authErrorCode(error) ?? ""];
+  if (copy) return copy;
+  if (typeof error === "string" && error.trim()) return stripAuthCode(error);
+  if (error instanceof Error && !(error instanceof LauncherApiError) && error.message) return stripAuthCode(error.message);
   if (isLauncherApiError(error)) {
     const known: Partial<Record<LauncherErrorCode, string>> = {
       SERVER_UNAVAILABLE: "Can't reach the Mystic Paradox server right now. Check your connection and try again.",
@@ -316,6 +483,8 @@ export function describeAuthError(error: unknown): string {
       AUTH_ACCOUNT_BANNED: "This account has been banned.",
       AUTH_APPROVAL_PENDING: "Your closed-test access request is waiting for approval.",
       AUTH_APPROVAL_REJECTED: "Your closed-test access request was not approved.",
+      // [2026-10-15] The sign-in deep link for a Discord user with no Mystic Paradox account (sign-in never creates one).
+      AUTH_DISCORD_NOT_LINKED: "Your Discord isn't linked to a Mystic Paradox account. Register with your email, then link Discord on the Account page.",
       AUTH_USERNAME_REQUIRED: "Choose your launcher username before playing.",
       AUTH_REFRESH_INVALID: "Your session has expired. Please sign in again.",
       AUTH_UNAUTHORIZED: "Please sign in again.",

@@ -12,6 +12,17 @@ export async function launcherUpdateHoldReason(): Promise<string | null> {
   return (await invoke<string | null>("launcher_update_hold_reason")) ?? null;
 }
 
+/** [2026-10-15] About -> Runtime: the installed runtime DLL against the signed release for `channel` (read-only). */
+export interface RuntimeVerification {
+  verified: boolean;
+  reason?: string | null;
+  version?: string | null;
+}
+
+export async function verifyInstalledRuntime(channel: string): Promise<RuntimeVerification> {
+  return invoke<RuntimeVerification>("verify_installed_runtime", { channel });
+}
+
 export async function checkLauncherUpdate(): Promise<LauncherUpdate | null> {
   return check({ timeout: 15_000 });
 }

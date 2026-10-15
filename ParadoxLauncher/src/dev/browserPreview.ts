@@ -10,6 +10,10 @@
  * [2026-10-14 realms] ?realmnokey (the Ember Hold realm has no agreed host yet: the join popup comes first), ?realmchanged
  * (its name now belongs to another host: Play is refused until the new one is trusted), ?nosignin (the directory cannot be
  * asked: no official sign-in).
+ * [2026-10-15] Sign-in: ?unverified (sign-in asks for the emailed code; the code is 123456), ?verify (sign-up asks for the code),
+ * "Forgot password?" opens the reset flow (?emailoff: the server cannot send mail), ?officialdown (the official server is
+ * unavailable: a red badge, Play waits). Account: ?unlinked (Discord not linked), ?nodiscord (no Discord status from the
+ * server). About: ?runtimebad (the installed runtime is not the signed release).
  * [2026-10-14] Terms and deletion: ?gate (the current documents are not accepted: the consent gate opens after sign-in),
  * ?gate=outdated (the acceptance is refused: update the launcher), ?consent404 (a backend without consent routes),
  * ?deactivated (the account is deactivated, deleted 20 days from now), ?nodeletion (a backend without the deletion route).
@@ -33,6 +37,8 @@ const account = {
   displayName: params.get("name") ?? "MysticFox",
   email: "slayer@example.com",
   discordLinked: true,
+  // [2026-10-15] ?unlinked: Discord is not linked (Link Discord); ?nodiscord: the server sends no Discord status.
+  discord: params.has("nodiscord") ? undefined : params.has("unlinked") ? { linked: false } : { linked: true, username: "MysticFox" },
   status: "active",
   approvalStatus: "approved",
   needsUsername: screen === "username",
@@ -183,7 +189,7 @@ mockIPC((cmd, args) => {
     const answer = optionalMock(cmd, args);
     if (answer !== undefined) return answer;
   }
-  const payload = (args ?? {}) as { serverId?: string; remember?: boolean; ownFolder?: boolean; hostPublicKey?: string; confirmUsername?: string; server?: { kind?: string; name?: string; backendUrl?: string; realmName?: string } };
+  const payload = (args ?? {}) as { serverId?: string; remember?: boolean; ownFolder?: boolean; hostPublicKey?: string; confirmUsername?: string; code?: string; server?: { kind?: string; name?: string; backendUrl?: string; realmName?: string } };
   switch (cmd) {
     case "native_restore_session": {
       if (screen === "checking") return new Promise(() => {});
@@ -194,12 +200,34 @@ mockIPC((cmd, args) => {
       return delay(screen === "login" || screen === "register" || screen === "pending" ? null : account, 250);
     }
     case "native_login": {
+      // [2026-10-15] ?unverified: the email is not verified yet, so the emailed code screen comes next.
+      if (params.has("unverified")) return Promise.reject("AUTH_EMAIL_UNVERIFIED: Check your email for the 6-digit code.");
       const target = servers.find((candidate) => candidate.id === (payload.serverId ?? selectedServerId));
       if (target?.kind === "local") signedInServers.add(target.id);
       return delay(accountFor(payload.serverId), 500);
     }
+    // [2026-10-15] ?verify: the official sign-up asks for the emailed code. Sign-up takes no name (needsUsername after the code).
     case "native_register":
-      return delay({ ...accountFor(payload.serverId), approvalStatus: "pending" }, 500);
+      return delay({ account: { ...accountFor(payload.serverId), approvalStatus: "pending", needsUsername: true }, verificationRequired: params.has("verify") }, 500);
+    // [2026-10-15] Email codes: 123456 is the right code in the preview; any other is refused as wrong.
+    case "native_verify_email":
+      if (payload.code !== "123456") return Promise.reject("AUTH_CODE_INVALID: That code is wrong or has expired. Check the latest email or resend the code.");
+      return delay({ approvalRequired: false, account: { ...accountFor(payload.serverId), needsUsername: true } }, 500);
+    case "native_reset_password":
+      if (payload.code !== "123456") return Promise.reject("AUTH_CODE_INVALID: That code is wrong or has expired. Check the latest email or resend the code.");
+      return delay({ approvalRequired: false, account: accountFor(payload.serverId) }, 500);
+    case "native_resend_email_code":
+      return delay(null, 300);
+    case "native_forgot_password":
+      if (params.has("emailoff")) return Promise.reject("AUTH_EMAIL_UNAVAILABLE: Email isn't available on this server right now.");
+      return delay(null, 300);
+    // [2026-10-15] ?officialdown: the official server's play switch is off (Home, the switcher and Servers say so).
+    case "native_official_play":
+      return delay(params.has("officialdown") ? { available: false } : { available: true }, 200);
+    case "native_start_discord_link":
+      return delay(null, 300);
+    case "native_unlink_discord":
+      return delay({ ...account, discord: { linked: false } }, 300);
     case "native_logout":
     case "native_forget_session":
       signedInServers.delete(payload.serverId ?? selectedServerId);
@@ -261,6 +289,11 @@ mockIPC((cmd, args) => {
       return delay(serverViews(), 150);
     case "is_game_running":
       return delay(running, 50);
+    // [2026-10-15] About -> Runtime. ?runtimebad: the installed file is not the signed release (the one-line reason).
+    case "verify_installed_runtime":
+      return delay(params.has("runtimebad")
+        ? { verified: false, reason: "The installed runtime is not the signed release: Runtime update hash verification failed.", version: "0.2.136" }
+        : { verified: true, reason: null, version: "0.2.136" }, 400);
     case "check_runtime_update":
       if (selectedServerId !== "official" && servers.find((server) => server.id === selectedServerId)?.kind === "local") return delay({ available: false, feedManaged: false }, 200);
       return delay({ available: false, version: "0.2.80", currentSha256: "331829b4e51d69e5c2f0a1b7d8e9f60718293a4b5c6d7e8f9a0b1c2d3e4f5a6b", latestSha256: "331829b4e51d69e5c2f0a1b7d8e9f60718293a4b5c6d7e8f9a0b1c2d3e4f5a6b", size: 929280 }, 700);
@@ -316,7 +349,7 @@ mockIPC((cmd, args) => {
       return delay(serverViews(), 200);
     }
     case "plugin:app|version":
-      return "0.1.46";
+      return "0.1.67";
     case "plugin:updater|check":
       return params.has("update") ? { rid: 1, currentVersion: "0.1.46", version: "0.1.47", date: null, body: "Smoother launcher, real status everywhere.", rawJson: {} } : null;
     case "plugin:window|is_maximized":

@@ -5,12 +5,16 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
-import { useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { checkPublicBuilds, type PublicBuildCheck as FileCheck, type PublicBuildReport, type PublicBuildStatus } from "../api/tauri";
+import { verifyInstalledRuntime, type RuntimeVerification } from "../api/updates";
+import { usePolicy } from "../policy/PolicyContext";
 import { Button } from "./Button";
 
 // [2026-10-15] About -> "Check against GitHub": the installed launcher, runtime loader and co-op transport compared with the
-// public repository's release builds by SHA-256 (commands/provenance.rs). It contacts GitHub only on the button press.
+// public repository's release builds by SHA-256 (commands/provenance.rs). The launcher runs it once at startup, in the
+// background (startPublicBuildCheckAtStartup, called by the app shell); the result is kept for this session, and the button
+// runs it again. Nothing is changed on this PC.
 
 const STATUS: Record<PublicBuildStatus, { text: string; tone: string }> = {
   match: { text: "Matches", tone: "good" },
@@ -21,23 +25,97 @@ const STATUS: Record<PublicBuildStatus, { text: string; tone: string }> = {
   unavailable: { text: "Not checked", tone: "warn" },
 };
 
+/** The game runtime. It has no public build, so its row shows the signed-release check instead of a hash comparison. */
+const RUNTIME_FILE = "MysticParadox.dll";
+
+// ---- the session's check: one store shared by the startup run and every About page -----------------------------------
+
+interface CheckStore {
+  status: "idle" | "checking" | "done" | "failed";
+  report: PublicBuildReport | null;
+}
+
+let store: CheckStore = { status: "idle", report: null };
+const listeners = new Set<() => void>();
+
+function publish(next: CheckStore) {
+  store = next;
+  listeners.forEach((listener) => listener());
+}
+
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+function current(): CheckStore {
+  return store;
+}
+
+let inFlight: Promise<void> | null = null;
+
+/** Runs the GitHub check now (a second call while one runs joins it). The last report stays until a new one arrives. */
+export function runPublicBuildCheck(): Promise<void> {
+  if (inFlight) return inFlight;
+  publish({ status: "checking", report: store.report });
+  inFlight = checkPublicBuilds()
+    .then((report) => publish({ status: "done", report }))
+    .catch(() => publish({ status: "failed", report: store.report }))
+    .finally(() => {
+      inFlight = null;
+    });
+  return inFlight;
+}
+
+/** Called once when the launcher starts: the check runs in the background, unless it already ran this session. */
+export function startPublicBuildCheckAtStartup(): void {
+  if (store.status === "idle") void runPublicBuildCheck();
+}
+
+// ---- the runtime row ------------------------------------------------------------------------------------------------
+
+type RuntimeCheck =
+  | { state: "checking" }
+  | { state: "unknown" }
+  | { state: "done"; result: RuntimeVerification }
+  | { state: "failed"; reason: string };
+
+function RuntimeChip({ runtime }: { runtime: RuntimeCheck }) {
+  if (runtime.state === "checking") return <span className="chip">Checking…</span>;
+  if (runtime.state === "unknown") return <span className="chip">Not checked</span>;
+  if (runtime.state === "done" && runtime.result.verified) return <span className="chip good">Verified</span>;
+  return <span className="chip bad">Not verified</span>;
+}
+
+function runtimeReason(runtime: RuntimeCheck): string | null {
+  if (runtime.state === "unknown") return "Sign in to check the runtime against the signed release.";
+  if (runtime.state === "failed") return runtime.reason;
+  if (runtime.state === "done" && !runtime.result.verified) return runtime.result.reason ?? "The installed runtime is not the signed release.";
+  return null;
+}
+
 function short(hash?: string | null): string {
   return hash ? `${hash.slice(0, 12)}…${hash.slice(-6)}` : "—";
 }
 
-function Row({ file }: { file: FileCheck }) {
+function Row({ file, runtime }: { file: FileCheck; runtime: RuntimeCheck }) {
   const status = STATUS[file.status] ?? STATUS.unavailable;
+  const isRuntime = file.name === RUNTIME_FILE;
+  const reason = isRuntime ? runtimeReason(runtime) : null;
   const showPublished = file.publishedSha256 && file.status !== "match";
   return (
     <li className="build-check-row" data-status={file.status}>
       <div className="build-check-head">
-        <span className="grow">
-          {file.label}
+        <div className="build-check-title">
+          <span className="build-check-name">{file.label}</span>
           <span className="sub">{file.name}{file.release ? ` · ${file.release}` : ""}</span>
-        </span>
-        <span className={`chip ${status.tone}`.trim()}>{status.text}</span>
+        </div>
+        {isRuntime ? <RuntimeChip runtime={runtime} /> : <span className={`chip ${status.tone}`.trim()}>{status.text}</span>}
       </div>
       <p className="section-desc">{file.note}</p>
+      {reason && <p className="build-check-reason" role="status">{reason}</p>}
       <dl className="build-check-hashes">
         <dt>Installed</dt>
         <dd title={file.installedSha256 ?? undefined}><code>{short(file.installedSha256)}</code></dd>
@@ -53,37 +131,65 @@ function Row({ file }: { file: FileCheck }) {
 }
 
 export function PublicBuildCheck() {
-  const [state, setState] = useState<"idle" | "checking" | "done" | "failed">("idle");
-  const [report, setReport] = useState<PublicBuildReport | null>(null);
+  const { status, report } = useSyncExternalStore(subscribe, current);
+  // [2026-10-15] The runtime is checked against the signed manifest of this account's channel.
+  const { policy } = usePolicy();
+  const channel = policy?.channel ?? null;
+  const [round, setRound] = useState(0);
+  const [runtime, setRuntime] = useState<RuntimeCheck>({ state: "checking" });
 
-  async function run() {
-    setState("checking");
-    try {
-      setReport(await checkPublicBuilds());
-      setState("done");
-    } catch {
-      setState("failed");
+  useEffect(() => {
+    if (!channel) {
+      setRuntime({ state: "unknown" });
+      return;
     }
-  }
+    let cancelled = false;
+    setRuntime({ state: "checking" });
+    verifyInstalledRuntime(channel)
+      .then((result) => {
+        if (!cancelled) setRuntime({ state: "done", result });
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setRuntime({
+            state: "failed",
+            reason: typeof error === "string" && error.trim() ? error : "The runtime could not be checked. Try again.",
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [channel, round]);
 
   const launcherPath = report?.files.find((file) => file.name === "launcher.exe")?.path;
+  const busy = status === "checking";
+
   return (
     <div className="section">
       <p className="section-desc">
         Compare this launcher and the game&apos;s runtime loader and co-op transport with the builds GitHub made from the
-        public source. Pressing the button contacts GitHub; nothing is changed.
+        public source. The launcher checks at startup, in the background, and the button checks again. Nothing is changed.
       </p>
       <div>
-        <Button variant="secondary" onClick={run} loading={state === "checking"}>
-          {state === "checking" ? "Checking…" : report ? "Check again" : "Check against GitHub"}
+        <Button
+          variant="secondary"
+          loading={busy}
+          loadingLabel="Checking…"
+          onClick={() => {
+            setRound((count) => count + 1);
+            void runPublicBuildCheck();
+          }}
+        >
+          {report ? "Check again" : "Check against GitHub"}
         </Button>
       </div>
-      {state === "failed" && <p className="section-desc" role="alert">The check could not run. Try again.</p>}
-      {report && state !== "checking" && (
+      {status === "failed" && <p className="section-desc" role="alert">The check could not run. Try again.</p>}
+      {report && !busy && (
         <>
           <ul className="build-check-list" aria-label="Build check results">
             {report.files.map((file) => (
-              <Row key={file.name} file={file} />
+              <Row key={file.name} file={file} runtime={runtime} />
             ))}
           </ul>
           <p className="section-desc">

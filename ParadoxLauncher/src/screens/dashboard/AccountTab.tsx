@@ -6,6 +6,7 @@ import { formatClock } from "../../lib/sessions";
 import { formatLongDay, deactivationMessage } from "../../lib/accountDeletion";
 import { AlertIcon, DiscordIcon, LogoutIcon, RefreshIcon, ShieldIcon } from "../../components/icons";
 import { ArtBackdrop } from "../../components/ArtBackdrop";
+import { Banner } from "../../components/Banner";
 import { Button } from "../../components/Button";
 import { DeactivationBanner } from "../../components/DeactivationBanner";
 import { DeleteAccountDialog } from "../../components/DeleteAccountDialog";
@@ -17,6 +18,11 @@ function at(index: number): CSSProperties {
 
 export function AccountTab() {
   const { account, logout, accountCheckedAt, accountRefreshing, accountRefreshError, refreshAccount } = useAuth();
+  // [2026-10-15] The Discord row: link or unlink the account's Discord, and show how the last link ended.
+  const { discordLinkNotice, linkDiscord, unlinkDiscord, dismissDiscordLinkNotice } = useAuth();
+  const [discordBusy, setDiscordBusy] = useState<"link" | "unlink" | null>(null);
+  const [discordError, setDiscordError] = useState<string | null>(null);
+  const [linkOpened, setLinkOpened] = useState(false);
   const rules = useAccountRules();
   const { officialNetwork, selected } = useServer();
   const legal = useLegalViewer();
@@ -125,17 +131,81 @@ export function AccountTab() {
               </div>
             </div>
           </div>
-          <div className="section">
-            <div className="section-head">
-              <div className="section-icon"><DiscordIcon /></div>
-              <div>
-                <h3 className="section-title">Discord</h3>
-                <p className="section-desc">
-                  {account?.discordLinked ? "Linked. You can sign in with Discord or your email." : "Not linked to this account."}
-                </p>
+          {/* [2026-10-15] Linked as <name> (Unlink), or not linked (Link Discord). A missing status shows no actions. */}
+          {officialNetwork && account && (
+            <div className="section">
+              <div className="section-row">
+                <div className="section-head">
+                  <div className="section-icon"><DiscordIcon /></div>
+                  <div>
+                    <h3 className="section-title">Discord</h3>
+                    <p className="section-desc">
+                      {account.discord === undefined
+                        ? "The account server does not show the Discord link yet."
+                        : account.discord.linked
+                          ? account.discord.username ? `Linked as ${account.discord.username}.` : "Linked. You can sign in with Discord or your email."
+                          : "Not linked. Link Discord to sign in with it as well as your email."}
+                    </p>
+                  </div>
+                </div>
+                {account.discord !== undefined && (
+                  <div className="section-actions">
+                    {account.discord.linked ? (
+                      <Button
+                        variant="secondary"
+                        loading={discordBusy === "unlink"}
+                        loadingLabel="Unlinking…"
+                        disabled={discordBusy !== null}
+                        onClick={async () => {
+                          setDiscordError(null);
+                          setDiscordBusy("unlink");
+                          try {
+                            await unlinkDiscord();
+                          } catch (err) {
+                            setDiscordError(describeAuthError(err));
+                          } finally {
+                            setDiscordBusy(null);
+                          }
+                        }}
+                      >
+                        Unlink
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="secondary"
+                        loading={discordBusy === "link"}
+                        loadingLabel="Opening Discord…"
+                        disabled={discordBusy !== null}
+                        onClick={async () => {
+                          setDiscordError(null);
+                          setDiscordBusy("link");
+                          try {
+                            await linkDiscord();
+                            setLinkOpened(true);
+                          } catch (err) {
+                            setDiscordError(describeAuthError(err));
+                          } finally {
+                            setDiscordBusy(null);
+                          }
+                        }}
+                      >
+                        Link Discord
+                      </Button>
+                    )}
+                  </div>
+                )}
               </div>
+              {discordError && <Banner>{discordError}</Banner>}
+              {linkOpened && !discordLinkNotice && !discordError && (
+                <Banner tone="muted">Finish linking in the browser window that opened. This page updates when Discord returns.</Banner>
+              )}
+              {discordLinkNotice && (
+                <Banner tone={discordLinkNotice.tone === "ok" ? "success" : "danger"} onDismiss={() => { setLinkOpened(false); dismissDiscordLinkNotice(); }}>
+                  {discordLinkNotice.text}
+                </Banner>
+              )}
             </div>
-          </div>
+          )}
         </section>
 
         {officialNetwork ? (

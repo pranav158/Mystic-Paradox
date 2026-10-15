@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { LauncherPolicy, LogPaths, ServerStatusResponse, UsernameAvailabilityResponse } from "./types";
+import type { LauncherPolicy, LogPaths, OfficialPlay, ServerStatusResponse, UsernameAvailabilityResponse } from "./types";
 import type { SessionSummary } from "../lib/sessions";
 
 /** [2026-10-13 realms S1] The three kinds of server the launcher can play on. */
@@ -199,6 +199,14 @@ export async function getPolicy(serverId?: string): Promise<LauncherPolicy> {
 /** The selected server's backend status (`/launcher/v1/status` of that server, never of another). */
 export async function getServerStatus(serverId?: string): Promise<ServerStatusResponse> {
   return invoke<ServerStatusResponse>("native_get_server_status", { serverId });
+}
+
+/**
+ * [2026-10-15] The official server's play switch, read from its own status whatever server is selected. It rejects when
+ * the status cannot be read; the caller then shows no note (the official server is not marked unavailable).
+ */
+export async function getOfficialPlay(): Promise<OfficialPlay> {
+  return invoke<OfficialPlay>("native_official_play");
 }
 
 /** Whether a username is free on the selected server (a local server's usernames are its own). */

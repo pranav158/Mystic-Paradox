@@ -146,6 +146,9 @@
   font-size: 14.5px;
   line-height: 1.65;
   text-shadow: 0 1px 12px rgba(0, 0, 0, 0.6);
+  /* [2026-10-15] The hero line may carry its own line break; a line that still wraps is balanced. */
+  white-space: pre-line;
+  text-wrap: balance;
 }
 
 .hero-chips {
@@ -454,6 +457,28 @@
 
 .launch-secondary {
   align-self: center;
+}
+
+/* [2026-10-15] The game folder and the launcher's version on one line: the path takes the room and ellipsizes, the chip keeps its
+   size. The compact chip is no taller than the path's line, so the card does not grow. */
+.launch-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 5px;
+}
+
+.launch-meta .launch-path {
+  min-width: 0;
+  margin-top: 0;
+}
+
+.chip.chip-compact {
+  flex: none;
+  height: 19px;
+  padding: 0 8px;
+  font-size: 10.5px;
 }
 
 /* ---- Status strip: three cells under the launch panel ------------------------- */

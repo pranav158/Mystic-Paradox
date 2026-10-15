@@ -461,6 +461,7 @@ mod tests {
                 status: "active".into(),
                 approval_status: "approved".into(),
                 needs_username: false,
+                discord: None,
             },
         };
         cache_access(&scope, session_epoch::current(scope.key()), &session);

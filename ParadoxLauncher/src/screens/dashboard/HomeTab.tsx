@@ -28,6 +28,8 @@ import { DeactivationBanner } from "../../components/DeactivationBanner";
 import { LocalServerBadge } from "../../components/LocalServerWarning";
 import { useServer } from "../../servers/ServerContext";
 import { statusNaming } from "../../servers/serverNames";
+import { officialUnavailable, officialUnavailableNote, serverStatusBadge } from "../../servers/officialPlay";
+import { getVersion } from "@tauri-apps/api/app";
 import { useRealmTrust } from "../../servers/RealmTrust";
 
 function gameRootPath(exePath: string): string {
@@ -84,11 +86,16 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   const { account, accountCheckedAt, accountRefreshing, accountRefreshError } = useAuth();
   const { policy, refreshPolicy } = usePolicy();
   const services = useServices();
-  const { openWarning, selected } = useServer();
+  const { openWarning, selected, officialPlay } = useServer();
   const realmTrust = useRealmTrust();
   // [2026-10-14] A deactivated account (a deletion was requested) cannot start the game: Play says why instead.
   const rules = useAccountRules();
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  // [2026-10-15] This launcher's own version, read at runtime (a muted line under Play).
+  const [launcherVersion, setLauncherVersion] = useState<string | null>(null);
+  useEffect(() => {
+    getVersion().then(setLauncherVersion).catch(() => {});
+  }, []);
   const [install, setInstall] = useState<InstallStatus | null>(null);
   const [phase, setPhase] = useState<PlayPhase>({ status: "idle" });
   const [runtime, setRuntime] = useState<RuntimeView>({ state: "idle" });
@@ -329,7 +336,9 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   const accountBlock = rules.deactivatedUntil !== null
     ? deactivationMessage(rules.deactivatedUntil)
     : rules.deletionChecking ? "Checking your account…" : null;
-  const playBlocked = ready ? install?.playBlockedReason ?? accountBlock : null;
+  // [2026-10-15] The official server's play switch is off: Play waits there, and says so (the backend's message, if any).
+  const officialBlock = serverKind === "official" && officialUnavailable(officialPlay) ? officialUnavailableNote(officialPlay) : null;
+  const playBlocked = ready ? install?.playBlockedReason ?? officialBlock ?? accountBlock : null;
   const canPlay = ready && !playBlocked && (install?.exeSha256 != null || runtimeRepairRequired) && (phase.status === "idle" || phase.status === "error");
   const canRepair = located && runtimeRepairRequired && !gameRunning && (phase.status === "idle" || phase.status === "error");
   const busy = phase.status !== "idle" && phase.status !== "error" && phase.status !== "running";
@@ -436,9 +445,13 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     runtimeNote = "Checked once your policy loads";
   }
 
+  // [2026-10-15] The owner's line, one sentence group per line (.hero-copy keeps the line break; the kicker above the name
+  // says "Welcome back,").
   const heroCopy = gameRunning
     ? "Your Slayer is out in the Shattered Isles. The launcher keeps watch until the game closes."
-    : "Ramsgate is waiting. Prepare your Slayer and return to the Shattered Isles.";
+    : "The Shattered Isles await.\nGear up, Slayer. Your next hunt begins.";
+  // [2026-10-15] One status badge for the selected server, next to its kind (the official server, a realm or a local one).
+  const statusBadge = serverStatusBadge({ kind: serverKind, health: services.health, officialPlay });
   const nonStableChannel = channel && channel !== "stable" ? channel : null;
   // [2026-10-14] Which server Play uses: the kind in words, then its name (the official server is "Mystic Paradox"). A
   // realm is named by its realm name; the player's own name for it is a smaller line under that, only when it differs.
@@ -503,8 +516,14 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
                 )}
               </h2>
               <p className="launch-desc">{statusDescription}</p>
-              {located && install?.exePath && (
-                <p className="launch-path mono" title={gameRootPath(install.exePath)}>{gameRootPath(install.exePath)}</p>
+              {/* [2026-10-15] The game folder and the launcher's version (a compact chip) share one line, so the card keeps its height. */}
+              {((located && install?.exePath) || launcherVersion) && (
+                <div className="launch-meta">
+                  {located && install?.exePath && (
+                    <p className="launch-path mono" title={gameRootPath(install.exePath)}>{gameRootPath(install.exePath)}</p>
+                  )}
+                  {launcherVersion && <span className="chip accent chip-compact">Launcher v{launcherVersion}</span>}
+                </div>
               )}
               {busy && <div className="loader-bar" role="progressbar" aria-label="Launcher task in progress" aria-valuetext={progressLabel ?? "Working"} />}
               {phase.status === "error" && <p className="launch-error" role="alert">{phase.message}</p>}
@@ -514,6 +533,7 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
               <div className="play-server" data-kind={serverKind}>
                 <div className="play-server-head">
                   <span className="play-server-kind">{serverKindLabel}</span>
+                  {statusBadge && <span className={`chip ${statusBadge.tone}`} data-testid="server-status">{statusBadge.text}</span>}
                   {serverKind === "local" && (
                     <LocalServerBadge onOpen={() => openWarning(serverId)}>LOCAL SERVER WARNING</LocalServerBadge>
                   )}

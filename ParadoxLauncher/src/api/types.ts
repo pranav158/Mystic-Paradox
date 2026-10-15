@@ -12,6 +12,14 @@ export type LauncherErrorCode =
   | "AUTH_ACCOUNT_BANNED"
   | "AUTH_APPROVAL_PENDING"
   | "AUTH_APPROVAL_REJECTED"
+  // [2026-10-15] Email codes: sign-in needs the emailed code, a wrong or expired code, and a server that cannot send mail.
+  | "AUTH_EMAIL_UNVERIFIED"
+  | "AUTH_CODE_INVALID"
+  | "AUTH_EMAIL_UNAVAILABLE"
+  // [2026-10-15] Discord: sign-in never creates an account; linking and unlinking in Settings.
+  | "AUTH_DISCORD_NOT_LINKED"
+  | "AUTH_DISCORD_ACCOUNT_HAS_LINK"
+  | "AUTH_DISCORD_ONLY_LOGIN"
   | "AUTH_USERNAME_REQUIRED"
   | "AUTH_REFRESH_INVALID"
   | "AUTH_UNAUTHORIZED"
@@ -36,6 +44,8 @@ export interface LauncherAccount {
   /** True for a fresh Discord account with no chosen username yet — the launcher
    *  must show the set-username step before the account can play. */
   needsUsername: boolean;
+  /** [2026-10-15] The account's Discord link. Missing means unknown (an older backend), not "not linked". */
+  discord?: { linked: boolean; username?: string };
 }
 
 export interface UsernameAvailabilityResponse {
@@ -46,6 +56,26 @@ export interface UsernameAvailabilityResponse {
 export interface ServerStatusResponse {
   online: boolean;
   supportedBuildChangelist: number;
+  /** [2026-10-15] The official server's play switch. Absent on an older backend, which means available. */
+  officialPlay?: OfficialPlay;
+}
+
+/** [2026-10-15] `officialPlay` of `/launcher/v1/status`: when `available` is false the official server cannot be played. */
+export interface OfficialPlay {
+  available: boolean;
+  message?: string;
+}
+
+/** [2026-10-15] A registration answer: a code was emailed when `verificationRequired` (the account is not signed in yet). */
+export interface RegistrationOutcome {
+  account: LauncherAccount;
+  verificationRequired: boolean;
+}
+
+/** [2026-10-15] A verify or reset answer: signed in, or waiting for approval (`approvalRequired`, no session). */
+export interface EmailOutcome {
+  approvalRequired: boolean;
+  account: LauncherAccount;
 }
 
 export interface LauncherPolicy {

@@ -15,7 +15,7 @@ interface LoginScreenProps {
 }
 
 export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
-  const { login, startDiscordLogin, authError } = useAuth();
+  const { login, startDiscordLogin, authError, startPasswordReset } = useAuth();
   // [2026-10-13 realms S5] Sign-in goes to the selected server's own backend. Discord belongs to the official account
   // system, so a local server (which has its own accounts) offers email and password only.
   const { selected, officialNetwork } = useServer();
@@ -101,6 +101,13 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
             rightAdornment={<RevealToggle shown={showPassword} onToggle={() => setShowPassword((v) => !v)} />}
           />
 
+          {/* [2026-10-15] Password resets are the official backend's (a local server keeps its own accounts). */}
+          {officialNetwork && (
+            <p className="auth-aside">
+              <button type="button" className="link" onClick={() => startPasswordReset()}>Forgot password?</button>
+            </p>
+          )}
+
           <Button type="submit" size="lg" block loading={submitting} loadingLabel="Signing in…">
             Sign in
           </Button>
@@ -110,7 +117,7 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
               <div className="divider">or</div>
 
               <Button variant="discord" size="lg" block loading={discordSubmitting} loadingLabel="Opening Discord…" onClick={handleDiscord}>
-                <DiscordIcon />Continue with Discord
+                <DiscordIcon />Sign in with Discord
               </Button>
             </>
           )}

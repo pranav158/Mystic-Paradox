@@ -133,6 +133,14 @@
   font-size: 13px;
 }
 
+/* [2026-10-15] A line of its own under the password field (the forgot-password link), aligned to the right. */
+.auth-aside {
+  display: flex;
+  justify-content: flex-end;
+  margin: -6px 0 0;
+  font-size: 13px;
+}
+
 .link {
   border-radius: 6px;
   color: var(--aether-hi);
