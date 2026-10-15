@@ -12,7 +12,7 @@
 //
 // Key: TAURI_SIGNING_PRIVATE_KEY (the key file's contents, as `tauri signer generate` writes it) and
 // TAURI_SIGNING_PRIVATE_KEY_PASSWORD, or --key-file / --password-file for a local run. Values are never printed.
-// The signature is checked against the updater public key in src-tauri/tauri.conf.json before it is written.
+// The signature is checked against the official updater public key (build-profiles/official.json) before it is written.
 //
 // usage: node scripts/sign-launcher-update.mjs --file <installer.exe> [--out <installer.exe.sig>] [--timestamp <unix>]
 //        [--key-file <path>] [--password-file <path>] [--tauri-conf <path>]
@@ -96,11 +96,16 @@ function privateKeyObject(seed) {
   return createPrivateKey({ key: Buffer.concat([ED25519_PKCS8_PREFIX, seed]), format: "der", type: "pkcs8" });
 }
 
-/** The updater public key from tauri.conf.json: { keyId, key }. */
+/**
+ * The updater public key: { keyId, key }. Read from a Tauri configuration ({plugins: {updater: {pubkey}}}) or, since
+ * 16 Oct, a launcher build profile ({tauri: {plugins: {updater: {pubkey}}}}): the official key lives in
+ * build-profiles/official.json, and the base tauri.conf.json names no key.
+ */
 export function updaterPublicKey(tauriConfPath) {
   const conf = JSON.parse(readFileSync(tauriConfPath, "utf8"));
-  const raw = minisignPayload(Buffer.from(conf?.plugins?.updater?.pubkey ?? "", "base64").toString("utf8"));
-  if (raw.length !== 42 || raw.subarray(0, 2).toString("latin1") !== "Ed") throw new Error("tauri.conf.json has no minisign updater key");
+  const pubkey = conf?.plugins?.updater?.pubkey || conf?.tauri?.plugins?.updater?.pubkey || "";
+  const raw = minisignPayload(Buffer.from(pubkey, "base64").toString("utf8"));
+  if (raw.length !== 42 || raw.subarray(0, 2).toString("latin1") !== "Ed") throw new Error(`${tauriConfPath} has no minisign updater key`);
   return { keyId: raw.subarray(2, 10), key: raw.subarray(10) };
 }
 
@@ -152,7 +157,7 @@ function main() {
   const timestamp = option("timestamp") ?? String(Math.floor(Date.now() / 1000));
   if (!/^[0-9]{1,12}$/.test(timestamp)) throw new Error("--timestamp must be a unix time in seconds");
   const here = dirname(fileURLToPath(import.meta.url));
-  const tauriConf = option("tauri-conf") ?? resolve(here, "..", "src-tauri", "tauri.conf.json");
+  const tauriConf = option("tauri-conf") ?? resolve(here, "..", "build-profiles", "official.json");
   const keyFile = option("key-file");
   const passwordFile = option("password-file");
   const keyValue = keyFile ? readFileSync(keyFile, "utf8") : process.env.TAURI_SIGNING_PRIVATE_KEY;
@@ -162,7 +167,7 @@ function main() {
   const publicKey = updaterPublicKey(tauriConf);
   const secretKey = openSecretKey(keyValue, password);
   if (!secretKey.keyId.equals(publicKey.keyId) || !secretKey.publicKey.equals(publicKey.key)) {
-    throw new Error("the signing key is not the updater key in tauri.conf.json");
+    throw new Error(`the signing key is not the updater key in ${tauriConf}`);
   }
   const file = readFileSync(filePath);
   const sig = signUpdate(file, basename(filePath), secretKey, timestamp);

@@ -263,7 +263,8 @@ mod tests {
 
     #[test]
     fn the_official_address_cannot_become_a_local_scope() {
-        // Release builds point at https://paradox.mysticfox.dev; a debug build's loopback API is a developer's own.
+        // A release build points at the address it was built with (the official one: https://paradox.mysticfox.dev);
+        // a debug build's loopback API is a developer's own.
         let official = api_base_url();
         let entry = ServerEntry {
             id: "s-aaaaaaaaaaaa".into(),

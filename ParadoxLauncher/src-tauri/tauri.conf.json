@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://paradox.mysticfox.dev https://api.mysticfox.dev; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'",
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'",
       "devCsp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:3000 https://paradox.mysticfox.dev https://api.mysticfox.dev; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'"
     }
   },
@@ -35,10 +35,8 @@
       }
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMwQURDNTgzMDhCREFFQUQKUldTdHJyMElnOFd0TUJGeVQyTHJQUitKSFo5QW5PU3lrZGVZR0RVOGgzdXdSNmJCcStudnlVQWEK",
-      "endpoints": [
-        "https://paradox.mysticfox.dev/launcher/v1/updates/{{target}}/{{arch}}/{{current_version}}"
-      ],
+      "pubkey": "",
+      "endpoints": [],
       "windows": {
         "installMode": "passive"
       }

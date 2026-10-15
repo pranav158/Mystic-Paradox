@@ -11,7 +11,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "release:launcher": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-launcher-release.ps1",
+    "release:launcher": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-launcher-release.ps1 -BuildProfile official",
     "publish:launcher": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-launcher-update.ps1"
   },
   "dependencies": {

@@ -55,21 +55,38 @@ async fn fetch_channel_manifest(
     }
 }
 
-const DEFAULT_RUNTIME_ENDPOINT: &str = "https://paradox.mysticfox.dev/launcher/v1/runtime";
 pub(crate) const TARGET_CHANGELIST: u32 = 647472;
-// Public key only. The matching private key is kept outside the repository and
-// is used exclusively by scripts/publish-runtime-update.mjs.
-const DEFAULT_RUNTIME_UPDATE_PUBLIC_KEY_B64: &str = "3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc=";
 
-/// The runtime feed. A self-hosted build sets MYSTICPARADOX_RUNTIME_ENDPOINT at build time.
+/// The runtime feed: MYSTICPARADOX_RUNTIME_ENDPOINT at build time, else the feed of the build's own server
+/// (`<api_base_url>/launcher/v1/runtime`). [2026-10-16] No server is named here (see `api_base_url`).
 fn runtime_endpoint() -> &'static str {
-    option_env!("MYSTICPARADOX_RUNTIME_ENDPOINT").unwrap_or(DEFAULT_RUNTIME_ENDPOINT)
+    static ENDPOINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ENDPOINT.get_or_init(|| match option_env!("MYSTICPARADOX_RUNTIME_ENDPOINT") {
+        Some(endpoint) => endpoint.to_string(),
+        None => format!(
+            "{}/launcher/v1/runtime",
+            super::auth::api_base_url().trim_end_matches('/')
+        ),
+    })
 }
 
-/// The Ed25519 key runtime updates are signed with (MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64 at build time).
+/// The Ed25519 key runtime updates are signed with: MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64 at build time. A release build
+/// must be given it (each server signs its own runtime); a debug build falls back to the Mystic Paradox public key.
+#[cfg(debug_assertions)]
 fn runtime_update_public_key_b64() -> &'static str {
+    // Public key only. The matching private key is kept outside the repository and
+    // is used exclusively by scripts/publish-runtime-update.mjs.
     option_env!("MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64")
-        .unwrap_or(DEFAULT_RUNTIME_UPDATE_PUBLIC_KEY_B64)
+        .unwrap_or("3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc=")
+}
+
+#[cfg(not(debug_assertions))]
+fn runtime_update_public_key_b64() -> &'static str {
+    env!(
+        "MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64",
+        "A release build needs the runtime signing public key of its server: set MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64 \
+         (scripts/configure-selfhost.ps1 does; the official release applies build-profiles/official.json)."
+    )
 }
 
 /// Downloads must come over HTTPS from the feed's own host and port.

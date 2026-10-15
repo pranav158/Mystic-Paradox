@@ -103,14 +103,24 @@ fn hold(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The OFFICIAL backend. Built-in: `MYSTICPARADOX_API_BASE_URL` at build time, else `127.0.0.1:3000` in debug builds.
+/// The OFFICIAL backend, fixed at build time by `MYSTICPARADOX_API_BASE_URL`; debug builds fall back to `127.0.0.1:3000`.
 /// A local server's address is its scope's (`AuthScope::base_url`), never this.
+/// [2026-10-16] A release build names no server of its own: without the variable it does not compile, so a build of the
+/// public source never talks to the Mystic Paradox servers by default. The official release applies
+/// `build-profiles/official.json` (scripts/use-build-profile.ps1); a self-hosted build gets its own address from
+/// scripts/configure-selfhost.ps1.
+#[cfg(debug_assertions)]
 pub(crate) fn api_base_url() -> &'static str {
-    if cfg!(debug_assertions) {
-        option_env!("MYSTICPARADOX_API_BASE_URL").unwrap_or("http://127.0.0.1:3000")
-    } else {
-        option_env!("MYSTICPARADOX_API_BASE_URL").unwrap_or("https://paradox.mysticfox.dev")
-    }
+    option_env!("MYSTICPARADOX_API_BASE_URL").unwrap_or("http://127.0.0.1:3000")
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn api_base_url() -> &'static str {
+    env!(
+        "MYSTICPARADOX_API_BASE_URL",
+        "A release build needs its server: set MYSTICPARADOX_API_BASE_URL (and MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64), \
+         for example with scripts/configure-selfhost.ps1. The official release applies build-profiles/official.json."
+    )
 }
 
 pub(crate) fn http_client() -> Result<reqwest::blocking::Client, String> {

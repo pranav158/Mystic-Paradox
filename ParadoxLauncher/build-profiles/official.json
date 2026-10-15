@@ -1,0 +1,24 @@
+{
+  "$comment": "The official Mystic Paradox launcher's servers and public keys (no secrets). Applied ONLY on purpose, by scripts/use-build-profile.ps1 (the official release workflow and npm run release:launcher). A build without a profile names no server: a release build then needs MYSTICPARADOX_API_BASE_URL and MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64 (scripts/configure-selfhost.ps1 sets them for a self-hosted server) and checks no launcher updates.",
+  "name": "official",
+  "env": {
+    "MYSTICPARADOX_API_BASE_URL": "https://paradox.mysticfox.dev",
+    "MYSTICPARADOX_RUNTIME_ENDPOINT": "https://paradox.mysticfox.dev/launcher/v1/runtime",
+    "MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64": "3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc="
+  },
+  "tauri": {
+    "app": {
+      "security": {
+        "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://paradox.mysticfox.dev https://api.mysticfox.dev; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'"
+      }
+    },
+    "plugins": {
+      "updater": {
+        "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMwQURDNTgzMDhCREFFQUQKUldTdHJyMElnOFd0TUJGeVQyTHJQUitKSFo5QW5PU3lrZGVZR0RVOGgzdXdSNmJCcStudnlVQWEK",
+        "endpoints": [
+          "https://paradox.mysticfox.dev/launcher/v1/updates/{{target}}/{{arch}}/{{current_version}}"
+        ]
+      }
+    }
+  }
+}

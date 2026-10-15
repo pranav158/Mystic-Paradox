@@ -1,4 +1,9 @@
 param(
+  # [2026-10-16] The servers this launcher is built for (build-profiles\<name>.json, applied by use-build-profile.ps1). There is
+  # no default: the source names no server. `npm run release:launcher` passes "official".
+  [Parameter(Mandatory = $true)]
+  [ValidatePattern("^[A-Za-z0-9_-]+$")]
+  [string]$BuildProfile,
   [string]$SigningKey = "$PSScriptRoot\..\.secrets\mystic-launcher.key",
   [string]$SigningPasswordFile = "$PSScriptRoot\..\.secrets\mystic-launcher.password",
   # Reports where the signing inputs come from and stops before the build. No value is printed.
@@ -37,7 +42,9 @@ try {
   # intentionally callable from the workspace/deployment scripts, so pin its
   # working directory to the launcher rather than requiring callers to cd first.
   Set-Location -LiteralPath (Split-Path -Parent $PSScriptRoot)
-  $buildArgs = @("--bundles", "nsis")
+  $profileOverlay = Join-Path (Get-Location) "src-tauri\target\build-profile.tauri.conf.json"
+  & "$PSScriptRoot\use-build-profile.ps1" -Name $BuildProfile -OverlayPath $profileOverlay
+  $buildArgs = @("--bundles", "nsis", "--config", $profileOverlay)
   $coop = if (Test-Path -LiteralPath "src-tauri\src\p2p\mod.rs") { "included" } else { "absent (dedicated-only)" }
   $antiCheat = if ($coop -eq "included" -and (Test-Path -LiteralPath "src-tauri\src\anticheat\mod.rs")) { "included" } else { "absent (Guard Lite)" }
   Write-Host "Launcher build; co-op module: $coop; anti-cheat module: $antiCheat"
@@ -51,6 +58,11 @@ try {
   $installedLauncher = Join-Path (Get-Location) "src-tauri\target\release\installed\launcher.exe"
   node "$PSScriptRoot\extract-installed-launcher.mjs" --installer $installer --output $installedLauncher --replace
   if ($LASTEXITCODE -ne 0) { throw "Failed to extract the final NSIS launcher payload (exit code $LASTEXITCODE)" }
+  # The launcher must carry its profile's server (compiled in from MYSTICPARADOX_API_BASE_URL).
+  $latin1 = [Text.Encoding]::GetEncoding(28591)
+  if (-not $latin1.GetString([IO.File]::ReadAllBytes($installedLauncher)).Contains($env:MYSTICPARADOX_API_BASE_URL)) {
+    throw "The built launcher does not contain its profile's server ($env:MYSTICPARADOX_API_BASE_URL)."
+  }
 } finally {
   Set-Location -LiteralPath $previousLocation
   # Only the values this script wrote are removed; CI-provided variables stay as the runner set them.

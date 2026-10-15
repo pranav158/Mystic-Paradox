@@ -70,9 +70,12 @@ jobs:
 
       - run: npm ci
 
+      # The launcher source names no server: a plain build of it never talks to the Mystic Paradox servers. This official
+      # release applies build-profiles/official.json on purpose - its build variables (server, runtime feed and key, compiled
+      # in) and its Tauri overlay (update server and key, allowed connections) - merged with this job's own setting.
       - name: Build the installer (unsigned here; the publish job signs it)
         run: |
-          [IO.File]::WriteAllText("$PWD\release.tauri.conf.json", '{"bundle":{"createUpdaterArtifacts":false}}')
+          & scripts/use-build-profile.ps1 -Name official -OverlayPath "$PWD\release.tauri.conf.json" -Merge '{"bundle":{"createUpdaterArtifacts":false}}'
           npm run tauri build -- --bundles nsis --config "$PWD\release.tauri.conf.json"
           if ($LASTEXITCODE -ne 0) { throw "tauri build failed (exit $LASTEXITCODE)" }
 
@@ -108,6 +111,17 @@ jobs:
           "sha256=$sha" >> $env:GITHUB_OUTPUT
           @("Installed launcher.exe:", '```', "$sha  launcher.exe", '```') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
 
+      # An official installer must carry the official server (compiled in from the profile); anything else stops here,
+      # before provenance and before the publish job.
+      - name: Check the installed launcher names the official server
+        run: |
+          $server = (Get-Content -Raw build-profiles/official.json | ConvertFrom-Json).env.MYSTICPARADOX_API_BASE_URL
+          $latin1 = [Text.Encoding]::GetEncoding(28591)
+          if (-not $latin1.GetString([IO.File]::ReadAllBytes("$PWD\installed\launcher.exe")).Contains($server)) {
+            throw "installed launcher.exe does not name $server"
+          }
+          "installed launcher.exe names $server"
+
       - name: Record the build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -131,7 +145,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      # Only the signer, its tests and the updater public key; nothing is installed.
+      # Only the signer, its tests and the updater public key (the official build profile: the base tauri.conf.json names
+      # no update server and no key); nothing is installed.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
@@ -139,7 +154,7 @@ jobs:
           sparse-checkout: |
             ParadoxLauncher/scripts/sign-launcher-update.mjs
             ParadoxLauncher/scripts/sign-launcher-update.test.mjs
-            ParadoxLauncher/src-tauri/tauri.conf.json
+            ParadoxLauncher/build-profiles/official.json
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -169,7 +184,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           INSTALLER: ${{ needs.build.outputs.installer }}
-        run: node ParadoxLauncher/scripts/sign-launcher-update.mjs --file "release/$INSTALLER"
+        run: node ParadoxLauncher/scripts/sign-launcher-update.mjs --file "release/$INSTALLER" --tauri-conf ParadoxLauncher/build-profiles/official.json
 
       - name: SHA256SUMS
         run: |
@@ -197,6 +212,6 @@ jobs:
           - \`INSTALLED-SHA256SUMS\` is the hash of the launcher.exe this installer installs; check the installed file with
             \`gh attestation verify "%LOCALAPPDATA%\\Mystic Paradox Launcher\\launcher.exe" --repo ${GITHUB_REPOSITORY}\`
             or the launcher's About page ("Check against GitHub").
-          - \`${INSTALLER}.sig\` is the updater signature (minisign key 30ADC58308BDAEAD; public key in \`ParadoxLauncher/src-tauri/tauri.conf.json\`).
+          - \`${INSTALLER}.sig\` is the updater signature (minisign key 30ADC58308BDAEAD; public key in \`ParadoxLauncher/build-profiles/official.json\`).
           EOF
           gh release create "$TAG" release/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Launcher ${VERSION}" --notes-file notes.md --latest
