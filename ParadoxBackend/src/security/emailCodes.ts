@@ -6,7 +6,7 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-// [2026-10-15] The one-time codes of email verification (purpose "verify") and password reset ("reset"). A code is 6 digits, valid
+// [2026-10-15] The one-time codes of email verification (purpose "verify"), password reset ("reset") and the Discord unlink ("unlink"). A code is 6 digits, valid
 // EMAIL_CODE_TTL_MINUTES from when it is issued, accepted once, and refused after EMAIL_CODE_MAX_TRIES wrong tries. The codes are
 // stored only as HMAC-SHA256 (HashEmailCode, under the API_KEY_HASH_SECRET). The TTL is the one constant every part reads: the
 // repository's expiry, the mail's wording (RenderCodeEmail) and the sign-in message.

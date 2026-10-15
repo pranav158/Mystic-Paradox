@@ -52,7 +52,7 @@ async function NewAccount(): Promise<{ userId: string; email: string; ip: string
 
 async function IssueAndRead(account: { userId: string; email: string; ip: string }, purpose: "verify" | "reset" = "verify"): Promise<string> {
     const Sent = await IssueEmailCode(account.userId, account.email, purpose, account.ip);
-    assert.equal(Sent, true, "the code was mailed");
+    assert.equal(Sent, "sent", "the code was mailed");
     const Code = Recorder.codeFor(account.email);
     assert.match(Code ?? "", /^\d{6}$/);
     return Code!;
@@ -149,9 +149,9 @@ test("one code a minute per account and purpose; a second send in the same minut
     const Account = await NewAccount();
     await IssueAndRead(Account, "verify");
     const Before = Recorder.sent.length;
-    assert.equal(await IssueEmailCode(Account.userId, Account.email, "verify", Account.ip), false);
+    assert.equal(await IssueEmailCode(Account.userId, Account.email, "verify", Account.ip), "limited");
     assert.equal(Recorder.sent.length, Before, "nothing was mailed");
-    assert.equal(await IssueEmailCode(Account.userId, Account.email, "reset", Account.ip), true, "the reset purpose has its own minute");
+    assert.equal(await IssueEmailCode(Account.userId, Account.email, "reset", Account.ip), "sent", "the reset purpose has its own minute");
 });
 
 test("five codes an hour per account and purpose, and twenty an hour per address (the window moves with time)", () => {
@@ -184,9 +184,9 @@ test("a mail that fails is logged by its code only; the stored code stays, and t
     };
     SetMailTransportForTest(Failing);
     try {
-        assert.equal(await IssueEmailCode(Account.userId, Account.email, "verify", Account.ip), false);
+        assert.equal(await IssueEmailCode(Account.userId, Account.email, "verify", Account.ip), "failed");
     } finally {
         SetMailTransportForTest(Recorder);
     }
-    assert.equal(await IssueEmailCode(Account.userId, Account.email, "verify", Account.ip), false, "the minute is used");
+    assert.equal(await IssueEmailCode(Account.userId, Account.email, "verify", Account.ip), "limited", "the minute is used");
 });

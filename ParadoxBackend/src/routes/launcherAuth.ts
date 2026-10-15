@@ -26,7 +26,9 @@ import {
     CheckUsernameAvailable,
     SetUsername
 } from "../controllers/launcherAuth";
-import { StartDiscordAuth, StartDiscordLink, HandleDiscordCallback, CompleteDiscordLogin, UnlinkDiscordAccount } from "../controllers/discordAuth";
+import {
+    StartDiscordAuth, StartDiscordLink, HandleDiscordCallback, CompleteDiscordLogin, StartDiscordUnlink, ConfirmDiscordUnlink
+} from "../controllers/discordAuth";
 // [2026-10-15] The email routes (email verification, resend, password reset by code) and their code flow (controllers/emailCodes.ts).
 import { ResendEmailCode, RequestPasswordResetCode, ResetPasswordWithCode, VerifyEmailWithPassword } from "../controllers/launcherEmail";
 import { GetLauncherPolicy } from "../controllers/launcherPolicy";
@@ -216,13 +218,18 @@ launcherAuthRouter.post("/launcher/v1/auth/password/reset", (req, res) =>
     })
 );
 
-// [2026-10-15] Link Discord to the signed-in account in Settings (the OAuth comes back to mysticparadox://link/done or link/error), and unlink it.
+// [2026-10-15] Link Discord to the signed-in account in Settings (the OAuth comes back to mysticparadox://link/done or link/error). Unlinking
+// is two steps: the start mails a code (purpose "unlink"), and the confirm checks it and unlinks. The one-click DELETE is gone.
 launcherAuthRouter.post("/launcher/v1/account/discord/link/start", HasLauncherAuth, (req, res) =>
     Handle(req, res, () => StartDiscordLink((req as any).LauncherAuthData.userId))
 );
 
-launcherAuthRouter.delete("/launcher/v1/account/discord", HasLauncherAuth, (req, res) =>
-    Handle(req, res, () => UnlinkDiscordAccount((req as any).LauncherAuthData.userId))
+launcherAuthRouter.post("/launcher/v1/account/discord/unlink/start", HasLauncherAuth, (req, res) =>
+    Handle(req, res, () => StartDiscordUnlink((req as any).LauncherAuthData.userId, GetClientIp(req)))
+);
+
+launcherAuthRouter.post("/launcher/v1/account/discord/unlink", HasLauncherAuth, (req, res) =>
+    Handle(req, res, () => ConfirmDiscordUnlink((req as any).LauncherAuthData.userId, req.body?.code, GetClientIp(req)))
 );
 
 launcherAuthRouter.get("/launcher/v1/me", HasLauncherAuth, (req, res) =>

@@ -46,7 +46,7 @@ export function HashApiKey(value: string, scope: "gameserver" | "user"): string 
  * [2026-10-15] An email verification or password reset code, stored only as HMAC-SHA256 under the same server secret. The account
  * and the purpose are part of the input, so a stored hash cannot be moved to another account or used for the other purpose.
  */
-export function HashEmailCode(userId: string, purpose: "verify" | "reset", code: string): string {
+export function HashEmailCode(userId: string, purpose: "verify" | "reset" | "unlink", code: string): string {
     return crypto
         .createHmac("sha256", ApiKeyHashSecret())
         .update("email-code", "utf8")

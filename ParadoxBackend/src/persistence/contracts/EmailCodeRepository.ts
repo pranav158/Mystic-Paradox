@@ -6,12 +6,14 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-// [2026-10-15] The live one-time code of an account for one purpose: "verify" (email verification) or "reset" (password reset).
-// There is at most one row per account and purpose (the Mongo _id and the SQLite _id are "<userId>:<purpose>"). Only the HMAC of the
+// [2026-10-15] The live one-time code of an account for one purpose: "verify" (email verification), "reset" (password reset) or "unlink"
+// (confirming the unlink of Discord). There is at most one row per account and purpose (the Mongo _id and the SQLite _id are
+// "<userId>:<purpose>"). Only the HMAC of the
 // code is stored (security/emailCodes.ts). A row is removed when its code is accepted, when it runs out of tries, when it expires,
 // or when the account is erased; the expiry (ttlAt) also lets the database purge a row nothing removed.
 
-export type EmailCodePurpose = "verify" | "reset";
+// [2026-10-15] "unlink": the code that confirms unlinking Discord from a signed-in account.
+export type EmailCodePurpose = "verify" | "reset" | "unlink";
 
 export interface EmailCodeRecord {
     userId: string;

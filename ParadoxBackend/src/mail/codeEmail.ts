@@ -14,7 +14,8 @@
  * no tracking. Nothing the user typed goes into the mail - only the code and fixed text.
  */
 
-export type CodeEmailPurpose = "verify" | "reset";
+// [2026-10-15] "unlink": the code that confirms unlinking Discord from the account (owner: unlinking asks for a code).
+export type CodeEmailPurpose = "verify" | "reset" | "unlink";
 
 export interface CodeEmail {
     subject: string;
@@ -34,7 +35,19 @@ const COPY: Record<CodeEmailPurpose, { subject: string; kicker: string; title: s
         kicker: "Password reset",
         title: "Reset your password",
         lead: "Enter this code in the Mystic Paradox launcher to choose a new password."
+    },
+    unlink: {
+        subject: "Your Mystic Paradox code to unlink Discord",
+        kicker: "Discord unlink",
+        title: "Unlink Discord",
+        lead: "Enter this code in the Mystic Paradox launcher to unlink Discord from your account."
     }
+};
+
+const IGNORE: Record<CodeEmailPurpose, string> = {
+    verify: "If you didn't create a Mystic Paradox account, ignore this email. Nothing happens without this code.",
+    reset: "If you didn't ask to reset your password, ignore this email. Your password stays as it is.",
+    unlink: "If you didn't ask to unlink Discord, ignore this email: Discord stays linked. Someone may know your password, so consider changing it."
 };
 
 const FONT_DISPLAY = "'Cinzel', 'Trajan Pro', Georgia, 'Times New Roman', serif";
@@ -55,9 +68,7 @@ export function RenderCodeEmail(purpose: CodeEmailPurpose, code: string, expires
     const copy = COPY[purpose];
     const minutes = `${expiresInMinutes} minute${expiresInMinutes === 1 ? "" : "s"}`;
     const expiry = `This code expires in ${minutes} and works only once.`;
-    const ignore = purpose === "reset"
-        ? "If you didn't ask to reset your password, ignore this email. Your password stays as it is."
-        : "If you didn't create a Mystic Paradox account, ignore this email. Nothing happens without this code.";
+    const ignore = IGNORE[purpose];
     const footer = "Mystic Paradox is a community-run, open-source Dauntless server. It is not affiliated with Phoenix Labs.";
 
     const subject = `${copy.subject}: ${code}`;

@@ -22,12 +22,22 @@ import {
     IsEmailCodeFormat,
     MaskEmail
 } from "../security/emailCodes";
-import { DescribeMailError, SendPasswordResetCode, SendVerificationCode } from "../mail/mailSender";
+import { DescribeMailError, SendDiscordUnlinkCode, SendPasswordResetCode, SendVerificationCode } from "../mail/mailSender";
 import { ReadSmtpSettings } from "../mail/mailConfig";
 import { logger } from "../logger";
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
+
+/** The answer for a wrong, expired, used or out-of-tries code, and for an address with no account (one message for all of them). */
+export const CODE_REFUSED_MESSAGE = "That code is wrong or has expired. Check the latest email or resend the code.";
+
+/** One attempt against a window; over the budget it refuses with AUTH_RATE_LIMITED. Keys combine the address or the IP with the route. */
+export function TakeAttempt(key: string, maxAttempts: number, windowMs: number): void {
+    if (IsRateLimited(key, maxAttempts, windowMs)) {
+        throw new LauncherApiError("AUTH_RATE_LIMITED", "Too many attempts. Try again later.");
+    }
+}
 
 /** True when the code mail's SMTP settings are complete (the environment is read at each call; tests set it per case). */
 export function IsEmailSendingConfigured(environment: NodeJS.ProcessEnv = process.env): boolean {
@@ -52,12 +62,15 @@ export function TakeCodeSendSlot(userId: string, purpose: EmailCodePurpose, ip: 
 }
 
 /**
- * Stores a new live code for the account and purpose (it replaces the code issued before) and mails it. Returns false, storing and
- * mailing nothing, when a send limit is reached. A failed mail is logged with its error code only; the stored code is kept, so the
- * owner can ask for another one.
+ * Stores a new live code for the account and purpose (it replaces the code issued before) and mails it. Returns "limited", storing and
+ * mailing nothing, when a send limit is reached, and "failed" when the mail could not be sent (logged with its error code only; the
+ * stored code is kept, so the owner can ask for another one). [2026-10-15] The signed-out routes answer the same whatever this says;
+ * a signed-in caller (the Discord unlink) may tell the player a failed send.
  */
-export async function IssueEmailCode(userId: string, email: string, purpose: EmailCodePurpose, ip: string): Promise<boolean> {
-    if (!TakeCodeSendSlot(userId, purpose, ip)) return false;
+export type EmailCodeIssue = "sent" | "limited" | "failed";
+
+export async function IssueEmailCode(userId: string, email: string, purpose: EmailCodePurpose, ip: string): Promise<EmailCodeIssue> {
+    if (!TakeCodeSendSlot(userId, purpose, ip)) return "limited";
 
     const Code = GenerateEmailCode();
     const IssuedAt = Date.now();
@@ -72,14 +85,15 @@ export async function IssueEmailCode(userId: string, email: string, purpose: Ema
 
     try {
         if (purpose === "verify") await SendVerificationCode(email, Code);
-        else await SendPasswordResetCode(email, Code);
+        else if (purpose === "reset") await SendPasswordResetCode(email, Code);
+        else await SendDiscordUnlinkCode(email, Code); // [2026-10-15] "unlink"
     } catch (error) {
         logger.warn(`[Email] the ${purpose} code for user ${userId} was not mailed (${DescribeMailError(error)})`);
-        return false;
+        return "failed";
     }
 
     logger.info(`[Email] ${purpose} code mailed to ${MaskEmail(email)} (user ${userId})`);
-    return true;
+    return "sent";
 }
 
 /**

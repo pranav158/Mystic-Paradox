@@ -92,6 +92,11 @@ export async function SendPasswordResetCode(email: string, code: string): Promis
     await SendCodeMail("reset", email, code);
 }
 
+/** [2026-10-15] Mails the code that confirms unlinking Discord from the account. */
+export async function SendDiscordUnlinkCode(email: string, code: string): Promise<void> {
+    await SendCodeMail("unlink", email, code);
+}
+
 /**
  * What may be logged about a failed send: the error's code or class name, never its text, because an SMTP reply can repeat the
  * recipient's address.

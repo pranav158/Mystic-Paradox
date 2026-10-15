@@ -10,10 +10,12 @@
  */
 
 import crypto from "crypto";
-import { GetRepositories } from "../persistence";
+import { GetRepositories, LauncherAccountRecord } from "../persistence";
 import { GenerateOpaqueToken, HashOpaqueToken } from "../security/launcherTokens";
 import { LauncherApiError } from "../security/launcherErrors";
+import { MaskEmail } from "../security/emailCodes";
 import { CreateSessionForUser, NoteSignIn, ToAccountView, LauncherAccountView, LauncherSessionResult } from "./launcherAuth";
+import { AcceptEmailCode, CODE_REFUSED_MESSAGE, IssueEmailCode, RequireEmailSending, TakeAttempt } from "./emailCodes";
 import { logger } from "../logger";
 import { AssertAccountAdmitted } from "../security/accountEligibility";
 import { IsDuplicateKeyError } from "../persistence/sqlite/errors";
@@ -278,24 +280,63 @@ export async function CompleteDiscordLogin(rawCompletionCode: string, deviceId: 
     return { ...Session, account: await ToAccountView(SignedIn) };
 }
 
+const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+
 /**
- * [2026-10-15] DELETE /launcher/v1/account/discord (signed in): unlinks the Discord user from the account. An account without a password
- * has Discord as its only sign-in, so its link stays (AUTH_DISCORD_ONLY_LOGIN). An account with no link is answered as it is.
+ * [2026-10-15] The refusals of both unlink routes, in this order: no Discord link (AUTH_DISCORD_NOT_LINKED, 403); no password, so Discord is
+ * the only sign-in (AUTH_DISCORD_ONLY_LOGIN, 409); no email to mail the code to (AUTH_DISCORD_ONLY_LOGIN, 409: such an account is Discord-only
+ * too); the code mail not set up on this server (AUTH_EMAIL_UNAVAILABLE, 503). Returns the account and its address.
  */
-export async function UnlinkDiscordAccount(userId: string): Promise<{ account: LauncherAccountView }> {
+async function RequireDiscordUnlink(userId: string): Promise<{ account: LauncherAccountRecord; email: string }> {
     const Repos = GetRepositories();
     const Account = await Repos.launcherAccounts.findByUserId(userId);
     if (Account == undefined) {
         throw new LauncherApiError("NOT_FOUND", "Account not found.");
     }
+    if ((await Repos.authIdentities.findByUserId("discord", userId)) == undefined) {
+        throw new LauncherApiError("AUTH_DISCORD_NOT_LINKED", "This account has no Discord account linked.");
+    }
+    if (Account.passwordHash == undefined) {
+        throw new LauncherApiError("AUTH_DISCORD_ONLY_LOGIN", "Discord is this account's only sign-in, so it can't be unlinked.");
+    }
+    if (!Account.email) {
+        throw new LauncherApiError("AUTH_DISCORD_ONLY_LOGIN", "This account has no email address to send the unlink code to, so Discord can't be unlinked.");
+    }
+    RequireEmailSending();
+    return { account: Account, email: Account.email };
+}
 
-    if ((await Repos.authIdentities.findByUserId("discord", userId)) != undefined) {
-        if (Account.passwordHash == undefined) {
-            throw new LauncherApiError("AUTH_DISCORD_ONLY_LOGIN", "Discord is this account's only sign-in, so it can't be unlinked.");
-        }
-        await Repos.authIdentities.deleteForUser("discord", userId);
-        logger.info(`Discord unlinked from account ${userId}`);
+/**
+ * [2026-10-15] POST /launcher/v1/account/discord/unlink/start (signed in, body {}): mails the code that confirms the unlink. Answers
+ * { sent: true, email } also when a send limit held the mail back (the code mailed before is still live). A mail that could not be sent
+ * is AUTH_EMAIL_UNAVAILABLE: the player is signed in, so saying so reveals nothing, and a silent "sent" would leave them waiting.
+ */
+export async function StartDiscordUnlink(userId: string, ip: string): Promise<{ sent: true; email: string }> {
+    TakeAttempt(`unlink-start-ip:${ip}`, 20, HOUR_MS);
+    TakeAttempt(`unlink-start:${userId}`, 5, HOUR_MS);
+    const { email } = await RequireDiscordUnlink(userId);
+    if ((await IssueEmailCode(userId, email, "unlink", ip)) === "failed") {
+        throw new LauncherApiError("AUTH_EMAIL_UNAVAILABLE", "The code email couldn't be sent. Try again in a minute.");
+    }
+    return { sent: true, email: MaskEmail(email) };
+}
+
+/**
+ * [2026-10-15] POST /launcher/v1/account/discord/unlink (signed in, body { code }): checks the emailed code and unlinks the Discord user. A
+ * wrong, expired or used code is AUTH_CODE_INVALID (400) and the link stays. An account without a password keeps its link (see
+ * RequireDiscordUnlink).
+ */
+export async function ConfirmDiscordUnlink(userId: string, code: unknown, ip: string): Promise<{ account: LauncherAccountView }> {
+    TakeAttempt(`unlink-confirm-ip:${ip}`, 30, FIFTEEN_MINUTES_MS);
+    TakeAttempt(`unlink-confirm:${userId}`, 10, FIFTEEN_MINUTES_MS);
+    const { account } = await RequireDiscordUnlink(userId);
+    if (!(await AcceptEmailCode(userId, "unlink", code))) {
+        throw new LauncherApiError("AUTH_CODE_INVALID", CODE_REFUSED_MESSAGE);
     }
 
-    return { account: await ToAccountView(Account) };
+    if ((await GetRepositories().authIdentities.deleteForUser("discord", userId)) > 0) {
+        logger.info(`Discord unlinked from account ${userId}`);
+    }
+    return { account: await ToAccountView(account) };
 }

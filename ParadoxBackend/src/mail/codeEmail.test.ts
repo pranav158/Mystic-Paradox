@@ -26,6 +26,13 @@ test("a reset email has its own subject and wording", () => {
     assert.match(mail.text, /expires in 1 minute and/);
 });
 
+test("an unlink email has its own subject and a warning about the password", () => {
+    const mail = RenderCodeEmail("unlink", "552019", 5);
+    assert.equal(mail.subject, "Your Mystic Paradox code to unlink Discord: 552019");
+    assert.match(mail.html, /Unlink Discord/);
+    assert.match(mail.text, /Discord stays linked/);
+});
+
 test("anything but 6 digits, or a bad expiry, is refused", () => {
     assert.throws(() => RenderCodeEmail("verify", "12345", 5));
     assert.throws(() => RenderCodeEmail("verify", "12345a", 5));

@@ -13,18 +13,14 @@
 import { GetRepositories } from "../persistence";
 import type { EmailCodePurpose } from "../persistence/contracts/EmailCodeRepository";
 import { LauncherApiError } from "../security/launcherErrors";
-import { IsRateLimited } from "../security/rateLimit";
 import { HashPassword, VerifyPassword } from "../security/passwords";
 import { DescribeMailError } from "../mail/mailSender";
 import { logger } from "../logger";
 import { AssertAccountNotBlocked, IsValidEmailAddress, LauncherAccountView, LauncherSessionResult, SignInAfterEmailProof } from "./launcherAuth";
-import { AcceptEmailCode, IssueEmailCode, RequireEmailSending } from "./emailCodes";
+import { AcceptEmailCode, CODE_REFUSED_MESSAGE, IssueEmailCode, RequireEmailSending, TakeAttempt } from "./emailCodes";
 
 const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
-
-/** The answer for a wrong, expired, used or out-of-tries code, and for an address with no account (one message for all of them). */
-const CODE_REFUSED_MESSAGE = "That code is wrong or has expired. Check the latest email or resend the code.";
 
 /** A registration not verified this long after it was made is removed, which frees its address. */
 export const UNVERIFIED_REGISTRATION_TTL_MS = 48 * 60 * 60 * 1000;
@@ -32,13 +28,6 @@ export const UNVERIFIED_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 
 function NormalizeAddress(email: string): string {
     return email.trim().toLowerCase();
-}
-
-/** One attempt against a window; over the budget it refuses with AUTH_RATE_LIMITED. Keys combine the address or the IP with the route. */
-function TakeAttempt(key: string, maxAttempts: number, windowMs: number): void {
-    if (IsRateLimited(key, maxAttempts, windowMs)) {
-        throw new LauncherApiError("AUTH_RATE_LIMITED", "Too many attempts. Try again later.");
-    }
 }
 
 /** What may be logged about a failed background step: the error's code or class name, never its message. */
