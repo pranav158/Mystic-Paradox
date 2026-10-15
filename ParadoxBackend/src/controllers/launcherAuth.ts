@@ -369,6 +369,23 @@ export async function LoginWithPassword(email: string, password: string, deviceI
     return { ...Session, account: await ToAccountView({ ...Account, lastLoginAt: Now }) };
 }
 
+/** [2026-10-15] How old lastLoginAt may get before a session restore or a Discord sign-in writes it again. */
+export const LAST_SIGN_IN_WRITE_INTERVAL_MS = 5 * 60 * 1000;
+
+/**
+ * [2026-10-15] Records a sign-in that does not go through the password form. The launcher restores its saved session (RefreshSession) and
+ * Discord signs in by OAuth; neither wrote lastLoginAt, so the dashboard's "Last sign-in" stayed at the last password sign-in (weeks old
+ * for players who never retype their password). Token refreshes repeat while the launcher runs, so the write happens at most once every
+ * LAST_SIGN_IN_WRITE_INTERVAL_MS per account. Returns the account as it now reads.
+ */
+export async function NoteSignIn(account: LauncherAccountRecord, now: Date = new Date()): Promise<LauncherAccountRecord> {
+    const Last = Date.parse(account.lastLoginAt ?? "");
+    if (Number.isFinite(Last) && now.getTime() - Last >= 0 && now.getTime() - Last < LAST_SIGN_IN_WRITE_INTERVAL_MS) return account;
+    const WhenIso = now.toISOString();
+    await GetRepositories().launcherAccounts.updateLastLogin(account.userId, WhenIso);
+    return { ...account, lastLoginAt: WhenIso };
+}
+
 export async function RefreshSession(rawRefreshToken: string, deviceId: string, deviceName: string): Promise<LauncherSessionResult> {
     if (typeof rawRefreshToken !== "string" || rawRefreshToken.length === 0) {
         throw new LauncherApiError("AUTH_REFRESH_INVALID", "Session expired. Please sign in again.");
@@ -406,6 +423,8 @@ export async function RefreshSession(rawRefreshToken: string, deviceId: string, 
         await Repos.refreshSessions.revokeFamily(Session.familyId);
         throw error;
     }
+    // [2026-10-15] A restored session is a sign-in for "Last sign-in" (NoteSignIn).
+    const SignedIn = await NoteSignIn(Account);
 
     await Repos.refreshSessions.revokeById(Session.id);
 
@@ -428,7 +447,7 @@ export async function RefreshSession(rawRefreshToken: string, deviceId: string, 
     return {
         accessToken: SignLauncherAccessToken({ userId: Session.userId, sid: Session.familyId }),
         refreshToken: NewRefreshToken,
-        account: await ToAccountView(Account)
+        account: await ToAccountView(SignedIn)
     };
 }
 

@@ -13,7 +13,7 @@ import crypto from "crypto";
 import { GetRepositories } from "../persistence";
 import { GenerateOpaqueToken, HashOpaqueToken } from "../security/launcherTokens";
 import { LauncherApiError } from "../security/launcherErrors";
-import { CreateSessionForUser, ToAccountView, LauncherAccountView, LauncherSessionResult } from "./launcherAuth";
+import { CreateSessionForUser, NoteSignIn, ToAccountView, LauncherAccountView, LauncherSessionResult } from "./launcherAuth";
 import { logger } from "../logger";
 import { AssertAccountAdmitted } from "../security/accountEligibility";
 import { IsDuplicateKeyError } from "../persistence/sqlite/errors";
@@ -270,10 +270,12 @@ export async function CompleteDiscordLogin(rawCompletionCode: string, deviceId: 
     }
 
     AssertAccountAdmitted(Account);
+    // [2026-10-15] A Discord sign-in counts for "Last sign-in" (NoteSignIn).
+    const SignedIn = await NoteSignIn(Account);
 
     const Session = await CreateSessionForUser(Account.userId, deviceId, deviceName);
 
-    return { ...Session, account: await ToAccountView(Account) };
+    return { ...Session, account: await ToAccountView(SignedIn) };
 }
 
 /**
