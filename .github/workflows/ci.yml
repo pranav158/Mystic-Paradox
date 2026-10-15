@@ -82,15 +82,6 @@ jobs:
       - run: cargo test
       - run: cargo build --release
 
-  # Dependency review requires GitHub's Dependency Graph. Enable it and set the
-  # repository variable DEPENDENCY_REVIEW_ENABLED=true to activate this job.
-  dependency-review:
-    if: github.event_name == 'pull_request' && vars.DEPENDENCY_REVIEW_ENABLED == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/dependency-review-action@v4
-
   secret-scan:
     runs-on: ubuntu-latest
     steps:
