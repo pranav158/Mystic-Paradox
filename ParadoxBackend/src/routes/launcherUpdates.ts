@@ -650,6 +650,113 @@ launcherUpdatesRouter.post("/launcher/v1/admin/updates/serving", express.json({ 
     res.json({ runtimeEnabled: enabled });
 });
 
+// [2026-10-15] Where a launcher manifest may send launchers (RELEASING.md). The installer is either served by this
+// backend (`file`, the old publish-launcher-update.ps1 layout under LAUNCHER_UPDATE_ROOT) or downloaded from a release
+// host - the public repo's GitHub releases, whose manifests the manager's feed writes after checking the updater
+// signature. LAUNCHER_UPDATE_URL_PREFIXES (comma-separated https prefixes ending in "/") replaces the default release
+// prefix; this backend's own update route is always allowed. The launcher verifies the installer's signature itself;
+// this keeps a bad manifest from pointing launchers at an unexpected host.
+const DEFAULT_LAUNCHER_RELEASE_PREFIX = "https://github.com/pranav158/Mystic-Paradox/releases/download/";
+const LAUNCHER_VERSION = /^\d{1,5}\.\d{1,5}\.\d{1,5}$/;
+
+export function LauncherUpdateUrlPrefixes(env: NodeJS.ProcessEnv = process.env, publicBaseUrl = UPDATE_PUBLIC_BASE_URL): string[] {
+    const configured = (env.LAUNCHER_UPDATE_URL_PREFIXES ?? DEFAULT_LAUNCHER_RELEASE_PREFIX)
+        .split(",")
+        .map((prefix) => prefix.trim())
+        .filter((prefix) => prefix.startsWith("https://") && prefix.endsWith("/") && !/[?#]/.test(prefix));
+    return [`${publicBaseUrl}/launcher/v1/updates/`, ...configured];
+}
+
+function compareLauncherVersions(a: string, b: string): number {
+    const pa = a.split(".").map(Number);
+    const pb = b.split(".").map(Number);
+    for (let i = 0; i < 3; i += 1) {
+        if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+    }
+    return 0;
+}
+
+function isAllowedLauncherUrl(url: unknown, prefixes: readonly string[]): url is string {
+    if (typeof url !== "string" || url.length > 1024) return false;
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== "https:" || parsed.search !== "" || parsed.hash !== "" || parsed.username !== "" || parsed.password !== "") return false;
+    } catch {
+        return false;
+    }
+    return prefixes.some((prefix) => url.startsWith(prefix) && url.length > prefix.length);
+}
+
+/**
+ * Whether to offer the served manifest to a launcher at `currentVersion` (200) or answer 204, and why not. `installerOnDisk`
+ * checks a self-hosted manifest's installer (`file`): a manifest whose installer is not on this server is never offered.
+ */
+export function DecideLauncherUpdate(
+    manifest: Record<string, unknown> | undefined,
+    currentVersion: string,
+    prefixes: readonly string[],
+    installerOnDisk?: (version: string, file: string) => boolean,
+): { offer: true } | { offer: false; reason: string } {
+    if (!manifest) return { offer: false, reason: "no launcher manifest" };
+    if (typeof manifest.version !== "string" || !LAUNCHER_VERSION.test(manifest.version)) return { offer: false, reason: "the manifest has no x.y.z version" };
+    if (typeof manifest.signature !== "string" || manifest.signature === "") return { offer: false, reason: "the manifest has no signature" };
+    if (!isAllowedLauncherUrl(manifest.url, prefixes)) return { offer: false, reason: "the manifest's download url is not allowed" };
+    if (LAUNCHER_VERSION.test(currentVersion) && compareLauncherVersions(manifest.version, currentVersion) <= 0) return { offer: false, reason: "up to date" };
+    if (typeof manifest.file === "string" && installerOnDisk && !installerOnDisk(manifest.version, manifest.file)) {
+        return { offer: false, reason: "the manifest's installer is not on this server" };
+    }
+    return { offer: true };
+}
+
+/** The manifest as Tauri's updater reads it: only its own fields (the feed's file, sha256 and size stay on the server). */
+export function UpdaterManifest(manifest: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const key of ["version", "notes", "pub_date", "url", "signature"]) {
+        if (manifest[key] !== undefined) out[key] = manifest[key];
+    }
+    return out;
+}
+
+/** A self-hosted installer's name, as the release workflow writes it and the manager accepts it: no spaces, this version. */
+const LAUNCHER_INSTALLER_NAME = /^[A-Za-z0-9._-]{1,120}_x64-setup\.exe$/;
+
+/**
+ * [2026-10-15] Where ".../files/:version/:file" finds a self-hosted installer under `root` (the manager writes
+ * launcher/<target>/<arch>/<version>/<file>, GITHUB_RELEASES.md), or undefined for a name that is not an installer of that
+ * version.
+ */
+export function LauncherInstallerPath(root: string, target: string, arch: string, version: string, file: string): string | undefined {
+    try {
+        if (!LAUNCHER_VERSION.test(version) || !LAUNCHER_INSTALLER_NAME.test(file) || !file.includes(`_${version}_`)) return undefined;
+        const resolved = path.resolve(root, "launcher", segment(target, "target"), segment(arch, "architecture"), version, file);
+        return resolved.startsWith(path.resolve(root) + path.sep) ? resolved : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** What ".../download" serves: a file under LAUNCHER_UPDATE_ROOT, a redirect to an allowed release download, or nothing. */
+export function LauncherDownloadTarget(
+    manifest: Record<string, unknown> | undefined,
+    prefixes: readonly string[],
+): { kind: "file"; version: string; file: string } | { kind: "redirect"; url: string } | undefined {
+    if (!manifest) return undefined;
+    if (typeof manifest.file === "string") {
+        const file = path.basename(manifest.file);
+        if (file !== manifest.file || typeof manifest.version !== "string") return undefined;
+        try {
+            return { kind: "file", version: segment(manifest.version, "version"), file };
+        } catch {
+            return undefined;
+        }
+    }
+    // The first prefix is this backend's own update route: never redirect to it (the download route itself).
+    if (isAllowedLauncherUrl(manifest.url, prefixes.slice(1))) return { kind: "redirect", url: manifest.url };
+    return undefined;
+}
+
+let lastRefusedLauncherManifest = "";
+
 // Tauri's signed launcher updater endpoints. The release script writes the
 // exact JSON shape expected by tauri-plugin-updater into this directory.
 //
@@ -666,12 +773,18 @@ launcherUpdatesRouter.get("/launcher/v1/updates/:target/:arch/download", (req, r
         const target = segment(req.params.target, "target");
         const arch = segment(req.params.arch, "architecture");
         const manifest = readJson(path.join(UPDATE_ROOT, "launcher", target, arch, "latest.json"));
-        const version = typeof manifest?.version === "string" ? segment(manifest.version, "version") : undefined;
-        const file = typeof manifest?.file === "string" ? path.basename(manifest.file) : undefined;
-        if (!version || !file || file !== manifest?.file) {
+        const download = LauncherDownloadTarget(manifest, LauncherUpdateUrlPrefixes());
+        if (download?.kind === "redirect") {
+            // [2026-10-15] A GitHub-hosted release: send the client (an old launcher, a "download" link) to the release file.
+            res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+            res.redirect(302, download.url);
+            return;
+        }
+        if (!download) {
             res.sendStatus(404);
             return;
         }
+        const { version, file } = download;
         const artifact = path.join(UPDATE_ROOT, "launcher", target, arch, version, file);
         if (!fs.existsSync(artifact)) {
             res.sendStatus(404);
@@ -679,29 +792,63 @@ launcherUpdatesRouter.get("/launcher/v1/updates/:target/:arch/download", (req, r
         }
         res.setHeader("Content-Type", "application/octet-stream");
         res.setHeader("Content-Length", fs.statSync(artifact).size);
-        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        // [2026-10-15] This url serves whichever version is current, so it must not be cached (the versioned route below is).
+        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
         fs.createReadStream(artifact).pipe(res);
     } catch {
         res.sendStatus(400);
     }
 });
 
+// [2026-10-15] A self-hosted installer by version and name: the url a self-hosted manifest gives (the manager checks the file's
+// size, sha256 and updater signature before writing it; the launcher checks the signature again). Five path segments, so it
+// never collides with ".../download" or ".../:currentVersion".
+launcherUpdatesRouter.get("/launcher/v1/updates/:target/:arch/files/:version/:file", (req, res) => {
+    if (rejectIfRateLimited(req, res, "update-download")) return;
+    const artifact = LauncherInstallerPath(UPDATE_ROOT, String(req.params.target), String(req.params.arch), String(req.params.version), String(req.params.file));
+    let size: number;
+    try {
+        const stat = artifact ? fs.statSync(artifact) : undefined;
+        if (!artifact || !stat?.isFile()) {
+            res.sendStatus(404);
+            return;
+        }
+        size = stat.size;
+    } catch {
+        res.sendStatus(404);
+        return;
+    }
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Length", size);
+    res.setHeader("Content-Disposition", `attachment; filename="${path.basename(artifact)}"`);
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    fs.createReadStream(artifact).pipe(res);
+});
+
 launcherUpdatesRouter.get("/launcher/v1/updates/:target/:arch/:currentVersion", (req, res) => {
     try {
-        const file = path.join(
-            UPDATE_ROOT,
-            "launcher",
-            segment(req.params.target, "target"),
-            segment(req.params.arch, "architecture"),
-            "latest.json",
-        );
+        const target = segment(req.params.target, "target");
+        const arch = segment(req.params.arch, "architecture");
+        const file = path.join(UPDATE_ROOT, "launcher", target, arch, "latest.json");
         const manifest = readJson(file);
-        if (!manifest) {
+        // A self-hosted installer must be on disk, at the path ".../download" or ".../files/..." would serve.
+        const installerOnDisk = (version: string, name: string): boolean => {
+            const strict = LauncherInstallerPath(UPDATE_ROOT, target, arch, version, name);
+            const legacy = path.basename(name) === name ? path.join(UPDATE_ROOT, "launcher", target, arch, segment(version, "version"), name) : undefined;
+            return [strict, legacy].some((candidate) => candidate !== undefined && fs.existsSync(candidate));
+        };
+        const decision = DecideLauncherUpdate(manifest, String(req.params.currentVersion), LauncherUpdateUrlPrefixes(), installerOnDisk);
+        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        if (!decision.offer) {
+            // [2026-10-15] An unusable manifest is not offered; logged once per change, not per launcher check.
+            if (manifest && decision.reason !== "up to date" && lastRefusedLauncherManifest !== `${file}:${decision.reason}`) {
+                lastRefusedLauncherManifest = `${file}:${decision.reason}`;
+                console.warn(`[update] launcher manifest not offered: ${decision.reason}`);
+            }
             res.sendStatus(204);
             return;
         }
-        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.json(manifest);
+        res.json(UpdaterManifest(manifest as Record<string, unknown>));
     } catch {
         res.sendStatus(400);
     }
