@@ -7,11 +7,74 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <string_view>
 
 namespace mystic::bridge {
+
+/// [2026-10-15] What one host lease heartbeat came to.
+enum class HeartbeatOutcome {
+    /// The backend renewed the lease.
+    Renewed,
+    /// No answer, or a gateway / overload status: the backend is away for a moment (a restart, a release push).
+    Unavailable,
+    /// An answer that refuses the lease: a fenced or stale generation, the emergency stop, an invalid heartbeat.
+    Rejected,
+};
+
+/// [2026-10-15] The outcome of a lease answer. `answered` is false when no HTTP answer arrived at all. 500, 502, 504, 408
+/// and 429 are the backend being away or overloaded; 503 is too, unless it is the operators' emergency stop.
+inline HeartbeatOutcome ClassifyHeartbeatResponse(bool answered, unsigned long status, std::string_view body) {
+    if (!answered) return HeartbeatOutcome::Unavailable;
+    if (status == 200) {
+        return body.find("\"renewed\":true") != std::string_view::npos ? HeartbeatOutcome::Renewed : HeartbeatOutcome::Rejected;
+    }
+    if (status == 503) {
+        return body.find("P2P_EMERGENCY_STOP") != std::string_view::npos ? HeartbeatOutcome::Rejected : HeartbeatOutcome::Unavailable;
+    }
+    if (status == 500 || status == 502 || status == 504 || status == 408 || status == 429) return HeartbeatOutcome::Unavailable;
+    return HeartbeatOutcome::Rejected;
+}
+
+/// [2026-10-15] The host's lease rule. A refusal ends the session after kRejectedLimit refusals in a row (a fenced
+/// generation must stop quickly). A backend that is only away is waited out until kUnavailableGrace has passed since the
+/// last renewal - longer than the backend's own lease and suspect window (10 s + 15 s by default), after which the backend
+/// has ended the session itself and its next answer is a refusal. Until 15 Oct three failures of any kind (about 4 s) ended
+/// the session, so a backend restart ended every hosted hub and the realm hunts with it.
+class LeaseTracker {
+public:
+    static constexpr unsigned kRejectedLimit = 2;
+    static constexpr std::chrono::seconds kUnavailableGrace{ 30 };
+
+    explicit LeaseTracker(std::chrono::steady_clock::time_point start) : last_renewed_(start) {}
+
+    /// Records one heartbeat's outcome at `now`; true when the lease must fail closed now.
+    bool record(HeartbeatOutcome outcome, std::chrono::steady_clock::time_point now) {
+        switch (outcome) {
+        case HeartbeatOutcome::Renewed:
+            last_renewed_ = now;
+            rejected_in_a_row_ = 0;
+            return false;
+        case HeartbeatOutcome::Rejected:
+            return ++rejected_in_a_row_ >= kRejectedLimit;
+        case HeartbeatOutcome::Unavailable:
+            rejected_in_a_row_ = 0;
+            return now - last_renewed_ >= kUnavailableGrace;
+        }
+        return true;
+    }
+
+    /// Whole seconds since the last renewal (diagnostics).
+    [[nodiscard]] long long seconds_since_renewal(std::chrono::steady_clock::time_point now) const {
+        return std::chrono::duration_cast<std::chrono::seconds>(now - last_renewed_).count();
+    }
+
+private:
+    std::chrono::steady_clock::time_point last_renewed_;
+    unsigned rejected_in_a_row_ = 0;
+};
 
 struct AdmissionConsumeRequest {
     std::string session_id;
@@ -71,7 +134,7 @@ public:
     [[nodiscard]] virtual AdmissionConsumeResult consume(const AdmissionConsumeRequest& request) = 0;
     [[nodiscard]] virtual bool publish_host_ready(const HostReadyRequest& request,
         std::string& error) = 0;
-    [[nodiscard]] virtual bool publish_heartbeat(const HostHeartbeatRequest& request,
+    [[nodiscard]] virtual HeartbeatOutcome publish_heartbeat(const HostHeartbeatRequest& request,
         std::string& error) = 0;
     [[nodiscard]] virtual GuardEventBatchResult publish_guard_event(const GuardEventBatchRequest& request) = 0;
     [[nodiscard]] virtual bool request_guard_completion(std::string_view session_id,
@@ -89,7 +152,7 @@ public:
     [[nodiscard]] AdmissionConsumeResult consume(const AdmissionConsumeRequest& request) override;
     [[nodiscard]] bool publish_host_ready(const HostReadyRequest& request,
         std::string& error) override;
-    [[nodiscard]] bool publish_heartbeat(const HostHeartbeatRequest& request,
+    [[nodiscard]] HeartbeatOutcome publish_heartbeat(const HostHeartbeatRequest& request,
         std::string& error) override;
     [[nodiscard]] GuardEventBatchResult publish_guard_event(const GuardEventBatchRequest& request) override;
     [[nodiscard]] bool request_guard_completion(std::string_view session_id,

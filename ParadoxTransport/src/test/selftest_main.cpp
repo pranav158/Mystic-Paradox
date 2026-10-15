@@ -207,6 +207,45 @@ int RunParse() {
     Check(!ParseIceMaterial(config, "peer=acct-1,42,short\n", material, error), "refuses a malformed peer");
     Check(!ParseIceMaterial(config, secrets + "peer=acct-1,44,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n", material, error),
         "refuses a duplicate peer account");
+
+    // [2026-10-15] The host lease: a backend that is away is waited out, a refusal is not (15 Oct: a 4 s backend restart
+    // ended a hosted Escalation because three failed heartbeats of any kind ended the lease).
+    Check(ClassifyHeartbeatResponse(true, 200, R"({"renewed":true,"state":"RUNNING"})") == HeartbeatOutcome::Renewed,
+        "lease: 200 renewed");
+    Check(ClassifyHeartbeatResponse(true, 200, R"({"renewed":false})") == HeartbeatOutcome::Rejected, "lease: 200 not renewed");
+    Check(ClassifyHeartbeatResponse(false, 0, "") == HeartbeatOutcome::Unavailable, "lease: no answer is unavailable");
+    for (const unsigned long status : { 500ul, 502ul, 503ul, 504ul, 408ul, 429ul }) {
+        Check(ClassifyHeartbeatResponse(true, status, "<html>Bad Gateway</html>") == HeartbeatOutcome::Unavailable,
+            "lease: gateway and overload statuses are unavailable");
+    }
+    Check(ClassifyHeartbeatResponse(true, 503, R"({"error":{"code":"P2P_EMERGENCY_STOP"}})") == HeartbeatOutcome::Rejected,
+        "lease: the emergency stop is a refusal");
+    for (const unsigned long status : { 400ul, 401ul, 403ul, 404ul, 409ul, 410ul }) {
+        Check(ClassifyHeartbeatResponse(true, status, R"({"error":{"code":"P2P_GENERATION_FENCED"}})") == HeartbeatOutcome::Rejected,
+            "lease: refusals stay refusals");
+    }
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        LeaseTracker away(t0);
+        bool failed = false;
+        // A 4 s restart, heartbeats every 2 s, then the backend answers again: never fails.
+        for (int second = 2; second <= 6; second += 2) failed |= away.record(HeartbeatOutcome::Unavailable, t0 + std::chrono::seconds(second));
+        failed |= away.record(HeartbeatOutcome::Renewed, t0 + std::chrono::seconds(8));
+        Check(!failed, "lease: a short backend restart is waited out");
+        // Away for longer than the grace since the last renewal: fails then, not before.
+        const auto renewed = t0 + std::chrono::seconds(8);
+        Check(!away.record(HeartbeatOutcome::Unavailable, renewed + LeaseTracker::kUnavailableGrace - std::chrono::seconds(1)),
+            "lease: still waiting just inside the grace");
+        Check(away.record(HeartbeatOutcome::Unavailable, renewed + LeaseTracker::kUnavailableGrace),
+            "lease: fails once the grace has passed");
+        LeaseTracker fenced(t0);
+        Check(!fenced.record(HeartbeatOutcome::Rejected, t0 + std::chrono::seconds(2)), "lease: one refusal is retried");
+        Check(fenced.record(HeartbeatOutcome::Rejected, t0 + std::chrono::seconds(4)), "lease: two refusals in a row fail at once");
+        LeaseTracker mixed(t0);
+        Check(!mixed.record(HeartbeatOutcome::Rejected, t0 + std::chrono::seconds(2)) &&
+            !mixed.record(HeartbeatOutcome::Renewed, t0 + std::chrono::seconds(4)) &&
+            !mixed.record(HeartbeatOutcome::Rejected, t0 + std::chrono::seconds(6)), "lease: a renewal resets the refusal count");
+    }
     return 0;
 }
 
@@ -558,11 +597,11 @@ public:
         ready_sessions_.push_back(request.session_id);
         return true;
     }
-    bool publish_heartbeat(const HostHeartbeatRequest& request, std::string&) override {
+    HeartbeatOutcome publish_heartbeat(const HostHeartbeatRequest& request, std::string&) override {
         std::lock_guard lock(mutex_);
         ++heartbeats_;
         last_admitted_[request.session_id] = request.admitted_peer_count;
-        return true;
+        return HeartbeatOutcome::Renewed;
     }
     GuardEventBatchResult publish_guard_event(const GuardEventBatchRequest&) override {
         return GuardEventBatchResult{ true, std::string(64, 'b'), "" };
@@ -763,7 +802,7 @@ public:
     bool publish_host_ready(const HostReadyRequest& request, std::string& error) override {
         return target_.publish_host_ready(request, error);
     }
-    bool publish_heartbeat(const HostHeartbeatRequest& request, std::string& error) override {
+    HeartbeatOutcome publish_heartbeat(const HostHeartbeatRequest& request, std::string& error) override {
         return target_.publish_heartbeat(request, error);
     }
     GuardEventBatchResult publish_guard_event(const GuardEventBatchRequest& request) override {

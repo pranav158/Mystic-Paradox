@@ -467,7 +467,7 @@ int RunIceHost(const std::filesystem::path& public_key_path, const std::filesyst
     Notify(observer.ready, ready_line);
 
     std::uint64_t lease_sequence = 0;
-    unsigned int heartbeat_failures = 0;
+    LeaseTracker lease(std::chrono::steady_clock::now());
     bool heartbeat_failed_closed = false;
     bool guard_completed = false;
     bool guard_completion_pending = false;
@@ -535,18 +535,25 @@ int RunIceHost(const std::filesystem::path& public_key_path, const std::filesyst
         if (now >= next_heartbeat) {
             ++lease_sequence;
             std::string heartbeat_error;
-            const bool heartbeat_ok = admission_client.publish_heartbeat({ bindings->session_id,
+            const HeartbeatOutcome outcome = admission_client.publish_heartbeat({ bindings->session_id,
                 "lease-" + std::to_string(bindings->generation) + '-' + std::to_string(lease_sequence), lease_sequence,
                 session->admitted_count(), 0, true, true }, heartbeat_error);
-            if (heartbeat_ok) {
-                heartbeat_failures = 0;
-            } else if (++heartbeat_failures >= 3) {
-                Notify(observer.diagnostic, "HOST LEASE FAIL: central authority unavailable or generation fenced");
+            // [2026-10-15] A refusal ends the lease after two in a row; a backend that is only away (a restart, a release
+            // push) is waited out for LeaseTracker::kUnavailableGrace while the players keep playing.
+            if (lease.record(outcome, now)) {
+                Notify(observer.diagnostic, outcome == HeartbeatOutcome::Rejected
+                    ? "HOST LEASE FAIL: the backend refused the lease (" + heartbeat_error + ')'
+                    : "HOST LEASE FAIL: central authority unavailable for " +
+                        std::to_string(lease.seconds_since_renewal(now)) + " s (" + heartbeat_error + ')');
                 Notify(observer.failure, "host:lease_failed");
                 heartbeat_failed_closed = true;
                 break;
-            } else {
-                Notify(observer.diagnostic, "HOST LEASE WARN: " + heartbeat_error);
+            }
+            if (outcome != HeartbeatOutcome::Renewed) {
+                Notify(observer.diagnostic, "HOST LEASE WARN: " + heartbeat_error +
+                    (outcome == HeartbeatOutcome::Unavailable
+                        ? " (waiting; last renewal " + std::to_string(lease.seconds_since_renewal(now)) + " s ago)"
+                        : std::string()));
             }
             next_heartbeat = now + kHeartbeatInterval;
         }

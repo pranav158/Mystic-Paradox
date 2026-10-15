@@ -221,14 +221,14 @@ bool WinHttpAdmissionClient::publish_host_ready(const HostReadyRequest& request,
     return true;
 }
 
-bool WinHttpAdmissionClient::publish_heartbeat(const HostHeartbeatRequest& request,
+HeartbeatOutcome WinHttpAdmissionClient::publish_heartbeat(const HostHeartbeatRequest& request,
     std::string& error) {
     error.clear();
     // A hub host holds up to 64 peers (session_role=HUB); the backend applies the per-kind limit.
     if (!SafeToken(request.session_id, 64, "-") || request.lease_sequence == 0 ||
         request.admitted_peer_count > 64 || request.queue_pressure > 100) {
         error = "invalid host heartbeat";
-        return false;
+        return HeartbeatOutcome::Rejected;
     }
     const std::string body = "{\"leaseSequence\":" + std::to_string(request.lease_sequence) +
         ",\"bridgeAlive\":" + (request.bridge_alive ? "true" : "false") +
@@ -237,16 +237,18 @@ bool WinHttpAdmissionClient::publish_heartbeat(const HostHeartbeatRequest& reque
         ",\"queuePressure\":" + std::to_string(request.queue_pressure) + "}";
     const HttpResult response = post("/mystic/v1/hunts/" + request.session_id +
         "/lease", body, request.request_id);
+    // [2026-10-15] Away (no answer, a gateway or overload status) is told apart from refused: LeaseTracker waits the
+    // first out and ends the session on the second.
+    const HeartbeatOutcome outcome = ClassifyHeartbeatResponse(response.error.empty(), response.status, response.body);
+    if (outcome == HeartbeatOutcome::Renewed) return outcome;
     if (!response.error.empty()) {
         error = response.error;
-        return false;
+    } else if (outcome == HeartbeatOutcome::Unavailable) {
+        error = "host heartbeat: the backend is unavailable (HTTP " + std::to_string(response.status) + ')';
+    } else {
+        error = "host heartbeat rejected active generation (HTTP " + std::to_string(response.status) + ')';
     }
-    if (response.status != 200 || response.body.find("\"renewed\":true") == std::string::npos) {
-        error = "host heartbeat rejected active generation (HTTP " +
-            std::to_string(response.status) + ')';
-        return false;
-    }
-    return true;
+    return outcome;
 }
 
 GuardEventBatchResult WinHttpAdmissionClient::publish_guard_event(const GuardEventBatchRequest& request) {
