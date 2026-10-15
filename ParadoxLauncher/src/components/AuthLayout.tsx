@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { ArtBackdrop } from "./ArtBackdrop";
 import { AetherMark } from "./AetherMark";
+import { NoticeBanner, NoticeTags } from "./NoticeBanner";
 
 /** Art on the left, a glass card on the right; collapses to art-behind-card on narrow windows. */
 export function AuthLayout({ children, banner }: { children: ReactNode; banner?: ReactNode }) {
@@ -31,8 +32,11 @@ interface AuthCardProps {
 export function AuthCard({ title, subtitle, icon, children, className }: AuthCardProps) {
   return (
     <div className={`glass glass-strong auth-card${className ? ` ${className}` : ""}`}>
+      {/* [2026-10-15] The launcher notices: the sticky banner above the form, the tags in the header above the title. */}
+      <NoticeBanner className="auth-notices" />
       {icon}
       <header className="auth-head">
+        <NoticeTags className="auth-tags" />
         <h1 className="auth-title">{title}</h1>
         {subtitle && <p className="auth-sub">{subtitle}</p>}
       </header>

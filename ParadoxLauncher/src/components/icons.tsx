@@ -285,6 +285,17 @@ export function AlertIcon(props: IconProps) {
   );
 }
 
+/** [2026-10-15] A launcher notice of the info tone: a circle with an "i". */
+export function InfoIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 11v5" />
+      <path d="M12 7.8h.01" strokeWidth="2.4" />
+    </Icon>
+  );
+}
+
 /** Co-op connection: three linked peers. */
 export function CoopIcon(props: IconProps) {
   return (

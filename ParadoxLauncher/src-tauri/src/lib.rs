@@ -40,6 +40,8 @@ macro_rules! launcher_commands {
             commands::auth::native_start_discord_link,
             commands::auth::native_start_discord_unlink,
             commands::auth::native_confirm_discord_unlink,
+            // [2026-10-15] Launcher notices (banner and tags) from the official backend; anonymous, never an error on a 404.
+            commands::notices::native_launcher_notices,
             // [2026-10-14] Terms of Use and Privacy Policy consent, and account deletion (official accounts only).
             commands::account::native_consent_status,
             commands::account::native_accept_consent,

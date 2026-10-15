@@ -66,6 +66,29 @@ export interface OfficialPlay {
   message?: string;
 }
 
+/** [2026-10-15] Launcher notices (`GET /launcher/v1/notices`, read from the official backend). Text only, never markup. */
+export type NoticeTone = "info" | "warning" | "critical";
+export type TagTone = "info" | "warning" | "danger" | "success";
+
+export interface LauncherAnnouncement {
+  id: string;
+  text: string;
+  tone: NoticeTone;
+  /** When `{time}` shows, as an ISO time. Absent when the text has no time. */
+  eventAt?: string;
+}
+
+export interface LauncherTag {
+  id: string;
+  text: string;
+  tone: TagTone;
+}
+
+export interface LauncherNotices {
+  announcements: LauncherAnnouncement[];
+  tags: LauncherTag[];
+}
+
 /** [2026-10-15] A registration answer: a code was emailed when `verificationRequired` (the account is not signed in yet). */
 export interface RegistrationOutcome {
   account: LauncherAccount;

@@ -3237,3 +3237,245 @@ test('Settings: the result of a Discord link is shown under the row', async () =
   await mount(accountTabWith({ account: { ...account, discord: { linked: true, username: 'MysticFox' } }, discordLinkNotice: { tone: 'error', text: 'Discord linking didn\'t complete. Please try again.' } }));
   assert.ok(document.body.textContent.includes('Discord linking didn\'t complete. Please try again.'));
 });
+
+// ---- [2026-10-15] Launcher notices: the {time} token, the banner, the dock, the tags, the card and the shared state -----
+
+const noticeTime = load('src/notices/noticeTime.ts', {});
+const NOTICE_EVENT = '2026-10-16T00:00:00.000Z';
+// 08:30 IST on 16 October (Asia/Kolkata) and 23:00 EDT on 15 October (New York): the restart is on the same local day.
+const SAME_DAY_EVE = new Date('2026-10-16T03:00:00.000Z');
+// 17:30 IST on 15 October and 08:00 EDT on 15 October: the restart falls on the next local day in Kolkata, the same in New York.
+const THURSDAY_NOON_UTC = new Date('2026-10-15T12:00:00.000Z');
+
+function nextMidnightUtcFrom(now) {
+  const next = new Date(now);
+  next.setUTCHours(24, 0, 0, 0);
+  return next.toISOString();
+}
+
+// The banner, dock and tags, loaded for real over a fixed set of notices (only the shared state is replaced). The selected
+// server is on the official network unless a test says otherwise.
+function noticeComponents(notices, server = { officialNetwork: true }) {
+  return load('src/components/NoticeBanner.tsx', {
+    '../notices/NoticesContext': { useNotices: () => notices },
+    '../servers/ServerContext': { useServer: () => server },
+    '../notices/noticeTime': noticeTime,
+    './icons': icons,
+  });
+}
+
+const noticeFixture = {
+  announcements: [
+    { id: 'restart', text: 'The backend service will restart at {time}.', tone: 'warning', eventAt: NOTICE_EVENT },
+    { id: 'patch', text: 'Patch notes are in About.', tone: 'info' },
+    { id: 'realms', text: 'Realms are paused for maintenance.', tone: 'critical' },
+  ],
+  tags: [
+    { id: 'exp', text: 'EXPERIMENTAL BUILD', tone: 'warning' },
+    { id: 'beta', text: 'BETA', tone: 'info' },
+    { id: 'live', text: 'LIVE', tone: 'success' },
+    { id: 'unsafe', text: 'UNSAFE', tone: 'danger' },
+  ],
+};
+
+test('{time}: the UTC clock, then the local clock with its zone name, and the local date only on another local day', () => {
+  const { formatNoticeTime } = noticeTime;
+  assert.equal(formatNoticeTime(NOTICE_EVENT, SAME_DAY_EVE, 'en-GB', 'Asia/Kolkata'), '00:00 UTC · 05:30 IST (local time)');
+  assert.equal(formatNoticeTime(NOTICE_EVENT, THURSDAY_NOON_UTC, 'en-GB', 'Asia/Kolkata'), '00:00 UTC · Fri 16 Oct, 05:30 IST (local time)');
+  assert.equal(formatNoticeTime(NOTICE_EVENT, SAME_DAY_EVE, 'en-US', 'America/New_York'), '00:00 UTC · 20:00 EDT (local time)');
+  assert.equal(formatNoticeTime(NOTICE_EVENT, THURSDAY_NOON_UTC, 'en-GB', 'Europe/London'), '00:00 UTC · Fri 16 Oct, 01:00 BST (local time)');
+  // A zone name that is an offset in the viewer's locale is replaced by its letters (en-IN, then en-US).
+  assert.equal(formatNoticeTime(NOTICE_EVENT, SAME_DAY_EVE, 'en-US', 'Asia/Kolkata'), '00:00 UTC · 05:30 IST (local time)');
+  assert.equal(formatNoticeTime(NOTICE_EVENT, SAME_DAY_EVE, 'en-GB', 'America/New_York'), '00:00 UTC · 20:00 EDT (local time)');
+  // No letters anywhere (Paris): the offset stays.
+  assert.equal(formatNoticeTime(NOTICE_EVENT, SAME_DAY_EVE, 'en-US', 'Europe/Paris'), '00:00 UTC · 02:00 GMT+2 (local time)');
+  // A zone whose winter name is GMT keeps GMT, and is not taken for UTC.
+  assert.equal(
+    formatNoticeTime('2026-01-10T00:00:00.000Z', new Date('2026-01-10T06:00:00.000Z'), 'en-GB', 'Europe/London'),
+    '00:00 UTC · 00:00 GMT (local time)',
+  );
+});
+
+test('{time}: in a zone that is UTC only the UTC clock shows, and a day that is not today gets its date in front', () => {
+  const { formatNoticeTime } = noticeTime;
+  assert.equal(formatNoticeTime('2026-10-15T00:00:00.000Z', THURSDAY_NOON_UTC, 'en-GB', 'UTC'), '00:00 UTC');
+  assert.equal(formatNoticeTime('2026-10-15T00:00:00.000Z', THURSDAY_NOON_UTC, 'en-GB', 'Etc/UTC'), '00:00 UTC');
+  assert.equal(formatNoticeTime(NOTICE_EVENT, THURSDAY_NOON_UTC, 'en-GB', 'UTC'), 'Fri 16 Oct, 00:00 UTC');
+});
+
+test('{time}: a missing or invalid event time has no phrase, and a missing or unknown zone shows only the UTC clock', () => {
+  const { formatNoticeTime } = noticeTime;
+  assert.equal(formatNoticeTime(undefined, SAME_DAY_EVE, 'en-GB', 'Asia/Kolkata'), null);
+  assert.equal(formatNoticeTime(null, SAME_DAY_EVE, 'en-GB', 'Asia/Kolkata'), null);
+  assert.equal(formatNoticeTime('', SAME_DAY_EVE, 'en-GB', 'Asia/Kolkata'), null);
+  assert.equal(formatNoticeTime('not a date', SAME_DAY_EVE, 'en-GB', 'Asia/Kolkata'), null);
+  assert.equal(formatNoticeTime(NOTICE_EVENT, new Date('nope'), 'en-GB', 'Asia/Kolkata'), null);
+  assert.equal(formatNoticeTime(NOTICE_EVENT, SAME_DAY_EVE, 'en-GB', undefined), '00:00 UTC');
+  assert.equal(formatNoticeTime(NOTICE_EVENT, SAME_DAY_EVE, 'en-GB', 'Mars/Olympus'), '00:00 UTC');
+});
+
+test('{time} in an announcement: expanded with the time, or taken out with its preposition when there is no time', () => {
+  const { expandNoticeText } = noticeTime;
+  assert.equal(
+    expandNoticeText('The backend service will restart at {time}.', NOTICE_EVENT, SAME_DAY_EVE, 'en-GB', 'Asia/Kolkata'),
+    'The backend service will restart at 00:00 UTC · 05:30 IST (local time).',
+  );
+  assert.equal(
+    expandNoticeText('The backend service will restart at {time}.', undefined, SAME_DAY_EVE, 'en-GB', 'Asia/Kolkata'),
+    'The backend service will restart.',
+  );
+  assert.equal(expandNoticeText('Maintenance {time} tonight.', undefined, SAME_DAY_EVE, 'en-GB', 'Asia/Kolkata'), 'Maintenance tonight.');
+  assert.equal(expandNoticeText('Patch notes are in About.', undefined, SAME_DAY_EVE, 'en-GB', 'Asia/Kolkata'), 'Patch notes are in About.');
+});
+
+test('{time} as the app calls it: this PC\'s zone and clock, read by the helper itself, never a zone written into the code', async () => {
+  const now = new Date();
+  const eventAt = nextMidnightUtcFrom(now);
+  const machineZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  assert.equal(noticeTime.viewerTimeZone(), machineZone, 'the app reads the zone Intl reports for this PC');
+  const text = noticeTime.formatNoticeTime(eventAt, now, noticeTime.viewerLocale(), noticeTime.viewerTimeZone());
+  assert.ok(text.startsWith('00:00 UTC'), text);
+  const machineIsUtc = new Intl.DateTimeFormat('en-US', { timeZone: machineZone }).resolvedOptions().timeZone === 'UTC';
+  if (machineIsUtc) {
+    assert.ok(!text.includes('(local time)'), text);
+  } else {
+    const clock = new Intl.DateTimeFormat('en-GB', { timeZone: machineZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(eventAt));
+    assert.ok(text.includes(`${clock} `), `${text} should show the PC's clock ${clock}`);
+    assert.ok(text.endsWith('(local time)'), text);
+  }
+  // The banner with no clock given reads the same PC values.
+  const { NoticeBanner } = noticeComponents(noticeFixture);
+  await mount(NoticeBanner, {});
+  const restart = document.querySelector('.notice-banner p').textContent;
+  assert.ok(restart.startsWith('The backend service will restart at 00:00 UTC'), restart);
+});
+
+test('the launcher notices: the banner stacks each announcement as text, expands {time} for the zone it is given, and critical is an alert', async () => {
+  const { NoticeBanner } = noticeComponents(noticeFixture);
+  await mount(NoticeBanner, { clock: { now: SAME_DAY_EVE, locale: 'en-US', timeZone: 'Asia/Kolkata' } });
+  const banners = [...document.querySelectorAll('.notice-banner')];
+  assert.equal(banners.length, 3, 'every announcement stacks');
+  assert.deepEqual(banners.map((item) => item.getAttribute('role')), ['status', 'status', 'alert']);
+  assert.equal(banners[0].querySelector('p').textContent, 'The backend service will restart at 00:00 UTC · 05:30 IST (local time).');
+  assert.ok(banners[0].classList.contains('notice-warning'));
+  assert.ok(banners[1].classList.contains('notice-info'));
+  assert.ok(banners[2].classList.contains('notice-critical'));
+  assert.equal(document.querySelectorAll('button').length, 0, 'the banner cannot be dismissed');
+});
+
+test('the launcher notices are text only: markup in a notice is shown as written, never built', async () => {
+  const { NoticeBanner } = noticeComponents({
+    announcements: [{ id: 'x', text: '<img src=x onerror="alert(1)"><b>bold</b>', tone: 'info' }],
+    tags: [],
+  });
+  await mount(NoticeBanner, {});
+  assert.equal(document.querySelector('img'), null);
+  assert.equal(document.querySelector('b'), null);
+  assert.equal(document.querySelector('.notice-banner p').textContent, '<img src=x onerror="alert(1)"><b>bold</b>');
+});
+
+test('the launcher notices: an empty answer shows nothing in the banner, the dock or the tags', async () => {
+  const empty = noticeComponents({ announcements: [], tags: [] });
+  await mount(() => React.createElement(React.Fragment, null,
+    React.createElement(empty.NoticeBanner),
+    React.createElement(empty.NoticeDock),
+    React.createElement(empty.NoticeTags)));
+  assert.equal(document.getElementById('root').innerHTML, '');
+});
+
+// [2026-10-15] A local (self-hosted) server is somebody else's: the official backend's notices are not shown there.
+test('the launcher notices: nothing shows while a local server is selected', async () => {
+  const local = noticeComponents(noticeFixture, { officialNetwork: false });
+  await mount(() => React.createElement(React.Fragment, null,
+    React.createElement(local.NoticeBanner),
+    React.createElement(local.NoticeDock),
+    React.createElement(local.NoticeTags)));
+  assert.equal(document.getElementById('root').innerHTML, '');
+});
+
+test('the launcher notices: the dock holds every banner above the tab', async () => {
+  const { NoticeDock } = noticeComponents(noticeFixture);
+  await mount(NoticeDock, {});
+  assert.equal(document.querySelectorAll('.notice-dock .notice-banner').length, 3);
+});
+
+test('the launcher notices: each tag carries its chip tone, and the tags are listed in order', async () => {
+  const { NoticeTags } = noticeComponents(noticeFixture);
+  await mount(NoticeTags, { className: 'brand-tags' });
+  assert.ok(document.querySelector('ul.notice-tags.brand-tags'));
+  const chips = [...document.querySelectorAll('.notice-tags li > .chip')];
+  assert.deepEqual(chips.map((chip) => chip.textContent), ['EXPERIMENTAL BUILD', 'BETA', 'LIVE', 'UNSAFE']);
+  const tones = chips.map((chip) => ['warn', 'accent', 'good', 'bad'].find((tone) => chip.classList.contains(tone)));
+  assert.deepEqual(tones, ['warn', 'accent', 'good', 'bad']);
+});
+
+test('the sign-in card: the banner sits above the form, and the tags sit in the header above the title', async () => {
+  const notices = noticeComponents(noticeFixture);
+  const layout = load('src/components/AuthLayout.tsx', {
+    './ArtBackdrop': { ArtBackdrop: () => null },
+    './AetherMark': { AetherMark: () => null },
+    './NoticeBanner': notices,
+  });
+  await mount(layout.AuthCard, {
+    title: 'Welcome back, Slayer',
+    children: React.createElement('form', { className: 'auth-form' }, React.createElement('input')),
+  });
+  const banner = document.querySelector('.notice-stack.auth-notices');
+  const tags = document.querySelector('header.auth-head .notice-tags');
+  const title = document.querySelector('h1.auth-title');
+  const form = document.querySelector('form.auth-form');
+  assert.ok(banner && tags && title && form, 'every part is shown');
+  // DOCUMENT_POSITION_FOLLOWING (4): the second node comes after the first.
+  assert.ok(banner.compareDocumentPosition(title) & 4, 'the banner is above the title');
+  assert.ok(banner.compareDocumentPosition(form) & 4, 'the banner is above the form');
+  assert.ok(tags.compareDocumentPosition(title) & 4, 'the tags are above the title');
+});
+
+test('the launcher notices are asked for at startup, every five minutes and on focus, and the last good answer stays when the backend cannot be reached', async () => {
+  const first = { announcements: [{ id: 'restart', text: 'The backend service will restart.', tone: 'warning' }], tags: [] };
+  const third = { announcements: [], tags: [{ id: 'exp', text: 'EXPERIMENTAL BUILD', tone: 'warning' }] };
+  const answers = [first, new Error('unreachable'), third];
+  let asked = 0;
+  const context = load('src/notices/NoticesContext.tsx', {
+    '../api/tauri': {
+      getLauncherNotices: async () => {
+        asked += 1;
+        const answer = answers.shift();
+        if (answer instanceof Error) throw answer;
+        return answer;
+      },
+    },
+  });
+  // A window of its own, so the five-minute timer can be fired by hand.
+  dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost' });
+  global.window = dom.window;
+  global.document = dom.window.document;
+  global.IS_REACT_ACT_ENVIRONMENT = true;
+  const intervals = [];
+  dom.window.setInterval = (callback, ms) => {
+    intervals.push({ callback, ms });
+    return intervals.length;
+  };
+  dom.window.clearInterval = () => {};
+  const seen = [];
+  const Probe = () => {
+    const notices = context.useNotices();
+    seen.push([...notices.announcements.map((item) => item.text), ...notices.tags.map((item) => item.text)].join(' | '));
+    return null;
+  };
+  root = createRoot(document.getElementById('root'));
+  await act(async () => root.render(React.createElement(context.NoticesProvider, null, React.createElement(Probe))));
+  assert.equal(asked, 1, 'asked at startup');
+  assert.equal(intervals.length, 1, 'one timer');
+  assert.equal(intervals[0].ms, 5 * 60 * 1000, 'every five minutes');
+  assert.equal(seen[seen.length - 1], 'The backend service will restart.');
+
+  await act(async () => { dom.window.dispatchEvent(new dom.window.Event('focus')); });
+  assert.equal(asked, 2, 'asked again on focus');
+  assert.equal(seen[seen.length - 1], 'The backend service will restart.', 'an unreachable backend keeps the last good answer');
+  assert.ok(!document.body.textContent.includes('unreachable'), 'and shows no error');
+
+  await act(async () => intervals[0].callback());
+  assert.equal(asked, 3, 'asked again by the timer');
+  assert.equal(seen[seen.length - 1], 'EXPERIMENTAL BUILD', 'a fresh answer replaces the kept one, empty announcements included');
+});

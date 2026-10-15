@@ -54,8 +54,10 @@ use, which have their own policies.
   for actions taken.
 - Your IP address is used to deliver data to you and, briefly and in memory, to limit abuse such as password guessing. It
   also appears in a few security logs, for example chat connections.
-- If you are a tester and choose "Upload last session", we receive that session's launcher and game logs, which include
-  your username and the folder path of your game install.
+- **Testers only:** if your account has tester access and you choose "Upload last session", we receive that Play session's
+  launcher and game logs (the launcher log, the session details and the game's log files). They include your username,
+  your account ID, the folder path of your game install, and what the launcher and the game did during that session.
+  Nothing is uploaded unless you press the button, and accounts without tester access cannot upload.
 
 **What we do not collect**
 - No real names, dates of birth, home addresses, phone numbers or payment details.
@@ -79,6 +81,8 @@ We do not sell your data, and we do not use it for advertising.
   through it.
 - **Cloudflare** relays co-op game traffic between players. It handles the IP addresses of the connected players and a
   pseudonymous identifier (not your account ID) we use to count relay usage.
+- **Our operators** (the people who run Mystic Paradox) can read the logs a tester uploads, to find and fix problems. Every
+  read and every deletion of an upload is recorded in our audit log. This applies to tester accounts only.
 - **Discord**, if you choose to sign in with Discord.
 - **Our hosting provider**, which runs our servers.
 - **Authorities**, if the law requires it.
@@ -104,6 +108,8 @@ Our servers are in India. Cloudflare's relay network is worldwide, so relayed tr
   your account exists.
 - **Integrity check data** is kept for up to 90 days.
 - **Server logs** are kept for up to 90 days and then deleted. Sign-in sessions expire on their own.
+- **Tester log uploads** (tester accounts only) are kept for 90 days after a session's last upload and then deleted
+  automatically. A tester can ask us to delete them sooner.
 
 ## 6. Local servers
 

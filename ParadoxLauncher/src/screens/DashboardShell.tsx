@@ -9,6 +9,7 @@ import { setUiPrefs, useMediaQuery, useUiPrefs } from "../lib/prefs";
 import { prefersReducedMotion, withViewTransition } from "../lib/platform";
 import { buildName, formatClock } from "../lib/sessions";
 import { OPTIONAL_PANELS } from "../lib/optionalPanels";
+import { NoticeDock, NoticeTags } from "../components/NoticeBanner";
 import { HomeTab } from "./dashboard/HomeTab";
 import { LibraryTab } from "./dashboard/LibraryTab";
 import { ServersTab } from "./dashboard/ServersTab";
@@ -158,6 +159,8 @@ function Shell() {
           <div className="brand-mark"><AetherMark title={null} /></div>
           <p className="brand-name">Mystic Paradox</p>
           <p className="brand-sub">Dauntless Server</p>
+          {/* [2026-10-15] The launcher's tags (EXPERIMENTAL BUILD and the like); hidden in the collapsed rail. */}
+          <NoticeTags className="brand-tags" />
         </div>
 
         <nav className="nav" aria-label="Launcher navigation" style={{ "--nav-index": Math.max(navIndex, 0) } as CSSProperties}>
@@ -206,6 +209,8 @@ function Shell() {
       </aside>
 
       <main className="main" ref={mainRef} aria-label="Launcher content">
+        {/* [2026-10-15] The sticky announcement, above the tab's page (outside it, so it does not replay on a tab change). */}
+        <NoticeDock />
         <div key={tab} className={`page-host${supportsViewTransitions() ? "" : " page-enter"}`}>
           {page}
         </div>

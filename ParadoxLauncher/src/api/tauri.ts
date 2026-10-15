@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { LauncherPolicy, LogPaths, OfficialPlay, ServerStatusResponse, UsernameAvailabilityResponse } from "./types";
+import type { LauncherNotices, LauncherPolicy, LogPaths, OfficialPlay, ServerStatusResponse, UsernameAvailabilityResponse } from "./types";
 import type { SessionSummary } from "../lib/sessions";
 
 /** [2026-10-13 realms S1] The three kinds of server the launcher can play on. */
@@ -207,6 +207,14 @@ export async function getServerStatus(serverId?: string): Promise<ServerStatusRe
  */
 export async function getOfficialPlay(): Promise<OfficialPlay> {
   return invoke<OfficialPlay>("native_official_play");
+}
+
+/**
+ * [2026-10-15] The launcher notices from the official backend. No sign-in. Rejects only when the backend cannot be
+ * reached; any other answer (including none, from an older backend) is an answer with no notices.
+ */
+export async function getLauncherNotices(): Promise<LauncherNotices> {
+  return invoke<LauncherNotices>("native_launcher_notices");
 }
 
 /** Whether a username is free on the selected server (a local server's usernames are its own). */

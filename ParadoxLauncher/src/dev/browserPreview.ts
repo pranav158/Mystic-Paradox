@@ -17,6 +17,8 @@
  * [2026-10-14] Terms and deletion: ?gate (the current documents are not accepted: the consent gate opens after sign-in),
  * ?gate=outdated (the acceptance is refused: update the launcher), ?consent404 (a backend without consent routes),
  * ?deactivated (the account is deactivated, deleted 20 days from now), ?nodeletion (a backend without the deletion route).
+ * [2026-10-15] Launcher notices are on by default (the EXPERIMENTAL BUILD tag and the restart notice for the next 00:00 UTC);
+ * ?nonotices shows none.
  */
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { LEGAL } from "../legal/legalMeta";
@@ -66,6 +68,13 @@ const install = params.has("nolocate")
   };
 
 const delay = <T,>(value: T, ms = 350) => new Promise<T>((resolve) => setTimeout(() => resolve(value), ms));
+
+// [2026-10-15] The next 00:00 UTC, the event time of the preview's restart notice.
+function nextMidnightUtc(): string {
+  const next = new Date();
+  next.setUTCHours(24, 0, 0, 0);
+  return next.toISOString();
+}
 
 // [2026-10-13 realms S1] An in-memory server list that follows the native rules closely enough to preview the page.
 interface PreviewServer {
@@ -224,6 +233,17 @@ mockIPC((cmd, args) => {
     // [2026-10-15] ?officialdown: the official server's play switch is off (Home, the switcher and Servers say so).
     case "native_official_play":
       return delay(params.has("officialdown") ? { available: false } : { available: true }, 200);
+    // [2026-10-15] Launcher notices: the experimental tag, and a restart notice for the next 00:00 UTC (?nonotices hides both).
+    case "native_launcher_notices":
+      return delay(params.has("nonotices") ? { announcements: [], tags: [] } : {
+        announcements: [{
+          id: "preview-restart",
+          text: "The backend service will restart at {time}.",
+          tone: "warning",
+          eventAt: nextMidnightUtc(),
+        }],
+        tags: [{ id: "preview-experimental", text: "EXPERIMENTAL BUILD", tone: "warning" }],
+      }, 150);
     case "native_start_discord_link":
       return delay(null, 300);
     // [2026-10-15] Unlinking: the start mails a code (answered with the masked address; ?emailoff refuses it), and the

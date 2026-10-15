@@ -19,6 +19,7 @@ import { SparkIcon } from "./components/icons";
 import { checkLauncherUpdate, installLauncherUpdate, launcherUpdateHoldReason, type LauncherUpdate } from "./api/updates";
 import { startPublicBuildCheckAtStartup } from "./components/PublicBuildCheck";
 import { sanitizeError } from "./lib/sanitize";
+import { NoticesProvider } from "./notices/NoticesContext";
 
 const DEV = import.meta.env.DEV;
 
@@ -236,18 +237,21 @@ function AppShell() {
 
 export default function App() {
   return (
-    <ServerProvider>
-      {/* [2026-10-14 realms] The realm host confirmation, its ownership warning and the realm notices (under ServerProvider). */}
-      <RealmTrustProvider>
-        <AuthProvider>
-          <AccountRulesProvider>
-            <PolicyProvider>
-              <AppShell />
-              <TitleBar />
-            </PolicyProvider>
-          </AccountRulesProvider>
-        </AuthProvider>
-      </RealmTrustProvider>
-    </ServerProvider>
+    // [2026-10-15] The launcher notices (banner and tags) are fetched once for the whole app, signed out or in.
+    <NoticesProvider>
+      <ServerProvider>
+        {/* [2026-10-14 realms] The realm host confirmation, its ownership warning and the realm notices (under ServerProvider). */}
+        <RealmTrustProvider>
+          <AuthProvider>
+            <AccountRulesProvider>
+              <PolicyProvider>
+                <AppShell />
+                <TitleBar />
+              </PolicyProvider>
+            </AccountRulesProvider>
+          </AuthProvider>
+        </RealmTrustProvider>
+      </ServerProvider>
+    </NoticesProvider>
   );
 }

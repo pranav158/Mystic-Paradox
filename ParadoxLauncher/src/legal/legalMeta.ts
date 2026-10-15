@@ -11,7 +11,7 @@
 // the text changes in substance so signed-in players are asked to accept it again.
 export const LEGAL = {
   termsVersion: "2026-10-14",
-  privacyVersion: "2026-10-14.2",
+  privacyVersion: "2026-10-15",
   minimumAge: 16,
   /** {{PRIVACY_EMAIL}}: privacy and data requests only (access, correction, export, deletion questions). */
   contactEmail: "privacy@mysticfox.dev",

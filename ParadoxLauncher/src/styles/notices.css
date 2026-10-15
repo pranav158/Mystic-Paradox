@@ -1,0 +1,135 @@
+/* [2026-10-15] Launcher notices: the sticky announcement banner (the dashboard dock and the sign-in card), and the tags
+   under the sidebar wordmark and in the sign-in header. Colours come from the tokens; the tag chips reuse the .chip tones
+   from components.css (accent, warn, bad, good). */
+
+/* ---- Announcements ------------------------------------------------------------------------------------------------ */
+
+.notice-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.notice-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0;
+  padding: 10px 13px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.5;
+  animation: rise var(--t-med) var(--ease-out) both;
+}
+
+.notice-banner svg {
+  width: 17px;
+  height: 17px;
+  flex: none;
+  margin-top: 1px;
+}
+
+.notice-banner p {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.notice-banner.notice-info {
+  border-color: var(--aether-line);
+  background: var(--aether-a10);
+  color: #d6e8ff;
+}
+
+.notice-banner.notice-info svg {
+  color: var(--aether-hi);
+}
+
+.notice-banner.notice-warning {
+  border-color: var(--warn-line);
+  background: var(--warn-a);
+  color: #f8e6b8;
+}
+
+.notice-banner.notice-warning svg {
+  color: var(--warn);
+}
+
+.notice-banner.notice-critical {
+  border-color: var(--bad-line);
+  background: var(--bad-a);
+  color: #ffd3da;
+}
+
+.notice-banner.notice-critical svg {
+  color: var(--bad);
+}
+
+/* The dashboard's strip. Sticky at the top of .main, below the title bar (its drag strip covers the top 38 px), with a
+   background that fades out at the bottom so scrolled content does not show through the banner. */
+.notice-dock {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  padding: calc(var(--titlebar-h) + 6px) var(--gutter) 14px;
+  background: linear-gradient(180deg, #050a12 0%, #050a12 calc(100% - 14px), rgba(5, 10, 18, 0) 100%);
+}
+
+/* In the sign-in card: the banner sits above the header, and the form below it. */
+.notice-stack.auth-notices {
+  margin-bottom: 16px;
+}
+
+/* ---- Tags ----------------------------------------------------------------------------------------------------------- */
+
+.notice-tags {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.notice-tags li {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.chip.notice-tag {
+  height: 20px;
+  padding: 0 8px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+/* Under the sidebar wordmark: a centred row of chips. */
+.notice-tags.brand-tags {
+  width: 100%;
+  margin-top: 12px;
+}
+
+/* In the sign-in header: left-aligned, above the title. */
+.notice-tags.auth-tags {
+  justify-content: flex-start;
+  margin-bottom: 12px;
+}
+
+/* The collapsed rail has no room for words: the tags are hidden there (the banner still shows). */
+.shell[data-compact="true"] .notice-tags {
+  display: none;
+}
+
+/* [2026-10-15] A short window has no room under the wordmark either: below 720 px the sidebar's foot (account, services) would
+   be pushed out of view, so the sidebar tags step aside. The sign-in screen keeps its tags. */
+@media (max-height: 720px) {
+  .notice-tags.brand-tags {
+    display: none;
+  }
+}
