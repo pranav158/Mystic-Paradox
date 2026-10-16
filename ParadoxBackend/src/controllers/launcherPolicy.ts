@@ -8,7 +8,7 @@
 
 import { GetRepositories } from "../persistence";
 import { LauncherApiError } from "../security/launcherErrors";
-import { TESTER_ROLE } from "../security/testerFeatures";
+import { ReadTesterChannel as ReadTesterChannelRule, TESTER_ROLE } from "../security/testerFeatures";
 import { GetOperationsPolicy } from "../services/operationsPolicy";
 import { GetP2PExtension } from "../extensions/p2p";
 import { logger } from "../logger";
@@ -27,23 +27,9 @@ export interface LauncherPolicyView {
     [field: string]: unknown;
 }
 
-const TESTER_CHANNELS = new Set(["stable", "beta", "dev"]);
-let TesterChannelWarned = false;
-
-/**
- * [2026-10-15] The update channel of a tester account: MYSTICPARADOX_TESTER_CHANNEL, stable unless set. Testers used to be moved to
- * beta unconditionally, but the VPS publishes only stable (runtime and Guard): a tester's launcher then found no runtime or Guard
- * manifest for its channel and could not play. Set beta only once a beta runtime and a beta Guard manifest are published.
- */
+/** [2026-10-16] The tester channel rule lives in security/testerFeatures.ts (shared with Play's channel check). */
 export function ReadTesterChannel(environment: NodeJS.ProcessEnv = process.env): "stable" | "beta" | "dev" {
-    const Raw = (environment.MYSTICPARADOX_TESTER_CHANNEL ?? "").trim().toLowerCase();
-    if (Raw === "") return "stable";
-    if (TESTER_CHANNELS.has(Raw)) return Raw as "stable" | "beta" | "dev";
-    if (!TesterChannelWarned) {
-        TesterChannelWarned = true;
-        logger.warn(`[LauncherPolicy] MYSTICPARADOX_TESTER_CHANNEL must be stable, beta or dev; testers stay on stable`);
-    }
-    return "stable";
+    return ReadTesterChannelRule(environment, (message) => logger.warn(message));
 }
 
 export async function GetLauncherPolicy(userId: string): Promise<LauncherPolicyView> {

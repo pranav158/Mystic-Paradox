@@ -71,14 +71,24 @@ test("non-tester beta and dev requests are denied", () => {
     expectLauncherError(() => AssertRuntimeChannelMatchesAccount("dev", ["player"]), "AUTH_TESTER_REQUIRED");
 });
 
-test("tester policy is beta and beta is authorized", () => {
-    assert.equal(ExpectedRuntimeChannel(["player", "tester"]), "beta");
-    assert.doesNotThrow(() => AssertRuntimeChannelMatchesAccount("beta", ["player", "tester"]));
+const BETA_TESTERS = { MYSTICPARADOX_TESTER_CHANNEL: "beta" };
+
+test("[2026-10-16] a tester's channel is MYSTICPARADOX_TESTER_CHANNEL, stable unless set - the policy route's own rule", () => {
+    assert.equal(ExpectedRuntimeChannel(["player", "tester"], {}), "stable");
+    assert.equal(ExpectedRuntimeChannel(["player", "tester"], BETA_TESTERS), "beta");
+    assert.equal(ExpectedRuntimeChannel(["player", "tester"], { MYSTICPARADOX_TESTER_CHANNEL: "dev" }), "dev");
+    assert.equal(ExpectedRuntimeChannel(["player"], BETA_TESTERS), "stable", "a non-tester stays on stable");
 });
 
-test("tester cannot claim stable or dev when policy currently requires beta", () => {
-    expectLauncherError(() => AssertRuntimeChannelMatchesAccount("stable", ["player", "tester"]), "AUTH_CHANNEL_MISMATCH");
-    expectLauncherError(() => AssertRuntimeChannelMatchesAccount("dev", ["player", "tester"]), "AUTH_CHANNEL_MISMATCH");
+test("[2026-10-16] a tester on the default (stable) is authorized on stable: Play was refused AUTH_CHANNEL_MISMATCH (409) after Max tester", () => {
+    assert.doesNotThrow(() => AssertRuntimeChannelMatchesAccount("stable", ["player", "tester"], {}));
+    expectLauncherError(() => AssertRuntimeChannelMatchesAccount("beta", ["player", "tester"], {}), "AUTH_CHANNEL_MISMATCH");
+});
+
+test("tester policy beta (when set) is authorized on beta only", () => {
+    assert.doesNotThrow(() => AssertRuntimeChannelMatchesAccount("beta", ["player", "tester"], BETA_TESTERS));
+    expectLauncherError(() => AssertRuntimeChannelMatchesAccount("stable", ["player", "tester"], BETA_TESTERS), "AUTH_CHANNEL_MISMATCH");
+    expectLauncherError(() => AssertRuntimeChannelMatchesAccount("dev", ["player", "tester"], BETA_TESTERS), "AUTH_CHANNEL_MISMATCH");
 });
 
 test("approved runtime hash is accepted from the channel manifest", () => {
