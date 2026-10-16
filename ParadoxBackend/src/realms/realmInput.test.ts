@@ -168,7 +168,7 @@ test("adding a player: a username is required, trimmed, 1-64 plain characters; n
 });
 
 test("realm limits: defaults, bounded overrides, garbage ignored", () => {
-    assert.deepEqual(ReadRealmLimits({}), { maxMembers: 1000, maxBans: 1000, maxActiveInvites: 25, maxJoinRequests: 50 });
+    assert.deepEqual(ReadRealmLimits({}), { maxMembers: 1000, maxBans: 1000, maxActiveInvites: 25, maxJoinRequests: 50, maxPlayerInvites: 50 });
     assert.equal(ReadRealmLimits({ MYSTICPARADOX_REALMS_MAX_MEMBERS: "50" }).maxMembers, 50);
     assert.equal(ReadRealmLimits({ MYSTICPARADOX_REALMS_MAX_MEMBERS: "1" }).maxMembers, 1000);
     assert.equal(ReadRealmLimits({ MYSTICPARADOX_REALMS_MAX_MEMBERS: "99999" }).maxMembers, 1000);

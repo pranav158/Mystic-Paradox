@@ -14,6 +14,7 @@ import {
     RealmJoinPolicy,
     RealmJoinRequest,
     RealmMember,
+    RealmPlayerInvite,
     RealmPresenceRecord,
     RealmRecord
 } from "../realmTypes";
@@ -21,6 +22,7 @@ import {
     AddBanResult,
     AddJoinRequestResult,
     AddMemberResult,
+    AddPlayerInviteResult,
     InsertRealmResult,
     RealmPresenceRepository,
     RealmsRepository
@@ -157,6 +159,7 @@ export class InMemoryRealmsRepository implements RealmsRepository {
         if (realm.members.some((entry) => entry.accountId === member.accountId)) return "ALREADY_MEMBER";
         if (realm.members.length >= maxMembers) return "FULL";
         realm.members.push(Copy(member));
+        if (realm.playerInvites !== undefined) realm.playerInvites = realm.playerInvites.filter((invite) => invite.accountId !== member.accountId);
         return "ADDED";
     }
 
@@ -177,6 +180,7 @@ export class InMemoryRealmsRepository implements RealmsRepository {
         realm.bans.push(Copy(ban));
         realm.members = realm.members.filter((member) => !(member.accountId === ban.accountId && member.role === "MEMBER"));
         if (realm.joinRequests !== undefined) realm.joinRequests = realm.joinRequests.filter((request) => request.accountId !== ban.accountId);
+        if (realm.playerInvites !== undefined) realm.playerInvites = realm.playerInvites.filter((invite) => invite.accountId !== ban.accountId);
         return "BANNED";
     }
 
@@ -207,6 +211,34 @@ export class InMemoryRealmsRepository implements RealmsRepository {
         if (realm === undefined || index < 0) return false;
         realm.joinRequests!.splice(index, 1);
         return true;
+    }
+
+    async addPlayerInvite(realmId: string, invite: RealmPlayerInvite, maxInvites: number): Promise<AddPlayerInviteResult> {
+        const realm = this.realms.get(realmId);
+        if (realm === undefined) return "NOT_FOUND";
+        const invites = realm.playerInvites ?? [];
+        if (realm.bans.some((ban) => ban.accountId === invite.accountId)) return "BANNED";
+        if (realm.members.some((member) => member.accountId === invite.accountId)) return "ALREADY_MEMBER";
+        if (invites.some((entry) => entry.accountId === invite.accountId)) return "ALREADY_INVITED";
+        if (invites.length >= maxInvites) return "FULL";
+        realm.playerInvites = [...invites, Copy(invite)];
+        return "ADDED";
+    }
+
+    async removePlayerInvite(realmId: string, accountId: string): Promise<boolean> {
+        const realm = this.realms.get(realmId);
+        const index = realm?.playerInvites?.findIndex((invite) => invite.accountId === accountId) ?? -1;
+        if (realm === undefined || index < 0) return false;
+        realm.playerInvites!.splice(index, 1);
+        return true;
+    }
+
+    async findByPlayerInvite(accountId: string, limit: number): Promise<RealmRecord[]> {
+        return [...this.realms.values()]
+            .filter((realm) => (realm.playerInvites ?? []).some((invite) => invite.accountId === accountId))
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .slice(0, limit)
+            .map(Copy);
     }
 
     async insertInvite(invite: RealmInviteRecord): Promise<"INSERTED" | "DUPLICATE"> {

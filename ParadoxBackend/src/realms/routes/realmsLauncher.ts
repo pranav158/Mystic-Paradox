@@ -54,7 +54,12 @@ import { RealmsService } from "../realmsService";
 //   GET  /launcher/v1/realms/mine/requests                      {requests: [{accountId, displayName, at}]}  (newest first; [2026-10-15])
 //   POST /launcher/v1/realms/mine/requests/:accountId/approve   {accountId, status: "APPROVED"}  (member added, request removed)
 //   POST /launcher/v1/realms/mine/requests/:accountId/deny      {accountId, status: "DENIED"}    (request removed)
-//   POST /launcher/v1/realms/mine/members/add                   {username} -> {accountId, displayName, added}  (let a player in by name)
+//   POST /launcher/v1/realms/mine/members/add                   {username} -> {accountId, displayName, added}  (legacy: launchers to 0.1.68)
+//   POST /launcher/v1/realms/mine/player-invites                {username} -> 201 {accountId, displayName, status: INVITED|MEMBER}  ([2026-10-16])
+//   POST /launcher/v1/realms/mine/player-invites/:accountId/cancel  {accountId, status: "CANCELLED"}
+//   GET  /launcher/v1/realms/player-invites                     {invites: [{realm, at}]}   (the caller's unanswered invites, newest first)
+//   POST /launcher/v1/realms/player-invites/:name/accept        {realm, joined: true}
+//   POST /launcher/v1/realms/player-invites/:name/decline       {declined: true}
 //   POST /launcher/v1/realms/presence/heartbeat                 {} -> {realm: {name, serving, hubReady, hostOnline} | null, expiresAt}  (every 30 s while the game runs)
 //   POST /launcher/v1/realms/presence/leave                     {} -> {left:true}      (the game exited)
 //   GET  /launcher/v1/realms/presence                           {realm: {...} | null, expiresAt}
@@ -190,6 +195,25 @@ export function CreateRealmsRouter(deps: RealmsRouterDeps): Router {
 
     router.post(`${BASE}/mine/members/add`, hosting, (req, res) =>
         Handle(res, async () => service.addMemberByUsername(AccountIdOf(req), Unwrap(ParseUsernameBody(req.body)).username))
+    );
+
+    // [2026-10-16] Player invites: the host invites by username; the player sees the invite and accepts or declines it.
+    router.post(`${BASE}/mine/player-invites`, hosting, (req, res) =>
+        Handle(res, async () => service.invitePlayerByUsername(AccountIdOf(req), Unwrap(ParseUsernameBody(req.body)).username), 201)
+    );
+
+    router.post(`${BASE}/mine/player-invites/:accountId/cancel`, hosting, (req, res) =>
+        Handle(res, async () => service.cancelPlayerInvite(AccountIdOf(req), MemberParam(req)))
+    );
+
+    router.get(`${BASE}/player-invites`, (req, res) => Handle(res, async () => service.listMyPlayerInvites(AccountIdOf(req))));
+
+    router.post(`${BASE}/player-invites/:name/accept`, active, (req, res) =>
+        Handle(res, async () => service.acceptPlayerInvite(AccountIdOf(req), Unwrap(ParseNameParam(req.params.name))))
+    );
+
+    router.post(`${BASE}/player-invites/:name/decline`, (req, res) =>
+        Handle(res, async () => service.declinePlayerInvite(AccountIdOf(req), Unwrap(ParseNameParam(req.params.name))))
     );
 
     // [2026-10-13 hub design section 2.2] The member's realm context: kept alive by the launcher, cleared when the game exits.

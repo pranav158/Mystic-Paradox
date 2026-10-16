@@ -251,8 +251,8 @@ test("a realm looked up by name shows public information only, with the ownershi
         const reply = await Call(H.port, "GET", `${BASE}/by-name/FRIENDS`, "friend-1");
         assert.equal(reply.status, 200);
         assert.deepEqual(Object.keys(reply.json.realm).sort(), [
-            "host", "hostPublicKey", "hubReady", "joinPolicy", "listed", "memberCount", "membership", "name", "online", "playerCount",
-            "realmId", "serving", "version"
+            "host", "hostPublicKey", "hubReady", "invited", "joinPolicy", "listed", "memberCount", "membership", "name", "online", "playerCount",
+            "realmId", "requested", "serving", "version"
         ]);
         assert.deepEqual(reply.json.realm.host, { displayName: "Hosty" });
         assert.ok(!/\d{1,3}(\.\d{1,3}){3}/.test(JSON.stringify(reply.json)));
@@ -464,5 +464,37 @@ test("the module is mounted only when MYSTICPARADOX_REALMS_MODULE is on, true or
             await new Promise<void>((resolve) => server.close(() => resolve()));
             StopRealmsSweeper();
         }
+    }
+});
+
+test("player invites over HTTP: the host invites by username, the player lists, declines or accepts, the host cancels", async () => {
+    const H = await Start(async (name) => ({ friendly: "friend-1", pal: "friend-2" } as Record<string, string>)[name.toLowerCase()]);
+    try {
+        await Call(H.port, "POST", BASE, "host-1", { name: "friends", hostPublicKey: KEY_A });
+        const invited = await Call(H.port, "POST", `${BASE}/mine/player-invites`, "host-1", { username: "Friendly" });
+        assert.equal(invited.status, 201);
+        assert.deepEqual(invited.json, { accountId: "friend-1", displayName: "Friendly", status: "INVITED" });
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/player-invites`, "host-1", {}), 400, "REALM_VALIDATION_FAILED");
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/player-invites`, "friend-2", { username: "friendly" }), 404, "REALM_NOT_FOUND");
+
+        const mine = await Call(H.port, "GET", `${BASE}/mine`, "host-1");
+        assert.deepEqual(mine.json.hosted.playerInvites.map((invite: { accountId: string }) => invite.accountId), ["friend-1"]);
+        const list = await Call(H.port, "GET", `${BASE}/player-invites`, "friend-1");
+        assert.equal(list.status, 200);
+        assert.deepEqual(list.json.invites.map((invite: { realm: { name: string; invited: boolean } }) => [invite.realm.name, invite.realm.invited]), [["friends", true]]);
+
+        const accepted = await Call(H.port, "POST", `${BASE}/player-invites/friends/accept`, "friend-1", {});
+        assert.equal(accepted.status, 200);
+        assert.equal(accepted.json.realm.membership, "MEMBER");
+        ExpectError(await Call(H.port, "POST", `${BASE}/player-invites/friends/accept`, "friend-1", {}), 404, "REALM_PLAYER_INVITE_NOT_FOUND");
+
+        await Call(H.port, "POST", `${BASE}/mine/player-invites`, "host-1", { username: "pal" });
+        assert.deepEqual((await Call(H.port, "POST", `${BASE}/player-invites/friends/decline`, "friend-2", {})).json, { declined: true });
+        await Call(H.port, "POST", `${BASE}/mine/player-invites`, "host-1", { username: "pal" });
+        assert.deepEqual((await Call(H.port, "POST", `${BASE}/mine/player-invites/friend-2/cancel`, "host-1", {})).json, { accountId: "friend-2", status: "CANCELLED" });
+        ExpectError(await Call(H.port, "POST", `${BASE}/mine/player-invites/friend-2/cancel`, "host-1", {}), 404, "REALM_PLAYER_INVITE_NOT_FOUND");
+        ExpectError(await Call(H.port, "POST", `${BASE}/player-invites/a_b/decline`, "friend-2", {}), 400, "REALM_NAME_INVALID");
+    } finally {
+        await H.close();
     }
 });

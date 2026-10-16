@@ -13,6 +13,7 @@ import {
     RealmJoinPolicy,
     RealmJoinRequest,
     RealmMember,
+    RealmPlayerInvite,
     RealmPresenceRecord,
     RealmRecord
 } from "../realmTypes";
@@ -27,6 +28,8 @@ export type AddMemberResult = "ADDED" | "ALREADY_MEMBER" | "BANNED" | "FULL" | "
 export type AddBanResult = "BANNED" | "ALREADY_BANNED" | "FULL" | "NOT_FOUND";
 /** [2026-10-15] A join request: ADDED now; the other answers say why it was not (checked in the order listed). */
 export type AddJoinRequestResult = "ADDED" | "ALREADY_REQUESTED" | "BANNED" | "ALREADY_MEMBER" | "FULL" | "NOT_FOUND";
+/** [2026-10-16] A player invite: ADDED now; the other answers say why it was not (checked in the order listed). */
+export type AddPlayerInviteResult = "ADDED" | "ALREADY_INVITED" | "BANNED" | "ALREADY_MEMBER" | "FULL" | "NOT_FOUND";
 
 export interface RealmsRepository {
     findById(realmId: string): Promise<RealmRecord | undefined>;
@@ -69,11 +72,14 @@ export interface RealmsRepository {
     /** The realm one of whose hub room ids this is (RealmRecord.hubRoomIds). */
     findByHubRoomId(hubRoomId: string): Promise<RealmRecord | undefined>;
 
-    /** Adds a member unless already in, banned, or the realm holds `maxMembers`. */
+    /**
+     * Adds a member unless already in, banned, or the realm holds `maxMembers`. [2026-10-16] The same update removes the account's
+     * player invite, so no invite outlives the membership it offered.
+     */
     addMember(realmId: string, member: RealmMember, maxMembers: number): Promise<AddMemberResult>;
     /** Removes a plain member (never the host). False when the account is not a member. */
     removeMember(realmId: string, accountId: string): Promise<boolean>;
-    /** Bans an account (member or not) and removes it from the members. */
+    /** Bans an account (member or not) and removes it from the members, its join request and [2026-10-16] its player invite. */
     addBan(realmId: string, ban: RealmBan, maxBans: number): Promise<AddBanResult>;
     /** Lifts a ban. False when the account was not banned. A ban also removes the account's join request (addBan). */
     removeBan(realmId: string, accountId: string): Promise<boolean>;
@@ -85,6 +91,16 @@ export interface RealmsRepository {
     addJoinRequest(realmId: string, request: RealmJoinRequest, maxRequests: number): Promise<AddJoinRequestResult>;
     /** Removes the account's join request. False when it had none. */
     removeJoinRequest(realmId: string, accountId: string): Promise<boolean>;
+
+    /**
+     * [2026-10-16] Records a player invite unless the account already has one, is banned or is a member, or the realm already holds
+     * `maxInvites` invites. The checks and the insert are one update, like addJoinRequest.
+     */
+    addPlayerInvite(realmId: string, invite: RealmPlayerInvite, maxInvites: number): Promise<AddPlayerInviteResult>;
+    /** Removes the account's player invite. False when it had none. */
+    removePlayerInvite(realmId: string, accountId: string): Promise<boolean>;
+    /** Realms holding a player invite for the account, by name. */
+    findByPlayerInvite(accountId: string, limit: number): Promise<RealmRecord[]>;
 
     insertInvite(invite: RealmInviteRecord): Promise<"INSERTED" | "DUPLICATE">;
     findInvite(code: string): Promise<RealmInviteRecord | undefined>;

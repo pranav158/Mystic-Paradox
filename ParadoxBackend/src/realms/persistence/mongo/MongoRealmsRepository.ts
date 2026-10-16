@@ -9,6 +9,7 @@ import {
     RealmJoinPolicy,
     RealmJoinRequest,
     RealmMember,
+    RealmPlayerInvite,
     RealmPresenceRecord,
     RealmRecord
 } from "../../realmTypes";
@@ -16,6 +17,7 @@ import {
     AddBanResult,
     AddJoinRequestResult,
     AddMemberResult,
+    AddPlayerInviteResult,
     DisplayNameResolver,
     InsertRealmResult,
     RealmPresenceRepository,
@@ -223,7 +225,8 @@ export class MongoRealmsRepository implements RealmsRepository {
                 "bans.accountId": { $ne: member.accountId },
                 $expr: { $lt: [{ $size: "$members" }, maxMembers] }
             },
-            { $push: { members: { ...member } as any } }
+            // [2026-10-16] The membership answers the account's player invite (the same update; $pull on a missing list does nothing).
+            { $push: { members: { ...member } as any }, $pull: { playerInvites: { accountId: member.accountId } as any } }
         );
         if (result.modifiedCount === 1) return "ADDED";
         // Nothing changed: find out which precondition failed.
@@ -254,7 +257,12 @@ export class MongoRealmsRepository implements RealmsRepository {
             {
                 $push: { bans: { ...ban } as any },
                 // [2026-10-15] A ban also withdraws the account's join request (the same update, so no request outlives the ban).
-                $pull: { members: { accountId: ban.accountId, role: "MEMBER" } as any, joinRequests: { accountId: ban.accountId } as any }
+                $pull: {
+                    members: { accountId: ban.accountId, role: "MEMBER" } as any,
+                    joinRequests: { accountId: ban.accountId } as any,
+                    // [2026-10-16] And the account's player invite.
+                    playerInvites: { accountId: ban.accountId } as any
+                }
             }
         );
         if (result.modifiedCount === 1) return "BANNED";
@@ -303,6 +311,44 @@ export class MongoRealmsRepository implements RealmsRepository {
             { $pull: { joinRequests: { accountId } as any } }
         );
         return result.modifiedCount === 1;
+    }
+
+    async addPlayerInvite(realmId: string, invite: RealmPlayerInvite, maxInvites: number): Promise<AddPlayerInviteResult> {
+        const { realms } = await this.collections();
+        // $ifNull: a realm that never sent an invite has no playerInvites field, and $size of a missing field is an error.
+        const result = await realms.updateOne(
+            {
+                _id: { $eq: realmId as any },
+                "bans.accountId": { $ne: invite.accountId },
+                "members.accountId": { $ne: invite.accountId },
+                "playerInvites.accountId": { $ne: invite.accountId },
+                $expr: { $lt: [{ $size: { $ifNull: ["$playerInvites", []] } }, maxInvites] }
+            },
+            { $push: { playerInvites: { ...invite } as any } }
+        );
+        if (result.modifiedCount === 1) return "ADDED";
+        // Nothing changed: find out which precondition failed (the same order as the in-memory double).
+        const doc = await realms.findOne({ _id: { $eq: realmId as any } }, { projection: { members: 1, bans: 1, playerInvites: 1 } });
+        if (doc == undefined) return "NOT_FOUND";
+        if ((doc.bans ?? []).some((ban: RealmBan) => ban.accountId === invite.accountId)) return "BANNED";
+        if ((doc.members ?? []).some((member: RealmMember) => member.accountId === invite.accountId)) return "ALREADY_MEMBER";
+        if ((doc.playerInvites ?? []).some((entry: RealmPlayerInvite) => entry.accountId === invite.accountId)) return "ALREADY_INVITED";
+        return "FULL";
+    }
+
+    async removePlayerInvite(realmId: string, accountId: string): Promise<boolean> {
+        const { realms } = await this.collections();
+        const result = await realms.updateOne(
+            { _id: { $eq: realmId as any }, "playerInvites.accountId": { $eq: accountId } },
+            { $pull: { playerInvites: { accountId } as any } }
+        );
+        return result.modifiedCount === 1;
+    }
+
+    async findByPlayerInvite(accountId: string, limit: number): Promise<RealmRecord[]> {
+        const { realms } = await this.collections();
+        const docs = await realms.find({ "playerInvites.accountId": { $eq: accountId } }).sort({ name: 1 }).limit(limit).toArray();
+        return docs.map(ToRealm);
     }
 
     async insertInvite(invite: RealmInviteRecord): Promise<"INSERTED" | "DUPLICATE"> {

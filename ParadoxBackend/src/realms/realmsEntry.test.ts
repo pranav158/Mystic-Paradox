@@ -140,7 +140,7 @@ test("an offline refusal costs nothing: the invite is not used and the stranger 
 });
 
 test("a full realm refuses the entry and gives the invite use back", async () => {
-    const kit = SetupRealms({ limits: { maxMembers: 2, maxBans: 5, maxActiveInvites: 25, maxJoinRequests: 50 } });
+    const kit = SetupRealms({ limits: { maxMembers: 2, maxBans: 5, maxActiveInvites: 25, maxJoinRequests: 50, maxPlayerInvites: 50 } });
     const realm = await kit.create("host-1", "friends");
     await kit.serve("host-1", realm.realmId);
     const { invite } = await kit.service.createInvite("host-1", { maxUses: 5, ttlHours: 24 });

@@ -139,20 +139,9 @@ if ((process.env.MYSTICPARADOX_LOG_ORIGIN_BODIES ?? "0") === "1") {
 // Per-address request budget (security/rateLimit.ts). One instance, counted once per request.
 const RequestLimiter = CreateRequestRateLimiter();
 
-// [2026-10-11 P2P, plan 39_ §13.1 B4] The player-hosted hunt routes are mounted early (below) for their own body
-// parser, which put them ahead of the request budget: lease, admission, Guard evidence and completion calls were
-// never limited. They now pass the same budget (hosts get their own bucket there) before their router.
-app.use("/mystic/v1/hunts", RequestLimiter);
-
-// Routes of an optional module that need their own body parser are mounted before the shared
-// parsers. All other routes use Express's default limit.
-Extension.http.mountEarlyRoutes(app);
-
-// [2026-10-14, P5.1] The verify hook keeps the raw bytes of /admin/v1 bodies for the manager operator signature (security/managerOperator.ts).
-app.use(express.json({ verify: CaptureAdminRawBody }));
-app.use(express.urlencoded({ extended: true }));
-
 // [move5 diagnostic — 2026-07-10]
+// [2026-10-16] Mounted ahead of the request budget and the early (player-host) routes: /mystic/v1/hunts (lease, Guard evidence,
+// completion) used to bypass it, so a refused completion or lease never appeared in the backend log.
 // Log every incoming request BEFORE any router so we can definitively answer:
 //   1. Does this request reach the metagame at all?
 //   2. Does it carry the x-mysticparadox-gameserver-apikey header? (→ IsGameserver path)
@@ -163,6 +152,8 @@ app.use(express.urlencoded({ extended: true }));
 // [BODY-CAPTURE] Toggle: dump request bodies for progression/store/currency POST paths to learn the client
 // contract (Slayer's Path unlocks, currency spends). OFF by default; enable with env MYSTICPARADOX_BODY_CAPTURE=1
 // (accepts 1/true/on/yes). Kept behind a flag so it can be re-enabled for future contract debugging.
+/** [2026-10-16] The player-host lease and Guard evidence routes (see the request log below). */
+const HIGH_FREQUENCY_HOST_ROUTE = /^\/mystic\/v1\/hunts\/[^/]+\/(lease|event-batches)$/;
 const BODY_CAPTURE_ENABLED = /^(1|true|on|yes)$/i.test(process.env.MYSTICPARADOX_BODY_CAPTURE ?? "");
 
 app.use((req, res, next) => {
@@ -178,19 +169,43 @@ app.use((req, res, next) => {
     const authBearer = typeof req.headers.authorization === "string" && req.headers.authorization.toLowerCase().startsWith("bearer ") ? "Y" : "N";
     const originHost = (req as OriginTaggedRequest).originHost;
     const loggedUrl = sanitizeUrlForLog(req.originalUrl);
-    logger.info(`[REQ] requestId=${requestId} ${req.method} ${req.headers.host || "?"}${loggedUrl}${originHost ? ` origin=${originHost}` : ""} gsKey=${gsKey}${Extension.http.requestLogTags(req)} bearer=${authBearer}`);
-    if (BODY_CAPTURE_ENABLED && req.method === "POST" && /(pjm|progression|breadcrumbs|store|reconcile|balance|purchase|unlock|merit|currenc|inventory)/i.test(req.originalUrl)) {
-        try { logger.info(`[BODY-CAPTURE] ${req.method} ${loggedUrl} body=${JSON.stringify(req.body)}`); } catch { /* ignore */ }
-    }
+    const requestLine = `[REQ] requestId=${requestId} ${req.method} ${req.headers.host || "?"}${loggedUrl}${originHost ? ` origin=${originHost}` : ""} gsKey=${gsKey}${Extension.http.requestLogTags(req)} bearer=${authBearer}`;
+    // [2026-10-16] A player host renews its lease every ~2 s and sends one Guard evidence batch per event: those two are logged
+    // only when refused (both lines then, at the answer), so a failure shows without a line pair per heartbeat and per hit.
+    const quietWhenOk = HIGH_FREQUENCY_HOST_ROUTE.test(req.path);
+    if (!quietWhenOk) logger.info(requestLine);
     res.on("finish", () => {
         AdjustMetric("mysticparadox_http_inflight", -1);
         IncrementMetric("mysticparadox_http_responses_total", 1, { class: metricClass, status: `${Math.floor(res.statusCode / 100)}xx` });
         ObserveMetric("mysticparadox_http_request_duration_ms", Date.now() - started, { class: metricClass });
         // Authentication may add safe ` key=value` tags (for example an optional module's runtime identity).
         const responseTags = typeof res.locals.responseLogTags === "string" ? res.locals.responseLogTags : "";
+        if (quietWhenOk && res.statusCode < 400) return;
+        if (quietWhenOk) logger.info(requestLine);
         logger.info(`[RES] requestId=${requestId} ${req.method} ${loggedUrl} → ${res.statusCode}` +
             `${responseTags} (${Date.now() - started}ms)`);
     });
+    next();
+});
+
+// [2026-10-11 P2P, plan 39_ §13.1 B4] The player-hosted hunt routes are mounted early (below) for their own body
+// parser, which put them ahead of the request budget: lease, admission, Guard evidence and completion calls were
+// never limited. They now pass the same budget (hosts get their own bucket there) before their router.
+app.use("/mystic/v1/hunts", RequestLimiter);
+
+// Routes of an optional module that need their own body parser are mounted before the shared
+// parsers. All other routes use Express's default limit.
+Extension.http.mountEarlyRoutes(app);
+
+// [2026-10-14, P5.1] The verify hook keeps the raw bytes of /admin/v1 bodies for the manager operator signature (security/managerOperator.ts).
+app.use(express.json({ verify: CaptureAdminRawBody }));
+app.use(express.urlencoded({ extended: true }));
+
+// [BODY-CAPTURE] (see BODY_CAPTURE_ENABLED above) needs the parsed body, so it runs after the shared parsers.
+app.use((req, _res, next) => {
+    if (BODY_CAPTURE_ENABLED && req.method === "POST" && /(pjm|progression|breadcrumbs|store|reconcile|balance|purchase|unlock|merit|currenc|inventory)/i.test(req.originalUrl)) {
+        try { logger.info(`[BODY-CAPTURE] ${req.method} ${sanitizeUrlForLog(req.originalUrl)} body=${JSON.stringify(req.body)}`); } catch { /* ignore */ }
+    }
     next();
 });
 

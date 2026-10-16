@@ -139,8 +139,8 @@ test("anyone signed in can look a realm up by name and gets public information o
     await create("host-1", "friends", { joinPolicy: "PUBLIC", listed: true, version: "0.2.128" });
     const { realm } = await service.getByName("stranger", "friends");
     assert.deepEqual(Object.keys(realm).sort(), [
-        "host", "hostPublicKey", "hubReady", "joinPolicy", "listed", "memberCount", "membership", "name", "online", "playerCount",
-        "realmId", "serving", "version"
+        "host", "hostPublicKey", "hubReady", "invited", "joinPolicy", "listed", "memberCount", "membership", "name", "online", "playerCount",
+        "realmId", "requested", "serving", "version"
     ]);
     assert.deepEqual(realm.host, { displayName: "Hosty" });
     assert.equal(realm.version, "0.2.128");
@@ -264,7 +264,7 @@ test("a banned account is refused before any invite is used, in invite-only and 
 });
 
 test("a full realm refuses the join and gives the invite use back", async () => {
-    const { repo, service, create } = Setup({ limits: { maxMembers: 2, maxBans: 5, maxActiveInvites: 25, maxJoinRequests: 50 } });
+    const { repo, service, create } = Setup({ limits: { maxMembers: 2, maxBans: 5, maxActiveInvites: 25, maxJoinRequests: 50, maxPlayerInvites: 50 } });
     await create("host-1", "friends");
     const { invite } = await service.createInvite("host-1", { maxUses: 5, ttlHours: 24 });
     await service.join("friend-1", { inviteCode: invite.code });
@@ -360,7 +360,7 @@ test("host-only actions answer not-found to an account that hosts no realm", asy
 });
 
 test("the ban list has a ceiling", async () => {
-    const { service, create } = Setup({ limits: { maxMembers: 10, maxBans: 2, maxActiveInvites: 25, maxJoinRequests: 50 } });
+    const { service, create } = Setup({ limits: { maxMembers: 10, maxBans: 2, maxActiveInvites: 25, maxJoinRequests: 50, maxPlayerInvites: 50 } });
     await create("host-1", "friends");
     await service.ban("host-1", "a1");
     await service.ban("host-1", "a2");
@@ -406,7 +406,7 @@ test("another host cannot revoke an invite that is not theirs", async () => {
 });
 
 test("a host has a ceiling of open invites; expired and revoked ones do not count", async () => {
-    const { clock, service, create } = Setup({ limits: { maxMembers: 10, maxBans: 10, maxActiveInvites: 2, maxJoinRequests: 50 } });
+    const { clock, service, create } = Setup({ limits: { maxMembers: 10, maxBans: 10, maxActiveInvites: 2, maxJoinRequests: 50, maxPlayerInvites: 50 } });
     await create("host-1", "friends");
     const first = (await service.createInvite("host-1", { maxUses: 1, ttlHours: 1 })).invite;
     await service.createInvite("host-1", { maxUses: 1, ttlHours: 24 });
@@ -553,7 +553,7 @@ test("deny removes the request and the player may ask again; a player with no re
 });
 
 test("a full request list refuses a new player and keeps the requests it has", async () => {
-    const { service, create } = Setup({ limits: { maxMembers: 10, maxBans: 10, maxActiveInvites: 25, maxJoinRequests: 1 } });
+    const { service, create } = Setup({ limits: { maxMembers: 10, maxBans: 10, maxActiveInvites: 25, maxJoinRequests: 1, maxPlayerInvites: 50 } });
     await create("host-1", "friends");
     await Rejects(service.join("friend-1", { name: "friends" }), "REALM_JOIN_REQUESTED");
     await Rejects(service.join("friend-2", { name: "friends" }), "REALM_REQUESTS_FULL");
@@ -562,7 +562,7 @@ test("a full request list refuses a new player and keeps the requests it has", a
 });
 
 test("approving into a full realm is refused and the request stays", async () => {
-    const { service, create } = Setup({ limits: { maxMembers: 2, maxBans: 10, maxActiveInvites: 25, maxJoinRequests: 50 } });
+    const { service, create } = Setup({ limits: { maxMembers: 2, maxBans: 10, maxActiveInvites: 25, maxJoinRequests: 50, maxPlayerInvites: 50 } });
     await create("host-1", "friends");
     await Rejects(service.join("friend-1", { name: "friends" }), "REALM_JOIN_REQUESTED");
     const { invite } = await service.createInvite("host-1", { maxUses: 1, ttlHours: 24 });
@@ -606,4 +606,116 @@ test("only the host manages requests and adds players: anyone else is told they 
     await Rejects(service.approveJoinRequest("friend-1", "friend-2"), "REALM_NOT_FOUND");
     await Rejects(service.denyJoinRequest("friend-1", "friend-2"), "REALM_NOT_FOUND");
     await Rejects(service.addMemberByUsername("friend-1", "pal"), "REALM_NOT_FOUND");
+});
+
+// ----- player invites [2026-10-16]: the host invites by username, the player accepts or declines -----
+
+function InviteSetup(limits?: RealmsServiceDeps["limits"]) {
+    const usernames = new Map([["pal", "friend-2"], ["friendly", "friend-1"], ["hosty", "host-1"]]);
+    return Setup({ resolveUsername: async (name) => usernames.get(name.toLowerCase()), ...(limits ? { limits } : {}) });
+}
+
+test("an invited player is not a member until they accept; both sides see the invite", async () => {
+    const { service, create } = InviteSetup();
+    await create("host-1", "friends");
+    assert.deepEqual(await service.invitePlayerByUsername("host-1", "  Friendly "), { accountId: "friend-1", displayName: "Friendly", status: "INVITED" });
+
+    const hosted = (await service.getMine("host-1")).hosted!;
+    assert.deepEqual(hosted.playerInvites, [{ accountId: "friend-1", displayName: "Friendly", at: new Date(T0).toISOString() }]);
+    assert.equal(hosted.memberCount, 1, "an invite is not a membership");
+    const seen = (await service.getByName("friend-1", "friends")).realm;
+    assert.equal(seen.invited, true);
+    assert.equal(seen.membership, null);
+    assert.deepEqual((await service.getMine("friend-1")).memberOf, []);
+
+    const mine = await service.listMyPlayerInvites("friend-1");
+    assert.deepEqual(mine.invites.map((invite) => [invite.realm.name, invite.realm.invited, invite.at]), [["friends", true, new Date(T0).toISOString()]]);
+    assert.deepEqual((await service.listMyPlayerInvites("friend-2")).invites, []);
+
+    const accepted = await service.acceptPlayerInvite("friend-1", "friends");
+    assert.equal(accepted.joined, true);
+    assert.equal(accepted.realm.membership, "MEMBER");
+    assert.equal(accepted.realm.invited, false);
+    assert.deepEqual((await service.listMyPlayerInvites("friend-1")).invites, []);
+    assert.deepEqual((await service.getMine("host-1")).hosted!.playerInvites, []);
+    assert.deepEqual((await service.getMine("friend-1")).memberOf.map((realm) => realm.name), ["friends"]);
+    await Rejects(service.acceptPlayerInvite("friend-1", "friends"), "REALM_PLAYER_INVITE_NOT_FOUND");
+});
+
+test("declining removes the invite and the host may invite again; the host can cancel; a missing invite is not found", async () => {
+    const { service, create } = InviteSetup();
+    await create("host-1", "friends");
+    await service.invitePlayerByUsername("host-1", "friendly");
+    assert.deepEqual(await service.declinePlayerInvite("friend-1", "friends"), { declined: true });
+    assert.deepEqual((await service.getMine("host-1")).hosted!.playerInvites, []);
+    await Rejects(service.declinePlayerInvite("friend-1", "friends"), "REALM_PLAYER_INVITE_NOT_FOUND");
+
+    await service.invitePlayerByUsername("host-1", "friendly");
+    assert.deepEqual(await service.invitePlayerByUsername("host-1", "FRIENDLY"), { accountId: "friend-1", displayName: "Friendly", status: "INVITED" }, "inviting again changes nothing");
+    assert.equal((await service.getMine("host-1")).hosted!.playerInvites.length, 1);
+    assert.deepEqual(await service.cancelPlayerInvite("host-1", "friend-1"), { accountId: "friend-1", status: "CANCELLED" });
+    await Rejects(service.cancelPlayerInvite("host-1", "friend-1"), "REALM_PLAYER_INVITE_NOT_FOUND");
+    await Rejects(service.acceptPlayerInvite("friend-1", "friends"), "REALM_PLAYER_INVITE_NOT_FOUND");
+    await Rejects(service.acceptPlayerInvite("friend-1", "nothing-here"), "REALM_NOT_FOUND");
+});
+
+test("joining or pressing Play with a pending invite accepts it instead of asking again", async () => {
+    const { service, create } = InviteSetup();
+    const realm = (await create("host-1", "friends")).realm;
+    await service.heartbeat("host-1", {});
+    await service.setHosting(realm.realmId, { hubState: "RUNNING" });
+
+    await service.invitePlayerByUsername("host-1", "friendly");
+    assert.deepEqual(await service.authorizeEntry("friend-1", { name: "friends" }), { ok: true, realmId: realm.realmId, isHost: false });
+    assert.equal((await service.getByName("friend-1", "friends")).realm.membership, "MEMBER");
+    assert.deepEqual((await service.listJoinRequests("host-1")).requests, [], "no request was recorded");
+
+    await service.invitePlayerByUsername("host-1", "pal");
+    const joined = await service.join("friend-2", { name: "friends" });
+    assert.equal(joined.joined, true);
+    assert.equal(joined.realm.membership, "MEMBER");
+    assert.deepEqual((await service.getMine("host-1")).hosted!.playerInvites, []);
+});
+
+test("inviting a player who asked to join lets them in at once; a member is answered MEMBER; the host cannot invite themselves", async () => {
+    const { service, create } = InviteSetup();
+    await create("host-1", "friends");
+    await Rejects(service.join("friend-1", { name: "friends" }), "REALM_JOIN_REQUESTED");
+    assert.equal((await service.getByName("friend-1", "friends")).realm.requested, true, "the player sees their request waiting");
+
+    assert.deepEqual(await service.invitePlayerByUsername("host-1", "friendly"), { accountId: "friend-1", displayName: "Friendly", status: "MEMBER" });
+    assert.deepEqual((await service.listJoinRequests("host-1")).requests, []);
+    const seen = (await service.getByName("friend-1", "friends")).realm;
+    assert.equal(seen.membership, "MEMBER");
+    assert.equal(seen.requested, false);
+    assert.deepEqual(await service.invitePlayerByUsername("host-1", "friendly"), { accountId: "friend-1", displayName: "Friendly", status: "MEMBER" });
+    await Rejects(service.invitePlayerByUsername("host-1", "hosty"), "REALM_INVALID_TARGET");
+    await Rejects(service.invitePlayerByUsername("host-1", "nobody"), "REALM_PLAYER_NOT_FOUND");
+});
+
+test("a ban withdraws the invite and refuses a new one; accepting after a ban is refused", async () => {
+    const { repo, service, create } = InviteSetup();
+    await create("host-1", "friends");
+    await service.invitePlayerByUsername("host-1", "pal");
+    await service.ban("host-1", "friend-2", "griefing");
+    assert.deepEqual((await repo.findById("realm-1"))!.playerInvites, []);
+    await Rejects(service.invitePlayerByUsername("host-1", "pal"), "REALM_BANNED");
+    await Rejects(service.acceptPlayerInvite("friend-2", "friends"), "REALM_PLAYER_INVITE_NOT_FOUND");
+    assert.deepEqual((await service.listMyPlayerInvites("friend-2")).invites, []);
+});
+
+test("the unanswered invite list has a ceiling", async () => {
+    const { service, create } = InviteSetup({ maxMembers: 10, maxBans: 10, maxActiveInvites: 25, maxJoinRequests: 50, maxPlayerInvites: 1 });
+    await create("host-1", "friends");
+    await service.invitePlayerByUsername("host-1", "friendly");
+    await Rejects(service.invitePlayerByUsername("host-1", "pal"), "REALM_PLAYER_INVITES_FULL");
+    await service.declinePlayerInvite("friend-1", "friends");
+    assert.equal((await service.invitePlayerByUsername("host-1", "pal")).status, "INVITED", "a freed slot takes the next invite");
+});
+
+test("only the host invites and cancels: anyone else is told they host no realm", async () => {
+    const { service, create } = InviteSetup();
+    await create("host-1", "friends");
+    await Rejects(service.invitePlayerByUsername("friend-1", "pal"), "REALM_NOT_FOUND");
+    await Rejects(service.cancelPlayerInvite("friend-1", "friend-2"), "REALM_NOT_FOUND");
 });

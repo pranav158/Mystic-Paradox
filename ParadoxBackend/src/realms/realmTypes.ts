@@ -33,6 +33,15 @@ export interface RealmJoinRequest {
     at: string;
 }
 
+/**
+ * [2026-10-16] A player the host invited by launcher username. The player becomes a member only by accepting (or by pressing Play
+ * with the invite pending); declining removes it. At most RealmLimits.maxPlayerInvites per realm.
+ */
+export interface RealmPlayerInvite {
+    accountId: string;
+    at: string;
+}
+
 /** State of one hosted server kind on the host's PC. Mirrored by the p2p module (setHosting), never self-reported. */
 export type RealmHubState = "NONE" | "STARTING" | "RUNNING" | "STOPPING";
 export type RealmHubKind = "RAMSGATE" | "TRAINING";
@@ -98,6 +107,11 @@ export interface RealmRecord {
      * account, bounded by RealmLimits.maxJoinRequests; absent until the first request. A ban removes the account's request.
      */
     joinRequests?: RealmJoinRequest[];
+    /**
+     * [2026-10-16] Players the host invited by username who have not answered yet (RealmPlayerInvite). One entry per account; absent
+     * until the first invite. Becoming a member (any way) and a ban both remove the account's invite in the same update.
+     */
+    playerInvites?: RealmPlayerInvite[];
 }
 
 /** A member's current realm context (section 2.2), as stored. */

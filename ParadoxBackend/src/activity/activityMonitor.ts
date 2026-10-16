@@ -463,9 +463,26 @@ const DefaultLauncherBuildSources: LauncherBuildSources = {
 };
 
 /**
+ * [2026-10-16] The verdict for a Play's launcher report on `channel`, against the served Guard pin and launcher version - the same one
+ * RecordLauncherBuild flags with. Used by the MYSTICPARADOX_UNOFFICIAL_LAUNCHER refusal (security/unofficialLauncherPolicy.ts). Never
+ * throws: a feed that cannot be read gives "unknown".
+ */
+export function ClassifyReportedLauncherBuild(channel: string, report: LauncherBuildReport | undefined,
+    sources: LauncherBuildSources = DefaultLauncherBuildSources): LauncherBuildVerdict {
+    if (report === undefined) return "unknown";
+    try {
+        return ClassifyLauncherBuild(report, sources.pinnedLauncherSha256(channel), sources.servedLauncherVersion());
+    } catch (error) {
+        logger.warn(`[UnofficialLauncher] launcher build check unavailable: ${String(error)}`);
+        return "unknown";
+    }
+}
+
+/**
  * The launcher build a Play reported (POST /launcher/v1/game-sessions). A build that is not the one Guard pins, on the served
  * version or newer, raises UNOFFICIAL_LAUNCHER (once per account and day); an older official build updates itself and is not
- * flagged. Self-reported, so a monitor only: nothing is refused. Returns the verdict; never throws.
+ * flagged. Self-reported, so a monitor only: nothing is refused here (MYSTICPARADOX_UNOFFICIAL_LAUNCHER=refuse refuses in the Play
+ * handler, security/unofficialLauncherPolicy.ts). Returns the verdict; never throws.
  */
 export async function RecordLauncherBuild(userId: string, channel: string, report: LauncherBuildReport | undefined,
     sources: LauncherBuildSources = DefaultLauncherBuildSources, nowMs: number = Date.now()): Promise<LauncherBuildVerdict> {

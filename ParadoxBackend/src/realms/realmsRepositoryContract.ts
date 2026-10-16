@@ -416,4 +416,39 @@ export function RunRealmsRepositoryContract(label: string, harness: () => Promis
         assert.equal(results.filter((result) => result === "FULL").length, 3);
         assert.equal((await repo.findById("id-friends"))!.joinRequests?.length, 3);
     });
+
+    // [2026-10-16] Player invites: the same checks and order as join requests; a membership or a ban answers the invite.
+    Case("player invites: recorded once, refused for a member, a banned account and a full list, and withdrawn on request", async (repo) => {
+        await repo.insertRealm(MakeRealm("friends", "host-1", {
+            members: [{ accountId: "host-1", role: "HOST", joinedAt: NOW }, { accountId: "friend", role: "MEMBER", joinedAt: NOW }],
+            bans: [{ accountId: "banned", at: NOW }]
+        }));
+        assert.equal(await repo.addPlayerInvite("id-friends", { accountId: "guest-1", at: NOW }, 2), "ADDED");
+        assert.equal(await repo.addPlayerInvite("id-friends", { accountId: "guest-1", at: LATER }, 2), "ALREADY_INVITED");
+        assert.equal(await repo.addPlayerInvite("id-friends", { accountId: "banned", at: NOW }, 2), "BANNED");
+        assert.equal(await repo.addPlayerInvite("id-friends", { accountId: "friend", at: NOW }, 2), "ALREADY_MEMBER");
+        assert.equal(await repo.addPlayerInvite("id-friends", { accountId: "guest-2", at: NOW }, 2), "ADDED");
+        assert.equal(await repo.addPlayerInvite("id-friends", { accountId: "guest-3", at: NOW }, 2), "FULL");
+        assert.equal(await repo.addPlayerInvite("id-nope", { accountId: "guest-3", at: NOW }, 2), "NOT_FOUND");
+        assert.deepEqual((await repo.findById("id-friends"))!.playerInvites, [{ accountId: "guest-1", at: NOW }, { accountId: "guest-2", at: NOW }]);
+
+        assert.equal(await repo.removePlayerInvite("id-friends", "guest-1"), true);
+        assert.equal(await repo.removePlayerInvite("id-friends", "guest-1"), false);
+        assert.equal(await repo.addPlayerInvite("id-friends", { accountId: "guest-3", at: NOW }, 2), "ADDED", "a withdrawn invite frees its place");
+    });
+
+    Case("a membership and a ban each remove the account's player invite, and findByPlayerInvite finds the inviting realms", async (repo) => {
+        await repo.insertRealm(MakeRealm("friends", "host-1"));
+        await repo.insertRealm(MakeRealm("embers", "host-2"));
+        await repo.addPlayerInvite("id-friends", { accountId: "guest", at: NOW }, 10);
+        await repo.addPlayerInvite("id-embers", { accountId: "guest", at: NOW }, 10);
+        await repo.addPlayerInvite("id-friends", { accountId: "other", at: NOW }, 10);
+        assert.deepEqual((await repo.findByPlayerInvite("guest", 10)).map((realm) => realm.name), ["embers", "friends"]);
+
+        assert.equal(await repo.addMember("id-friends", { accountId: "guest", role: "MEMBER", joinedAt: LATER }, 10), "ADDED");
+        assert.deepEqual((await repo.findById("id-friends"))!.playerInvites, [{ accountId: "other", at: NOW }]);
+        assert.equal(await repo.addBan("id-embers", { accountId: "guest", at: LATER }, 10), "BANNED");
+        assert.deepEqual((await repo.findById("id-embers"))!.playerInvites, []);
+        assert.deepEqual(await repo.findByPlayerInvite("guest", 10), []);
+    });
 }

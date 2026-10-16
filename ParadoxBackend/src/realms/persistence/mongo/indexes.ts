@@ -19,6 +19,8 @@ export async function EnsureRealmsDatabase(Db: Db): Promise<void> {
     await Realms.createIndex({ hostAccountId: 1 }, { unique: true });
     // "Which realms am I in" for the launcher's server list.
     await Realms.createIndex({ "members.accountId": 1 });
+    // [2026-10-16] "Which realms invited me" for the launcher's invitations (sparse: most realms never send one).
+    await Realms.createIndex({ "playerInvites.accountId": 1 }, { sparse: true });
     // The public listing: online realms first.
     await Realms.createIndex({ onlineUntil: -1, name: 1 }, { partialFilterExpression: { listed: true } });
     // [hub design 2.3] The sweeper's "whose online state just lapsed" query (realms that were never online have no onlineUntil).

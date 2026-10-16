@@ -9,7 +9,7 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-import { RecordLauncherBuild, TouchGameSession } from "../activity/activityMonitor";
+import { ClassifyReportedLauncherBuild, RecordLauncherBuild, TouchGameSession } from "../activity/activityMonitor";
 import { ParseLauncherBuildReport } from "../activity/activityRules";
 import crypto from "crypto";
 import { GetRepositories, LauncherAccountRecord } from "../persistence";
@@ -17,6 +17,7 @@ import { ResolveRegistrationApproval } from "../config/registrationApproval";
 import { HashPassword, VerifyPassword } from "../security/passwords";
 import { GenerateOpaqueToken, HashOpaqueToken, SignLauncherAccessToken } from "../security/launcherTokens";
 import { LauncherApiError } from "../security/launcherErrors";
+import { CurrentUnofficialLauncherPolicy, UNOFFICIAL_LAUNCHER_MESSAGE, UnofficialLauncherRefuses } from "../security/unofficialLauncherPolicy";
 import { IsRateLimited } from "../security/rateLimit";
 import { MaskEmail } from "../security/emailCodes";
 import { EmailVerificationRequired } from "../config/emailVerification";
@@ -511,6 +512,19 @@ export async function RequestGameExchangeCode(
         throw new LauncherApiError("GAME_BUILD_UNSUPPORTED", "This Dauntless installation isn't recognized. Verify or repair your installation.");
     }
 
+    // [2026-10-16] An unofficial launcher build (security/unofficialLauncherPolicy.ts): refused only with
+    // MYSTICPARADOX_UNOFFICIAL_LAUNCHER=refuse, and never an outdated official build, a report-less older launcher, an allowed test hash
+    // or (by default) a tester or admin. Before the realm gate below, which may use an invite.
+    const LauncherReport = ParseLauncherBuildReport(launcherBuild);
+    const LauncherVerdict = ClassifyReportedLauncherBuild(runtimeChannel, LauncherReport);
+    if (LauncherVerdict === "unofficial") {
+        const LauncherPolicy = CurrentUnofficialLauncherPolicy();
+        const Refused = UnofficialLauncherRefuses(LauncherVerdict, LauncherReport, Account.roles, LauncherPolicy);
+        logger.info(`[UnofficialLauncher] ${Refused ? "refused" : LauncherPolicy.mode === "refuse" ? "exempt" : "observe, would refuse"}`
+            + ` Play user=${userId} launcher=${LauncherReport?.version ?? "?"} sha256=${LauncherReport?.sha256.slice(0, 16) ?? "?"}...`);
+        if (Refused) throw new LauncherApiError("LAUNCHER_UNOFFICIAL", UNOFFICIAL_LAUNCHER_MESSAGE);
+    }
+
     // Last gate before the code exists: entering a realm may use an invite and add the member, so nothing above may still refuse.
     const RealmEntry = await AuthorizeGameSessionRealm(userId, realm);
 
@@ -536,7 +550,7 @@ export async function RequestGameExchangeCode(
     // [2026-10-14] A game session starts here (the activity monitor's playtime; presence touches extend it).
     TouchGameSession(userId);
     // [2026-10-15] The launcher build this Play came from (UNOFFICIAL_LAUNCHER flag; a monitor, never awaited, never throws).
-    void RecordLauncherBuild(userId, runtimeChannel, ParseLauncherBuildReport(launcherBuild));
+    void RecordLauncherBuild(userId, runtimeChannel, LauncherReport);
     return { exchangeCode: Code, expiresInSeconds: EXCHANGE_CODE_TTL_MS / 1000 };
 }
 

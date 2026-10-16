@@ -36,6 +36,10 @@ const REALM_ERROR_STATUSES = {
     REALM_REQUESTS_FULL: 409,
     REALM_REQUEST_NOT_FOUND: 404,
     REALM_PLAYER_NOT_FOUND: 404,
+    // [2026-10-16] Player invites: the realm holds too many unanswered invites; a cancel, accept or decline names an invite that is
+    // not there.
+    REALM_PLAYER_INVITES_FULL: 409,
+    REALM_PLAYER_INVITE_NOT_FOUND: 404,
     // [2026-10-13 realms hub design section 2.1] Play with a realm: the host's hub is not running (the host itself is exempt), and
     // the module is switched off on this server (a request that names a realm is refused, never played as official).
     REALM_OFFLINE: 409,
