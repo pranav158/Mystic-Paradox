@@ -1,10 +1,12 @@
 # Dauntless 1.14.7 port — progress notes
 
 Dauntless 1.14.7 (`rel-1.14.7-Archon`, changelist `647472`) is the final release of the game. This page
-tracks the port from the 1.12.0 target. Since 9 October 2026 every component on `main` targets 1.14.7
-(alpha).
-A 1.12.0 setup builds from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0)
-tag. These notes move into the main docs once the port is usable.
+tracks the port from the 1.12.0 target. Since 9 October 2026 every component on `main` targets 1.14.7, and
+the official server runs it as a **closed beta** (access on request in our
+[Discord server](https://discord.gg/e3HuAZGdU3)).
+A 1.12.0 setup (legacy, no longer updated) builds from the
+[`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag. These notes move into
+the main docs once the port is complete.
 
 ## Target
 
@@ -45,11 +47,11 @@ state or their own player state.
 
 ### The hub's local player
 
-The 1.14.7 hub process runs in listen-server mode at map load and spawns a local player with no
-network connection. The 1.12.0 patches that prevented this stop the 1.14.7 boot, so the local player
-is tolerated and kept away from clients: its controller, player state and pawn are removed from the
-replication graph before their replication flags are cleared (the order matters; clearing the flags
-first routes the removal to the wrong graph node).
+The 1.14.7 server process starts in listen-server mode and used to spawn a local player with no network
+connection. At first it was tolerated and kept away from clients: its controller, player state and pawn were
+removed from the replication graph before their replication flags were cleared (the order matters; clearing
+the flags first routes the removal to the wrong graph node). Since 10 October every server boots without a
+viewport or local player at all, and the first player's login starts the match (see below).
 
 ### Player data
 
@@ -65,8 +67,8 @@ ran without faults for the test.
 
 Two more stale 1.12.0 call targets were found on the way: a channel-creation call that landed inside
 an unrelated spline function (the hub "spline crash"), and the omnicell charge getters, which are now
-called by name instead of by address. A server-side crash in an interaction-callout widget, which is
-built only because of the hub's local player, is guarded on servers.
+called by name instead of by address. A server-side crash in an interaction-callout widget is guarded on
+servers.
 
 ### Rewards, empty hunts and clean exits (9 October 2026)
 
@@ -74,8 +76,7 @@ built only because of the hub's local player, is guarded on servers.
   crafting screen, and a full re-login showed the same counts.
 - **Extra character fixed.** The hub's local player used to get a pawn about a minute after the hub
   started, and a client already connected at that moment saw an extra character. The runtime had told
-  the game that every controller may restart, the hub's own included; it now refuses that one, and a
-  pawn that still appears is destroyed.
+  the game that every controller may restart, the hub's own included; it now refuses that one.
 - **Empty hunt servers shut down again.** The hunt's local player kept the game's player count at 1,
   so the 50-second empty shutdown never fired and hunt servers piled up until the server limit. The
   runtime now counts remote client connections instead.
@@ -88,11 +89,73 @@ built only because of the hub's local player, is guarded on servers.
   one reverts with a `DISABLE_LOGIN_BRANDING.flag`, `DISABLE_CREDITS_BRANDING.flag` or
   `DISABLE_PRESS_START_BRANDING.flag` beside the game executable.
 
+### No local player, saved state, travel and the first party hunt (10 October 2026)
+
+- **No local player on servers.** Hubs and hunts boot without a viewport or local player, so the extra
+  character, its second XP credit and the workarounds for it are gone. Progression components that waited
+  for it are resumed once the configuration has loaded, and the Training Grounds' arrival scene no longer
+  waits out an 18-second timeout.
+- **State that survives a map change.** Bounty progress and claims, and cooldowns, are stored per account.
+  Before, the daily bounty re-drafted on every arrival (draining the draft tokens) and a patrol reward paid out
+  on every arrival. Season-challenge coins are paid once per claimed challenge.
+- **Travel crash fixed.** A return to a map visited earlier could crash the client inside the engine's map
+  load: a stale garbage-collector keep flag on one input component kept the previous world alive, and the
+  map load reused that world. The client now releases it, so the old world is freed.
+- **HUD over the arrival beam and the airship:** the cause was found (the runtime cleared the cinematic mode
+  on the cinematic's own input edge) and a fix shipped.
+- **First two-player party hunt on 1.14.7.**
+
+### Experience, reforge and mastery (11 October 2026)
+
+- **XP saves.** Kill XP for weapons, the player and the Hunt Pass is granted once per kill and saved, and
+  rank-ups are confirmed. Kill XP follows the game's own tuning: none for a Behemoth far below the weapon's
+  level, and a capped weapon banks XP up to its banked level.
+- **Weapon reforge** works (reset, the reforge count and the banked-XP restore), and **mastery** is saved
+  from the game server's reports.
+- Sprouts are saved, the fountain coin toss pays once a day, and the Hunt Pass starts fresh.
+- Every request now passes a per-address rate limit.
+
+### Co-op hunts and Paradox realms (13–14 October 2026)
+
+- **Co-op transport:** hunts can be hosted on a player's PC and joined over ICE with STUN/TURN relays
+  (`ParadoxTransport`, libjuice). A solo hunt hosted this way saved its loot and ended cleanly.
+- **Paradox realms:** a player hosts a whole realm — Ramsgate and its hunts — on their own PC. Two players
+  played a realm over the relay alone: Ramsgate, party and solo hunts from the normal Start Hunt button, with
+  loot, XP, bounties and mastery saved. A local realm can use SQLite instead of MongoDB.
+- Terms and Privacy (16+), consent, account deletion with a 30-day hold, and data retention.
+
+### Realms only on the official server (15 October 2026)
+
+- The official server runs no dedicated servers any more: every hub and hunt is a Paradox realm hosted on a
+  player's PC. New accounts there wait for approval (the closed beta).
+- **Hunt end:** calling the airship at the end of a hunt used to cut the hunt server out from under the
+  player. The hunt now drains and closes once everyone has left it.
+- Email codes for sign-up, password reset and Discord linking; launcher notices.
+- The launcher and the runtime's loader and transport are built by this repository's GitHub workflows, with
+  build provenance (`gh attestation verify <file> --repo pranav158/Mystic-Paradox`); the launcher is signed
+  there too. The runtime DLL itself is built by the maintainer, because it needs the game SDK.
+
+### Realm access, the Ramsgate kick and faster Play (16 October 2026)
+
+- **Usernames:** a username policy applies to new names.
+- **Who can join a realm:** Solo, Allowlisted or Public, with invites and join requests.
+- **Ramsgate kick fixed.** Players at a high player level were sent back to the login screen about a second
+  after reaching Ramsgate, with no error. The realm host's starter grant (thirteen starter cosmetics) was
+  refused by the backend, and the game treats a failed inventory transaction during its inventory load as a
+  broken inventory and returns the player to the menu. The host may now grant exactly those items. The
+  diagnosis came from new runtime traces of what queues a travel on the client and what sends a player back
+  to the menu on the server.
+- **Gauntlet:** its service calls now answer in the shapes the 1.14.7 client parses. The Gauntlet itself
+  stays off.
+- **Faster Play:** the game polled its matchmaking status every 10 seconds, so Play took 10–12 seconds; the
+  backend now asks for one-second polls while matching.
+- **Airship back to Ramsgate** (launcher 0.1.73, the next release): leaving a realm hunt by airship could time
+  out to the login screen, because the launcher closed the hunt's connection as soon as the hub join began,
+  while the game was still travelling over it. The connection now closes once the game has left the hunt.
+
 ### Still open
 
-- An intermittent client crash on the way back from a hunt to Ramsgate (once in four returns), inside
-  the engine's map load.
-- The gameplay HUD shows during the arrival beam and the airship lobby (also present on 1.12.0).
+- The Gauntlet (only its menus answer).
 
 ## Lessons so far
 
@@ -103,3 +166,6 @@ built only because of the hub's local player, is guarded on servers.
   call target rather than heap corruption.
 - The patches that made 1.12.0 boot as a dedicated server do not transfer as-is; the 1.14.7 boot path
   has to be followed again.
+- A refused backend write can look like a network problem. The game sends a player back to the menu
+  without an error when an inventory transaction fails at the wrong moment; trace what sent them there
+  instead of guessing from timing.

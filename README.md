@@ -9,16 +9,28 @@
   compatibility layer, so you can run the game on a server of your own.
 </p>
 
+<br>
+
+> [!WARNING]
+> **🔒 The launcher on the [Releases](https://github.com/pranav158/Mystic-Paradox/releases) page is a closed beta test.**
+>
+> It connects to the official Mystic Paradox server, which is open to invited testers only. A new account stays
+> **pending until it is approved**, and a pending account cannot sign in or play.
+>
+> **To request access, [join our Discord server](https://discord.gg/e3HuAZGdU3) and ask there.**
+> Please create **one** account and wait for it: creating more accounts does not get you approved any sooner.
+
+<br>
 
 <p align="center"><a href="https://discord.gg/e3HuAZGdU3"><b>Join our Discord Server</b></a></p>
 
-
 <p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-blue"></a>
-  <a href="https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0"><img alt="Dauntless 1.12.0: tag dauntless-1.12.0" src="https://img.shields.io/badge/Dauntless%201.12.0-tag%20dauntless--1.12.0-2ea44f"></a>
-  <a href="docs/DAUNTLESS_1_14_7_PORT.md"><img alt="Dauntless 1.14.7 alpha" src="https://img.shields.io/badge/Dauntless-1.14.7%20alpha-orange"></a>
+  <a href="docs/DAUNTLESS_1_14_7_PORT.md"><img alt="Dauntless: 1.14.7" src="https://img.shields.io/badge/Dauntless-1.14.7-orange"></a>
+  <a href="https://github.com/pranav158/Mystic-Paradox/releases"><img alt="Launcher: closed beta" src="https://img.shields.io/badge/launcher-closed%20beta-red"></a>
+  <a href="https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0"><img alt="Dauntless 1.12.0: legacy tag" src="https://img.shields.io/badge/Dauntless%201.12.0-legacy%20tag-lightgrey"></a>
   <img alt="Platform: Windows x64" src="https://img.shields.io/badge/platform-Windows%20x64-lightgrey">
-  <img alt="Discord: uwumystic" src="https://img.shields.io/badge/Discord-uwumystic-5865F2?logo=discord&logoColor=white">
+  <a href="https://discord.gg/e3HuAZGdU3"><img alt="Discord: join the server" src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white"></a>
 </p>
 
 <p align="center">
@@ -38,16 +50,19 @@
 
 | Game version | State |
 |---|---|
-| **Dauntless 1.14.7** (CL `647472`) | 🚧 Alpha on `main`: every component targets 1.14.7. Hubs, dedicated hunts and saved hunt rewards work; co-op hunts and Paradox realms (hubs and hunts hosted on a player's PC, connected through Mystic Relay on the official servers) are in, off by default — [progress notes](docs/DAUNTLESS_1_14_7_PORT.md) · [co-op and realms](docs/SELF_HOSTING.md#co-op-hunts-and-paradox-realms) |
-| **Dauntless 1.12.0** (CL `392819`) | ✅ Alpha, self-hostable — build it from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag |
+| **Dauntless 1.14.7** (CL `647472`) | 🧪 **Closed beta** on the official server; `main` targets 1.14.7. Ramsgate, the Training Grounds, hunts, parties and saved progress (loot, XP, weapon levels, reforge, mastery, bounties) work. The official server runs everything as **Paradox realms**: hubs and hunts hosted on a player's PC, connected through Mystic Relay. A self-hosted server can also run dedicated hubs and hunts — [progress notes](docs/DAUNTLESS_1_14_7_PORT.md) · [co-op and realms](docs/SELF_HOSTING.md#co-op-hunts-and-paradox-realms) |
+| **Dauntless 1.12.0** (CL `392819`) | 🗄️ Legacy alpha, no longer updated — build it from the [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag |
 
-Expect active development, not production-grade uptime.
+Expect active development, not production-grade uptime. The Gauntlet is not available yet.
 
 > [!NOTE]
 > `main` and the guides below target Dauntless 1.14.7. For a 1.12.0 setup, check out the
 > `dauntless-1.12.0` tag; the self-hosting guide also covers upgrading from it.
 
 ## 🚀 Get started
+
+**Just want to play?** The official launcher is in a closed beta: [request access on Discord](https://discord.gg/e3HuAZGdU3)
+before you sign up (see the note at the top). The steps below are for running a server of your own.
 
 1. **Read the [FAQ](docs/FAQ.md)** — what the project is, what it isn't, and where to get help.
 2. **Install Dauntless 1.14.7** from Epic with your own account — [Installing Dauntless](docs/INSTALLING_DAUNTLESS.md).
@@ -87,8 +102,9 @@ Expect active development, not production-grade uptime.
 
 - 🐛 **Bugs, feature requests and testing feedback:** open a [GitHub issue](../../issues). Include the
   component, commit, configuration with secrets removed, reproduction steps and logs.
-- 💬 **Discord:** add **`uwumystic`**. Please include a short note with your friend request explaining
-  why you're reaching out, so project requests don't get lost among unrelated ones.
+- 💬 **Discord:** [join our server](https://discord.gg/e3HuAZGdU3) for beta access, announcements and
+  help. You can also add the maintainer, **`uwumystic`**; please include a short note with your friend
+  request explaining why you're reaching out, so project requests don't get lost among unrelated ones.
 - 🔒 **Security problems:** report them privately — see [SECURITY.md](SECURITY.md).
 
 Pull requests are welcome. Never submit game files, leaked source or secrets. Project support is not

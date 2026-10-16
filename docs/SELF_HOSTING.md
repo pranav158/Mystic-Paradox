@@ -1,7 +1,7 @@
 # Self-hosting Mystic Paradox: source to Ramsgate
 
 > [!NOTE]
-> This guide is for Dauntless 1.14.7, which `main` targets (alpha). For 1.12.0, follow the guide on the
+> This guide is for Dauntless 1.14.7, which `main` targets. For 1.12.0 (legacy), follow the guide on the
 > [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag. Upgrading an
 > existing 1.12.0 deployment? See [Upgrading from 1.12.0](#upgrading-from-1120).
 
