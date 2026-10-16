@@ -17,6 +17,7 @@ import { ResolveRegistrationApproval } from "../config/registrationApproval";
 import { HashPassword, VerifyPassword } from "../security/passwords";
 import { GenerateOpaqueToken, HashOpaqueToken, SignLauncherAccessToken } from "../security/launcherTokens";
 import { LauncherApiError } from "../security/launcherErrors";
+import { AssertUsernameAllowed, ValidateUsername } from "../security/usernamePolicy";
 import { CurrentUnofficialLauncherPolicy, UNOFFICIAL_LAUNCHER_MESSAGE, UnofficialLauncherRefuses } from "../security/unofficialLauncherPolicy";
 import { IsRateLimited } from "../security/rateLimit";
 import { MaskEmail } from "../security/emailCodes";
@@ -38,11 +39,8 @@ import {
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const EXCHANGE_CODE_TTL_MS = 60 * 1000; // 60 seconds
 const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/i;
-// Usernames are the in-game display name AND the /invite <name> handle: letters + digits only,
-// no spaces/symbols, 3–16 chars, unique case-insensitively.
-const USERNAME_PATTERN = /^[A-Za-z0-9]+$/;
-const USERNAME_MIN = 3;
-const USERNAME_MAX = 16;
+// Usernames (the in-game display name AND the /invite <name> handle) follow security/usernamePolicy.ts: letters and digits, 3–16 chars,
+// unique case-insensitively, and [2026-10-16] at least one letter, no staff/project impersonation, nothing vulgar, abusive or a slur.
 
 // Comma-separated allow-list of the exact executable hashes this server will hand
 // out a game session for — the "approved build manifest" referenced in
@@ -98,19 +96,10 @@ function NormalizeDisplayName(displayName: string): string {
     return displayName.trim().toLowerCase();
 }
 
-// Trims edge whitespace, then enforces the strict username rules. Returns the clean value.
-function ValidateUsername(raw: unknown): string {
-    const username = typeof raw === "string" ? raw.trim() : "";
-
-    if (username.length < USERNAME_MIN || username.length > USERNAME_MAX) {
-        throw new LauncherApiError("AUTH_VALIDATION_FAILED", `Username must be ${USERNAME_MIN}\u2013${USERNAME_MAX} characters.`);
-    }
-
-    if (!USERNAME_PATTERN.test(username)) {
-        throw new LauncherApiError("AUTH_VALIDATION_FAILED", "Username can only contain letters and numbers (no spaces or symbols).");
-    }
-
-    return username;
+/** [2026-10-16] True when another account (not `exceptUserId`) holds this name in any letter case. */
+async function UsernameTaken(username: string, exceptUserId?: string): Promise<boolean> {
+    const Existing = await GetRepositories().launcherAccounts.findByDisplayNameNormalized(username.toLowerCase());
+    return Existing != undefined && Existing.userId !== exceptUserId;
 }
 
 // [2026-10-09, ported from the public repo's August security follow-ups] Linear-time email check. The old
@@ -250,10 +239,12 @@ export async function RegisterAccount(
 
     // [2026-10-15] displayName is optional. Without one (absent, null or blank) the account carries its userId as its placeholder name and
     // usernameSet false, exactly as Discord accounts do; the launcher then asks for the name (account.needsUsername). A name that is sent is
-    // validated as before.
+    // validated as before. [2026-10-16] Launcher 0.1.71 asks for the name on the sign-up form again (a pending account has no session to set
+    // one after its email code); the name stays optional here so launchers 0.1.67-0.1.70 can still register.
     const GivenName = displayName === undefined || displayName === null || (typeof displayName === "string" && displayName.trim() === "")
         ? undefined
         : ValidateUsername(displayName);
+    if (GivenName !== undefined) AssertUsernameAllowed(GivenName);
     ValidateRegistrationInput(email, password);
     const AcceptedConsent = ValidateRegistrationConsent(consent, new Date().toISOString());
 
@@ -270,7 +261,7 @@ export async function RegisterAccount(
         throw new LauncherApiError("AUTH_EMAIL_TAKEN", "That email is already registered.");
     }
 
-    if (NormalizedDisplayName !== undefined && (await Repos.launcherAccounts.findByDisplayNameNormalized(NormalizedDisplayName)) != undefined) {
+    if (GivenName !== undefined && await UsernameTaken(GivenName)) {
         throw new LauncherApiError("AUTH_DISPLAY_NAME_TAKEN", "That display name is already taken.");
     }
 
@@ -560,12 +551,12 @@ export async function CheckUsernameAvailable(rawUsername: string): Promise<{ ava
 
     try {
         Username = ValidateUsername(rawUsername);
+        AssertUsernameAllowed(Username);
     } catch (error) {
         return { available: false, reason: error instanceof LauncherApiError ? error.message : "Invalid username." };
     }
 
-    const Existing = await GetRepositories().launcherAccounts.findByDisplayNameNormalized(Username.toLowerCase());
-    return Existing == undefined ? { available: true } : { available: false, reason: "That username is already taken." };
+    return await UsernameTaken(Username) ? { available: false, reason: "That username is already taken." } : { available: true };
 }
 
 // Sets the authenticated account's unique username (used by the Discord set-username step, and
@@ -575,16 +566,15 @@ export async function SetUsername(userId: string, rawUsername: string): Promise<
     const Normalized = Username.toLowerCase();
 
     const Repos = GetRepositories();
-    const Existing = await Repos.launcherAccounts.findByDisplayNameNormalized(Normalized);
-
-    // Allow keeping your own name; block taking someone else's.
-    if (Existing != undefined && Existing.userId !== userId) {
-        throw new LauncherApiError("AUTH_DISPLAY_NAME_TAKEN", "That username is already taken.");
-    }
-
     const Account = await Repos.launcherAccounts.findByUserId(userId);
     if (Account == undefined) {
         throw new LauncherApiError("NOT_FOUND", "Account not found.");
+    }
+
+    // Allow keeping your own name (even one the policy would refuse now, set before it existed); block taking someone else's.
+    if (Account.usernameSet === false || Account.displayNameNormalized !== Normalized) AssertUsernameAllowed(Username);
+    if (await UsernameTaken(Username, userId)) {
+        throw new LauncherApiError("AUTH_DISPLAY_NAME_TAKEN", "That username is already taken.");
     }
 
     try {
