@@ -28,11 +28,33 @@ const FALLBACK_HASH: &str = "000000000000000000000000000000000000000000000000000
 /// so once rather than every 20 s.
 static GUARD_UNVERIFIED_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// [2026-10-16] Control sequences are per account, so the cursor is kept per account id. Launchers up to 0.1.71 kept one
+/// `controlCursor` per PC: a second account on the PC polled after the first account's 103 while its own JOIN_RENDEZVOUS was
+/// sequence 1, never saw it, and its realm entry expired ("matchmaking failed", 16 Oct 06:10 UTC). That old field is not read
+/// (nobody can tell which account wrote it) and is gone from the file at the next save.
 #[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct P2PHostSettings {
     #[serde(default)]
-    control_cursor: u64,
+    control_cursors: HashMap<String, u64>,
+}
+
+/// [2026-10-16] The last control sequence this PC handled for `account_id`; 0 for an account it has not served.
+fn cursor_for(settings: &P2PHostSettings, account_id: &str) -> u64 {
+    settings
+        .control_cursors
+        .get(account_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// [2026-10-16] Moves `account_id`'s cursor to `sequence` (never back).
+fn advance_cursor(settings: &mut P2PHostSettings, account_id: &str, sequence: u64) {
+    let cursor = settings
+        .control_cursors
+        .entry(account_id.to_string())
+        .or_insert(0);
+    *cursor = (*cursor).max(sequence);
 }
 
 #[derive(Clone, Default)]
@@ -114,11 +136,20 @@ struct ControlMessage {
     generation: Option<u32>,
     payload: Value,
     expires_at: String,
+    /// [2026-10-16] Set when a launcher already handled it (this one before a restart, or another PC signed in to the same
+    /// account): a poll from 0 lists those too while they live (10 min), and they must not run twice.
+    #[serde(default)]
+    acknowledged_at: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ControlEnvelope {
     messages: Vec<ControlMessage>,
+    /// [2026-10-16] The backend found the cursor beyond this account's last message and answered from the start with the
+    /// messages not acknowledged yet (a launcher up to 0.1.71 on a PC shared by accounts).
+    #[serde(default)]
+    stale_cursor: bool,
 }
 
 fn runner_started() -> &'static Mutex<bool> {
@@ -597,6 +628,11 @@ fn submit_observation(access_token: &str, session_id: &str, generation: u32) -> 
     }
 }
 
+/// [2026-10-16] A message some launcher already acknowledged (launchers acknowledge after handling).
+fn is_already_handled(message: &ControlMessage) -> bool {
+    message.acknowledged_at.is_some()
+}
+
 // [2026-10-14] HOST_OFFER_CANCELLED is terminal too: the backend sends it to the host and every member when a hunt ends before it
 // is active, now also when the party leader cancels the search (DELETE /candidate/leave). It used to fall through to the ignored
 // branch, so a host that had already started the hunt's server kept it running. Stopping an unknown session does nothing.
@@ -722,6 +758,8 @@ fn handle_control(
 
 fn run_control_loop(app: AppHandle) {
     let mut access_token: Option<String> = None;
+    // [2026-10-16] The account the token belongs to: the control cursor is that account's (P2PHostSettings).
+    let mut account_id = String::new();
     let mut next_presence = Instant::now();
     let mut next_observation = Instant::now();
     let mut known_sessions = HashMap::<String, u32>::new();
@@ -739,7 +777,19 @@ fn run_control_loop(app: AppHandle) {
         }
         if access_token.is_none() {
             match refresh_native_session(&app) {
-                Ok(session) => access_token = Some(session.access_token),
+                Ok(session) => {
+                    if session.account.user_id != account_id {
+                        // Another account signed in on this PC: its sessions and cursor are its own.
+                        if !account_id.is_empty() {
+                            process::append_active_session_log(
+                                "p2p control account changed; its own control cursor applies",
+                            );
+                        }
+                        known_sessions.clear();
+                        account_id = session.account.user_id.clone();
+                    }
+                    access_token = Some(session.access_token);
+                }
                 Err(error) => {
                     process::append_active_session_log(&format!(
                         "p2p control session refresh failed reason={error}"
@@ -776,7 +826,7 @@ fn run_control_loop(app: AppHandle) {
             }
             next_observation = Instant::now() + OBSERVATION_INTERVAL;
         }
-        let cursor = load_settings(&app).control_cursor;
+        let cursor = cursor_for(&load_settings(&app), &account_id);
         let client = match reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(4))
             .timeout(Duration::from_secs(10))
@@ -806,7 +856,19 @@ fn run_control_loop(app: AppHandle) {
         let Ok(envelope) = response.json::<ControlEnvelope>() else {
             continue;
         };
+        if envelope.stale_cursor {
+            process::append_active_session_log(&format!(
+                "p2p control cursor {cursor} was beyond this account's messages; the server answered from the start"
+            ));
+        }
         for message in envelope.messages {
+            if is_already_handled(&message) {
+                // Handled before (here before a restart, or on another PC of this account): only the cursor moves.
+                let mut settings = load_settings(&app);
+                advance_cursor(&mut settings, &account_id, message.sequence);
+                let _ = save_settings(&app, &settings);
+                continue;
+            }
             let handled = handle_control(&app, &mut token, &message).is_ok();
             if !handled {
                 std::thread::sleep(Duration::from_secs(2));
@@ -827,7 +889,7 @@ fn run_control_loop(app: AppHandle) {
                 break;
             }
             let mut settings = load_settings(&app);
-            settings.control_cursor = settings.control_cursor.max(message.sequence);
+            advance_cursor(&mut settings, &account_id, message.sequence);
             let _ = save_settings(&app, &settings);
             if handled {
                 if let (Some(session_id), Some(generation)) =
@@ -984,6 +1046,77 @@ mod tests {
     #[test]
     fn host_presence_requires_no_roles_when_no_protected_process_exists() {
         assert!(required_guard_roles(None, None).is_empty());
+    }
+
+    // [2026-10-16] The control cursor is the signed-in account's (0.1.71 kept one per PC: "matchmaking failed").
+
+    #[test]
+    fn each_account_keeps_its_own_control_cursor() {
+        let mut settings = P2PHostSettings::default();
+        advance_cursor(&mut settings, "acc-vps", 103);
+        assert_eq!(
+            cursor_for(&settings, "acc-vps"),
+            103,
+            "the same account resumes"
+        );
+        assert_eq!(
+            cursor_for(&settings, "acc-mysticx"),
+            0,
+            "another account on this PC starts at its own beginning"
+        );
+        advance_cursor(&mut settings, "acc-mysticx", 1);
+        advance_cursor(&mut settings, "acc-vps", 90);
+        assert_eq!(cursor_for(&settings, "acc-mysticx"), 1);
+        assert_eq!(
+            cursor_for(&settings, "acc-vps"),
+            103,
+            "a cursor never moves back"
+        );
+        // Saved and read again, each account keeps its own.
+        let saved = serde_json::to_string(&settings).unwrap();
+        let read: P2PHostSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(cursor_for(&read, "acc-vps"), 103);
+        assert_eq!(cursor_for(&read, "acc-mysticx"), 1);
+    }
+
+    #[test]
+    fn the_old_single_cursor_is_not_given_to_any_account() {
+        // A 0.1.71 file: one cursor for the whole PC, written by an account nobody can name.
+        let read: P2PHostSettings = serde_json::from_str(r#"{"controlCursor":103}"#).unwrap();
+        assert_eq!(cursor_for(&read, "acc-vps"), 0);
+        assert_eq!(cursor_for(&read, "acc-mysticx"), 0);
+        let saved = serde_json::to_string(&read).unwrap();
+        assert!(
+            !saved.contains("\"controlCursor\""),
+            "the old field is gone at the next save: {saved}"
+        );
+    }
+
+    #[test]
+    fn a_message_another_launcher_already_handled_is_not_handled_again() {
+        let message = |acknowledged: Option<&str>| -> ControlMessage {
+            serde_json::from_value(serde_json::json!({
+                "messageId": "00000000-0000-0000-0000-000000000001",
+                "sequence": 7,
+                "messageType": "JOIN_RENDEZVOUS",
+                "sessionId": "s",
+                "generation": 1,
+                "payload": {},
+                "expiresAt": "2026-10-16T06:20:00.000Z",
+                "acknowledgedAt": acknowledged,
+            }))
+            .unwrap()
+        };
+        assert!(is_already_handled(&message(Some(
+            "2026-10-16T06:10:06.000Z"
+        ))));
+        assert!(!is_already_handled(&message(None)));
+        // The backend's answer to a stale cursor is read too.
+        let envelope: ControlEnvelope =
+            serde_json::from_str(r#"{"messages":[],"staleCursor":true}"#).unwrap();
+        assert!(envelope.stale_cursor);
+        let envelope: ControlEnvelope = serde_json::from_str(r#"{"messages":[]}"#).unwrap();
+        assert!(!envelope.stale_cursor);
     }
 
     // [2026-10-16] The 5 s observation set lets ended sessions go (0.1.71 observed every completed hunt until exit).

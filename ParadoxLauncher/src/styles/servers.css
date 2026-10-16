@@ -142,3 +142,8 @@
   flex: none;
   gap: 8px;
 }
+
+/* [2026-10-16] The answer of the join request sent right after a realm is added, under the add form. */
+.add-ask .feedback {
+  margin-top: 0;
+}

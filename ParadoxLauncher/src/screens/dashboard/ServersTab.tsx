@@ -15,6 +15,7 @@ import { AlertIcon, FolderIcon, ServersIcon, ShieldIcon } from "../../components
 import { useServer } from "../../servers/ServerContext";
 import { serverNaming } from "../../servers/serverNames";
 import { serverUnavailable } from "../../servers/officialPlay";
+import { realmStanding, type RealmStanding } from "../../servers/realmStatus";
 import { AddServerForm } from "../../servers/AddServerForm";
 import { RealmInvitations } from "../../servers/RealmInvites";
 
@@ -57,10 +58,13 @@ function serverDetail(server: ServerView): string {
  * [2026-10-16] Where the player stands with a realm, as the directory answered: allowed in, a join request waiting for the host,
  * an invite waiting for the player, or none of these. Unknown until the realm is looked up (or when it cannot be).
  */
-type Standing = "member" | "requested" | "invited" | "none";
+// [2026-10-16] The same standing Home reads (servers/realmStatus.ts), for the signed-in account.
+type Standing = RealmStanding;
 
 const STANDING_CHIP: Record<Standing, { text: string; tone: string }> = {
+  own: { text: "Your realm", tone: "good" },
   member: { text: "Allowed", tone: "good" },
+  open: { text: "Open to all", tone: "good" },
   requested: { text: "Request sent", tone: "warn" },
   invited: { text: "Invited", tone: "live" },
   none: { text: "Not allowed yet", tone: "" },
@@ -84,6 +88,8 @@ export function ServersTab() {
   // [2026-10-16] Each realm's standing (looked up once per realm), and a row's success line (a request sent, an answer).
   const [standing, setStanding] = useState<Record<string, Standing>>({});
   const [rowNote, setRowNote] = useState<{ id: string; message: string } | null>(null);
+  // [2026-10-16] The join request sent right after an add: its answer, under the add form.
+  const [addAsk, setAddAsk] = useState<{ tone: "ok" | "bad"; message: string } | null>(null);
   const lookedUpRef = useRef(new Set<string>());
   const mountedRef = useRef(true);
   const busyRef = useRef(false);
@@ -118,7 +124,7 @@ export function ServersTab() {
       realmLookup(id)
         .then((found) => {
           if (!mountedRef.current) return;
-          const next: Standing = found.member ? "member" : found.requested ? "requested" : found.invited ? "invited" : "none";
+          const next: Standing = realmStanding(found, found.own === true);
           setStanding((current) => ({ ...current, [id]: next }));
         })
         .catch(() => {});
@@ -126,22 +132,27 @@ export function ServersTab() {
   }, [realmIds]);
 
   // [2026-10-16] Asks the realm's host to let the player in: sent when a realm is added, and from its row ("Ask to join").
-  const askToJoin = useCallback(async (server: ServerView) => {
+  // After an add the answer is also shown under the add form, where the player is looking: a refusal shown only on the row
+  // further down went unnoticed (REALM_NAME_INVALID for a reserved realm name, 16 Oct).
+  const askToJoin = useCallback(async (server: ServerView, fromAdd = false) => {
     setRowError(null);
     setRowNote(null);
+    setAddAsk(null);
     const name = serverNaming(server).primary;
     try {
       const answer = await realmRequestJoin(server.id);
       if (!mountedRef.current) return;
       setStanding((current) => ({ ...current, [server.id]: answer === "MEMBER" ? "member" : "requested" }));
-      setRowNote({
-        id: server.id,
-        message: answer === "MEMBER"
-          ? `You can join ${name}.`
-          : `Request sent to the host of ${name}. You can play there once they approve it.`,
-      });
+      const message = answer === "MEMBER"
+        ? `You can join ${name}.`
+        : `Request sent to the host of ${name}. You can play there once they approve it.`;
+      setRowNote({ id: server.id, message });
+      if (fromAdd) setAddAsk({ tone: "ok", message });
     } catch (err) {
-      if (mountedRef.current) setRowError({ id: server.id, message: friendly(err) });
+      if (!mountedRef.current) return;
+      const message = friendly(err);
+      setRowError({ id: server.id, message });
+      if (fromAdd) setAddAsk({ tone: "bad", message: `The join request to ${name} was not sent: ${message}` });
     }
   }, []);
 
@@ -191,7 +202,7 @@ export function ServersTab() {
     setServers(list);
     if (added?.kind === "paradox_realm") {
       lookedUpRef.current.add(added.id);
-      void askToJoin(added);
+      void askToJoin(added, true);
     }
   };
 
@@ -214,6 +225,11 @@ export function ServersTab() {
         {/* [2026-10-14] The add form, then the list of servers. Hosting a realm is on the Host realm page. */}
         <section className="glass card reveal" style={at(1)} aria-label="Add a realm">
           <AddServerForm onAdded={realmAdded} />
+          {addAsk && (
+            <div className="section add-ask">
+              <p className={`feedback ${addAsk.tone}`} role={addAsk.tone === "bad" ? "alert" : "status"}>{addAsk.message}</p>
+            </div>
+          )}
         </section>
 
         <section className="glass card reveal" style={at(2)} aria-label="Your realms">

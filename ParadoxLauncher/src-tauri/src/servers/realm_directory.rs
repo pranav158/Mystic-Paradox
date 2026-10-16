@@ -37,6 +37,9 @@ struct RealmInfo {
     /// [2026-10-16] The host invited the player and the player has not answered.
     #[serde(default)]
     invited: bool,
+    /// [2026-10-16] Who may join: `PUBLIC` (anyone signed in; Play joins) or `INVITE_ONLY` (approved players).
+    #[serde(default)]
+    join_policy: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +71,8 @@ pub struct RealmLookupView {
     pub invited: bool,
     /// [2026-10-16] The player is this realm's host (Home then reads the realm's state from this PC's own host when it can).
     pub own: bool,
+    /// [2026-10-16] The realm's join policy as the directory names it (`PUBLIC` or `INVITE_ONLY`), when it does.
+    pub join_policy: Option<String>,
 }
 
 /// Reads a successful lookup answer. A key of the wrong shape is refused, so nothing malformed is ever stored.
@@ -90,6 +95,7 @@ pub fn parse_lookup(body: &[u8]) -> Result<RealmLookupView, String> {
         serving: info.serving,
         ownership_changed: info.ownership_changed,
         own: info.membership.as_deref() == Some("HOST"),
+        join_policy: info.join_policy,
         member: info.membership.is_some(),
         requested: info.requested,
         invited: info.invited,
@@ -310,12 +316,14 @@ mod tests {
         assert_eq!(view.host_public_key, "KEY-0123456789abcdefghijklmnop");
         assert_eq!(view.fingerprint, "KEY-0123…ijklmnop");
         assert!(view.online && !view.serving && view.ownership_changed);
+        assert_eq!(view.join_policy.as_deref(), Some("PUBLIC"));
 
         // No key was sent: the directory leaves the field out, and a blank display name is no name.
         let body = br#"{"realm":{"name":"ember-hold","host":{"displayName":"  "},
             "hostPublicKey":"KEY-0123456789abcdef"}}"#;
         let view = parse_lookup(body).unwrap();
         assert_eq!(view.host_name, None);
+        assert_eq!(view.join_policy, None);
         assert!(!view.ownership_changed);
         assert!(!view.online);
     }

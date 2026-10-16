@@ -80,7 +80,7 @@ const install = { located: true, exeSha256: 'approved', runtimeRepairRequired: f
 const noTrust = () => ({ notice: null, dismissNotice() {}, ensureHost: async () => true, trustNewHost: async () => false });
 const Banner = ({ tone, children, onDismiss }) => React.createElement('div', { className: 'banner', 'data-tone': tone ?? 'danger' },
   children, onDismiss ? React.createElement('button', { type: 'button', onClick: onDismiss }, 'Dismiss') : null);
-function home(api, refreshPolicy = async () => policy, serviceState = services, { trust = noTrust(), selected, rules = accountRulesDefault(), officialPlay = null, realm = null } = {}) {
+function home(api, refreshPolicy = async () => policy, serviceState = services, { trust = noTrust(), selected, rules = accountRulesDefault(), officialPlay = null, realm = null, realmHook } = {}) {
   return load('src/screens/dashboard/HomeTab.tsx', {
     '../../auth/AuthContext': { useAuth: () => ({ account }) },
     '../../auth/AccountRules': { useAccountRules: () => rules },
@@ -111,7 +111,7 @@ function home(api, refreshPolicy = async () => policy, serviceState = services, 
     '../../servers/officialPlay': officialPlayLib,
     // [2026-10-16] The selected realm's own state (none unless a test gives one); the rules are loaded for real.
     '../../servers/realmStatus': realmStatusLib,
-    '../../servers/useRealmStatus': { useRealmStatus: () => realm },
+    '../../servers/useRealmStatus': { useRealmStatus: realmHook ?? (() => ({ status: realm, refresh() {}, markRequested() {} })) },
     '@tauri-apps/api/app': { getVersion: async () => '0.1.67' },
   }).HomeTab;
 }
@@ -460,6 +460,7 @@ function serversTab(api, context = serverCtx, panels = [], trust = noTrust()) {
   return load('src/screens/dashboard/ServersTab.tsx', {
     '../../servers/serverNames': serverNames,
     '../../servers/officialPlay': officialPlayLib,
+    '../../servers/realmStatus': realmStatusLib,
     // [2026-10-16] A realm lookup fails by default (no standing chip); a join request waits for the host.
     '../../api/tauri': {
       listServers: async () => [officialServer, localServer],
@@ -2051,6 +2052,23 @@ test('Servers: a realm added and agreed to shows no host note', async () => {
 
 // ---- [2026-10-16] Join requests and invites, the player's side -----------------------------------------------------------
 
+// [2026-10-16] A refused request right after an add is shown where the player is looking (the add form), and on the row.
+test('Servers: a join request refused after an add says so under the add form, in the server\'s words', async () => {
+  await mount(serversTab({
+    addServer: async () => [officialServer, emberRealm],
+    realmRequestJoin: async () => { throw 'That realm name is not valid.'; },
+  }, serverCtx, [], noTrust()));
+  await act(async () => typeInto(field('Realm name'), 'ember-hold'));
+  await act(async () => button('Add realm').click());
+  await act(async () => {});
+  const under = document.querySelector('.add-ask .feedback');
+  assert.ok(under, 'the answer is under the add form');
+  assert.equal(under.textContent, 'The join request to ember-hold was not sent: That realm name is not valid.');
+  assert.ok(under.classList.contains('bad'));
+  const row = document.querySelector('.server-row[data-kind="paradox_realm"]');
+  assert.match(row.textContent, /That realm name is not valid\./, 'and on the realm\'s row');
+});
+
 test('Servers: adding a realm sends its host a join request, and the row says the request was sent', async () => {
   const asked = [];
   await mount(serversTab({
@@ -3429,15 +3447,15 @@ test('a realm is enterable only while it serves; the player\'s own realm follows
   const { realmStatus, realmPlayBlock } = realmStatusLib;
   const { serverStatusBadge } = officialPlayLib;
   // The directory: online alone (the host's launcher reports in) is not enough; serving is.
-  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: true }, null), { state: 'serving', own: false });
-  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false }, null), { state: 'offline', own: false });
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: true, member: true }, null), { state: 'serving', own: false, standing: 'member' });
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false, member: true }, null), { state: 'offline', own: false, standing: 'member' });
   assert.equal(realmStatus('ember-hold', null, null), null, 'nothing answered: unknown');
   // The player's own realm: this PC's host decides, even when the directory still says serving.
-  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: true, own: true }, { realmName: 'ember-hold', state: 'stopped' }), { state: 'offline', own: true });
-  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false, own: true }, { realmName: 'Ember-Hold', state: 'starting' }), { state: 'starting', own: true });
-  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false, own: true }, { realmName: 'ember-hold', state: 'online' }), { state: 'serving', own: true });
-  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false, own: true }, null), { state: 'offline', own: true }, 'without the hosting module: the directory');
-  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: true }, { realmName: 'other-realm', state: 'stopped' }), { state: 'serving', own: false }, 'another realm hosted here does not count');
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: true, own: true }, { realmName: 'ember-hold', state: 'stopped' }), { state: 'offline', own: true, standing: 'own' });
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false, own: true }, { realmName: 'Ember-Hold', state: 'starting' }), { state: 'starting', own: true, standing: 'own' });
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false, own: true }, { realmName: 'ember-hold', state: 'online' }), { state: 'serving', own: true, standing: 'own' });
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false, own: true }, null), { state: 'offline', own: true, standing: 'own' }, 'without the hosting module: the directory');
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: true, member: true }, { realmName: 'other-realm', state: 'stopped' }), { state: 'serving', own: false, standing: 'member' }, 'another realm hosted here does not count');
 
   // The lines under Play.
   assert.equal(realmPlayBlock({ state: 'serving', own: false }), null);
@@ -3461,7 +3479,7 @@ const realmInstall = { ...install, serverId: 's-2', serverKind: 'paradox_realm',
 const emberHold = { id: 's-2', kind: 'paradox_realm', name: 'Ember Hold', realmName: 'ember-hold' };
 
 test('Home: a realm whose host has not started it shows Offline and Play waits with the reason', async () => {
-  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'offline', own: false } }));
+  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'offline', own: false, standing: 'member' } }));
   await act(async () => {});
   const badge = document.querySelector('[data-testid="server-status"]');
   assert.equal(badge.textContent, 'Offline');
@@ -3471,7 +3489,7 @@ test('Home: a realm whose host has not started it shows Offline and Play waits w
 });
 
 test('Home: the player\'s own stopped realm says to start it on the Host realm page', async () => {
-  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'offline', own: true } }));
+  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'offline', own: true, standing: 'own' } }));
   await act(async () => {});
   assert.equal(document.querySelector('[data-testid="server-status"]').textContent, 'Offline');
   assert.equal(button('Realm offline').disabled, true);
@@ -3479,7 +3497,7 @@ test('Home: the player\'s own stopped realm says to start it on the Host realm p
 });
 
 test('Home: a realm that serves shows Online and Play', async () => {
-  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'serving', own: false } }));
+  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'serving', own: false, standing: 'member' } }));
   await act(async () => {});
   const badge = document.querySelector('[data-testid="server-status"]');
   assert.equal(badge.textContent, 'Online');
@@ -3511,8 +3529,8 @@ test('the realm state is read at once and every 15 s; this PC\'s host is asked o
   dom.window.setInterval = (callback, ms) => { intervals.push({ callback, ms }); return intervals.length; };
   dom.window.clearInterval = () => {};
   const seen = [];
-  const Probe = ({ server }) => {
-    const status = lib.useRealmStatus(server);
+  const Probe = ({ server, accountId = 'acc-1' }) => {
+    const { status } = lib.useRealmStatus(server, accountId);
     seen.push(status ? `${status.state}${status.own ? ' own' : ''}` : 'none');
     return null;
   };
@@ -3536,6 +3554,156 @@ test('the realm state is read at once and every 15 s; this PC\'s host is asked o
   await act(async () => { dom.window.dispatchEvent(new dom.window.Event('focus')); });
   assert.equal(lookups.length, 3, 'read again on focus');
   assert.equal(seen[seen.length - 1], 'serving');
+});
+
+// ---- [2026-10-16] The player's standing in the selected realm (0.1.71 showed a ready Play to a second account on the same PC,
+// which had never asked to join: the realm list is the PC's, not the account's) -----------------------------------------
+
+test('the standing comes from the same lookup: host, member, an invite, a request, a realm open to all, or none', () => {
+  const { realmStatus, realmStanding, realmJoinStep } = realmStatusLib;
+  const directory = { online: true, serving: true };
+  assert.equal(realmStanding({ ...directory, own: true, member: true }, true), 'own');
+  assert.equal(realmStanding({ ...directory, member: true }, false), 'member');
+  assert.equal(realmStanding({ ...directory, invited: true, requested: true }, false), 'invited', 'an invite to answer comes first');
+  assert.equal(realmStanding({ ...directory, requested: true }, false), 'requested');
+  assert.equal(realmStanding({ ...directory, joinPolicy: 'PUBLIC' }, false), 'open', 'Play joins a realm open to all');
+  assert.equal(realmStanding({ ...directory, joinPolicy: 'INVITE_ONLY' }, false), 'none');
+  // The standing travels with the realm's state, whatever that state is.
+  assert.deepEqual(realmStatus('mysticfox', { online: true, serving: true, joinPolicy: 'INVITE_ONLY' }, null), { state: 'serving', own: false, standing: 'none' });
+  assert.deepEqual(realmStatus('mysticfox', { online: true, serving: false, requested: true }, null), { state: 'offline', own: false, standing: 'requested' });
+  // Home's step before Play.
+  const at = (standing) => ({ state: 'serving', own: false, standing });
+  assert.deepEqual(realmJoinStep(at('none'), 'mysticfox'), {
+    line: 'mysticfox lets in the players its host approves. Ask to join, and you can play once the host approves it.',
+    button: 'Ask to join', action: 'ask',
+  });
+  assert.deepEqual(realmJoinStep(at('requested'), 'mysticfox', true), { line: 'Request sent to mysticfox. You can play once the host approves it.', button: 'Request sent', action: null });
+  assert.deepEqual(realmJoinStep(at('requested'), 'mysticfox'), { line: 'Waiting for the host of mysticfox to approve your request.', button: 'Request sent', action: null });
+  assert.deepEqual(realmJoinStep(at('invited'), 'mysticfox'), { line: 'You have an invite to mysticfox. Accept it on the Realms page.', button: 'Open Realms', action: 'realms' });
+  for (const standing of ['own', 'member', 'open']) assert.equal(realmJoinStep(at(standing), 'mysticfox'), null, `${standing}: Play is theirs`);
+  assert.equal(realmJoinStep(null, 'mysticfox'), null, 'not known: Play is not held');
+});
+
+// A stand-in for useRealmStatus whose markRequested turns "none" into "requested", as the real one does.
+function standingHook(initial) {
+  const calls = { refresh: 0, marked: 0 };
+  const hook = () => {
+    const [status, setStatus] = React.useState(initial);
+    return {
+      status,
+      refresh: () => { calls.refresh += 1; },
+      markRequested: () => {
+        calls.marked += 1;
+        setStatus((current) => (current && current.standing === 'none' ? { ...current, standing: 'requested' } : current));
+      },
+    };
+  };
+  return { hook, calls };
+}
+const playButton = () => document.querySelector('button.play');
+
+test('Home: an account the realm has not let in asks to join; the button then waits as Request sent', async () => {
+  const asked = [];
+  const { hook, calls } = standingHook({ state: 'serving', own: false, standing: 'none' });
+  await mount(home({ getInstallStatus: async () => realmInstall, realmRequestJoin: async (id) => { asked.push(id); return 'REQUESTED'; } }, undefined, undefined, { selected: emberHold, realmHook: hook }));
+  await act(async () => {});
+  assert.equal(document.querySelector('[data-testid="server-status"]').textContent, 'Online', 'the badge is the realm\'s own state');
+  assert.equal(playButton().textContent, 'Ask to join');
+  assert.equal(playButton().disabled, false);
+  assert.ok(document.body.textContent.includes('Not in this realm yet'));
+  await act(async () => playButton().click());
+  assert.deepEqual(asked, ['s-2'], 'the same request the Realms page sends');
+  assert.equal(calls.marked, 1);
+  assert.ok(calls.refresh >= 1, 'the standing is read again');
+  assert.equal(playButton().textContent, 'Request sent');
+  assert.equal(playButton().disabled, true);
+  assert.ok(document.body.textContent.includes('Request sent to ember-hold. You can play once the host approves it.'));
+});
+
+test('Home: a refused Ask to join shows the server\'s sentence, and the button stays to try again', async () => {
+  const { hook } = standingHook({ state: 'serving', own: false, standing: 'none' });
+  await mount(home({ getInstallStatus: async () => realmInstall, realmRequestJoin: async () => { throw 'That realm name is not valid.'; } }, undefined, undefined, { selected: emberHold, realmHook: hook }));
+  await act(async () => {});
+  await act(async () => playButton().click());
+  assert.equal(document.querySelector('.launch-error').textContent, 'That realm name is not valid.');
+  assert.equal(playButton().textContent, 'Ask to join');
+  assert.equal(playButton().disabled, false);
+});
+
+test('Home: a request that waits shows a disabled Request sent and who it waits for', async () => {
+  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'serving', own: false, standing: 'requested' } }));
+  await act(async () => {});
+  assert.equal(playButton().textContent, 'Request sent');
+  assert.equal(playButton().disabled, true);
+  assert.ok(document.body.textContent.includes('Waiting for the host of ember-hold to approve your request.'));
+});
+
+test('Home: an invite is answered on the Realms page, which the button opens', async () => {
+  const opened = [];
+  const Home = home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'serving', own: false, standing: 'invited' } });
+  await mount(Home, { onNavigate: (tab) => opened.push(tab) });
+  await act(async () => {});
+  assert.ok(document.body.textContent.includes('You have an invite to ember-hold. Accept it on the Realms page.'));
+  assert.equal(playButton().textContent, 'Open Realms');
+  await act(async () => playButton().click());
+  assert.deepEqual(opened, ['servers']);
+});
+
+test('Home: a member, the host, and a realm open to all get the normal Play', async () => {
+  for (const standing of ['member', 'own', 'open']) {
+    await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'serving', own: standing === 'own', standing } }));
+    await act(async () => {});
+    assert.equal(playButton().textContent, 'Play', standing);
+    assert.equal(playButton().disabled, false, standing);
+    await unmountNow();
+  }
+});
+
+test('the realm standing is read again for another account on the same PC, never taken from the last one', async () => {
+  const lookups = [];
+  const answers = { 'acc-1': { online: true, serving: true, member: true }, 'acc-2': { online: true, serving: true, joinPolicy: 'INVITE_ONLY' } };
+  let account = 'acc-1';
+  const lib = load('src/servers/useRealmStatus.ts', {
+    '../api/tauri': { realmLookup: async (id) => { lookups.push([id, account]); return answers[account]; } },
+    '../lib/optionalRealmHost': { LOCAL_REALM_HOST: null },
+    './realmStatus': realmStatusLib,
+  });
+  dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost' });
+  global.window = dom.window;
+  global.document = dom.window.document;
+  global.IS_REACT_ACT_ENVIRONMENT = true;
+  dom.window.setInterval = () => 1;
+  dom.window.clearInterval = () => {};
+  const seen = [];
+  const Probe = ({ accountId }) => {
+    const { status } = lib.useRealmStatus(emberHold, accountId);
+    seen.push(status ? status.standing : 'unknown');
+    return null;
+  };
+  root = createRoot(document.getElementById('root'));
+  await act(async () => root.render(React.createElement(Probe, { accountId: 'acc-1' })));
+  assert.equal(seen.at(-1), 'member');
+  account = 'acc-2';
+  seen.length = 0;
+  await act(async () => root.render(React.createElement(Probe, { accountId: 'acc-2' })));
+  assert.ok(!seen.includes('member'), 'the first account\'s standing is never shown to the second');
+  assert.equal(seen.at(-1), 'none');
+  assert.deepEqual(lookups, [['s-2', 'acc-1'], ['s-2', 'acc-2']], 'read again for the new account');
+});
+
+test('Servers: a realm open to all and the host\'s own realm have their own chips', async () => {
+  const realmOpen = { ...realmServer, id: 's-o', name: 'O', realmName: 'realm-open' };
+  const realmMine = { ...realmServer, id: 's-m', name: 'M', realmName: 'realm-mine' };
+  const standings = { 's-o': { joinPolicy: 'PUBLIC' }, 's-m': { own: true, member: true } };
+  await mount(serversTab({
+    listServers: async () => [officialServer, realmOpen, realmMine],
+    realmLookup: async (id) => ({ name: id, hostPublicKey: 'KEY-0123456789abcdef', fingerprint: 'x', online: true, serving: true, ownershipChanged: false, ...standings[id] }),
+  }));
+  await act(async () => {});
+  const rowOf = (name) => [...document.querySelectorAll('.server-row')].find((row) => row.querySelector('.server-name')?.textContent === name);
+  assert.match(rowOf('realm-open').textContent, /Open to all/);
+  assert.equal(serverRowButton(rowOf('realm-open'), 'Ask to join'), undefined, 'Play joins it');
+  assert.match(rowOf('realm-mine').textContent, /Your realm/);
 });
 
 test('Servers: the official server shows a red "Currently unavailable" chip beside its Official one', async () => {

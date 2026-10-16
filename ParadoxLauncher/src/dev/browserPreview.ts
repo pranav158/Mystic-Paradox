@@ -17,7 +17,8 @@
  * [2026-10-16] ?buildkind=unofficial|development: the UNOFFICIAL BUILD / DEVELOPMENT BUILD badge (sidebar, sign-in, About).
  * [2026-10-16] Sign-up: the username check refuses Tempest, LyraSpark, BrannOak, NovaBlade (taken, any case), Admin, AdminBob,
  * Mod7, MysticFox2 (reserved) and Sh1tLord (not allowed); ?nametaken refuses the name at submit (the race).
- * [2026-10-16] Home with ?server=s-realm: ?realmoffline (its host has not started it), ?realmown (the player's own realm, read
+ * [2026-10-16] Home with ?server=s-realm: ?realmstanding=none|requested|invited (this account is not in the realm yet),
+ * ?realmoffline (its host has not started it), ?realmown (the player's own realm, read
  * from this PC's host: stopped, or online with ?realmonline).
  * [2026-10-14] Terms and deletion: ?gate (the current documents are not accepted: the consent gate opens after sign-in),
  * ?gate=outdated (the acceptance is refused: update the launcher), ?consent404 (a backend without consent routes),
@@ -403,11 +404,13 @@ mockIPC((cmd, args) => {
         // [2026-10-16] ?realmoffline: the host's launcher reports in but the realm is not started (Home: Offline, Play waits).
         serving: !params.has("realmoffline"),
         ownershipChanged: Boolean(server.hostPublicKey) && server.hostPublicKey !== key,
-        member: server.id === "s-realm" || params.has("realmown"),
-        requested: previewRequested.has(server.id),
-        invited: false,
+        // [2026-10-16] ?realmstanding=none|requested|invited: where this account stands (Home: Ask to join, Request sent, an invite).
+        member: params.has("realmstanding") ? false : server.id === "s-realm" || params.has("realmown"),
+        requested: params.get("realmstanding") === "requested" || previewRequested.has(server.id),
+        invited: params.get("realmstanding") === "invited",
         // [2026-10-16] ?realmown: the player hosts this realm (Home then reads this PC's host: stopped unless ?realmonline).
         own: params.has("realmown"),
+        joinPolicy: "INVITE_ONLY",
       }, 300);
     }
     case "set_realm_host_key": {

@@ -15,10 +15,19 @@
 /** The selected realm: enterable, being started by its host on this PC, or not running. */
 export type RealmLiveState = "serving" | "starting" | "offline";
 
+/**
+ * [2026-10-16] The signed-in player's standing in the realm (the same lookup, answered for THIS account). The realm list
+ * belongs to the PC, not the account, so a second account on the same PC finds the realm already listed and never "added" it:
+ * 0.1.71 then showed a ready Play to an account the host had never let in. `open`: not a member, but the realm lets anyone in
+ * (Play joins it).
+ */
+export type RealmStanding = "own" | "member" | "open" | "invited" | "requested" | "none";
+
 export interface RealmStatus {
   state: RealmLiveState;
   /** The player hosts this realm. */
   own: boolean;
+  standing: RealmStanding;
 }
 
 /** What the realm directory says about a realm (`realm_lookup`). */
@@ -26,6 +35,10 @@ export interface RealmDirectoryAnswer {
   online: boolean;
   serving: boolean;
   own?: boolean;
+  member?: boolean;
+  requested?: boolean;
+  invited?: boolean;
+  joinPolicy?: string | null;
 }
 
 /** This PC's own realm host, when the optional hosting module is present (`realm_host_status`). */
@@ -51,10 +64,57 @@ export function realmStatus(
     const state: RealmLiveState = local.state === "online"
       ? "serving"
       : local.state === "starting" || local.state === "restarting" ? "starting" : "offline";
-    return { state, own: true };
+    return { state, own: true, standing: "own" };
   }
   if (!directory) return null;
-  return { state: directory.serving ? "serving" : "offline", own };
+  return { state: directory.serving ? "serving" : "offline", own, standing: realmStanding(directory, own) };
+}
+
+/** The player's standing from the lookup: an invite to answer comes before a request that waits. */
+export function realmStanding(directory: RealmDirectoryAnswer, own: boolean): RealmStanding {
+  if (own) return "own";
+  if (directory.member) return "member";
+  if (directory.invited) return "invited";
+  if (directory.requested) return "requested";
+  if (directory.joinPolicy === "PUBLIC") return "open";
+  return "none";
+}
+
+/** [2026-10-16] Home's step for a player the realm has not let in yet: the line under Play and what its button does. */
+export interface RealmJoinStep {
+  line: string;
+  /** The button's words. */
+  button: string;
+  /** "ask": send the join request; "realms": open the Realms page (the invite is answered there); null: disabled. */
+  action: "ask" | "realms" | null;
+}
+
+/**
+ * The step before Play for a player who is not in the realm yet, or null when Play is theirs (the host, a member, a realm
+ * that lets anyone in, or a standing that is not known). `justRequested`: the request was sent from Home a moment ago.
+ */
+export function realmJoinStep(status: RealmStatus | null, realmName: string, justRequested = false): RealmJoinStep | null {
+  if (!status) return null;
+  switch (status.standing) {
+    case "none":
+      return {
+        line: `${realmName} lets in the players its host approves. Ask to join, and you can play once the host approves it.`,
+        button: "Ask to join",
+        action: "ask",
+      };
+    case "requested":
+      return {
+        line: justRequested
+          ? `Request sent to ${realmName}. You can play once the host approves it.`
+          : `Waiting for the host of ${realmName} to approve your request.`,
+        button: "Request sent",
+        action: null,
+      };
+    case "invited":
+      return { line: `You have an invite to ${realmName}. Accept it on the Realms page.`, button: "Open Realms", action: "realms" };
+    default:
+      return null;
+  }
 }
 
 /** The line under Play while the realm cannot be entered (Play waits), or null. */

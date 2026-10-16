@@ -139,6 +139,8 @@ export interface RealmLookup {
   invited?: boolean;
   /** [2026-10-16] The player is this realm's host. */
   own?: boolean;
+  /** [2026-10-16] Who may join: "PUBLIC" (anyone signed in; Play joins) or "INVITE_ONLY", when the directory says. */
+  joinPolicy?: string | null;
 }
 
 export async function realmLookup(serverId: string): Promise<RealmLookup> {

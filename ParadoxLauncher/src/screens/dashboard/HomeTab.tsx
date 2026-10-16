@@ -14,6 +14,7 @@ import {
   REALM_HOST_KEY_REQUIRED,
   REALM_JOIN_REQUESTED,
   REALM_OWNER_CHANGED,
+  realmRequestJoin,
   secureLaunch,
   type InstallStatus,
   type RuntimeUpdateStatus,
@@ -32,7 +33,7 @@ import { serverNaming, statusNaming } from "../../servers/serverNames";
 import { officialUnavailable, officialUnavailableNote, serverStatusBadge } from "../../servers/officialPlay";
 import { getVersion } from "@tauri-apps/api/app";
 import { useRealmTrust } from "../../servers/RealmTrust";
-import { realmPlayBlock } from "../../servers/realmStatus";
+import { realmJoinStep, realmPlayBlock } from "../../servers/realmStatus";
 import { useRealmStatus } from "../../servers/useRealmStatus";
 
 function gameRootPath(exePath: string): string {
@@ -82,7 +83,8 @@ const RUNTIME_CACHE_MS = 120_000;
 
 interface HomeTabProps {
   onOpenAccount?: () => void;
-  onNavigate?: (tab: "settings" | "library") => void;
+  // [2026-10-16] "servers" (the Realms page): an invite is answered there.
+  onNavigate?: (tab: "settings" | "library" | "servers") => void;
 }
 
 export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: HomeTabProps) {
@@ -92,7 +94,16 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   const { openWarning, selected, officialPlay } = useServer();
   const realmTrust = useRealmTrust();
   // [2026-10-16] A selected Paradox realm's own state (its host may not have started it), for the badge and Play.
-  const realmStatus = useRealmStatus(selected);
+  // [2026-10-16] Read for the signed-in account: the realm list is the PC's, so another account may not be in the realm yet.
+  const { status: realmStatus, refresh: refreshRealm, markRequested } = useRealmStatus(selected, account?.userId);
+  // [2026-10-16] "Ask to join" on Home: the request was sent from here (the line says so), its call runs, or it failed.
+  const [joinRequestedHere, setJoinRequestedHere] = useState(false);
+  const [joinBusy, setJoinBusy] = useState(false);
+  const [joinError, setJoinError] = useState<string | null>(null);
+  useEffect(() => {
+    setJoinRequestedHere(false);
+    setJoinError(null);
+  }, [selected?.id, account?.userId]);
   // [2026-10-14] A deactivated account (a deletion was requested) cannot start the game: Play says why instead.
   const rules = useAccountRules();
   const [restoreError, setRestoreError] = useState<string | null>(null);
@@ -291,6 +302,7 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     } catch (err) {
       // [2026-10-15] The request to the host is sent: the player waits for an answer and presses Play again after it.
       if (err === REALM_JOIN_REQUESTED) {
+        refreshRealm();
         if (mountedRef.current) {
           const realmName = selected ? serverNaming(selected).primary : "";
           setPlayNotice(realmName
@@ -311,7 +323,29 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     } finally {
       playLockRef.current = false;
     }
-  }, [install, account, phase.status, refreshPolicy, invalidateRuntime, selected, realmTrust, rules]);
+  }, [install, account, phase.status, refreshPolicy, invalidateRuntime, selected, realmTrust, rules, refreshRealm]);
+
+  // [2026-10-16] Asks the selected realm's host to let this account in (the call the Realms page makes when a realm is added).
+  const handleAskToJoin = useCallback(async () => {
+    if (!selected || joinBusy) return;
+    setJoinBusy(true);
+    setJoinError(null);
+    try {
+      const answer = await realmRequestJoin(selected.id);
+      if (!mountedRef.current) return;
+      if (answer === "REQUESTED") {
+        setJoinRequestedHere(true);
+        markRequested();
+      }
+      refreshRealm();
+    } catch (err) {
+      if (mountedRef.current) {
+        setJoinError(typeof err === "string" && err.trim() ? err : err instanceof Error ? err.message : "Couldn't send the request. Try again.");
+      }
+    } finally {
+      if (mountedRef.current) setJoinBusy(false);
+    }
+  }, [selected, joinBusy, markRequested, refreshRealm]);
 
   const restoreFromHome = useCallback(async () => {
     setRestoreError(null);
@@ -357,9 +391,13 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     : rules.deletionChecking ? "Checking your account…" : null;
   // [2026-10-15] The official server's play switch is off: Play waits there, and says so (the backend's message, if any).
   const officialBlock = serverKind === "official" && officialUnavailable(officialPlay) ? officialUnavailableNote(officialPlay) : null;
-  // [2026-10-16] A realm whose host has not started it: Play waits and says so (the player's own realm: start it first).
+  // [2026-10-16] A realm that has not let this account in yet: the step comes first (Ask to join, the request waits, or an
+  // invite to accept on the Realms page). Then a realm whose host has not started it: Play waits and says so.
+  const realmLabel = selected ? serverNaming(selected).primary : "this realm";
+  const joinStep = serverKind === "paradox_realm" ? realmJoinStep(realmStatus, realmLabel, joinRequestedHere) : null;
   const realmBlock = serverKind === "paradox_realm" ? realmPlayBlock(realmStatus) : null;
-  const playBlocked = ready ? install?.playBlockedReason ?? officialBlock ?? accountBlock ?? realmBlock : null;
+  const playBlocked = ready ? install?.playBlockedReason ?? officialBlock ?? accountBlock ?? joinStep?.line ?? realmBlock : null;
+  const joinStepShown = joinStep != null && playBlocked === joinStep.line;
   const canPlay = ready && !playBlocked && (install?.exeSha256 != null || runtimeRepairRequired) && (phase.status === "idle" || phase.status === "error");
   const canRepair = located && runtimeRepairRequired && !gameRunning && (phase.status === "idle" || phase.status === "error");
   const busy = phase.status !== "idle" && phase.status !== "error" && phase.status !== "running";
@@ -368,7 +406,9 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   const statusTitle = gameRunning
     ? "Dauntless is running"
     : ready
-      ? playBlocked ? "Play isn't available yet" : runtimeRepairRequired ? "Runtime will be repaired" : "Ready to launch"
+      ? joinStepShown
+        ? realmStatus?.standing === "requested" ? "Waiting for the host" : realmStatus?.standing === "invited" ? "You're invited" : "Not in this realm yet"
+        : playBlocked ? "Play isn't available yet" : runtimeRepairRequired ? "Runtime will be repaired" : "Ready to launch"
       : located
         ? "Installation needs attention"
         : "Select your game folder";
@@ -395,13 +435,18 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
       : canPlay
         ? "Play"
         : playBlocked
-          ? playBlocked === realmBlock
-            ? realmStatus?.state === "starting" ? "Realm starting" : "Realm offline"
-            : "Unavailable"
+          ? joinStepShown && joinStep
+            ? joinBusy ? "Sending…" : joinStep.button
+            : playBlocked === realmBlock
+              ? realmStatus?.state === "starting" ? "Realm starting" : "Realm offline"
+              : "Unavailable"
           : canRepair
             ? "Repair"
             : "Locate game";
-  const buttonAction = gameRunning ? handleCheckStatus : canPlay ? handlePlay : canRepair ? handleRepair : handleLocate;
+  const joinAction = !gameRunning && !busy && joinStepShown && joinStep?.action
+    ? joinStep.action === "ask" ? () => void handleAskToJoin() : () => onNavigate("servers")
+    : null;
+  const buttonAction = gameRunning ? handleCheckStatus : joinAction ?? (canPlay ? handlePlay : canRepair ? handleRepair : handleLocate);
   const playVariant = busy ? " is-busy" : gameRunning ? " is-running" : canPlay ? "" : " is-secondary";
 
   // ---- Status cards: every value below comes from a native call or the backend. ----
@@ -552,6 +597,7 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
               {busy && <div className="loader-bar" role="progressbar" aria-label="Launcher task in progress" aria-valuetext={progressLabel ?? "Working"} />}
               {phase.status === "error" && <p className="launch-error" role="alert">{phase.message}</p>}
               {playNotice && phase.status !== "error" && <p className="launch-notice" role="status">{playNotice}</p>}
+              {joinError && <p className="launch-error" role="alert">{joinError}</p>}
             </div>
             <div className="launch-actions">
               {/* [2026-10-14] The server Play will use, named in words (kind and name), so it is never a surprise. */}
@@ -571,7 +617,7 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
                 {playServerDetail && <p className="play-server-detail" title={playServerDetail}>{playServerDetail}</p>}
               </div>
               <div className={`play-wrap${canPlay && !gameRunning && !busy ? " is-ready" : ""}`}>
-                <button type="button" onClick={buttonAction} disabled={busy || (playBlocked != null && !gameRunning)} className={`play${playVariant}`}>
+                <button type="button" onClick={buttonAction} disabled={busy || joinBusy || (playBlocked != null && !gameRunning && !joinAction)} className={`play${playVariant}`}>
                   {busy ? <span className="spinner" aria-hidden="true" /> : gameRunning ? <span className="dot pulse" aria-hidden="true" /> : canPlay ? <PlayIcon /> : null}
                   <span key={buttonText} className="swap">{buttonText}</span>
                 </button>
