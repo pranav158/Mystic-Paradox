@@ -120,9 +120,9 @@
   margin-top: 12px;
 }
 
-/* In the sign-in header: left-aligned, above the title. */
+/* In the sign-in header, above the title. [2026-10-16] Centred with the header (it was left-aligned). */
 .notice-tags.auth-tags {
-  justify-content: flex-start;
+  justify-content: center;
   margin-bottom: 12px;
 }
 

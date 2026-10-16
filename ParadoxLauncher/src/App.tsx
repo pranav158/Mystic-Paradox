@@ -128,10 +128,15 @@ function ServerConsentScreen() {
 }
 
 function AppShell() {
-  const { status, authError, retrySavedSession, forgetSavedSession, backToSignIn } = useAuth();
+  const { status, account, authError, retrySavedSession, forgetSavedSession, backToSignIn } = useAuth();
   // [2026-10-14] Terms of Use and Privacy Policy: a Mystic Paradox account must accept the current ones before the dashboard.
   const rules = useAccountRules();
   const [showRegister, setShowRegister] = useState(false);
+  // [2026-10-16] The sign-up form is a choice made while signed out. Once a registration has moved on (the code screen, the
+  // approval wait, signed in), "Back to sign in" and any later sign-out return to the sign-in card, not to the sign-up form.
+  useEffect(() => {
+    if (status !== "signedOut") setShowRegister(false);
+  }, [status]);
   const [launcherUpdate, setLauncherUpdate] = useState<LauncherUpdate | null>(null);
   const { selected, officialNetwork } = useServer();
 
@@ -195,8 +200,9 @@ function AppShell() {
     screen = (
       <StatusScreen title="Request received">
         <p className="auth-sub">
+          {/* [2026-10-16] Since 0.1.71 the name is chosen at sign-up: only an account that still has none is told to choose it. */}
           {officialNetwork
-            ? "Your account is waiting for an administrator's approval. Once it is approved, sign in to play and choose your username."
+            ? `Your account is waiting for an administrator's approval. Once it is approved, sign in to play${account?.needsUsername ? " and choose your username" : ""}.`
             : `Your username is reserved. The host of ${selected?.name ?? "this server"} may need to approve new accounts; once yours is approved, sign in to play.`}
         </p>
         <div className="status-actions single">

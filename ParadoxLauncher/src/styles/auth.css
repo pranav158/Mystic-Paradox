@@ -82,8 +82,11 @@
   animation: rise 560ms var(--ease-out) both;
 }
 
+/* [2026-10-16] The card's header (tags, title, subtitle) is centred like its footer lines (the sign-up link, Terms and
+   Privacy) and like the status cards; it was left-aligned while the footer was centred. The form's labels stay left. */
 .auth-head {
   margin-bottom: 22px;
+  text-align: center;
 }
 
 .auth-title {
@@ -169,6 +172,12 @@
 
 .status-card .auth-head {
   margin-bottom: 10px;
+}
+
+/* [2026-10-16] A status card is centred as a whole; its announcement banner keeps its own left-aligned text, as on every
+   other card. */
+.status-card .auth-notices {
+  text-align: left;
 }
 
 .status-mark {
