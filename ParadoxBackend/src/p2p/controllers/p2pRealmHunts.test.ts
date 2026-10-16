@@ -590,6 +590,31 @@ test("draining: the host's clean shutdown ends the drain COMPLETED, without a re
     });
 });
 
+test("[2026-10-16] an ended hunt's observation is accepted but not stored, and the answer names the state (the launcher stops)", async () => {
+    await WithKit(async (kit) => {
+        const { hunt, capability } = await RunningHunt(kit, "party-ended-observe");
+        const body = { generation: hunt.generation, observedAt: new Date().toISOString(), hostReachable: false, localBridgeAlive: false,
+            metricsAvailable: false, routeKind: "UNKNOWN" };
+        // While it runs, the observation is stored and the answer says RUNNING.
+        assert.deepEqual(await RecordParticipantObservation(MEMBER, hunt.sessionId, body),
+            { accepted: true, sessionId: hunt.sessionId, generation: hunt.generation, state: "RUNNING" });
+        const storedBefore = kit.hunts.observations.filter((entry) => entry.sessionId === hunt.sessionId).length;
+        assert.equal(storedBefore, 1);
+        // A host ending a running (undrained) hunt leaves it ABORTED; COMPLETED is answered the same way.
+        await EndHunt(capability, { reason: "HOST_CLEAN_SHUTDOWN" });
+        const endedState = kit.hunts.hunts.get(hunt.sessionId)!.state;
+        assert.ok(endedState === "COMPLETED" || endedState === "ABORTED", endedState);
+        assert.deepEqual(await RecordParticipantObservation(MEMBER, hunt.sessionId, body),
+            { accepted: true, sessionId: hunt.sessionId, generation: hunt.generation, stored: false, state: endedState });
+        assert.equal(kit.hunts.observations.filter((entry) => entry.sessionId === hunt.sessionId).length, storedBefore, "nothing more stored");
+        // Still bound to the roster and the generation: anyone else is told the session is not theirs.
+        await assert.rejects(() => RecordParticipantObservation("stranger-account", hunt.sessionId, body),
+            (error: unknown) => error instanceof LauncherApiError && error.code === "P2P_GENERATION_FENCED");
+        await assert.rejects(() => RecordParticipantObservation(MEMBER, hunt.sessionId, { ...body, generation: hunt.generation + 1 }),
+            (error: unknown) => error instanceof LauncherApiError && error.code === "P2P_GENERATION_FENCED");
+    });
+});
+
 test("draining: an operator stop fences a draining server at once and never recovers it; the party is freed by the drain", async () => {
     await WithKit(async (kit) => {
         const { hunt } = await RunningHunt(kit, "party-stop");
@@ -618,7 +643,7 @@ test("draining: a member's observation is accepted and dropped; the drained serv
         await RequestNewHunt(kit, "party-observe");
         const observation = await RecordParticipantObservation(MEMBER, hunt.sessionId, { generation: hunt.generation,
             observedAt: new Date().toISOString(), hostReachable: false, localBridgeAlive: false, metricsAvailable: false, routeKind: "UNKNOWN" });
-        assert.deepEqual(observation, { accepted: true, sessionId: hunt.sessionId, generation: hunt.generation, stored: false });
+        assert.deepEqual(observation, { accepted: true, sessionId: hunt.sessionId, generation: hunt.generation, stored: false, state: "DRAINING" });
         assert.equal(kit.hunts.observations.filter((entry) => entry.sessionId === hunt.sessionId).length, 0, "no quorum is kept");
         // The drained server is inactive: only the new hunt counts against its host and its realm (the limits use these).
         assert.equal(await kit.hunts.countActiveHostSessions(HOST), 1);

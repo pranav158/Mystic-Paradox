@@ -56,6 +56,7 @@ import crypto from "node:crypto";
 
 import { logger } from "../logger";
 import { loadGameData, tryLoadGameData } from "../gameData/loader";
+import { GauntletMatchmakingEnabled } from "../matchmakingHuntPolicy";
 import { GetCharactersForUid } from "./character";
 import { GetInventoryForUserIdAndCharacterId, RunInventoryTransaction } from "./inventory";
 
@@ -270,6 +271,45 @@ export function PlanHostPlayerJourney(storedNodes: any, mergedNodes: any, graph:
         stripped: [...Stripped, ...Refuse],
         relocked: Relocked
     };
+}
+
+// [2026-10-16] Gauntlet stays shown but disabled until MYSTICPARADOX_GAUNTLET=on (owner's decision: mark it disabled, do not remove it).
+// The game's hunt map enables Gauntlet from the Slayer's Path node Gauntlet_Unlock (a Blueprint check on the journey data, not in the
+// executable): on 16 Oct the owner's account held it at 2 and a hunt's map offered Gauntlet. So while Gauntlet is off the backend serves
+// that node as Locked (0) on every journey answer and never changes what is stored: a save that brings the masked status back keeps the
+// stored entry, so a player's real unlock is there when Gauntlet is turned on. Matchmaking refuses Gauntlet hunts anyway
+// (matchmakingHuntPolicy.ts).
+export const GAUNTLET_UNLOCK_NODE = "Gauntlet_Unlock";
+
+/** The journey nodes served as Locked: Gauntlet_Unlock while MYSTICPARADOX_GAUNTLET is not on, else none. */
+export function JourneyNodesShownLocked(environment: NodeJS.ProcessEnv = process.env): readonly string[] {
+    return GauntletMatchmakingEnabled(environment) ? [] : [GAUNTLET_UNLOCK_NODE];
+}
+
+/** A copy of the map for a journey answer, with every shown-locked node that is present set to Locked (0). The input is not changed. */
+export function MaskJourneyNodesForPlayer(nodes: any, shownLocked: readonly string[] = JourneyNodesShownLocked()): Record<string, any> {
+    const Safe: Record<string, any> = nodes && typeof nodes === "object" && !Array.isArray(nodes) ? nodes : {};
+    if (shownLocked.length === 0) return Safe;
+    const Out: Record<string, any> = { ...Safe };
+    for (const NodeId of shownLocked) {
+        if (Object.hasOwn(Out, NodeId) && Out[NodeId] && typeof Out[NodeId] === "object") Out[NodeId] = { ...Out[NodeId], node_status: 0 };
+    }
+    return Out;
+}
+
+/**
+ * For a save (runs on the merged map, before the host check): a shown-locked node that is unlocked in the stored map keeps its stored
+ * entry, whatever the game sent back (it saw the masked Locked status). A node the stored map does not have unlocked is left as sent,
+ * so a real unlock while Gauntlet is off is still checked and stored.
+ */
+export function RestoreJourneyNodesShownLocked(storedNodes: any, mergedNodes: any,
+    shownLocked: readonly string[] = JourneyNodesShownLocked()): Record<string, any> {
+    const Merged: Record<string, any> = mergedNodes && typeof mergedNodes === "object" && !Array.isArray(mergedNodes) ? { ...mergedNodes } : {};
+    const Stored: Record<string, any> = storedNodes && typeof storedNodes === "object" && !Array.isArray(storedNodes) ? storedNodes : {};
+    for (const NodeId of shownLocked) {
+        if (Object.hasOwn(Stored, NodeId) && IsNodeUnlocked(Stored[NodeId])) Merged[NodeId] = Stored[NodeId];
+    }
+    return Merged;
 }
 
 /**

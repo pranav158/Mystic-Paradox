@@ -19,7 +19,9 @@ import { AddEncounteredContent, GetBreadcrumbsForCharacterIdAndUserId, GetPlayer
 import { ApplyMasteryReport, ApplyMasteryReportWithPlan, HostMasteryLimits, MASTERY_PERSISTENCE, SummarizeMasteryPlan } from "../controllers/masteryReport";
 import { ClassifyReforgeGrant, ExperienceTrackForPrestige, FinishStaleReforgesForUser, IsReforgeableTrack, PlanPurchaseRestore, ReforgeConflictError, ReforgeGrantHook, ReforgeGrantPlan, ReforgeReset } from "../controllers/reforge";
 import { GetRepositories } from "../persistence";
-import { GetUnlockedNodeIds, GrantSlayersPathRewards, HostJourneyPlan, PlanHostPlayerJourney } from "../controllers/slayersPath";
+import {
+    GetUnlockedNodeIds, GrantSlayersPathRewards, HostJourneyPlan, MaskJourneyNodesForPlayer, PlanHostPlayerJourney, RestoreJourneyNodesShownLocked
+} from "../controllers/slayersPath";
 import { IsPrestigeSourceTrack } from "../controllers/wallet";
 import { MonitorHuntPassGrant, MonitorProgressionReport, MonitorProgressionServed, MonitorSourceOf } from "../diagnostics/economyMonitor";
 import type { HostWriteKind } from "../extensions/p2p";
@@ -871,7 +873,8 @@ progressionRouter.get("/pjm/:userId", HasParadoxBackendAuth, async (req: any, re
         }
 
         logger.info(`Player journey map fetched for userId ${RequestedUserId} (persisted: ${Object.keys(Saved.nodes).length} nodes, v${Saved.update_version})`);
-        res.status(200).json({ code: null, message: "OK", payload: Saved });
+        // [2026-10-16] Gauntlet_Unlock is served Locked while Gauntlet is off (controllers/slayersPath.ts); the stored map is unchanged.
+        res.status(200).json({ code: null, message: "OK", payload: { ...Saved, nodes: MaskJourneyNodesForPlayer(Saved.nodes) } });
         return;
     }
     logger.info(`Player journey map fetched for userId ${RequestedUserId} (no save yet - empty baseline)`);
@@ -932,14 +935,15 @@ progressionRouter.post("/pjm/:userId", HasParadoxBackendAuth, async (req: any, r
     const Nodes = req.body?.nodes ?? {};
     const UpdateVersion = req.body?.update_version ?? 1;
     const HostVerdict: { plan?: HostJourneyPlan } = {};
-    const Saved = await SavePlayerJourney(RequestedUserId, Nodes, UpdateVersion, IsHost
-        ? (StoredNodes, MergedNodes) => {
-            // Runs again on a compare-and-swap retry; the plan of the attempt that stored is the one kept.
-            const Planned = PlanHostPlayerJourney(StoredNodes, MergedNodes);
-            HostVerdict.plan = Planned;
-            return Planned.nodes;
-        }
-        : undefined);
+    // [2026-10-16] Both writers first get back the stored entry of a node served Locked while Gauntlet is off (they saw the masked status;
+    // a stored unlock is kept and is not a re-lock). Runs again on a compare-and-swap retry; the plan of the attempt that stored is kept.
+    const Saved = await SavePlayerJourney(RequestedUserId, Nodes, UpdateVersion, (StoredNodes, MergedNodes) => {
+        const Restored = RestoreJourneyNodesShownLocked(StoredNodes, MergedNodes);
+        if(!IsHost) return Restored;
+        const Planned = PlanHostPlayerJourney(StoredNodes, Restored);
+        HostVerdict.plan = Planned;
+        return Planned.nodes;
+    });
 
     // [2026-10-14] The activity monitor's unlock history: the nodes this save newly unlocked, and where the save came from.
     void RecordSlayersPathUnlocksActivity(RequestedUserId, Saved.newlyUnlocked, IsHost ? "host" : "gameserver");
@@ -971,7 +975,7 @@ progressionRouter.post("/pjm/:userId", HasParadoxBackendAuth, async (req: any, r
     res.status(200).json({
         code: null,
         message: "OK",
-        payload: { nodes: Saved.nodes, update_version: Saved.update_version }
+        payload: { nodes: MaskJourneyNodesForPlayer(Saved.nodes), update_version: Saved.update_version }
     });
 });
 
@@ -992,7 +996,7 @@ progressionRouter.get("/pjm", HasParadoxBackendAuth, async (req: any, res) => {
         const Saved = await GetPlayerJourney(UserId);
         if(Saved != undefined){
             logger.info(`GET /pjm — returning persisted map for ${UserId} (${Object.keys(Saved.nodes).length} nodes, v${Saved.update_version})`);
-            res.status(200).json({ code: null, message: "OK", payload: Saved });
+            res.status(200).json({ code: null, message: "OK", payload: { ...Saved, nodes: MaskJourneyNodesForPlayer(Saved.nodes) } });
             return;
         }
     }

@@ -980,7 +980,7 @@ test("hub status and observations: accepted for the host and for members with an
         await ThrowsCode(() => GetHuntStatus(STRANGER, hub.sessionId), "P2P_SESSION_NOT_FOUND");
         const observation = { generation: 1, observedAt: iso(), hostReachable: true, localBridgeAlive: true, metricsAvailable: false, routeKind: "UNKNOWN" };
         const accepted = await RecordParticipantObservation(MEMBER, hub.sessionId, observation);
-        assert.deepEqual(accepted, { accepted: true, sessionId: hub.sessionId, generation: 1, stored: false });
+        assert.deepEqual(accepted, { accepted: true, sessionId: hub.sessionId, generation: 1, stored: false, state: "RUNNING" });
         assert.equal(kit.hunts.observations.length, 0);
         assert.equal((await RecordParticipantObservation(HOST, hub.sessionId, observation)).accepted, true);
         await ThrowsCode(() => RecordParticipantObservation(STRANGER, hub.sessionId, observation), "P2P_GENERATION_FENCED");

@@ -1596,7 +1596,16 @@ export async function RecordParticipantObservation(accountId: string, sessionId:
         if (!known || hunt!.generation !== body?.generation) {
             throw new LauncherApiError("P2P_GENERATION_FENCED", "The observation is not bound to the active hub generation.");
         }
-        return { accepted: true, sessionId, generation: hunt!.generation, stored: false };
+        return { accepted: true, sessionId, generation: hunt!.generation, stored: false, state: hunt!.state };
+    }
+    // [2026-10-16] An ended hunt (COMPLETED or ABORTED) keeps no observations: a roster member's report is accepted, not stored, and the
+    // answer names the state, so a launcher from 0.1.72 stops observing it (0.1.71 kept reporting every 5 s until it closed: repro
+    // 16 Oct 05:25-05:28 UTC). Every answer carries `state` since then (older launchers ignore it).
+    if (hunt?.state === "COMPLETED" || hunt?.state === "ABORTED") {
+        if (hunt.generation !== body?.generation || !hunt.roster.some((entry) => entry.accountId === accountId)) {
+            throw new LauncherApiError("P2P_GENERATION_FENCED", "The observation is not bound to the active roster generation.");
+        }
+        return { accepted: true, sessionId, generation: hunt.generation, stored: false, state: hunt.state };
     }
     // [2026-10-15] A drained hunt keeps no participant quorum (the monitor never marks it SUSPECT): a member's observation is
     // accepted and dropped, so its launcher is not told the session was fenced while the players are still on its server.
@@ -1604,7 +1613,7 @@ export async function RecordParticipantObservation(accountId: string, sessionId:
         if (hunt.generation !== body?.generation || !hunt.roster.some((entry) => entry.accountId === accountId)) {
             throw new LauncherApiError("P2P_GENERATION_FENCED", "The observation is not bound to the active roster generation.");
         }
-        return { accepted: true, sessionId, generation: hunt.generation, stored: false };
+        return { accepted: true, sessionId, generation: hunt.generation, stored: false, state: hunt.state };
     }
     const participant = hunt?.roster.find((entry) => entry.accountId === accountId);
     if (hunt == undefined || participant == undefined || hunt.generation !== body?.generation) {
@@ -1655,7 +1664,7 @@ export async function RecordParticipantObservation(accountId: string, sessionId:
         }
         await repos.p2pHunts.recordParticipantObservation(observation, mongoSession);
     });
-    return { accepted: true, sessionId, generation: hunt.generation };
+    return { accepted: true, sessionId, generation: hunt.generation, state: hunt.state };
 }
 
 async function ExpireOffer(hunt: P2PHuntSessionRecord): Promise<void> {
