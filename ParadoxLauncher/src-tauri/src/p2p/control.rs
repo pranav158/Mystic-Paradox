@@ -484,9 +484,83 @@ fn acknowledge(access_token: &str, message_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn submit_observation(access_token: &str, session_id: &str, generation: u32) {
-    let running = p2p_session::is_session_running(session_id);
-    let _ = reqwest::blocking::Client::builder()
+/// [2026-10-16] What the backend said about one observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObservationAnswer {
+    /// Accepted. `state` is the hunt's state when the answer names one (today's backend does not; a later one may).
+    Accepted { state: Option<String> },
+    /// The generation is no longer the hunt's, or the hunt is gone (409 P2P_GENERATION_FENCED, 404, 410).
+    Ended,
+    /// No answer, or one that says nothing about the session (network, 401, 429, 5xx, ...): asked again next time.
+    Unknown,
+}
+
+/// [2026-10-16] Hunt states after which there is nothing left to observe. DRAINING is not one: its server still serves the
+/// players in it, and the drain needs the observations.
+fn is_terminal_hunt_state(state: &str) -> bool {
+    matches!(state, "COMPLETED" | "ABORTED" | "FENCED")
+}
+
+fn read_observation_answer(status: u16, body: &[u8]) -> ObservationAnswer {
+    match status {
+        200..=299 => ObservationAnswer::Accepted {
+            state: serde_json::from_slice::<Value>(body)
+                .ok()
+                .and_then(|answer| answer.get("state")?.as_str().map(str::to_string)),
+        },
+        404 | 410 => ObservationAnswer::Ended,
+        409 if crate::commands::auth::error_code_of(body).as_deref()
+            == Some("P2P_GENERATION_FENCED") =>
+        {
+            ObservationAnswer::Ended
+        }
+        _ => ObservationAnswer::Unknown,
+    }
+}
+
+/// [2026-10-16] Whether a session stays in the 5 s observation set. A session that no longer runs on this PC (its server
+/// reaped itself, its join ended, or it was closed here) has nothing to observe; nor has one the backend called ended. Until
+/// 0.1.72 a session left the set only on one of the terminal control messages, so every hunt that simply completed was
+/// observed every 5 s for as long as the launcher ran (VPS log, 16 Oct 05:25-05:28: two COMPLETED hunts).
+fn keeps_observing(running_locally: bool, answer: &ObservationAnswer) -> bool {
+    if !running_locally {
+        return false;
+    }
+    match answer {
+        ObservationAnswer::Ended => false,
+        ObservationAnswer::Accepted { state: Some(state) } => !is_terminal_hunt_state(state),
+        ObservationAnswer::Accepted { state: None } | ObservationAnswer::Unknown => true,
+    }
+}
+
+/// [2026-10-16] One observation tick over the observed sessions: `observe` says whether a session still runs here and, only
+/// for one that does, what the backend answered. A session that no longer runs is not reported (an "unreachable" report for a
+/// session this PC merely left would count against a hunt other players are still in). Returns the sessions dropped, each
+/// with the reason, for the log.
+fn prune_observed(
+    known: &mut HashMap<String, u32>,
+    mut observe: impl FnMut(&str, u32) -> (bool, Option<ObservationAnswer>),
+) -> Vec<(String, String)> {
+    let mut dropped = Vec::new();
+    known.retain(|session_id, generation| {
+        let (running, answer) = observe(session_id, *generation);
+        let answer = answer.unwrap_or(ObservationAnswer::Unknown);
+        if keeps_observing(running, &answer) {
+            return true;
+        }
+        let reason = match (&answer, running) {
+            (_, false) => "not running on this PC".to_string(),
+            (ObservationAnswer::Accepted { state: Some(state) }, _) => format!("hunt {state}"),
+            _ => "ended by the server".to_string(),
+        };
+        dropped.push((session_id.clone(), reason));
+        false
+    });
+    dropped
+}
+
+fn submit_observation(access_token: &str, session_id: &str, generation: u32) -> ObservationAnswer {
+    let response = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
         .and_then(|client| {
@@ -498,8 +572,9 @@ fn submit_observation(access_token: &str, session_id: &str, generation: u32) {
                 .bearer_auth(access_token)
                 .json(&serde_json::json!({
                     "generation": generation,
-                    "hostReachable": running,
-                    "localBridgeAlive": running,
+                    // [2026-10-16] Only a session that runs on this PC is reported (prune_observed).
+                    "hostReachable": true,
+                    "localBridgeAlive": true,
                     // The current native ABI exposes aggregate diagnostics, not a coherent
                     // per-session metrics snapshot. Mark that absence explicitly instead of
                     // publishing made-up zero latency/loss values as healthy measurements.
@@ -509,6 +584,17 @@ fn submit_observation(access_token: &str, session_id: &str, generation: u32) {
                 }))
                 .send()
         });
+    match response {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response
+                .bytes()
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default();
+            read_observation_answer(status, &body)
+        }
+        Err(_) => ObservationAnswer::Unknown,
+    }
 }
 
 // [2026-10-14] HOST_OFFER_CANCELLED is terminal too: the backend sends it to the host and every member when a hunt ends before it
@@ -673,8 +759,20 @@ fn run_control_loop(app: AppHandle) {
             next_presence = Instant::now() + PRESENCE_INTERVAL;
         }
         if Instant::now() >= next_observation {
-            for (session_id, generation) in &known_sessions {
-                submit_observation(&token, session_id, *generation);
+            // [2026-10-16] Ended sessions leave the set here (prune_observed); a DRAINING hunt whose server runs stays.
+            let dropped = prune_observed(&mut known_sessions, |session_id, generation| {
+                if !p2p_session::is_session_running(session_id) {
+                    return (false, None);
+                }
+                (
+                    true,
+                    Some(submit_observation(&token, session_id, generation)),
+                )
+            });
+            for (session_id, reason) in dropped {
+                process::append_active_session_log(&format!(
+                    "p2p observation stopped session={session_id} reason={reason}"
+                ));
             }
             next_observation = Instant::now() + OBSERVATION_INTERVAL;
         }
@@ -886,5 +984,138 @@ mod tests {
     #[test]
     fn host_presence_requires_no_roles_when_no_protected_process_exists() {
         assert!(required_guard_roles(None, None).is_empty());
+    }
+
+    // [2026-10-16] The 5 s observation set lets ended sessions go (0.1.71 observed every completed hunt until exit).
+
+    #[test]
+    fn an_observation_answer_is_read_for_its_end() {
+        assert_eq!(
+            read_observation_answer(200, br#"{"accepted":true,"sessionId":"s","generation":2}"#),
+            ObservationAnswer::Accepted { state: None }
+        );
+        assert_eq!(
+            read_observation_answer(200, br#"{"accepted":true,"state":"COMPLETED"}"#),
+            ObservationAnswer::Accepted {
+                state: Some("COMPLETED".to_string())
+            }
+        );
+        assert_eq!(
+            read_observation_answer(
+                409,
+                br#"{"error":{"code":"P2P_GENERATION_FENCED","message":"x"}}"#
+            ),
+            ObservationAnswer::Ended
+        );
+        assert_eq!(
+            read_observation_answer(404, b"{}"),
+            ObservationAnswer::Ended
+        );
+        assert_eq!(
+            read_observation_answer(409, br#"{"error":{"code":"SOMETHING_ELSE"}}"#),
+            ObservationAnswer::Unknown,
+            "only a fenced generation ends it"
+        );
+        assert_eq!(
+            read_observation_answer(503, b""),
+            ObservationAnswer::Unknown
+        );
+        assert_eq!(
+            read_observation_answer(401, b""),
+            ObservationAnswer::Unknown
+        );
+    }
+
+    #[test]
+    fn ended_sessions_leave_the_observation_set_and_a_draining_one_stays() {
+        let mut known = HashMap::from([
+            ("completed".to_string(), 3),
+            ("fenced".to_string(), 1),
+            ("reaped".to_string(), 2),
+            ("draining".to_string(), 4),
+            ("flaky".to_string(), 5),
+        ]);
+        let mut reported = Vec::new();
+        let dropped = prune_observed(&mut known, |session_id, generation| {
+            match session_id {
+                // Its server reaped itself (the 60 s empty reap) or the session was closed here: not running, not reported.
+                "reaped" => (false, None),
+                _ => {
+                    reported.push((session_id.to_string(), generation));
+                    let answer = match session_id {
+                        "completed" => ObservationAnswer::Accepted {
+                            state: Some("COMPLETED".to_string()),
+                        },
+                        "fenced" => ObservationAnswer::Ended,
+                        "draining" => ObservationAnswer::Accepted {
+                            state: Some("DRAINING".to_string()),
+                        },
+                        _ => ObservationAnswer::Unknown,
+                    };
+                    (true, Some(answer))
+                }
+            }
+        });
+        let mut kept: Vec<_> = known.keys().cloned().collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec!["draining".to_string(), "flaky".to_string()],
+            "a draining hunt whose server runs is kept, and so is one whose answer was lost"
+        );
+        let mut dropped: Vec<_> = dropped;
+        dropped.sort();
+        assert_eq!(
+            dropped,
+            vec![
+                ("completed".to_string(), "hunt COMPLETED".to_string()),
+                ("fenced".to_string(), "ended by the server".to_string()),
+                ("reaped".to_string(), "not running on this PC".to_string()),
+            ]
+        );
+        assert!(
+            !reported
+                .iter()
+                .any(|(session_id, _)| session_id == "reaped"),
+            "a session that no longer runs here is not reported"
+        );
+        assert!(reported.contains(&("draining".to_string(), 4)));
+
+        // The next tick asks only about what is left.
+        let mut asked = Vec::new();
+        prune_observed(&mut known, |session_id, _| {
+            asked.push(session_id.to_string());
+            (true, Some(ObservationAnswer::Accepted { state: None }))
+        });
+        asked.sort();
+        assert_eq!(asked, vec!["draining".to_string(), "flaky".to_string()]);
+    }
+
+    #[test]
+    fn a_session_is_observed_only_while_it_runs_here_and_is_not_ended() {
+        let accepted = ObservationAnswer::Accepted { state: None };
+        assert!(keeps_observing(true, &accepted));
+        assert!(
+            !keeps_observing(false, &accepted),
+            "its process exited or it was closed here"
+        );
+        assert!(!keeps_observing(true, &ObservationAnswer::Ended));
+        for state in ["COMPLETED", "ABORTED", "FENCED"] {
+            assert!(!keeps_observing(
+                true,
+                &ObservationAnswer::Accepted {
+                    state: Some(state.to_string())
+                }
+            ));
+        }
+        for state in ["DRAINING", "RUNNING", "SUSPECT", "ABORTING", "RECOVERING"] {
+            assert!(keeps_observing(
+                true,
+                &ObservationAnswer::Accepted {
+                    state: Some(state.to_string())
+                }
+            ));
+        }
+        assert!(keeps_observing(true, &ObservationAnswer::Unknown));
     }
 }
