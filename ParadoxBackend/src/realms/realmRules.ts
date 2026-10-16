@@ -55,6 +55,19 @@ export function ValidateRealmName(raw: unknown): RealmNameCheck {
     return { ok: true, name };
 }
 
+/**
+ * [2026-10-16, owner] A realm is named after its host's username: MysticFox hosts "mysticfox" (the launcher shows "MysticFox's
+ * Realm"), and other players add it by typing that username. Lower case; any other character (a legacy underscore or dot) becomes a
+ * hyphen, runs of them collapse and none is kept at either end. Undefined when the result is not a realm name, for example an
+ * account with no username yet (its placeholder is the 36-character account id). The reserved list does not apply: the name is the
+ * host's own username, which the username policy already checked.
+ */
+export function RealmNameForUsername(username: unknown): string | undefined {
+    if (typeof username !== "string" || username.length > 256) return undefined;
+    const name = username.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    return REALM_NAME_PATTERN.test(name) ? name : undefined;
+}
+
 /** A realm that was never online frees its name this long after it was created. */
 export const NEVER_ONLINE_RELEASE_MS = 3 * MS_PER_DAY;
 /** A realm that was online at least once frees its name this long after it was last online. */

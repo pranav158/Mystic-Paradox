@@ -72,7 +72,8 @@ export function ParseAccountIdParam(value: unknown): string | undefined {
 }
 
 export interface CreateRealmInput {
-    name: string;
+    /** [2026-10-16] Absent: the realm is named after the host's username (realmsService.createRealm, RealmNameForUsername). */
+    name?: string;
     hostPublicKey: string;
     joinPolicy: RealmJoinPolicy;
     listed: boolean;
@@ -84,11 +85,16 @@ export function ParseCreateRealmBody(body: unknown): Parsed<CreateRealmInput> {
     const source = AsObject(body);
     if (source === undefined) return Fail("The request body must be a JSON object.");
 
-    const name = ValidateRealmName(source.name);
-    if (!name.ok) {
-        return name.reason === "RESERVED"
-            ? Fail("That realm name is reserved.", "REALM_NAME_RESERVED")
-            : Fail("A realm name is 3-24 letters, digits or hyphens, and cannot start or end with a hyphen.", "REALM_NAME_INVALID");
+    // [2026-10-16, owner] The launcher sends no name: the realm takes the host's username. A name that is sent is checked as before.
+    let name: string | undefined;
+    if (Has(source, "name")) {
+        const checked = ValidateRealmName(source.name);
+        if (!checked.ok) {
+            return checked.reason === "RESERVED"
+                ? Fail("That realm name is reserved.", "REALM_NAME_RESERVED")
+                : Fail("A realm name is 3-24 letters, digits or hyphens, and cannot start or end with a hyphen.", "REALM_NAME_INVALID");
+        }
+        name = checked.name;
     }
     const hostPublicKey = ParseHostPublicKey(source.hostPublicKey);
     if (hostPublicKey === undefined) return Fail("hostPublicKey must be the host's public key as text.");
@@ -104,7 +110,8 @@ export function ParseCreateRealmBody(body: unknown): Parsed<CreateRealmInput> {
         if (typeof source.listed !== "boolean") return Fail("listed must be true or false.");
         listed = source.listed;
     }
-    const input: CreateRealmInput = { name: name.name, hostPublicKey, joinPolicy, listed };
+    const input: CreateRealmInput = { hostPublicKey, joinPolicy, listed };
+    if (name !== undefined) input.name = name;
     if (Has(source, "version")) {
         const version = ParseVersion(source.version);
         if (version === undefined) return Fail("version is malformed.");

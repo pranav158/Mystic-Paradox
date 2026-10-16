@@ -33,7 +33,12 @@ test("creating a realm: defaults are invite-only and unlisted, the name is canon
 
 test("creating a realm: each field is checked strictly, with a code that says what was wrong", () => {
     assert.equal(Failure(ParseCreateRealmBody({ name: "ab", hostPublicKey: KEY })), "REALM_NAME_INVALID");
-    assert.equal(Failure(ParseCreateRealmBody({ hostPublicKey: KEY })), "REALM_NAME_INVALID");
+    // [2026-10-16] No name: the realm takes the host's username (realmsService). A name that is sent but empty or wrong is still refused.
+    const Unnamed = ParseCreateRealmBody({ hostPublicKey: KEY });
+    assert.equal(Unnamed.ok, true);
+    assert.equal(Unnamed.ok && Unnamed.value.name, undefined);
+    assert.equal(Failure(ParseCreateRealmBody({ name: "", hostPublicKey: KEY })), "REALM_NAME_INVALID");
+    assert.equal(Failure(ParseCreateRealmBody({ name: null, hostPublicKey: KEY })), "REALM_NAME_INVALID");
     assert.equal(Failure(ParseCreateRealmBody({ name: "Official", hostPublicKey: KEY })), "REALM_NAME_RESERVED");
     assert.equal(Failure(ParseCreateRealmBody({ name: "abc" })), "REALM_VALIDATION_FAILED");
     for (const hostPublicKey of ["short", "x".repeat(513), "has spaces in it 1234", "<script>alert(1)</script>", 12345678901234567890, null, {}, [KEY]]) {

@@ -31,6 +31,7 @@ import {
     PRESENCE_CACHE_MS,
     PRESENCE_TTL_MS,
     PresenceTouchNeedsWrite,
+    RealmNameForUsername,
     RealmNameReleaseAt,
     SortJoinRequestsNewestFirst,
     ValidateHostingPatch
@@ -556,6 +557,28 @@ export function CreateRealmsService(deps: RealmsServiceDeps) {
         return (realm.playerInvites ?? []).some((invite) => invite.accountId === accountId);
     }
 
+    /**
+     * [2026-10-16, owner] The name a claim takes. Without one (the launcher), the host's username (RealmNameForUsername); an account
+     * with no username yet cannot claim. A name that is sent (the API) must not be another player's username, so nobody holds the
+     * realm name a player would be found by.
+     */
+    async function RealmNameToClaim(accountId: string, requested: string | undefined): Promise<string> {
+        const own = RealmNameForUsername((await NamesFor([accountId])).get(accountId));
+        if (requested === undefined) {
+            if (own === undefined) {
+                throw new LauncherApiError("REALM_USERNAME_REQUIRED", "Set a username before you host a realm: your realm is named after it.");
+            }
+            return own;
+        }
+        if (requested !== own && deps.resolveUsername !== undefined) {
+            const holder = await deps.resolveUsername(requested);
+            if (holder !== undefined && holder !== accountId) {
+                throw new LauncherApiError("REALM_NAME_IS_USERNAME", "That name is another player's username. A realm is named after its host.");
+            }
+        }
+        return requested;
+    }
+
     return {
         /** Claims a realm name for the caller's account (one realm per host account). */
         async createRealm(accountId: string, input: CreateRealmInput): Promise<{ realm: RealmHostView }> {
@@ -564,11 +587,12 @@ export function CreateRealmsService(deps: RealmsServiceDeps) {
             if ((await repo.findByHost(accountId)) !== undefined) {
                 throw new LauncherApiError("REALM_ALREADY_EXISTS", "You already host a realm. Release it before claiming another name.");
             }
+            const name = await RealmNameToClaim(accountId, input.name);
             const nowMs = Now();
             const realmId = NewRealmId();
             const realm: RealmRecord = {
                 realmId,
-                name: input.name,
+                name,
                 hostAccountId: accountId,
                 hostPublicKey: input.hostPublicKey,
                 joinPolicy: input.joinPolicy,

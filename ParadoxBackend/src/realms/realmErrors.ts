@@ -18,6 +18,10 @@ const REALM_ERROR_STATUSES = {
     REALM_NAME_RESERVED: 400,
     REALM_NAME_TAKEN: 409,
     REALM_ALREADY_EXISTS: 409,
+    // [2026-10-16] A realm is named after its host's username: an account without a username cannot claim one, and a name that is
+    // another player's username is refused.
+    REALM_USERNAME_REQUIRED: 409,
+    REALM_NAME_IS_USERNAME: 409,
     REALM_NOT_FOUND: 404,
     REALM_NOT_MEMBER: 404,
     REALM_BANNED: 403,

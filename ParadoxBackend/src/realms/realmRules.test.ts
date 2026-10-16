@@ -19,10 +19,26 @@ import {
     NormalizeInviteCode,
     NormalizeRealmName,
     RESERVED_REALM_NAMES,
+    RealmNameForUsername,
     RealmNameReleaseAt,
     SortJoinRequestsNewestFirst,
     ValidateRealmName
 } from "./realmRules";
+
+// [2026-10-16] A realm is named after its host's username.
+test("a realm name from a username: lower case, other characters become one hyphen, nothing at either end", () => {
+    assert.equal(RealmNameForUsername("MysticFox"), "mysticfox");
+    assert.equal(RealmNameForUsername("  Pal42 "), "pal42");
+    assert.equal(RealmNameForUsername("Old_Name.Two"), "old-name-two");
+    assert.equal(RealmNameForUsername("__edge__"), "edge");
+    // The username is the host's own, so a reserved word is not refused here (the username policy checked it).
+    assert.equal(RealmNameForUsername("Mystic"), "mystic");
+    // No username yet: the placeholder is the account id, too long for a realm name.
+    assert.equal(RealmNameForUsername("00000000-0000-4000-8000-000000000000"), undefined);
+    for (const bad of ["ab", "", "___", "x".repeat(25), undefined, null, 42, {}]) {
+        assert.equal(RealmNameForUsername(bad), undefined, String(bad));
+    }
+});
 import { RealmBan, RealmInviteRecord, RealmMember } from "./realmTypes";
 
 const T0 = Date.parse("2026-10-13T12:00:00.000Z");

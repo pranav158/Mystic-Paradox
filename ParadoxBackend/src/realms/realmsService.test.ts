@@ -600,12 +600,43 @@ test("adding by username: an unknown name is not found (also when no resolver is
 });
 
 test("only the host manages requests and adds players: anyone else is told they host no realm", async () => {
-    const { service, create } = Setup({ resolveUsername: async () => "friend-2" });
+    const { service, create } = Setup({ resolveUsername: async (name) => (name.toLowerCase() === "pal" ? "friend-2" : undefined) });
     await create("host-1", "friends");
     await Rejects(service.listJoinRequests("friend-1"), "REALM_NOT_FOUND");
     await Rejects(service.approveJoinRequest("friend-1", "friend-2"), "REALM_NOT_FOUND");
     await Rejects(service.denyJoinRequest("friend-1", "friend-2"), "REALM_NOT_FOUND");
     await Rejects(service.addMemberByUsername("friend-1", "pal"), "REALM_NOT_FOUND");
+});
+
+// ----- [2026-10-16] a realm is named after its host's username -----
+
+test("a claim without a name takes the host's username; no username, no realm", async () => {
+    const { service } = Setup();
+    const Claim = (accountId: string, name?: string) =>
+        service.createRealm(accountId, { ...(name === undefined ? {} : { name }), hostPublicKey: KEY_A, joinPolicy: "INVITE_ONLY", listed: false });
+    const { realm } = await Claim("host-1");
+    assert.equal(realm.name, "hosty");
+    assert.equal(realm.host.displayName, "Hosty");
+    assert.equal((await service.getByName("friend-1", "hosty")).realm.name, "hosty");
+    // An account with no username yet (no display name) cannot claim one.
+    await Rejects(Claim("nobody-yet"), "REALM_USERNAME_REQUIRED");
+});
+
+test("a reserved word is the host's own realm name when it is their username", async () => {
+    const { service } = Setup({ displayNames: async (ids) => new Map(ids.map((id) => [id, "Mystic"])) });
+    const { realm } = await service.createRealm("host-1", { hostPublicKey: KEY_A, joinPolicy: "INVITE_ONLY", listed: false });
+    assert.equal(realm.name, "mystic");
+});
+
+test("a name that is another player's username is refused; the host's own is fine", async () => {
+    const usernames = new Map([["pal", "friend-2"], ["hosty", "host-1"]]);
+    const { service } = Setup({ resolveUsername: async (name) => usernames.get(name.toLowerCase()) });
+    const Claim = (accountId: string, name: string) =>
+        service.createRealm(accountId, { name, hostPublicKey: KEY_A, joinPolicy: "INVITE_ONLY", listed: false });
+    await Rejects(Claim("host-1", "pal"), "REALM_NAME_IS_USERNAME");
+    assert.equal((await Claim("host-1", "hosty")).realm.name, "hosty");
+    // A name nobody has as a username stays possible through the API.
+    assert.equal((await Claim("friend-1", "ember-hold")).realm.name, "ember-hold");
 });
 
 // ----- player invites [2026-10-16]: the host invites by username, the player accepts or declines -----
