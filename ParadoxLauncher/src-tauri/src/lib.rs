@@ -112,11 +112,15 @@ pub fn run() {
         // Restore size, position and maximised state, but never decorations: the window is
         // frameless by design, and 0.1.44 and earlier saved `decorated: true`, which would bring the
         // native title bar back on top of the custom one.
+        // [2026-10-16] Nor visibility: the window starts hidden and is shown once its page has drawn its first frame
+        // (`src/lib/windowReveal.ts`, fallback `launch::reveal_main_window_fallback`). With VISIBLE the plugin would show
+        // it at restore time, before the page has painted.
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(
                     tauri_plugin_window_state::StateFlags::all()
-                        & !tauri_plugin_window_state::StateFlags::DECORATIONS,
+                        & !tauri_plugin_window_state::StateFlags::DECORATIONS
+                        & !tauri_plugin_window_state::StateFlags::VISIBLE,
                 )
                 .build(),
         )
@@ -128,6 +132,8 @@ pub fn run() {
                 app.deep_link().register_all()?;
             }
 
+            // [2026-10-16] The main window starts hidden; its page shows it after the first frame, or this does.
+            launch::reveal_main_window_fallback(app.handle());
             auth::deep_link::listen(app.handle().clone());
             auth::deep_link::check_startup_url(app.handle());
             // Silent first-pass signed runtime repair. It never blocks launcher startup; Play

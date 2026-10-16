@@ -1,12 +1,15 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" style="background: #050a12; color-scheme: dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
     <title>Mystic Paradox</title>
   </head>
 
-  <body>
+  <!-- [2026-10-16] The launcher's own dark (--bg) from the first paint, before the stylesheet: the window starts hidden and
+       is shown after the first frame (src/lib/windowReveal.ts), but nothing here may ever paint white. -->
+  <body style="margin: 0; background: #050a12">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

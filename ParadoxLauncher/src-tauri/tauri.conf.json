@@ -20,7 +20,10 @@
         "minWidth": 960,
         "minHeight": 600,
         "decorations": false,
-        "shadow": true
+        "shadow": true,
+        "center": true,
+        "visible": false,
+        "backgroundColor": "#050a12"
       }
     ],
     "security": {

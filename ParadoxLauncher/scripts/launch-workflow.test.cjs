@@ -3564,6 +3564,35 @@ test('the launcher notices: each tag carries its chip tone, and the tags are lis
   assert.deepEqual(tones, ['warn', 'accent', 'good', 'bad']);
 });
 
+// [2026-10-16] The launcher window starts hidden (no white flash, no jump to its saved place). The page shows and focuses it
+// once, after its first frame; outside Tauri (the browser preview) it does nothing, and a failure is left to the native
+// fallback instead of throwing.
+test('the launcher window is shown once after its first frame, never outside Tauri, and a failure does not throw', async () => {
+  const calls = [];
+  const appWindow = { show: async () => { calls.push('show'); }, setFocus: async () => { calls.push('focus'); } };
+  const reveal = (getCurrentWindow) => load('src/lib/windowReveal.ts', { '@tauri-apps/api/window': { getCurrentWindow } });
+  const savedFrame = global.requestAnimationFrame;
+  global.requestAnimationFrame = (callback) => setTimeout(callback, 0);
+  try {
+    dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost' });
+    global.window = dom.window;
+    global.document = dom.window.document;
+    await reveal(() => appWindow).revealMainWindow();
+    assert.deepEqual(calls, [], 'the browser preview has no native window');
+
+    dom.window.__TAURI_INTERNALS__ = {};
+    const once = reveal(() => appWindow);
+    await once.revealMainWindow();
+    await once.revealMainWindow();
+    assert.deepEqual(calls, ['show', 'focus'], 'shown, then focused, once per page');
+
+    await reveal(() => { throw new Error('no window'); }).revealMainWindow();
+    assert.deepEqual(calls, ['show', 'focus'], 'a failure changes nothing and does not throw');
+  } finally {
+    global.requestAnimationFrame = savedFrame;
+  }
+});
+
 // [2026-10-16] The build badge: nothing on the official build; UNOFFICIAL BUILD (with its tooltip) after the backend's tags on
 // any other release build, shown even without tags and on every server (it is the launcher's, not the server's); DEVELOPMENT
 // BUILD on a debug build; and the About page says the same in one line.

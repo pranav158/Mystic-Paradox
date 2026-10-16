@@ -74,6 +74,30 @@ fn window_log(line: &str) {
     process::append_active_session_log(line);
 }
 
+/// [2026-10-16] How long a hidden main window may wait for its page before it is shown anyway.
+const WINDOW_REVEAL_FALLBACK: Duration = Duration::from_secs(4);
+
+/// [2026-10-16] The main window is created hidden (`tauri.conf.json` `visible: false`, dark `backgroundColor`): WebView2
+/// painted white before the page loaded, and the window-state plugin then moved the window to its saved place, which
+/// showed as a white flash and a jump at every start. The page shows the window after its first frame
+/// (`src/lib/windowReveal.ts`). This is the safety net: should the page never do so (a script error), the window is shown
+/// after `WINDOW_REVEAL_FALLBACK`, so the launcher can never stay invisible.
+pub fn reveal_main_window_fallback(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(WINDOW_REVEAL_FALLBACK);
+        let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+            return;
+        };
+        if window.is_visible().unwrap_or(true) {
+            return;
+        }
+        window_log("launcher window shown by the fallback: the page did not show it in time");
+        let _ = window.show();
+        let _ = window.set_focus();
+    });
+}
+
 /// `RunEvent::WindowEvent` close request on the main window.
 pub fn note_close_requested() {
     CLOSE_REQUESTED.store(true, Ordering::Release);
@@ -123,6 +147,8 @@ pub fn restore_main_window(app: &AppHandle) {
                 match result {
                     Ok(_) => {
                         window_log(&format!("launcher window rebuilt (rebuild={rebuild})"));
+                        // Built hidden from the same configuration: its page shows it, or the fallback does.
+                        reveal_main_window_fallback(&app);
                         break;
                     }
                     Err(error) => window_log(&format!(

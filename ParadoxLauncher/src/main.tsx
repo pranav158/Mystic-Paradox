@@ -1,11 +1,20 @@
-import React from "react";
+import React, { useEffect } from "react";
 import ReactDOM from "react-dom/client";
 import "@fontsource-variable/cinzel";
 import "@fontsource-variable/inter";
 import App from "./App";
 import { installPointerFx } from "./lib/pointerFx";
 import { applyUiScale } from "./lib/prefs";
+import { revealMainWindow } from "./lib/windowReveal";
 import "./index.css";
+
+/** [2026-10-16] Shows the hidden launcher window once the app has committed its first frame (lib/windowReveal.ts). */
+function RevealWindowWhenPainted() {
+  useEffect(() => {
+    void revealMainWindow();
+  }, []);
+  return null;
+}
 
 async function boot() {
   // `npm run dev` in a normal browser has no Tauri runtime; install IPC mocks so the UI can be
@@ -19,6 +28,7 @@ async function boot() {
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
       <App />
+      <RevealWindowWhenPainted />
     </React.StrictMode>,
   );
 }
