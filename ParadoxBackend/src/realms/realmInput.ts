@@ -179,9 +179,13 @@ export function ParseJoinBody(body: unknown): Parsed<JoinInput> {
     if (source === undefined) return Fail("The request body must be a JSON object.");
     const input: JoinInput = {};
     if (Has(source, "name")) {
+        // [2026-10-16] A join names a realm that already exists; it does not claim the name. So a well-formed reserved name passes, as
+        // in ParseNameParam: the owner's own realm is "mysticfox" (reserved for new realms), and every join request to it by name was
+        // refused with 400 (16 Oct 06:06:56 UTC, a new account's Ask to join), so only Play's own path reached the host.
         const name = ValidateRealmName(source.name);
-        if (!name.ok) return Fail("That is not a realm name.", "REALM_NAME_INVALID");
-        input.name = name.name;
+        if (name.ok) input.name = name.name;
+        else if (name.reason === "RESERVED" && typeof source.name === "string") input.name = source.name.trim().toLowerCase();
+        else return Fail("That is not a realm name.", "REALM_NAME_INVALID");
     }
     if (Has(source, "inviteCode")) {
         const code = NormalizeInviteCode(source.inviteCode);

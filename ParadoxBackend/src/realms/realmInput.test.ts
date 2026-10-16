@@ -86,6 +86,12 @@ test("joining takes a name and/or an invite code, normalised, plus an optional k
     assert.equal(Failure(ParseJoinBody({ name: "friends", knownHostKey: "bad key" })), "REALM_VALIDATION_FAILED");
     assert.equal(Failure(ParseJoinBody({ name: { $ne: "x" } })), "REALM_NAME_INVALID");
     assert.equal(Failure(ParseJoinBody({ inviteCode: { $ne: "x" } })), "REALM_VALIDATION_FAILED");
+    // [2026-10-16] A join names an existing realm: a well-formed reserved name passes (the owner's realm is "mysticfox"), while a
+    // malformed one is still refused. Creating a realm under a reserved name is still refused (ParseCreateRealmBody).
+    assert.deepEqual(ParseJoinBody({ name: "MysticFox " }), { ok: true, value: { name: "mysticfox" } });
+    assert.deepEqual(ParseJoinBody({ name: "mysticfox", knownHostKey: KEY }), { ok: true, value: { name: "mysticfox", knownHostKey: KEY } });
+    assert.equal(Failure(ParseJoinBody({ name: "-mysticfox" })), "REALM_NAME_INVALID");
+    assert.equal(Failure(ParseCreateRealmBody({ name: "mysticfox" })), "REALM_NAME_RESERVED");
 });
 
 test("heartbeat: optional online flag and version", () => {

@@ -333,9 +333,15 @@ export class InMemoryP2PHuntRepository implements P2PHuntRepository {
         return Copy(record);
     }
 
-    async listControlMessages(accountId: string, afterSequence: number, now: string, limit: number): Promise<P2PControlMessageRecord[]> {
-        return this.controlMessages.filter((message) => message.accountId === accountId && message.sequence > afterSequence && message.expiresAt > now)
+    async listControlMessages(accountId: string, afterSequence: number, now: string, limit: number,
+        options: { unacknowledgedOnly?: boolean } = {}): Promise<P2PControlMessageRecord[]> {
+        return this.controlMessages.filter((message) => message.accountId === accountId && message.sequence > afterSequence && message.expiresAt > now
+                && (!options.unacknowledgedOnly || message.acknowledgedAt === undefined))
             .sort((a, b) => a.sequence - b.sequence).slice(0, limit).map(Copy);
+    }
+
+    async latestControlSequence(accountId: string): Promise<number> {
+        return this.controlSequences.get(accountId) ?? 0;
     }
 
     async acknowledgeControlMessage(accountId: string, messageId: string, acknowledgedAt: string): Promise<boolean> {

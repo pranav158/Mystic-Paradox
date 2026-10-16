@@ -538,14 +538,24 @@ export class MongoP2PHuntRepository implements P2PHuntRepository {
         return record;
     }
 
-    async listControlMessages(accountId: string, afterSequence: number, now: string, limit: number): Promise<P2PControlMessageRecord[]> {
+    async listControlMessages(accountId: string, afterSequence: number, now: string, limit: number,
+        options: { unacknowledgedOnly?: boolean } = {}): Promise<P2PControlMessageRecord[]> {
         const db = await GetMongoDb();
         const docs = await db.collection(P2PCollections.P2PControlMessages).find({
-            accountId,
+            accountId: { $eq: accountId },
             sequence: { $gt: afterSequence },
-            expiresAt: { $gt: now }
+            expiresAt: { $gt: now },
+            ...(options.unacknowledgedOnly ? { acknowledgedAt: { $exists: false } } : {})
         }).sort({ sequence: 1 }).limit(limit).toArray();
         return docs.map((doc) => ({ ...doc, messageId: String(doc._id) } as unknown as P2PControlMessageRecord));
+    }
+
+    async latestControlSequence(accountId: string): Promise<number> {
+        const db = await GetMongoDb();
+        // enqueueControlMessage stores the last assigned sequence as nextSequence ($inc, returnDocument after).
+        const counter = await db.collection(P2PCollections.P2PControlSequences).findOne({ _id: { $eq: accountId as any } });
+        const value = Number(counter?.nextSequence ?? 0);
+        return Number.isSafeInteger(value) && value > 0 ? value : 0;
     }
 
     async acknowledgeControlMessage(accountId: string, messageId: string, acknowledgedAt: string): Promise<boolean> {

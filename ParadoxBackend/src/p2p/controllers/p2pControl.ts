@@ -16,15 +16,22 @@ export async function PollP2PControl(accountId: string, afterSequenceValue: unkn
         throw new LauncherApiError("P2P_TICKET_INVALID", "The control cursor is invalid.");
     }
 
+    // [2026-10-16] A cursor beyond the account's last message belongs to another account: launchers up to 0.1.72 keep one cursor per
+    // PC, so a new account on a PC that served another one asked for "after 103" while its own JOIN_RENDEZVOUS was sequence 1, and its
+    // realm entry expired (16 Oct 06:10-06:11 UTC, REALM_ENTRY_EXPIRED). Such a poll is answered from the start with the messages not
+    // acknowledged yet (a launcher acknowledges each message before it handles it), so each is still delivered once.
+    const repos = GetP2PRepositories().p2pHunts;
+    const staleCursor = afterSequence > 0 && afterSequence > await repos.latestControlSequence(accountId);
     const deadline = Date.now() + waitMs;
     do {
-        const messages = await GetP2PRepositories().p2pHunts.listControlMessages(
+        const messages = await repos.listControlMessages(
             accountId,
-            afterSequence,
+            staleCursor ? 0 : afterSequence,
             new Date().toISOString(),
-            MAX_MESSAGES
+            MAX_MESSAGES,
+            staleCursor ? { unacknowledgedOnly: true } : undefined
         );
-        if (messages.length > 0) return { messages };
+        if (messages.length > 0) return staleCursor ? { messages, staleCursor: true } : { messages };
         if (Date.now() >= deadline) break;
         await Delay(Math.min(POLL_MS, deadline - Date.now()));
     } while (Date.now() <= deadline);

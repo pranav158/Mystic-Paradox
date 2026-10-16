@@ -498,7 +498,11 @@ export interface P2PHuntRepository {
         disconnectedAt: string;
     }, session?: ClientSession): Promise<boolean>;
     enqueueControlMessage(input: Omit<P2PControlMessageRecord, "messageId" | "sequence">, session?: ClientSession): Promise<P2PControlMessageRecord>;
-    listControlMessages(accountId: string, afterSequence: number, now: string, limit: number): Promise<P2PControlMessageRecord[]>;
+    /** [2026-10-16] `unacknowledgedOnly` leaves out the messages a launcher already acknowledged (the stale-cursor answer, p2pControl.ts). */
+    listControlMessages(accountId: string, afterSequence: number, now: string, limit: number,
+        options?: { unacknowledgedOnly?: boolean }): Promise<P2PControlMessageRecord[]>;
+    /** [2026-10-16] The sequence of the account's last control message, 0 when it never had one. */
+    latestControlSequence(accountId: string): Promise<number>;
     acknowledgeControlMessage(accountId: string, messageId: string, acknowledgedAt: string): Promise<boolean>;
     upsertHostPresence(record: P2PHostPresenceRecord, session?: ClientSession): Promise<void>;
     listHostPresences(accountIds: string[], observedAfter: string, session?: ClientSession): Promise<P2PHostPresenceRecord[]>;
