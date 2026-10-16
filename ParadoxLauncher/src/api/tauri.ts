@@ -131,10 +131,42 @@ export interface RealmLookup {
   online: boolean;
   serving: boolean;
   ownershipChanged: boolean;
+  /** [2026-10-16] The player may enter (a member, or the host). */
+  member?: boolean;
+  /** [2026-10-16] The player's join request waits for the host. */
+  requested?: boolean;
+  /** [2026-10-16] The host invited the player and the player has not answered. */
+  invited?: boolean;
 }
 
 export async function realmLookup(serverId: string): Promise<RealmLookup> {
   return invoke<RealmLookup>("realm_lookup", { serverId });
+}
+
+/** [2026-10-16] A realm invite the signed-in player has not answered. */
+export interface RealmInvite {
+  realmName: string;
+  hostName: string | null;
+  at: string | null;
+  online: boolean;
+}
+
+/** [2026-10-16] The realm invites the signed-in player has not answered (needs the official sign-in). */
+export async function realmInvites(): Promise<RealmInvite[]> {
+  return invoke<RealmInvite[]>("realm_invites");
+}
+
+/** [2026-10-16] Accepts or declines a realm invite. After an accept, add the realm to the list with addServer. */
+export async function realmAnswerInvite(realmName: string, accept: boolean): Promise<void> {
+  return invoke<void>("realm_answer_invite", { realmName, accept });
+}
+
+/** [2026-10-16] MEMBER: the player may enter now. REQUESTED: the request waits for the host. */
+export type RealmJoinAnswer = "MEMBER" | "REQUESTED";
+
+/** [2026-10-16] Asks to join a Paradox realm in the list (sent when it is added, and from its row). */
+export async function realmRequestJoin(serverId: string): Promise<RealmJoinAnswer> {
+  return invoke<RealmJoinAnswer>("realm_request_join", { serverId });
 }
 
 /** Stores the host key the player agreed to for a Paradox realm. Resolves with the refreshed list. */
@@ -340,4 +372,12 @@ export interface PublicBuildReport {
 /** Compares this launcher, the runtime loader and the co-op transport with the public release builds. Contacts GitHub. */
 export async function checkPublicBuilds(): Promise<PublicBuildReport> {
   return invoke<PublicBuildReport>("check_public_builds");
+}
+
+/** [2026-10-16] "official" (built by the official release with its build profile), "unofficial" (any other release build) or
+ * "development" (a debug build). A courtesy label for the badge, not a security check. */
+export type BuildKind = "official" | "unofficial" | "development";
+
+export async function launcherBuildKind(): Promise<BuildKind> {
+  return invoke<BuildKind>("launcher_build_kind");
 }

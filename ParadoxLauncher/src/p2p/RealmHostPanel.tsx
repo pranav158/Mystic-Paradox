@@ -5,16 +5,18 @@ import { Dropdown, type DropdownOption } from "../components/Dropdown";
 import { Modal } from "../components/Modal";
 import { RealmTrustNote } from "../components/RealmTrustNote";
 import { TextField } from "../components/TextField";
-import { AlertIcon, ServersIcon, ShieldIcon } from "../components/icons";
+import { AlertIcon, InfoIcon, ServersIcon, ShieldIcon } from "../components/icons";
 import { formatClock, formatDuration, formatWhen } from "../lib/sessions";
 import { useServer } from "../servers/ServerContext";
 import {
-  realmHostAddPlayer,
   realmHostApproveRequest,
   realmHostBan,
+  realmHostCancelInvite,
   realmHostDenyRequest,
+  realmHostInvitePlayer,
   realmHostJoinRequests,
   realmHostKick,
+  realmHostPeople,
   realmHostSetJoinPolicy,
   realmHostSetLimits,
   realmHostStart,
@@ -27,6 +29,8 @@ import {
   type RealmHostStatus,
   type RealmJoinPolicy,
   type RealmJoinRequest,
+  type RealmPeople,
+  type RealmPerson,
 } from "./realmHostApi";
 import {
   EMPTY_DRAFT,
@@ -54,6 +58,8 @@ import "./realmHost.css";
 // that folder has no hosting UI at all.
 
 const POLL_MS = 5_000;
+/** [2026-10-16] The allowed players and the unanswered invites change only by the host or an answer: read less often. */
+const PEOPLE_POLL_MS = 30_000;
 
 // [2026-10-15] Who may join. "Approved players only" is the realm's default (invite-only): others send a request.
 const JOIN_POLICY_OPTIONS: DropdownOption[] = [
@@ -92,7 +98,12 @@ function playerName(player: { displayName: string | null; accountId: string }): 
   return player.displayName?.trim() || player.accountId;
 }
 
-type Confirm = { kind: "stop" } | { kind: "kick" | "ban"; player: RealmHostPlayer } | { kind: "unban"; player: RealmHostBan };
+type Confirm =
+  | { kind: "stop" }
+  | { kind: "kick" | "ban"; player: RealmHostPlayer }
+  | { kind: "unban"; player: RealmHostBan }
+  // [2026-10-16] Takes an allowed player off the list (the same backend action as a kick).
+  | { kind: "remove"; player: RealmPerson };
 
 function Meter({ label, text, ratio, tone }: { label: string; text: string; ratio: number; tone: MeterTone }) {
   const percent = Math.round(ratio * 100);
@@ -131,6 +142,12 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
   const [addName, setAddName] = useState("");
   const [addError, setAddError] = useState<string | null>(null);
   const [addDone, setAddDone] = useState<string | null>(null);
+  // [2026-10-16] The native notice an action already showed in its own section (Invite a player): not repeated at the top.
+  const [noticeShownInline, setNoticeShownInline] = useState<string | null>(null);
+  // [2026-10-16] The allowed players and the unanswered invites, with the list's own read error and a cancel's error.
+  const [people, setPeople] = useState<RealmPeople | null>(null);
+  const [peopleError, setPeopleError] = useState<string | null>(null);
+  const [inviteError, setInviteError] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const busyRef = useRef(false);
   const dirtyRef = useRef(false);
@@ -164,6 +181,18 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
       setRequestsError(next.error);
     } catch (err) {
       if (mountedRef.current) setRequestsError(friendly(err));
+    }
+  }, []);
+
+  // [2026-10-16] The allowed players and the unanswered invites. A failed read is shown in the section.
+  const loadPeople = useCallback(async () => {
+    try {
+      const next = await realmHostPeople();
+      if (!mountedRef.current) return;
+      setPeople(next);
+      setPeopleError(next.error);
+    } catch (err) {
+      if (mountedRef.current) setPeopleError(friendly(err));
     }
   }, []);
 
@@ -203,6 +232,17 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
       stop();
     };
   }, [poll]);
+
+  // [2026-10-16] The people lists, once the realm is known and then every 30 s (and after each action that changes them).
+  const hasRealm = status?.realm != null;
+  useEffect(() => {
+    if (!hasRealm) return;
+    void loadPeople();
+    const timer = setInterval(() => {
+      if (document.visibilityState !== "hidden") void loadPeople();
+    }, PEOPLE_POLL_MS);
+    return () => clearInterval(timer);
+  }, [hasRealm, loadPeople]);
 
   // One action at a time. A refusal is shown where the player pressed the button. Resolves with the status the action
   // answered, or null when the call itself failed (the failure is shown already).
@@ -274,7 +314,7 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
     let answer: RealmHostStatus | null;
     if (confirm.kind === "stop") {
       answer = await run("stop", () => realmHostStop(), { onError });
-    } else if (confirm.kind === "kick") {
+    } else if (confirm.kind === "kick" || confirm.kind === "remove") {
       const id = confirm.player.accountId;
       answer = await run(`kick:${id}`, () => realmHostKick(id), { onError });
     } else if (confirm.kind === "unban") {
@@ -291,6 +331,7 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
       return;
     }
     closeConfirm();
+    if (confirm.kind !== "stop") void loadPeople();
   };
 
   // [2026-10-15] Approve or deny a waiting player. A refusal comes back as the status's error notice, shown in the section.
@@ -304,10 +345,12 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
     );
     if (answer && answer.noticeKind === "error") setRequestError(answer.notice ?? "The launcher refused the request.");
     void loadRequests();
+    void loadPeople();
   };
 
-  // [2026-10-15] Lets a player in by username. The native notice names them ("<name> can now join your realm directly.").
-  const addPlayer = async () => {
+  // [2026-10-16] Invites a player by username. The native notice names them ("Invite sent to <name>. ..."); a player who had
+  // asked to join is let in at once ("<name> can join your realm.").
+  const invitePlayer = async () => {
     const username = addName.trim();
     setAddDone(null);
     if (username === "") {
@@ -315,15 +358,28 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
       return;
     }
     setAddError(null);
-    const answer = await run("add", () => realmHostAddPlayer(username), { onError: setAddError });
+    const answer = await run("add", () => realmHostInvitePlayer(username), { onError: setAddError });
     if (!answer || !mountedRef.current) return;
     if (answer.noticeKind === "error") {
       setAddError(answer.notice ?? "The launcher refused the request.");
       return;
     }
-    setAddDone(answer.notice ?? `${username} can now join your realm directly.`);
+    setAddDone(answer.notice ?? `Invite sent to ${username}.`);
+    setNoticeShownInline(answer.notice);
     setAddName("");
     void loadRequests();
+    void loadPeople();
+  };
+
+  // [2026-10-16] Withdraws an unanswered invite. A refusal is shown in the section.
+  const cancelInvite = async (person: RealmPerson) => {
+    setInviteError(null);
+    const id = person.accountId;
+    const answer = await run(`cancel:${id}`, () => realmHostCancelInvite(id), { onError: setInviteError });
+    if (!answer || !mountedRef.current) return;
+    if (answer.noticeKind === "error") setInviteError(answer.notice ?? "The launcher refused the request.");
+    else setNoticeShownInline(answer.notice);
+    void loadPeople();
   };
 
   const changeJoinPolicy = (value: string) => {
@@ -367,6 +423,9 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
     );
   }
 
+  // [2026-10-16] The allowed players and the unanswered invites.
+  const members = people?.members ?? [];
+  const invites = people?.invites ?? [];
   const confirmBusy = busy != null && confirm != null;
   const confirmName = confirm && confirm.kind !== "stop" ? playerName(confirm.player) : "";
 
@@ -402,16 +461,19 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
           <span>Hosting runs Ramsgate, Training and hunts on this PC. Players on it use their official accounts.</span>
         </p>
         <RealmTrustNote />
-        {status?.notice && (
+        {status?.notice && status.notice !== noticeShownInline && (
           // [2026-10-14] A refusal or failure is in the error style; a notice about the realm's own state is not. Both are
           // notices (role status), not failed calls: a failed call is the alert below.
+          // [2026-10-16] Only the hub restart ("The realm hub stopped. Starting it again.") is a warning. Every other info
+          // notice confirms an action (added, approved, denied, who can join), so it is not yellow while the realm is stopped.
           <p
             className="rh-notice"
-            data-tone={status.noticeKind === "error" ? "bad" : state === "online" ? "info" : "warn"}
+            data-tone={status.noticeKind === "error" ? "bad" : state === "restarting" ? "warn" : "info"}
             data-kind={status.noticeKind}
             role="status"
           >
-            <AlertIcon /><span>{status.notice}</span>
+            {status.noticeKind === "error" || state === "restarting" ? <AlertIcon /> : <InfoIcon />}
+            <span>{status.notice}</span>
           </p>
         )}
         {actionError && <p className="feedback bad" role="alert">{actionError}</p>}
@@ -441,8 +503,11 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
       {realm && (
         <div className="section">
           <div className="rh-head">
-            <h3 className="rh-heading">Join requests</h3>
-            {requests.length > 0 && <span className="chip warn">{requests.length} waiting</span>}
+            <div className="rh-head-main">
+              <h3 className="rh-heading">Join requests</h3>
+              {/* [2026-10-16] Heading counts are the number alone (the noun for screen readers); the colour marks what needs you. */}
+              {requests.length > 0 && <span className="chip warn">{requests.length}<span className="sr-only"> waiting</span></span>}
+            </div>
             <Button variant="ghost" size="sm" onClick={() => void loadRequests()} disabled={working}>Refresh</Button>
           </div>
           {requests.length === 0 ? (
@@ -490,14 +555,14 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
       {realm && (
         <div className="section">
           <div className="rh-head">
-            <h3 className="rh-heading">Add a player</h3>
-            <span className="rh-sub">They join without sending a request.</span>
+            <h3 className="rh-heading">Invite a player</h3>
+            <span className="rh-sub">They can join once they accept it in their launcher.</span>
           </div>
           <form
             className="rh-add"
             onSubmit={(event) => {
               event.preventDefault();
-              void addPlayer();
+              void invitePlayer();
             }}
           >
             <TextField
@@ -514,11 +579,79 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
               autoComplete="off"
               spellCheck={false}
             />
-            <Button type="submit" disabled={working || addName.trim() === ""} loading={busy === "add"} loadingLabel="Adding…">
-              Allow
+            <Button type="submit" disabled={working || addName.trim() === ""} loading={busy === "add"} loadingLabel="Inviting…">
+              Invite
             </Button>
           </form>
           {addDone && <p className="feedback ok" role="status">{addDone}</p>}
+          {invites.length > 0 && (
+            <>
+              <div className="rh-head rh-subhead">
+                <div className="rh-head-main">
+                  <h4 className="rh-subheading">Waiting for an answer</h4>
+                  <span className="chip">{invites.length}<span className="sr-only"> invited</span></span>
+                </div>
+              </div>
+              <ul className="rh-list">
+                {invites.map((person) => (
+                  <li className="rh-row" key={person.accountId}>
+                    <div className="rh-who">
+                      <div className="rh-name"><span className="rh-name-text" title={person.accountId}>{playerName(person)}</span></div>
+                      {person.at && <div className="rh-meta"><span className="rh-sub">Invited {formatWhen(person.at)}</span></div>}
+                    </div>
+                    <div className="rh-actions">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={working}
+                        loading={busy === `cancel:${person.accountId}`}
+                        loadingLabel="Cancelling…"
+                        onClick={() => void cancelInvite(person)}
+                      >
+                        Cancel invite
+                      </Button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {inviteError && <p className="feedback bad" role="alert">{inviteError}</p>}
+        </div>
+      )}
+
+      {/* [2026-10-16] Everyone who may join: invited players who accepted, approved requests, and earlier additions. */}
+      {realm && (
+        <div className="section">
+          <div className="rh-head">
+            <div className="rh-head-main">
+              <h3 className="rh-heading">Allowed players</h3>
+              {members.length > 0 && <span className="chip">{members.length}<span className="sr-only"> allowed</span></span>}
+            </div>
+            <span className="rh-sub">They can join whenever your realm is online.</span>
+          </div>
+          {people === null && !peopleError ? (
+            <div className="loader-bar rh-loading" />
+          ) : members.length === 0 ? (
+            <p className="note">No one yet. Invite a player, or approve a join request.</p>
+          ) : (
+            <ul className="rh-list">
+              {members.map((person) => (
+                <li className="rh-row" key={person.accountId}>
+                  <div className="rh-who">
+                    <div className="rh-name"><span className="rh-name-text" title={person.accountId}>{playerName(person)}</span></div>
+                    {person.at && <div className="rh-meta"><span className="rh-sub">Allowed {formatWhen(person.at)}</span></div>}
+                  </div>
+                  <div className="rh-actions">
+                    <Button variant="secondary" size="sm" disabled={working} onClick={() => openConfirm({ kind: "remove", player: person })}>
+                      Remove
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          {peopleError && <p className="feedback bad" role="alert">Couldn't read your players. {peopleError}</p>}
         </div>
       )}
 
@@ -621,8 +754,10 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
       {showPlayers && (
         <div className="section">
           <div className="rh-head">
-            <h3 className="rh-heading">Players</h3>
-            <span className="rh-sub">{capacity ? `${players.length} of ${capacity.maxPlayers}` : plural(players.length, "player")}</span>
+            <div className="rh-head-main">
+              <h3 className="rh-heading">Players</h3>
+              <span className="chip">{capacity ? `${players.length} of ${capacity.maxPlayers}` : plural(players.length, "player")}</span>
+            </div>
             {checkedAt != null && <span className="rh-sub">Read at {formatClock(checkedAt)}</span>}
           </div>
           {players.length === 0 ? (
@@ -665,8 +800,10 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
       {(bans.length > 0 || showPlayers) && (
         <div className="section">
           <div className="rh-head">
-            <h3 className="rh-heading">Banned players</h3>
-            <span className="rh-sub">{bans.length > 0 ? String(bans.length) : ""}</span>
+            <div className="rh-head-main">
+              <h3 className="rh-heading">Banned players</h3>
+              {bans.length > 0 && <span className="chip bad">{bans.length}<span className="sr-only"> banned</span></span>}
+            </div>
           </div>
           {bans.length === 0 ? (
             <p className="note">No one is banned.</p>
@@ -698,19 +835,20 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
           title={confirm.kind === "stop"
             ? "Stop your realm?"
             : confirm.kind === "kick" ? `Kick ${confirmName}?`
-              : confirm.kind === "unban" ? `Unban ${confirmName}?` : `Ban ${confirmName}?`}
-          tone={confirm.kind === "kick" || confirm.kind === "unban" ? "default" : "danger"}
+              : confirm.kind === "remove" ? `Remove ${confirmName}?`
+                : confirm.kind === "unban" ? `Unban ${confirmName}?` : `Ban ${confirmName}?`}
+          tone={confirm.kind === "kick" || confirm.kind === "unban" || confirm.kind === "remove" ? "default" : "danger"}
           onClose={confirmBusy ? () => {} : closeConfirm}
           footer={(
             <div className="modal-actions">
               <Button variant="ghost" onClick={closeConfirm} disabled={confirmBusy}>{confirm.kind === "stop" ? "Keep running" : "Cancel"}</Button>
               <Button
-                variant={confirm.kind === "kick" || confirm.kind === "unban" ? "secondary" : "danger"}
+                variant={confirm.kind === "kick" || confirm.kind === "unban" || confirm.kind === "remove" ? "secondary" : "danger"}
                 onClick={() => void confirmAction()}
                 loading={confirmBusy}
-                loadingLabel={confirm.kind === "stop" ? "Stopping…" : confirm.kind === "kick" ? "Kicking…" : confirm.kind === "unban" ? "Unbanning…" : "Banning…"}
+                loadingLabel={confirm.kind === "stop" ? "Stopping…" : confirm.kind === "kick" ? "Kicking…" : confirm.kind === "remove" ? "Removing…" : confirm.kind === "unban" ? "Unbanning…" : "Banning…"}
               >
-                {confirm.kind === "stop" ? "Stop realm" : confirm.kind === "kick" ? "Kick" : confirm.kind === "unban" ? "Unban" : "Ban"}
+                {confirm.kind === "stop" ? "Stop realm" : confirm.kind === "kick" ? "Kick" : confirm.kind === "remove" ? "Remove" : confirm.kind === "unban" ? "Unban" : "Ban"}
               </Button>
             </div>
           )}
@@ -728,6 +866,9 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
           )}
           {confirm.kind === "unban" && (
             <p><strong>{confirmName}</strong> can join your realm again.</p>
+          )}
+          {confirm.kind === "remove" && (
+            <p><strong>{confirmName}</strong> can no longer join your realm. To let them back in, invite them again.</p>
           )}
           {confirm.kind === "ban" && (
             <>

@@ -17,6 +17,7 @@ import type {
   RealmHostStatus,
   RealmJoinPolicy,
   RealmJoinRequest,
+  RealmPerson,
 } from "./realmHostApi";
 
 const params = new URLSearchParams(window.location.search);
@@ -46,6 +47,16 @@ let requests: RealmJoinRequest[] = [
   { accountId: "acc-lyra", displayName: "LyraSpark", at: iso(-12) },
   { accountId: "acc-brann", displayName: "BrannOak", at: iso(-95) },
 ];
+
+// [2026-10-16] The allowed players and the unanswered invites (newest first).
+let members: RealmPerson[] = [
+  { accountId: "acc-nova", displayName: "NovaBlade", at: iso(-2 * 24 * 60) },
+  { accountId: "acc-ash", displayName: "AshWarden", at: iso(-6 * 24 * 60) },
+];
+let invites: RealmPerson[] = [
+  { accountId: "acc-mira", displayName: "MiraVale", at: iso(-40) },
+];
+const KNOWN_USERNAMES = ["LyraSpark", "BrannOak", "MiraVale", "Mysticzzz", "QuietFox"];
 
 function status(): RealmHostStatus {
   const up = state === "online" || state === "restarting";
@@ -116,16 +127,34 @@ export default function realmHostPreview(cmd: string, args: unknown): Promise<un
       if (!requests.some((request) => request.accountId === payload.accountId)) {
         return say("That player has not asked to join your realm.", 250, "error");
       }
+      const decided = requests.find((request) => request.accountId === payload.accountId)!;
       requests = requests.filter((request) => request.accountId !== payload.accountId);
+      if (cmd === "realm_host_approve_request") members = [{ accountId: decided.accountId, displayName: decided.displayName, at: iso(0) }, ...members];
       return say(cmd === "realm_host_approve_request" ? "The player can join your realm now." : "The request was denied.", 300);
     }
-    case "realm_host_add_player": {
-      const name = (payload.username ?? "").trim();
-      if (name === "" || name.length > 64) return say("Enter a username of 1 to 64 characters.", 250, "error");
-      if (name.toLowerCase() === "nobody") return say("No player has that username.", 300, "error");
-      requests = requests.filter((request) => request.displayName?.toLowerCase() !== name.toLowerCase());
-      return say(`${name} can now join your realm directly.`, 300);
+    case "realm_host_invite_player": {
+      const typed = (payload.username ?? "").trim();
+      if (typed === "" || typed.length > 64) return say("Enter a username of 1 to 64 characters.", 250, "error");
+      const name = KNOWN_USERNAMES.find((known) => known.toLowerCase() === typed.toLowerCase());
+      if (!name) return say("No player has that username.", 300, "error");
+      const accountId = `acc-${name.toLowerCase()}`;
+      if (members.some((member) => member.accountId === accountId)) return say(`${name} can join your realm.`, 300);
+      // A player who asked to join is let in at once, as the backend does.
+      if (requests.some((request) => request.accountId === accountId)) {
+        requests = requests.filter((request) => request.accountId !== accountId);
+        members = [{ accountId, displayName: name, at: iso(0) }, ...members];
+        return say(`${name} can join your realm.`, 300);
+      }
+      if (!invites.some((invite) => invite.accountId === accountId)) invites = [{ accountId, displayName: name, at: iso(0) }, ...invites];
+      return say(`Invite sent to ${name}. They can join once they accept it in their launcher.`, 300);
     }
+    case "realm_host_cancel_invite": {
+      if (!invites.some((invite) => invite.accountId === payload.accountId)) return say("That player has no invite waiting.", 250, "error");
+      invites = invites.filter((invite) => invite.accountId !== payload.accountId);
+      return say("The invite was cancelled.", 300);
+    }
+    case "realm_host_people":
+      return delay({ members: [...members], invites: [...invites], error: null }, 150);
     case "realm_host_set_join_policy": {
       if (payload.joinPolicy !== "INVITE_ONLY" && payload.joinPolicy !== "PUBLIC") return say("Choose who can join: approved players or anyone.", 250, "error");
       joinPolicy = payload.joinPolicy;
@@ -158,6 +187,7 @@ export default function realmHostPreview(cmd: string, args: unknown): Promise<un
       after(1_500, () => { state = "stopped"; players = []; startedAt = null; notice = null; noticeKind = "info"; });
       return delay(status(), 300);
     case "realm_host_kick": {
+      members = members.filter((member) => member.accountId !== payload.accountId);
       if (!validAccountId(payload.accountId)) return say("That is not a player id.", 250, "error");
       players = players.filter((player) => player.accountId !== payload.accountId);
       return say("The player was removed from the realm.", 300);

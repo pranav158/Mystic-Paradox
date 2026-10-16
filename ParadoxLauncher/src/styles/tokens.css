@@ -64,4 +64,6 @@
   --sidebar-w: 252px;
   --titlebar-h: 38px;
   --gutter: clamp(22px, 3.4vw, 56px);
+  /* [2026-10-16] The content width of every page but Home (.subpage-inner), shared with the notice above it. */
+  --page-max: 1060px;
 }

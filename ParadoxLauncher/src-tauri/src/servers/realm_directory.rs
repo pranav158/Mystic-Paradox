@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
-use super::model::{key_fingerprint, validate_host_key};
+use super::model::{key_fingerprint, validate_host_key, validate_realm_name};
 use crate::commands::auth::{api_base_url, http_client, send_authorized};
 
 /// `{ realm: RealmPublicInfo }`, reduced to what the launcher reads.
@@ -28,6 +28,15 @@ struct RealmInfo {
     /// Only answered when the request carried the key the launcher knows (`knownHostKey`).
     #[serde(default)]
     ownership_changed: bool,
+    /// The player's own standing: `HOST`, `MEMBER` or none.
+    #[serde(default)]
+    membership: Option<String>,
+    /// [2026-10-16] The player asked to join and waits for the host.
+    #[serde(default)]
+    requested: bool,
+    /// [2026-10-16] The host invited the player and the player has not answered.
+    #[serde(default)]
+    invited: bool,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +60,12 @@ pub struct RealmLookupView {
     pub serving: bool,
     /// The name now belongs to a different key than the one sent. Only meaningful when a key was sent.
     pub ownership_changed: bool,
+    /// [2026-10-16] The player may enter (a member, or the host).
+    pub member: bool,
+    /// [2026-10-16] The player's join request waits for the host.
+    pub requested: bool,
+    /// [2026-10-16] The host invited the player and the player has not answered.
+    pub invited: bool,
 }
 
 /// Reads a successful lookup answer. A key of the wrong shape is refused, so nothing malformed is ever stored.
@@ -72,6 +87,9 @@ pub fn parse_lookup(body: &[u8]) -> Result<RealmLookupView, String> {
         online: info.online,
         serving: info.serving,
         ownership_changed: info.ownership_changed,
+        member: info.membership.is_some(),
+        requested: info.requested,
+        invited: info.invited,
     })
 }
 
@@ -116,6 +134,162 @@ pub fn lookup(
     parse_lookup(&body)
 }
 
+// ---- [2026-10-16] Player invites and join requests, the player's side ----------------------------------------------------
+
+/// `{ invites: [{ realm, at }] }`.
+#[derive(Deserialize)]
+struct InvitesEnvelope {
+    #[serde(default)]
+    invites: Vec<InviteEntry>,
+}
+
+#[derive(Deserialize)]
+struct InviteEntry {
+    realm: InviteRealm,
+    at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InviteRealm {
+    name: String,
+    host: HostInfo,
+    #[serde(default)]
+    online: bool,
+}
+
+/// One invite the player received, as the Servers page shows it.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RealmInviteView {
+    pub realm_name: String,
+    pub host_name: Option<String>,
+    pub at: Option<String>,
+    pub online: bool,
+}
+
+/// What a join request answered: the player may enter now, or the request waits for the host.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum JoinAnswer {
+    Member,
+    Requested,
+}
+
+pub fn parse_invites(body: &[u8]) -> Result<Vec<RealmInviteView>, String> {
+    let envelope: InvitesEnvelope = serde_json::from_slice(body).map_err(|_| {
+        "The realm directory answered in a form this launcher does not read.".to_string()
+    })?;
+    Ok(envelope
+        .invites
+        .into_iter()
+        .map(|invite| RealmInviteView {
+            realm_name: invite.realm.name,
+            host_name: invite
+                .realm
+                .host
+                .display_name
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty()),
+            at: invite.at,
+            online: invite.realm.online,
+        })
+        .collect())
+}
+
+/// A join answered 409 REALM_JOIN_REQUESTED: not a failure, the request was recorded (or already was).
+fn is_join_requested(status: u16, body: &[u8]) -> bool {
+    status == 409
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value["error"]["code"].as_str().map(str::to_string))
+            .as_deref()
+            == Some("REALM_JOIN_REQUESTED")
+}
+
+fn send(
+    app: &AppHandle,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<(u16, Vec<u8>), String> {
+    let url = format!("{}{path}", api_base_url());
+    let response = send_authorized(app, |token| {
+        let mut request = http_client()?
+            .request(method.clone(), &url)
+            .bearer_auth(token);
+        if let Some(body) = &body {
+            request = request.json(body);
+        }
+        request
+            .send()
+            .map_err(|_| "Couldn't reach the Mystic Paradox server.".to_string())
+    })?;
+    let status = response.status().as_u16();
+    let bytes = response
+        .bytes()
+        .map(|bytes| bytes.to_vec())
+        .unwrap_or_default();
+    Ok((status, bytes))
+}
+
+/// The invites the signed-in player has not answered (`GET /launcher/v1/realms/player-invites`).
+pub fn player_invites(app: &AppHandle) -> Result<Vec<RealmInviteView>, String> {
+    let (status, body) = send(
+        app,
+        reqwest::Method::GET,
+        "/launcher/v1/realms/player-invites",
+        None,
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(refusal_text(status, &body));
+    }
+    parse_invites(&body)
+}
+
+/// Accepts or declines an invite. The name is validated before it reaches a URL.
+pub fn answer_invite(app: &AppHandle, realm_name: &str, accept: bool) -> Result<(), String> {
+    let name = validate_realm_name(realm_name)?;
+    let action = if accept { "accept" } else { "decline" };
+    let (status, body) = send(
+        app,
+        reqwest::Method::POST,
+        &format!("/launcher/v1/realms/player-invites/{name}/{action}"),
+        Some(serde_json::json!({})),
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(refusal_text(status, &body));
+    }
+    Ok(())
+}
+
+/// Asks to join a realm by name (`POST /launcher/v1/realms/join`): a member (or a PUBLIC realm) answers MEMBER, an invite-only
+/// realm records a request for its host and answers REQUESTED. The key the player agreed to is sent, so a new owner is refused.
+pub fn request_join(
+    app: &AppHandle,
+    realm_name: &str,
+    known_host_key: Option<&str>,
+) -> Result<JoinAnswer, String> {
+    let name = validate_realm_name(realm_name)?;
+    let mut body = serde_json::json!({ "name": name });
+    if let Some(key) = known_host_key {
+        body["knownHostKey"] = serde_json::Value::String(key.to_string());
+    }
+    let (status, bytes) = send(
+        app,
+        reqwest::Method::POST,
+        "/launcher/v1/realms/join",
+        Some(body),
+    )?;
+    if (200..300).contains(&status) {
+        return Ok(JoinAnswer::Member);
+    }
+    if is_join_requested(status, &bytes) {
+        return Ok(JoinAnswer::Requested);
+    }
+    Err(refusal_text(status, &bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +315,52 @@ mod tests {
         assert_eq!(view.host_name, None);
         assert!(!view.ownership_changed);
         assert!(!view.online);
+    }
+
+    #[test]
+    fn a_lookup_says_whether_the_player_is_in_waits_or_is_invited() {
+        let body = br#"{"realm":{"name":"ember-hold","host":{"displayName":"Tempest"},
+            "hostPublicKey":"KEY-0123456789abcdef","membership":"MEMBER","requested":false,"invited":false}}"#;
+        let view = parse_lookup(body).unwrap();
+        assert!(view.member && !view.requested && !view.invited);
+        let body = br#"{"realm":{"name":"ember-hold","host":{"displayName":"Tempest"},
+            "hostPublicKey":"KEY-0123456789abcdef","membership":null,"requested":true,"invited":true}}"#;
+        let view = parse_lookup(body).unwrap();
+        assert!(!view.member && view.requested && view.invited);
+        // An older backend sends neither flag.
+        let body =
+            br#"{"realm":{"name":"ember-hold","host":{},"hostPublicKey":"KEY-0123456789abcdef"}}"#;
+        let view = parse_lookup(body).unwrap();
+        assert!(!view.member && !view.requested && !view.invited);
+    }
+
+    #[test]
+    fn invites_are_read_with_their_host_and_time() {
+        let body = br#"{"invites":[{"realm":{"name":"ember-hold","host":{"displayName":"Tempest"},"online":true},
+            "at":"2026-10-16T10:00:00.000Z"},{"realm":{"name":"quiet-vale","host":{"displayName":" "}},"at":null}]}"#;
+        let invites = parse_invites(body).unwrap();
+        assert_eq!(invites.len(), 2);
+        assert_eq!(invites[0].realm_name, "ember-hold");
+        assert_eq!(invites[0].host_name.as_deref(), Some("Tempest"));
+        assert_eq!(invites[0].at.as_deref(), Some("2026-10-16T10:00:00.000Z"));
+        assert!(invites[0].online);
+        assert_eq!(invites[1].host_name, None);
+        assert!(!invites[1].online);
+        assert_eq!(parse_invites(br#"{}"#).unwrap(), Vec::new());
+        assert!(parse_invites(b"<html>").is_err());
+    }
+
+    #[test]
+    fn a_recorded_request_is_told_apart_from_a_refusal() {
+        let requested =
+            br#"{"error":{"code":"REALM_JOIN_REQUESTED","message":"Request sent to the host."}}"#;
+        assert!(is_join_requested(409, requested));
+        assert!(!is_join_requested(403, requested));
+        assert!(!is_join_requested(
+            409,
+            br#"{"error":{"code":"REALM_FULL","message":"Full."}}"#
+        ));
+        assert!(!is_join_requested(409, b"not json"));
     }
 
     #[test]

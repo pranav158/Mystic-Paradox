@@ -61,11 +61,37 @@
   color: var(--bad);
 }
 
+/* A section's heading line: the title with its count chip on the left, a hint or a button on the right. */
 .rh-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
+  min-height: 24px;
+}
+
+.rh-head-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.rh-head .chip {
+  height: 22px;
+  padding: 0 9px;
+  font-size: 11px;
+}
+
+/* [2026-10-16] A list inside a section (the invites waiting for an answer, under Invite a player). */
+.rh-subhead {
+  margin-top: 16px;
+}
+
+.rh-subheading {
+  color: var(--ink-2);
+  font-size: 13px;
+  font-weight: 650;
 }
 
 .rh-heading {
@@ -157,21 +183,33 @@
 /* [2026-10-15] Who can join: one dropdown, not wider than a limit field. */
 .rh-policy {
   margin-top: 14px;
-  max-width: 320px;
+  /* [2026-10-16] Wide enough for the longest option's detail line at full length (320 px cut it by a few pixels). */
+  max-width: 360px;
 }
 
-/* [2026-10-15] Add a player: the username field and its button on one line (they wrap on a narrow window). */
+/* [2026-10-15] Add a player: the username field and its button on one line.
+   [2026-10-16] The field's label, input and hint (or error) are rows of this grid (subgrid), so the button sits on the
+   input's own row at the input's height. Bottom-aligned, it had dropped to the hint line. */
 .rh-add {
-  display: flex;
-  align-items: flex-end;
-  flex-wrap: wrap;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto;
+  gap: 7px 12px;
   margin-top: 14px;
 }
 
 .rh-add .field {
-  flex: 1 1 240px;
+  display: grid;
+  grid-row: 1 / span 3;
+  grid-template-rows: subgrid;
   min-width: 0;
+}
+
+.rh-add > .btn {
+  --h: 46px;
+  grid-row: 2;
+  grid-column: 2;
+  min-width: 96px;
 }
 
 .rh-list {

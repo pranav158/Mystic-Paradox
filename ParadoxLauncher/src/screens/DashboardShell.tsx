@@ -4,6 +4,7 @@ import { AetherMark } from "../components/AetherMark";
 import { useAuth } from "../auth/AuthContext";
 import { useServer } from "../servers/ServerContext";
 import { serverNaming } from "../servers/serverNames";
+import { RealmInvitesProvider, useRealmInvites } from "../servers/RealmInvites";
 import { ServicesProvider, useServices, type ServiceHealth } from "../services/ServicesContext";
 import { setUiPrefs, useMediaQuery, useUiPrefs } from "../lib/prefs";
 import { prefersReducedMotion, withViewTransition } from "../lib/platform";
@@ -28,7 +29,8 @@ const HOST_NAV_ITEM: NavItem = { id: "host", label: "Host realm", icon: HostReal
 const NAV_ITEMS: NavItem[] = [
   { id: "home", label: "Home", icon: HomeIcon },
   { id: "library", label: "Library", icon: LibraryIcon },
-  { id: "servers", label: "Servers & realms", icon: ServersIcon },
+  // [2026-10-16] "Realms" (was "Servers & realms"): local servers are gone, so the page lists the official server and realms.
+  { id: "servers", label: "Realms", icon: ServersIcon },
   ...(OPTIONAL_PANELS.length > 0 ? [HOST_NAV_ITEM] : []),
   { id: "settings", label: "Settings", icon: SettingsIcon },
   { id: "about", label: "About", icon: AboutIcon },
@@ -125,6 +127,8 @@ function ServicesCard() {
 
 function Shell() {
   const { account } = useAuth();
+  // [2026-10-16] Realm invites waiting for an answer: counted on the Realms item.
+  const { invites } = useRealmInvites();
   const prefs = useUiPrefs();
   const narrow = useMediaQuery("(max-width: 1099px)");
   const compact = prefs.sidebar === "compact" || (prefs.sidebar === "auto" && narrow);
@@ -165,19 +169,25 @@ function Shell() {
 
         <nav className="nav" aria-label="Launcher navigation" style={{ "--nav-index": Math.max(navIndex, 0) } as CSSProperties}>
           <span className="nav-indicator" data-hidden={navIndex < 0} aria-hidden="true" />
-          {NAV_ITEMS.map(({ id, label, icon: ItemIcon }) => (
-            <button
-              key={id}
-              type="button"
-              className="nav-item"
-              aria-current={tab === id ? "page" : undefined}
-              onClick={() => navigate(id)}
-              data-tip={label}
-            >
-              <ItemIcon />
-              <span className="nav-label">{label}</span>
-            </button>
-          ))}
+          {NAV_ITEMS.map(({ id, label, icon: ItemIcon }) => {
+            const count = id === "servers" ? invites.length : 0;
+            const tip = count > 0 ? `${label} · ${count === 1 ? "1 invite" : `${count} invites`}` : label;
+            return (
+              <button
+                key={id}
+                type="button"
+                className="nav-item"
+                aria-current={tab === id ? "page" : undefined}
+                onClick={() => navigate(id)}
+                data-tip={tip}
+                aria-label={count > 0 ? tip : undefined}
+              >
+                <ItemIcon />
+                <span className="nav-label">{label}</span>
+                {count > 0 && <span className="nav-badge" aria-hidden="true">{count}</span>}
+              </button>
+            );
+          })}
         </nav>
 
         <div className="sidebar-foot">
@@ -210,7 +220,7 @@ function Shell() {
 
       <main className="main" ref={mainRef} aria-label="Launcher content">
         {/* [2026-10-15] The sticky announcement, above the tab's page (outside it, so it does not replay on a tab change). */}
-        <NoticeDock />
+        <NoticeDock page={tab !== "home"} />
         <div key={tab} className={`page-host${supportsViewTransitions() ? "" : " page-enter"}`}>
           {page}
         </div>
@@ -234,7 +244,9 @@ function supportsViewTransitions(): boolean {
 export function DashboardShell() {
   return (
     <ServicesProvider>
-      <Shell />
+      <RealmInvitesProvider>
+        <Shell />
+      </RealmInvitesProvider>
     </ServicesProvider>
   );
 }

@@ -3,12 +3,13 @@ import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { AetherMark } from "../../components/AetherMark";
 import { ArtBackdrop } from "../../components/ArtBackdrop";
-import { ExternalIcon, LinkIcon, ShieldIcon } from "../../components/icons";
+import { ChevronRightIcon, ExternalIcon, InfoIcon, LinkIcon, ShieldIcon } from "../../components/icons";
 import { useServices } from "../../services/ServicesContext";
 import { buildName } from "../../lib/sessions";
 import { useLegalViewer } from "../../components/LegalDocument";
 import { PublicBuildCheck } from "../../components/PublicBuildCheck";
 import { LEGAL } from "../../legal/legalMeta";
+import { useBuildBadge } from "../../lib/buildKind";
 
 // [2026-10-15] The attribution notice that ADDITIONAL_TERMS.md (section 1) asks for in the Appropriate Legal Notices. The launcher is
 // the project's own code, so it shows no upstream credit; the original authors' notices stay in the source and NOTICE.md.
@@ -33,6 +34,8 @@ export function AboutTab() {
   const [version, setVersion] = useState("");
   const { supportedChangelist } = useServices();
   const legal = useLegalViewer();
+  // [2026-10-16] An unofficial or development build says so here too (a courtesy label; none on the official build).
+  const buildBadge = useBuildBadge();
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => {});
@@ -60,10 +63,13 @@ export function AboutTab() {
                   <span className="chip">Server build {buildName(supportedChangelist) ?? `CL ${supportedChangelist}`}</span>
                 )}
               </div>
+              {buildBadge && <p className="note about-build-kind" title={buildBadge.title}>{buildBadge.about}</p>}
             </div>
           </div>
         </section>
 
+        {/* [2026-10-16] One list for every link: the source and licence open in the browser, the Terms of Use and the
+            Privacy Policy in the launcher (the chevron says so). */}
         <section className="glass card reveal" style={at(2)} aria-label="Links">
           <div className="section">
             <div className="link-list">
@@ -77,6 +83,22 @@ export function AboutTab() {
                   <ExternalIcon />
                 </a>
               ))}
+              <button type="button" className="link-row" onClick={() => legal.open("terms")}>
+                <ShieldIcon />
+                <span className="grow">
+                  Terms of Use
+                  <span className="sub">Version {LEGAL.termsVersion}</span>
+                </span>
+                <ChevronRightIcon />
+              </button>
+              <button type="button" className="link-row" onClick={() => legal.open("privacy")}>
+                <ShieldIcon />
+                <span className="grow">
+                  Privacy Policy
+                  <span className="sub">Version {LEGAL.privacyVersion}</span>
+                </span>
+                <ChevronRightIcon />
+              </button>
             </div>
           </div>
         </section>
@@ -86,46 +108,31 @@ export function AboutTab() {
           <PublicBuildCheck />
         </section>
 
+        {/* [2026-10-16] The licence and disclaimer under a section title, as every other card has one. */}
         <section className="glass card reveal" style={at(4)} aria-label="Licence and disclaimer">
           <div className="section">
-            <p className="section-desc">
-              Mystic Paradox is free software under the GNU Affero General Public License, version 3 (AGPL-3.0). It comes
-              with no warranty. If you run a changed version for other people over a network, the licence requires you to
-              offer them its source.
-            </p>
-            <p className="section-desc">Copyright (C) 2026 MysticFox / Pranav Karande</p>
-            <p className="section-desc">
-              Mystic Paradox&apos;s Dauntless 1.12.0 and 1.14.7 ports and related modifications were developed by MysticFox /
-              Pranav Karande. See{" "}
-              <a href={NOTICE_URL} target="_blank" rel="noopener noreferrer" onClick={(event) => openExternal(event, NOTICE_URL)}>
-                NOTICE.md
-              </a>{" "}
-              for contribution and provenance information.
-            </p>
-            <p className="section-desc">
-              Mystic Paradox is not affiliated with, endorsed by or supported by the owners of Dauntless.
-            </p>
-          </div>
-        </section>
-
-        {/* [2026-10-14] The Terms of Use and Privacy Policy, read in the launcher. */}
-        <section className="glass card reveal" style={at(5)} aria-label="Terms and privacy">
-          <div className="section">
-            <div className="link-list">
-              <button type="button" className="link-row" onClick={() => legal.open("terms")}>
-                <ShieldIcon />
-                <span className="grow">
-                  Terms of Use
-                  <span className="sub">Version {LEGAL.termsVersion}</span>
-                </span>
-              </button>
-              <button type="button" className="link-row" onClick={() => legal.open("privacy")}>
-                <ShieldIcon />
-                <span className="grow">
-                  Privacy Policy
-                  <span className="sub">Version {LEGAL.privacyVersion}</span>
-                </span>
-              </button>
+            <div className="section-head">
+              <div className="section-icon"><InfoIcon /></div>
+              <div className="min-w-0 about-legal">
+                <h2 className="section-title">Licence and disclaimer</h2>
+                <p className="section-desc">
+                  Mystic Paradox is free software under the GNU Affero General Public License, version 3 (AGPL-3.0). It comes
+                  with no warranty. If you run a changed version for other people over a network, the licence requires you to
+                  offer them its source.
+                </p>
+                <p className="section-desc">
+                  Mystic Paradox&apos;s Dauntless 1.12.0 and 1.14.7 ports and related modifications were developed by MysticFox /
+                  Pranav Karande. See{" "}
+                  <a href={NOTICE_URL} target="_blank" rel="noopener noreferrer" onClick={(event) => openExternal(event, NOTICE_URL)}>
+                    NOTICE.md
+                  </a>{" "}
+                  for contribution and provenance information.
+                </p>
+                <p className="section-desc">
+                  Mystic Paradox is not affiliated with, endorsed by or supported by the owners of Dauntless.
+                </p>
+                <p className="note">Copyright (C) 2026 MysticFox / Pranav Karande</p>
+              </div>
             </div>
           </div>
         </section>

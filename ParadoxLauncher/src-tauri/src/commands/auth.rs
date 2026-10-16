@@ -252,6 +252,12 @@ pub(crate) fn api_error_message(status: u16, code: Option<&str>, fallback: &str)
             "Email isn't available on this server right now.",
         ),
         Some("OFFICIAL_PLAY_UNAVAILABLE") => OFFICIAL_UNAVAILABLE.to_string(),
+        // [2026-10-16] The server refuses Play from an unofficial launcher build (MYSTICPARADOX_UNOFFICIAL_LAUNCHER=refuse).
+        Some("LAUNCHER_UNOFFICIAL") => {
+            "This launcher isn't an official Mystic Paradox build. Install the official \
+            launcher (github.com/pranav158/Mystic-Paradox/releases) to play on Mystic Paradox."
+                .to_string()
+        }
         // [2026-10-15] Linking and unlinking Discord in Settings.
         Some("AUTH_DISCORD_ONLY_LOGIN") => {
             "Discord is this account's only sign-in, so it can't be unlinked.".to_string()
@@ -2374,6 +2380,9 @@ mod tests {
             api_error_message(409, Some("OFFICIAL_PLAY_UNAVAILABLE"), "x"),
             OFFICIAL_UNAVAILABLE
         );
+        // [2026-10-16] An unofficial launcher build refused at Play gets the sentence, not "x (server status 403)".
+        assert!(api_error_message(403, Some("LAUNCHER_UNOFFICIAL"), "x")
+            .starts_with("This launcher isn't an official Mystic Paradox build."));
     }
 
     #[test]

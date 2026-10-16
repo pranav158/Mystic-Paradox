@@ -28,7 +28,7 @@ export function HostRealmTab() {
           <h1 className="page-title">Host realm</h1>
           <p className="page-desc">
             Run your realm on this PC: Ramsgate, Training and the hunts, for the players you invite. It is available when
-            the official server or a Paradox realm is selected in Servers &amp; realms.
+            the official server or a Paradox realm is selected on the Realms page.
           </p>
         </header>
 

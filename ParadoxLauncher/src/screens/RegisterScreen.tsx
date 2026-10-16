@@ -5,7 +5,6 @@ import { Button } from "../components/Button";
 import { Banner } from "../components/Banner";
 import { AuthCard, AuthLayout } from "../components/AuthLayout";
 import { UsernameField, useUsernameField } from "../components/UsernameField";
-import { ServerSwitcher } from "../components/ServerSwitcher";
 import { LegalConsentChecks } from "../components/LegalConsentChecks";
 import { LegalLinks, useLegalViewer } from "../components/LegalDocument";
 import { LEGAL } from "../legal/legalMeta";
@@ -85,7 +84,6 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
           ? "Create an account on this server. It is stored only on the server's own PC, it may need the host's approval, and it is not a Mystic Paradox account."
           : "Create your Mystic Paradox account. Closed-test accounts are approved by an administrator."}
       >
-        <ServerSwitcher />
         <form onSubmit={handleSubmit} className="auth-form" noValidate>
           {error && <Banner>{error}</Banner>}
 

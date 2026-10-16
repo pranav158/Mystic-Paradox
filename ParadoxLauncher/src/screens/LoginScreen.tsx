@@ -5,7 +5,6 @@ import { Button } from "../components/Button";
 import { Banner } from "../components/Banner";
 import { AuthCard, AuthLayout } from "../components/AuthLayout";
 import { DiscordIcon } from "../components/icons";
-import { ServerSwitcher, switcherReturnsFocusTo } from "../components/ServerSwitcher";
 import { LegalLinks, useLegalViewer } from "../components/LegalDocument";
 import { useServer } from "../servers/ServerContext";
 import { serverNaming } from "../servers/serverNames";
@@ -18,10 +17,7 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
   const { login, startDiscordLogin, authError, startPasswordReset } = useAuth();
   // [2026-10-13 realms S5] Sign-in goes to the selected server's own backend. Discord belongs to the official account
   // system, so a local server (which has its own accounts) offers email and password only.
-  const { selected, officialNetwork } = useServer();
-  // [2026-10-14] A server chosen on the switcher brings this card back after its restore, and the switcher takes the focus
-  // back (ServerSwitcher.tsx). Then the email field must not autofocus and take it.
-  const [focusOnSwitcher] = useState(() => switcherReturnsFocusTo(selected?.id));
+  const { selected, officialNetwork, servers, select } = useServer();
   const serverName = selected && !officialNetwork ? serverNaming(selected).primary : null;
   const legal = useLegalViewer();
 
@@ -57,6 +53,19 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
     }
   }
 
+  // [2026-10-16] The sign-in card has no server choice. A local server chosen on the Servers page still shows its own
+  // sign-in here, so this is the way back to the Mystic Paradox account (otherwise the card would be a dead end).
+  async function switchToOfficialAccount() {
+    const official = servers.find((server) => server.kind === "official");
+    if (!official) return;
+    setError(null);
+    try {
+      await select(official.id);
+    } catch (err) {
+      setError(typeof err === "string" && err.trim() ? err.trim().slice(0, 300) : "Couldn't switch to the Mystic Paradox account.");
+    }
+  }
+
   async function handleDiscord() {
     setError(null);
     setDiscordSubmitting(true);
@@ -76,7 +85,6 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
           ? "Use your account on this server. It is not your Mystic Paradox account, and Mystic Paradox never sees it."
           : "Sign in to return to the Shattered Isles."}
       >
-        <ServerSwitcher />
         <form onSubmit={handleSubmit} className="auth-form" noValidate>
           {displayedError && <Banner>{displayedError}</Banner>}
 
@@ -88,7 +96,7 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             disabled={submitting}
-            autoFocus={!focusOnSwitcher}
+            autoFocus
           />
 
           <TextField
@@ -126,6 +134,11 @@ export function LoginScreen({ onCreateAccount }: LoginScreenProps) {
             {serverName ? "New to this server?" : "New to Mystic Paradox?"}
             <button type="button" className="link" onClick={onCreateAccount}>Create an account</button>
           </p>
+          {serverName && (
+            <p className="auth-foot">
+              <button type="button" className="link" onClick={() => void switchToOfficialAccount()}>Use your Mystic Paradox account instead</button>
+            </p>
+          )}
         </form>
         {/* [2026-10-14] The documents, one click away on the sign-in screen as well as at registration. */}
         <LegalLinks onOpen={legal.open} />

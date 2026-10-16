@@ -6,6 +6,7 @@ import { useNotices } from "../notices/NoticesContext";
 import { useServer } from "../servers/ServerContext";
 import type { LauncherNotices } from "../api/types";
 import { expandNoticeText, viewerLocale, viewerTimeZone } from "../notices/noticeTime";
+import { useBuildBadge } from "../lib/buildKind";
 import { AlertIcon, InfoIcon } from "./icons";
 
 /**
@@ -92,20 +93,26 @@ export function NoticeBanner({ className, clock }: { className?: string; clock?:
  * The dashboard's strip: at the top of the content area on every tab, below the title bar, and kept in view while the page
  * scrolls. Renders nothing without announcements, so the page layout is unchanged then.
  */
-export function NoticeDock() {
+export function NoticeDock({ page = false }: { page?: boolean }) {
   const { announcements } = useShownNotices();
   if (announcements.length === 0) return null;
   return (
-    <div className="notice-dock">
+    // [2026-10-16] `page`: above a page other than Home, the banner keeps to the page's content width.
+    <div className={`notice-dock${page ? " is-page" : ""}`}>
       <NoticeBanner />
     </div>
   );
 }
 
-/** The chips: small uppercase labels, one per tag, in the order the backend sent them. Renders nothing without tags. */
+/**
+ * The chips: small uppercase labels, one per tag, in the order the backend sent them, then this launcher's own build badge
+ * ([2026-10-16] UNOFFICIAL BUILD / DEVELOPMENT BUILD; none on the official build). The badge is the launcher's, not the
+ * server's, so it shows on every server. Renders nothing without tags or badge.
+ */
 export function NoticeTags({ className }: { className?: string }) {
   const { tags } = useShownNotices();
-  if (tags.length === 0) return null;
+  const badge = useBuildBadge();
+  if (tags.length === 0 && !badge) return null;
   return (
     <ul className={`notice-tags${className ? ` ${className}` : ""}`} aria-label="Launcher notices">
       {tags.map((tag) => (
@@ -113,6 +120,13 @@ export function NoticeTags({ className }: { className?: string }) {
           <span className={`chip notice-tag ${TAG_TONE[tag.tone] ? TAG_TONE[tag.tone] : "accent"}`}>{tag.text}</span>
         </li>
       ))}
+      {badge && (
+        <li key="build-kind">
+          <span className={`chip notice-tag build-badge${badge.tone ? ` ${badge.tone}` : ""}`} title={badge.title}>
+            {badge.text}
+          </span>
+        </li>
+      )}
     </ul>
   );
 }

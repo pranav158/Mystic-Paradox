@@ -7,7 +7,7 @@ use tauri::AppHandle;
 use crate::auth::consent;
 use crate::commands::auth::{api_base_url, forget_server};
 use crate::install::paths;
-use crate::servers::realm_directory::{self, RealmLookupView};
+use crate::servers::realm_directory::{self, JoinAnswer, RealmInviteView, RealmLookupView};
 use crate::servers::{
     self, is_official_backend_address, normalize_backend_url, play_block_reason, FolderSource,
     NewServer, ServerEntry, ServerKind, ServerTarget, OFFICIAL_ID,
@@ -268,6 +268,42 @@ pub async fn realm_lookup(app: AppHandle, server_id: String) -> Result<RealmLook
     .await
 }
 
+/// [2026-10-16] The realm invites the signed-in player has not answered (the Servers page's invitations).
+#[tauri::command]
+pub async fn realm_invites(app: AppHandle) -> Result<Vec<RealmInviteView>, String> {
+    blocking(move || realm_directory::player_invites(&app)).await
+}
+
+/// [2026-10-16] Accepts or declines a realm invite. After an accept the page adds the realm to the list (`add_server`).
+#[tauri::command]
+pub async fn realm_answer_invite(
+    app: AppHandle,
+    realm_name: String,
+    accept: bool,
+) -> Result<(), String> {
+    blocking(move || realm_directory::answer_invite(&app, &realm_name, accept)).await
+}
+
+/// [2026-10-16] Asks to join a Paradox realm in the list: MEMBER when the player may enter, REQUESTED when the request waits for
+/// the host. Sent when a realm is added and from the realm's row ("Ask again").
+#[tauri::command]
+pub async fn realm_request_join(app: AppHandle, server_id: String) -> Result<JoinAnswer, String> {
+    blocking(move || {
+        let list = servers::store::load(&app);
+        let entry = list
+            .find(&server_id)
+            .ok_or_else(|| "That server is not in your list.".to_string())?;
+        if entry.kind != ServerKind::ParadoxRealm {
+            return Err("Only a Paradox realm can be asked to join.".to_string());
+        }
+        let realm = entry
+            .realm_name
+            .as_deref()
+            .ok_or_else(|| "That realm has no name to ask.".to_string())?;
+        realm_directory::request_join(&app, realm, entry.host_public_key.as_deref())
+    })
+    .await
+}
 /// [2026-10-14 realms] Stores the host key the player agreed to for a Paradox realm (the key the lookup showed; validated).
 /// Resolves with the refreshed list.
 #[tauri::command]

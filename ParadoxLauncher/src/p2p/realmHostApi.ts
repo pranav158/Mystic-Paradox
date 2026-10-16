@@ -154,9 +154,35 @@ export function realmHostDenyRequest(accountId: string): Promise<RealmHostStatus
   return invoke<RealmHostStatus>("realm_host_deny_request", { accountId });
 }
 
-/** [2026-10-15] Lets a player in by launcher username. The notice names them; a name nobody has is an error notice. */
-export function realmHostAddPlayer(username: string): Promise<RealmHostStatus> {
-  return invoke<RealmHostStatus>("realm_host_add_player", { username });
+/**
+ * [2026-10-16] Invites a player by launcher username; they join once they accept in their own launcher (a player who had asked
+ * to join is let in at once). The notice names them; a name nobody has is an error notice.
+ */
+export function realmHostInvitePlayer(username: string): Promise<RealmHostStatus> {
+  return invoke<RealmHostStatus>("realm_host_invite_player", { username });
+}
+
+/** [2026-10-16] Withdraws an invite the player has not answered. A refusal comes back as the status's error notice. */
+export function realmHostCancelInvite(accountId: string): Promise<RealmHostStatus> {
+  return invoke<RealmHostStatus>("realm_host_cancel_invite", { accountId });
+}
+
+/** [2026-10-16] One allowed player (`at` = when they joined) or one unanswered invite (`at` = when it was sent). */
+export interface RealmPerson {
+  accountId: string;
+  displayName: string | null;
+  at: string | null;
+}
+
+/** [2026-10-16] The host's allowed players and unanswered invites. A failed read is `error`, with both lists empty. */
+export interface RealmPeople {
+  members: RealmPerson[];
+  invites: RealmPerson[];
+  error: string | null;
+}
+
+export function realmHostPeople(): Promise<RealmPeople> {
+  return invoke<RealmPeople>("realm_host_people");
 }
 
 /** [2026-10-15] Sets who may join (the realm's join policy). Answers the whole status. */

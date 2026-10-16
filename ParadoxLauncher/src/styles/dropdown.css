@@ -17,7 +17,9 @@
   box-sizing: border-box;
   min-width: 0;
   min-height: 36px;
-  padding: 0 10px 0 12px;
+  /* [2026-10-16] Vertical room for a value with a second line (Who can join, a local server's address); a one-line value
+     is still 36 px tall. */
+  padding: 6px 10px 6px 12px;
   border: 1px solid var(--line-2);
   border-radius: 12px;
   background: rgba(4, 9, 16, 0.55);
@@ -121,9 +123,15 @@
   z-index: 200;
   box-sizing: border-box;
   display: grid;
+  /* [2026-10-16] One column as wide as the list. An auto column grew to the rows' unwrapped text (a long detail line such as
+     Who can join's "Others send a request, and you approve it below."), so the rows were wider than the list and a
+     horizontal scrollbar showed under them (0.1.69). Now the text ends in an ellipsis instead. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 2px;
   margin: 0;
   padding: 6px;
+  /* Rows never scroll sideways; without this, overflow-y: auto makes overflow-x auto too. */
+  overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
   border: 1px solid var(--line-3);

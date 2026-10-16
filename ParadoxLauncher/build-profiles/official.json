@@ -4,7 +4,8 @@
   "env": {
     "MYSTICPARADOX_API_BASE_URL": "https://paradox.mysticfox.dev",
     "MYSTICPARADOX_RUNTIME_ENDPOINT": "https://paradox.mysticfox.dev/launcher/v1/runtime",
-    "MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64": "3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc="
+    "MYSTICPARADOX_RUNTIME_PUBLIC_KEY_B64": "3ZMtA7qUgs1F+1NQs2kmSG2zbOvXfjsh6+axI6eC/tc=",
+    "MYSTICPARADOX_BUILD_KIND": "official"
   },
   "tauri": {
     "app": {

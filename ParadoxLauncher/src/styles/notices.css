@@ -77,6 +77,11 @@
   background: linear-gradient(180deg, #050a12 0%, #050a12 calc(100% - 14px), rgba(5, 10, 18, 0) 100%);
 }
 
+/* [2026-10-16] Above a page other than Home, the banner is as wide as the page's content, not the whole window. */
+.notice-dock.is-page .notice-stack {
+  max-width: var(--page-max);
+}
+
 /* In the sign-in card: the banner sits above the header, and the form below it. */
 .notice-stack.auth-notices {
   margin-bottom: 16px;

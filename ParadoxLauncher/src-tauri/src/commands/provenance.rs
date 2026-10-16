@@ -255,9 +255,10 @@ async fn check_launcher(client: Option<&Client>, repo: &str) -> PublicBuildCheck
             }
         }
         Fetch::NotFound => {
+            // [2026-10-16] Said plainly (a 0.1.69 test build showed "releases before 0.1.65 do not", which read as an error).
             check.status = CheckStatus::NotPublished;
             check.note = format!(
-                "No public release {tag} lists an installed launcher.exe (releases before 0.1.65 do not), so this launcher cannot be matched."
+                "GitHub has no public build of launcher {version} to compare with. A test build made on a PC shows this, and so does a launcher older than 0.1.65 (those releases do not list it). It does not mean the file was changed."
             );
         }
         Fetch::Failed => check.note = "Couldn't reach GitHub.".into(),
@@ -375,7 +376,7 @@ async fn check_runtime_files(
         } else {
             check.status = CheckStatus::NotPublished;
             check.note = format!(
-                "No public runtime release ({searched} searched) has this file: it was built by the server operator before the public builds (runtime 0.2.136 and earlier), or it was changed."
+                "None of the {searched} public runtime releases checked has this exact file. Files from runtime 0.2.136 and earlier show this (the server operator built them before GitHub did), and so does a changed file."
             );
         }
     }
@@ -420,9 +421,42 @@ pub async fn check_public_builds(app: AppHandle) -> Result<PublicBuildReport, St
     })
 }
 
+/// [2026-10-16] Which kind of launcher this is, for the UNOFFICIAL BUILD / DEVELOPMENT BUILD badge (sidebar, sign-in, About).
+/// `MYSTICPARADOX_BUILD_KIND=official` is set only by build-profiles/official.json, which only the official release applies
+/// (scripts/use-build-profile.ps1). A courtesy label, not a security check: the source is public, so anyone can set the
+/// marker or remove the badge. The backend judges a launcher by its hash (MYSTICPARADOX_UNOFFICIAL_LAUNCHER).
+#[tauri::command]
+pub fn launcher_build_kind() -> &'static str {
+    build_kind(
+        option_env!("MYSTICPARADOX_BUILD_KIND"),
+        cfg!(debug_assertions),
+    )
+}
+
+/// A debug build is never a published one, so it is "development" even with the official marker.
+fn build_kind(marker: Option<&str>, debug: bool) -> &'static str {
+    if debug {
+        "development"
+    } else if marker == Some("official") {
+        "official"
+    } else {
+        "unofficial"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_release_build_with_the_official_marker_is_official() {
+        assert_eq!(build_kind(Some("official"), false), "official");
+        assert_eq!(build_kind(None, false), "unofficial");
+        assert_eq!(build_kind(Some("Official"), false), "unofficial");
+        assert_eq!(build_kind(Some(""), false), "unofficial");
+        assert_eq!(build_kind(None, true), "development");
+        assert_eq!(build_kind(Some("official"), true), "development");
+    }
 
     #[test]
     fn checksum_lines_are_read_in_text_and_binary_form_and_anything_else_is_skipped() {

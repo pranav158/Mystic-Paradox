@@ -52,6 +52,8 @@ macro_rules! launcher_commands {
             commands::install::pick_install_path,
             // [2026-10-15] About -> "Check against GitHub" (contacts GitHub only when asked).
             commands::provenance::check_public_builds,
+            // [2026-10-16] The UNOFFICIAL BUILD / DEVELOPMENT BUILD badge (a courtesy label; the build profile sets the marker).
+            commands::provenance::launcher_build_kind,
             // [2026-10-15] The launcher's own update waits while a game runs or this PC hosts.
             commands::updates::launcher_update_hold_reason,
             commands::launch::is_game_running,
@@ -75,6 +77,9 @@ macro_rules! launcher_commands {
             // [2026-10-14 realms] The host key of a Paradox realm: the directory lookup and the stored key.
             commands::servers::realm_lookup,
             commands::servers::set_realm_host_key,
+            commands::servers::realm_invites,
+            commands::servers::realm_answer_invite,
+            commands::servers::realm_request_join,
             $($extra),*
         ]
     };
@@ -151,7 +156,9 @@ pub fn run() {
         p2p::realm_host_join_requests,
         p2p::realm_host_approve_request,
         p2p::realm_host_deny_request,
-        p2p::realm_host_add_player,
+        p2p::realm_host_invite_player,
+        p2p::realm_host_cancel_invite,
+        p2p::realm_host_people,
         p2p::realm_host_set_join_policy,
     ));
     #[cfg(not(mystic_p2p))]

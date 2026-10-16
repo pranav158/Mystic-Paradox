@@ -1266,13 +1266,52 @@ pub async fn realm_host_deny_request(app: AppHandle, account_id: String) -> Real
     .await
 }
 
+/// [2026-10-16] Invites a player by launcher username: they join only after accepting in their own launcher.
 #[tauri::command]
-pub async fn realm_host_add_player(app: AppHandle, username: String) -> RealmHostStatus {
+pub async fn realm_host_invite_player(app: AppHandle, username: String) -> RealmHostStatus {
     run(app, move |app| {
-        add_player(app, &username);
+        invite_player(app, &username);
         snapshot(Some(app), true)
     })
     .await
+}
+
+/// [2026-10-16] Withdraws an invite the player has not answered.
+#[tauri::command]
+pub async fn realm_host_cancel_invite(app: AppHandle, account_id: String) -> RealmHostStatus {
+    run(app, move |app| {
+        if !valid_account_id(&account_id) {
+            set_error("That is not a player id.".to_string());
+        } else {
+            match post(
+                app,
+                &format!("{MINE}/player-invites/{account_id}/cancel"),
+                &json!({}),
+            ) {
+                Ok(_) => {
+                    realm_log("realm player invite cancelled");
+                    set_notice(Some("The invite was cancelled.".to_string()));
+                }
+                Err(failure) => set_error(failure.readable()),
+            }
+        }
+        snapshot(Some(app), true)
+    })
+    .await
+}
+
+/// [2026-10-16] The host's allowed players (the members, without the host) and unanswered invites (`GET .../mine`). Its own
+/// answer, like the request list: a failed read is `error`, not a panel notice.
+#[tauri::command]
+pub async fn realm_host_people(app: AppHandle) -> RealmPeopleStatus {
+    match tauri::async_runtime::spawn_blocking(move || people(&app)).await {
+        Ok(status) => status,
+        Err(_) => RealmPeopleStatus {
+            members: Vec::new(),
+            invites: Vec::new(),
+            error: Some("The player list stopped unexpectedly.".to_string()),
+        },
+    }
 }
 
 #[tauri::command]
@@ -1300,8 +1339,9 @@ fn request_action(app: &AppHandle, account_id: &str, action: &str, done: &str) {
     }
 }
 
-/// Lets a player in by launcher username; the backend looks the name up. The notice names the player as the server knows them.
-fn add_player(app: &AppHandle, username: &str) {
+/// [2026-10-16] Invites a player by launcher username; the backend looks the name up. A player who had asked to join is let in
+/// at once (`status: MEMBER`). The notice names the player as the server knows them.
+fn invite_player(app: &AppHandle, username: &str) {
     let name = username.trim();
     if name.is_empty()
         || name.chars().count() > USERNAME_LIMIT
@@ -1314,25 +1354,121 @@ fn add_player(app: &AppHandle, username: &str) {
     }
     match post(
         app,
-        &format!("{MINE}/members/add"),
+        &format!("{MINE}/player-invites"),
         &json!({ "username": name }),
     ) {
         Ok(response) => {
             let answer: Value = response.json().unwrap_or(Value::Null);
-            let shown = answer["displayName"]
-                .as_str()
-                .filter(|text| !text.is_empty())
-                .unwrap_or(name);
-            let sentence = if answer["added"].as_bool() == Some(false) {
-                format!("{shown} can already join your realm.")
-            } else {
-                format!("{shown} can now join your realm directly.")
-            };
-            realm_log("realm player added by username");
-            set_notice(Some(sentence));
+            set_notice(Some(invite_sentence(&answer, name)));
+            realm_log("realm player invited by username");
         }
         Err(failure) => set_error(failure.readable()),
     }
+}
+
+/// The notice for an invite answer: a waiting invite, or a player who is in already (or was let in because they had asked).
+fn invite_sentence(answer: &Value, typed: &str) -> String {
+    let shown = answer["displayName"]
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(typed);
+    if answer["status"].as_str() == Some("MEMBER") {
+        format!("{shown} can join your realm.")
+    } else {
+        format!("Invite sent to {shown}. They can join once they accept it in their launcher.")
+    }
+}
+
+/// One allowed player or one unanswered invite, as the host's lists show them.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RealmPersonSummary {
+    pub account_id: String,
+    pub display_name: Option<String>,
+    /// When they joined (an allowed player) or were invited (an invite).
+    pub at: Option<String>,
+}
+
+/// The host's allowed players and unanswered invites, or why they could not be read (then both lists are empty).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RealmPeopleStatus {
+    pub members: Vec<RealmPersonSummary>,
+    pub invites: Vec<RealmPersonSummary>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PeopleMineView {
+    hosted: Option<PeopleHostedView>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeopleHostedView {
+    #[serde(default)]
+    members: Vec<PeopleMemberView>,
+    #[serde(default)]
+    player_invites: Vec<RealmPersonSummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeopleMemberView {
+    account_id: String,
+    display_name: Option<String>,
+    role: String,
+    joined_at: Option<String>,
+}
+
+fn people(app: &AppHandle) -> RealmPeopleStatus {
+    let read = get(app, MINE).and_then(|response| {
+        response
+            .bytes()
+            .map_err(|_| Failure::local("The server's answer could not be read.".to_string()))
+    });
+    match read.map(|body| parse_people(&body)) {
+        Ok(Ok(status)) => status,
+        Ok(Err(message)) => RealmPeopleStatus {
+            members: Vec::new(),
+            invites: Vec::new(),
+            error: Some(message),
+        },
+        Err(failure) => RealmPeopleStatus {
+            members: Vec::new(),
+            invites: Vec::new(),
+            error: Some(failure.readable()),
+        },
+    }
+}
+
+/// Reads `GET .../mine`: the members without the host (newest first) and the invites (the backend sends them newest first).
+fn parse_people(body: &[u8]) -> Result<RealmPeopleStatus, String> {
+    let view: PeopleMineView = serde_json::from_slice(body)
+        .map_err(|_| "The server's answer could not be read.".to_string())?;
+    let Some(hosted) = view.hosted else {
+        return Ok(RealmPeopleStatus {
+            members: Vec::new(),
+            invites: Vec::new(),
+            error: None,
+        });
+    };
+    let mut members: Vec<RealmPersonSummary> = hosted
+        .members
+        .into_iter()
+        .filter(|member| member.role == "MEMBER")
+        .map(|member| RealmPersonSummary {
+            account_id: member.account_id,
+            display_name: member.display_name,
+            at: member.joined_at,
+        })
+        .collect();
+    members.sort_by(|a, b| b.at.cmp(&a.at));
+    Ok(RealmPeopleStatus {
+        members,
+        invites: hosted.player_invites,
+        error: None,
+    })
 }
 
 /// Who may join: `INVITE_ONLY` ("Approved players only") or `PUBLIC` ("Anyone"), through the backend's settings route.
@@ -1937,6 +2073,54 @@ pub(super) fn offer_refusal() -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // [2026-10-16] The host's allowed players and invites, and the invite notice.
+    #[test]
+    fn the_people_lists_keep_members_without_the_host_newest_first_and_the_invites() {
+        let body = br#"{"hosted":{"members":[
+            {"accountId":"host-1","displayName":"Hosty","role":"HOST","joinedAt":"2026-10-01T00:00:00.000Z"},
+            {"accountId":"a","displayName":"Old","role":"MEMBER","joinedAt":"2026-10-02T00:00:00.000Z"},
+            {"accountId":"b","displayName":null,"role":"MEMBER","joinedAt":"2026-10-05T00:00:00.000Z"}],
+            "playerInvites":[{"accountId":"c","displayName":"Guest","at":"2026-10-06T00:00:00.000Z"}]},"memberOf":[]}"#;
+        let status = parse_people(body).unwrap();
+        assert_eq!(
+            status
+                .members
+                .iter()
+                .map(|m| m.account_id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        assert_eq!(status.members[1].display_name.as_deref(), Some("Old"));
+        assert_eq!(status.invites.len(), 1);
+        assert_eq!(status.invites[0].display_name.as_deref(), Some("Guest"));
+        assert_eq!(status.error, None);
+
+        // No realm hosted, and an older backend without invites.
+        let none = parse_people(br#"{"hosted":null,"memberOf":[]}"#).unwrap();
+        assert!(none.members.is_empty() && none.invites.is_empty());
+        let old = parse_people(br#"{"hosted":{"members":[]}}"#).unwrap();
+        assert!(old.invites.is_empty());
+        assert!(parse_people(b"<html>").is_err());
+    }
+
+    #[test]
+    fn the_invite_notice_says_whether_the_player_waits_or_is_in() {
+        let invited = json!({ "accountId": "a", "displayName": "Lyra", "status": "INVITED" });
+        assert_eq!(
+            invite_sentence(&invited, "lyra"),
+            "Invite sent to Lyra. They can join once they accept it in their launcher."
+        );
+        let member = json!({ "accountId": "a", "displayName": "Lyra", "status": "MEMBER" });
+        assert_eq!(
+            invite_sentence(&member, "lyra"),
+            "Lyra can join your realm."
+        );
+        assert_eq!(
+            invite_sentence(&json!({}), "typed"),
+            "Invite sent to typed. They can join once they accept it in their launcher."
+        );
+    }
 
     #[test]
     fn default_max_servers_follows_the_formula_and_clamps() {

@@ -55,7 +55,7 @@ export function useServer(): ServerState {
 export function ServerProvider({ children }: { children: ReactNode }) {
   const [list, setList] = useState<{ ready: boolean; servers: ServerView[] }>({ ready: false, servers: [] });
   const [warningFor, setWarningFor] = useState<string | null>(null);
-  const promptedRef = useRef(new Set<string>());
+  const movedFromLocalRef = useRef(false);
 
   const sync = useCallback((next: ServerView[]) => setList({ ready: true, servers: next }), []);
 
@@ -89,13 +89,19 @@ export function ServerProvider({ children }: { children: ReactNode }) {
   const needsAck = selected?.kind === "local" && !selected.acknowledged;
   const selectedId = selected?.id;
 
-  // A local server that has just been selected (or was selected when the launcher started) asks once, on its own.
-  // After a Cancel the player can reopen the popup from the screen that explains why nothing happens.
+  // [2026-10-16] Local servers are not supported by this launcher any more: one still selected from an earlier version is
+  // left for the official server as soon as the list is read (once; a refusal, for example while a game runs, is left alone).
+  // The local server's warning no longer opens by itself.
+  const selectedKind = selected?.kind;
   useEffect(() => {
-    if (!needsAck || !selectedId || promptedRef.current.has(selectedId)) return;
-    promptedRef.current.add(selectedId);
-    setWarningFor(selectedId);
-  }, [needsAck, selectedId]);
+    if (!list.ready || selectedKind !== "local" || movedFromLocalRef.current) return;
+    const official = list.servers.find((server) => server.kind === "official");
+    if (!official) return;
+    movedFromLocalRef.current = true;
+    selectServer(official.id)
+      .then((next) => setList({ ready: true, servers: next }))
+      .catch(() => {});
+  }, [list, selectedKind]);
 
   const select = useCallback(async (serverId: string) => {
     sync(await selectServer(serverId));

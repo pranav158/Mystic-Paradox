@@ -455,11 +455,17 @@ function serversTab(api, context = serverCtx, panels = [], trust = noTrust()) {
   return load('src/screens/dashboard/ServersTab.tsx', {
     '../../servers/serverNames': serverNames,
     '../../servers/officialPlay': officialPlayLib,
-    '../../api/tauri': { listServers: async () => [officialServer, localServer], ...api },
+    // [2026-10-16] A realm lookup fails by default (no standing chip); a join request waits for the host.
+    '../../api/tauri': {
+      listServers: async () => [officialServer, localServer],
+      realmLookup: async () => { throw 'No lookup in this test.'; },
+      realmRequestJoin: async () => 'REQUESTED',
+      ...api,
+    },
     '../../components/Button': { Button: TestButton },
     '../../components/ArtBackdrop': { ArtBackdrop: () => null },
-    '../../components/LocalServerWarning': { LocalServerBadge },
     '../../servers/ServerContext': { useServer: () => context },
+    '../../servers/RealmInvites': { RealmInvitations: () => null },
     '../../servers/AddServerForm': { AddServerForm: addServerForm(api, context, trust) },
     '../../lib/optionalPanels': { OPTIONAL_PANELS: panels },
     '../../components/icons': icons,
@@ -474,48 +480,47 @@ function typeInto(input, value) {
   input.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
 }
 
-test('Servers lists every server with its kind, folder and the red local warning', async () => {
+test('Servers lists every server with its kind and folder; a local server is not supported and can only be removed', async () => {
   await mount(serversTab({}));
   const text = document.body.textContent;
   assert.match(text, /Mystic Paradox/);
   assert.match(text, /Official/);
   assert.match(text, /In use/);
   assert.match(text, /My server/);
-  assert.match(text, /LOCAL SERVER WARNING/);
-  assert.match(text, /https:\/\/realm\.example\.com/);
   assert.match(text, /C:\\Games\\Dauntless(?!\\)/, 'the game root, not the exe path');
-  assert.match(text, /Not selected yet/);
+  const local = [...document.querySelectorAll('.server-row')].find((row) => row.dataset.kind === 'local');
+  assert.match(local.textContent, /Not supported/);
+  assert.match(local.textContent, /Local servers are not supported by this launcher any more/);
+  assert.deepEqual([...local.querySelectorAll('button')].map((item) => item.textContent.trim()), ['Remove'], 'only Remove is offered');
   assert.equal([...document.querySelectorAll('button')].filter((item) => item.textContent.trim() === 'Remove').length, 1,
     'the official server has no Remove');
-  assert.match(text, /does not install, check or update them/);
+  assert.doesNotMatch(text, /LOCAL SERVER WARNING/);
 });
 
-test('adding a local server shows the validation message, then clears the form on success', async () => {
+test('the add form adds realms only: a refusal keeps what was typed, a success clears it', async () => {
   const requests = [];
-  let outcome = 'Only https:// addresses are allowed (http:// only for localhost).';
+  let outcome = 'There is no realm with that name.';
   await mount(serversTab({
     addServer: async (request) => {
       requests.push(request);
       if (outcome) throw outcome;
-      return [officialServer, localServer, { ...localServer, id: 's-2', name: 'Friends' }];
+      return [officialServer, { ...realmServer, id: 's-9', name: 'Friends', realmName: 'friends' }];
     },
   }));
-  await act(async () => button('Local server').click());
-  assert.match(document.body.textContent, /pick its folder after adding it/, 'a local server needs its own folder');
+  assert.equal(button('Local server'), undefined, 'no local server choice');
+  assert.equal(field('Server address'), undefined);
+  await act(async () => typeInto(field('Realm name'), 'friends'));
   await act(async () => typeInto(field('Name'), 'Friends'));
-  await act(async () => typeInto(field('Server address'), 'http://friends.example.com'));
-  await act(async () => button('Add server').click());
-  assert.deepEqual(requests, [{ kind: 'local', name: 'Friends', backendUrl: 'http://friends.example.com' }]);
-  assert.match(document.body.textContent, /Only https:\/\/ addresses are allowed/);
-  assert.equal(field('Server address').value, 'http://friends.example.com', 'the form keeps what was typed');
+  await act(async () => button('Add realm').click());
+  assert.deepEqual(requests, [{ kind: 'paradox_realm', name: 'Friends', realmName: 'friends' }]);
+  assert.match(document.body.textContent, /There is no realm with that name\./);
+  assert.equal(field('Realm name').value, 'friends', 'the form keeps what was typed');
 
   outcome = null;
-  await act(async () => typeInto(field('Server address'), 'https://friends.example.com'));
-  await act(async () => button('Add server').click());
+  await act(async () => button('Add realm').click());
   assert.equal(requests.length, 2);
-  assert.equal(field('Server address').value, '');
+  assert.equal(field('Realm name').value, '');
   assert.equal(field('Name').value, '');
-  assert.match(document.body.textContent, /Friends/);
 });
 
 test('a realm is added by name and its realm name is typed in lower case', async () => {
@@ -523,7 +528,7 @@ test('a realm is added by name and its realm name is typed in lower case', async
   await mount(serversTab({ addServer: async (request) => { requests.push(request); return [officialServer]; } }));
   await act(async () => typeInto(field('Realm name'), 'Ember-Hold'));
   assert.equal(field('Realm name').value, 'ember-hold');
-  await act(async () => button('Add server').click());
+  await act(async () => button('Add realm').click());
   assert.deepEqual(requests, [{ kind: 'paradox_realm', name: '', realmName: 'ember-hold' }]);
   assert.doesNotMatch(document.body.textContent, /pick its folder/, 'a realm plays from the official install: no folder to pick');
 });
@@ -532,41 +537,35 @@ test('selecting reports the native refusal on the row, and works when allowed', 
   let refuse = true;
   const calls = [];
   await mount(serversTab({
+    listServers: async () => [officialServer, realmServer],
     selectServer: async (id) => {
       calls.push(id);
       if (refuse) throw 'Close Dauntless before changing servers or install folders.';
-      return [{ ...officialServer, selected: false }, { ...localServer, selected: true }];
+      return [{ ...officialServer, selected: false }, { ...realmServer, selected: true }];
     },
   }));
-  await act(async () => button('Use this server').click());
-  assert.deepEqual(calls, ['s-1']);
+  await act(async () => button('Use this realm').click());
+  assert.deepEqual(calls, ['s-2']);
   assert.match(document.body.textContent, /Close Dauntless before changing servers/);
-  assert.ok(button('Use this server'), 'the server is not selected after a refusal');
+  assert.ok(button('Use this realm'), 'the realm is not selected after a refusal');
   refuse = false;
-  await act(async () => button('Use this server').click());
+  await act(async () => button('Use this realm').click());
   const rows = [...document.querySelectorAll('.server-row')];
   assert.doesNotMatch(rows[0].textContent, /In use/);
   assert.match(rows[1].textContent, /In use/);
 });
 
-test('removing needs a second click, and choosing a folder targets that server', async () => {
-  const removed = [], picked = [];
-  let listed = 0;
+test('removing needs a second click', async () => {
+  const removed = [];
   await mount(serversTab({
-    listServers: async () => { listed++; return [officialServer, localServer]; },
+    listServers: async () => [officialServer, localServer],
     removeServer: async (id) => { removed.push(id); return [officialServer]; },
-    pickInstallPath: async (id, ownFolder) => { picked.push([id, ownFolder]); return {}; },
   }));
   await act(async () => button('Remove').click());
   assert.deepEqual(removed, [], 'the first click only asks');
   assert.ok(button('Click again to remove'));
   await act(async () => button('Keep').click());
   assert.equal(button('Click again to remove'), undefined);
-
-  const before = listed;
-  await act(async () => button('Choose folder').click());
-  assert.deepEqual(picked, [['s-1', true]], 'the picker is asked for that server, as its own folder');
-  assert.equal(listed, before + 1, 'the list is read again after the picker');
 
   await act(async () => button('Remove').click());
   await act(async () => button('Click again to remove').click());
@@ -614,7 +613,16 @@ const plainButton = ({ children, loading, loadingLabel, variant, size, block, ..
 function realServerContext(api) {
   const Modal = load('src/components/Modal.tsx', {});
   const warning = load('src/components/LocalServerWarning.tsx', { './Button': { Button: plainButton }, './Modal': Modal });
-  return load('src/servers/ServerContext.tsx', { '../api/tauri': { getOfficialPlay: async () => ({ available: true }), ...api }, '../components/LocalServerWarning': warning });
+  // [2026-10-16] A selection is refused by default (as while a game runs), so a local server stays selected unless a test lets
+  // the provider move to the official server.
+  return load('src/servers/ServerContext.tsx', {
+    '../api/tauri': {
+      getOfficialPlay: async () => ({ available: true }),
+      selectServer: async () => { throw 'Close Dauntless before changing servers or install folders.'; },
+      ...api,
+    },
+    '../components/LocalServerWarning': warning,
+  });
 }
 // ---- [2026-10-14] Terms of Use, consent and account deletion ----------------------------------------------------
 // The legal text is the owner's: these tests use short stand-ins for the viewer, and read the real files only for the
@@ -673,12 +681,28 @@ const officialEntry = {
 const select = (list, id) => list.map((server) => ({ ...server, selected: server.id === id }));
 const dialog = () => document.querySelector('[role="dialog"]');
 
-test('the warning popup names the risks and is the only way to accept a local server', async () => {
+test('a launcher that starts with a local server selected moves to the official server, without the warning', async () => {
+  const selected = [];
+  let list = select([officialEntry, localEntry], 's-1');
+  const { ServerProvider, useServer } = realServerContext({
+    listServers: async () => list,
+    selectServer: async (id) => { selected.push(id); return (list = select(list, id)); },
+  });
+  let context;
+  function Probe() { context = useServer(); return null; }
+  await mount(() => React.createElement(ServerProvider, null, React.createElement(Probe)));
+  await act(async () => {});
+  assert.deepEqual(selected, ['official']);
+  assert.equal(context.selected.kind, 'official');
+  assert.equal(context.officialNetwork, true);
+  assert.equal(dialog(), null, 'the local warning does not open');
+});
+
+test('the warning popup names the risks and is the only way to accept a local server; it no longer opens by itself', async () => {
   const acknowledged = [];
   let list = select([officialEntry, localEntry], 's-1');
   const { ServerProvider, useServer } = realServerContext({
     listServers: async () => list,
-    selectServer: async (id) => (list = select(list, id)),
     acknowledgeLocalServer: async (id, remember) => {
       acknowledged.push([id, remember]);
       list = list.map((server) => server.id === id ? { ...server, acknowledged: true, warningRemembered: remember } : server);
@@ -690,23 +714,19 @@ test('the warning popup names the risks and is the only way to accept a local se
   function App() { return React.createElement(ServerProvider, null, React.createElement(Probe)); }
   await mount(App);
 
-  // A local server is selected and not accepted: the popup opens by itself, and nothing may be sent to the server yet.
+  // The move to the official server was refused (a game runs): the local server stays, nothing may be sent to it, and the
+  // warning waits until it is opened.
   assert.equal(context.needsAck, true);
   assert.equal(context.officialNetwork, false);
-  assert.ok(dialog(), 'the popup opens on its own');
+  assert.equal(dialog(), null, 'the popup does not open on its own');
+  await act(async () => context.openWarning('s-1'));
   const text = dialog().textContent;
   assert.match(text, /Local server warning/);
   assert.match(text, /My server/);
   assert.match(text, /https:\/\/realm\.example\.com:8443/);
   assert.match(text, /not run, hosted, listed, monitored or checked by Mystic Paradox/);
   assert.match(text, /may contain\s+malware/);
-  assert.match(text, /takes no responsibility/);
-  assert.match(text, /stored only on the host's PC/);
-  assert.match(text, /never synced to the official Mystic\s+Paradox network/);
-  assert.match(text, /can see the server's address \(IP\) unless the host puts their own relay, VPN or tunnel/);
   assert.match(text, /Only join if you trust the host/);
-  assert.ok(button('I agree'));
-  assert.ok(button('Cancel'));
 
   // Cancel records nothing and the server still needs its warning.
   await act(async () => button('Cancel').click());
@@ -714,7 +734,6 @@ test('the warning popup names the risks and is the only way to accept a local se
   assert.deepEqual(acknowledged, []);
   assert.equal(context.needsAck, true);
 
-  // The badge reopens it, with the "Don't show again" box off, and agreeing saves the choice per server.
   await act(async () => context.openWarning('s-1'));
   const box = dialog().querySelector('input[type="checkbox"]');
   assert.equal(box.checked, false);
@@ -723,7 +742,6 @@ test('the warning popup names the risks and is the only way to accept a local se
   assert.deepEqual(acknowledged, [['s-1', true]]);
   assert.equal(dialog(), null);
   assert.equal(context.needsAck, false);
-  assert.equal(context.selected.warningRemembered, true);
 });
 
 test('agreeing without the box is for this run only, and a remembered choice shows ticked when reopened', async () => {
@@ -750,11 +768,14 @@ test('agreeing without the box is for this run only, and a remembered choice sho
 
 test('a refused agreement keeps the popup open with the reason', async () => {
   let list = select([officialEntry, localEntry], 's-1');
-  const { ServerProvider } = realServerContext({
+  const { ServerProvider, useServer } = realServerContext({
     listServers: async () => list,
     acknowledgeLocalServer: async () => { throw "Couldn't save your server warning choice."; },
   });
-  await mount(() => React.createElement(ServerProvider, null, null));
+  let context;
+  function Probe() { context = useServer(); return null; }
+  await mount(() => React.createElement(ServerProvider, null, React.createElement(Probe)));
+  await act(async () => context.openWarning('s-1'));
   await act(async () => button('I agree').click());
   assert.ok(dialog());
   assert.match(dialog().textContent, /Couldn't save your server warning choice/);
@@ -892,20 +913,26 @@ function loginScreen(serverState) {
       AuthCard: ({ title, subtitle, children }) => React.createElement('section', null, React.createElement('h1', null, title), React.createElement('p', null, subtitle), children),
     },
     '../components/icons': icons,
-    '../components/ServerSwitcher': { ServerSwitcher: () => React.createElement('div', { id: 'switcher' }), switcherReturnsFocusTo: () => false },
     '../components/LegalDocument': LegalDocument,
     '../servers/ServerContext': { useServer: () => serverState },
   }).LoginScreen;
 }
 
-test('the sign-in card names a local server and offers no Discord there', async () => {
-  await mount(loginScreen({ selected: { ...localEntry, acknowledged: true, selected: true }, officialNetwork: false }), { onCreateAccount() {} });
+test('the sign-in card names a local server, offers no Discord there, and leads back to the Mystic Paradox account', async () => {
+  const chosen = [];
+  const local = { ...localEntry, acknowledged: true, selected: true };
+  await mount(loginScreen({
+    selected: local, officialNetwork: false, servers: [{ ...officialEntry, selected: false }, local],
+    select: async (serverId) => { chosen.push(serverId); },
+  }), { onCreateAccount() {} });
   assert.match(document.querySelector('h1').textContent, /Sign in to My server/);
   assert.match(document.body.textContent, /never sees it/);
   assert.equal(button('Sign in with Discord'), undefined);
   assert.ok(button('Sign in'));
   assert.match(document.body.textContent, /New to this server\?/);
-  assert.ok(document.getElementById('switcher'), 'the card lets the player switch server');
+  assert.equal(document.querySelector('[role="combobox"]'), null, 'the card has no server choice');
+  await act(async () => button('Use your Mystic Paradox account instead').click());
+  assert.deepEqual(chosen, [officialEntry.id]);
 });
 
 test('the official sign-in card is unchanged and keeps Discord', async () => {
@@ -913,6 +940,7 @@ test('the official sign-in card is unchanged and keeps Discord', async () => {
   assert.match(document.querySelector('h1').textContent, /Welcome back, Slayer/);
   assert.ok(button('Sign in with Discord'));
   assert.match(document.body.textContent, /New to Mystic Paradox\?/);
+  assert.equal(button('Use your Mystic Paradox account instead'), undefined, 'the way back is only on a local server\'s card');
 });
 
 test('the policy is read from the selected server and never reused by another server', async () => {
@@ -971,20 +999,16 @@ test('the services chip checks the selected server and drops an answer for the o
   assert.equal(context.supportedChangelist, 647472);
 });
 
-test('the Servers page shares every change with the selected-server state and opens the warning from the red badge', async () => {
-  const shared = [], opened = [];
-  const after = [{ ...officialServer, selected: false }, { ...localServer, selected: true }];
-  const context = { sync: (list) => shared.push(list), openWarning: (id) => opened.push(id) };
-  await mount(serversTab({ selectServer: async () => after }, context));
+test('the Servers page shares every change with the selected-server state', async () => {
+  const shared = [];
+  const after = [{ ...officialServer, selected: false }, { ...realmServer, selected: true }];
+  const context = { sync: (list) => shared.push(list), openWarning() {} };
+  await mount(serversTab({ listServers: async () => [officialServer, realmServer], selectServer: async () => after }, context));
   assert.ok(shared.length >= 1, 'the list read on mount is shared');
-  await act(async () => button('LOCAL SERVER WARNING').click());
-  assert.deepEqual(opened, ['s-1']);
   shared.length = 0;
-  await act(async () => button('Use this server').click());
+  await act(async () => button('Use this realm').click());
   assert.deepEqual(shared, [after], 'the new selection reaches sign-in and the status chip');
-  assert.match(document.body.textContent, /Sign-in/);
-  assert.match(document.body.textContent, /This server's own accounts/);
-  assert.match(document.body.textContent, /never sends\s+your Mystic Paradox account to a local server/);
+  assert.match(document.body.textContent, /Your Mystic Paradox account\./);
 });
 
 // ---- [2026-10-14 realms hub 6.2] "Host my realm" panel ------------------------------------------------------------
@@ -1022,7 +1046,8 @@ const onlineStatus = (patch = {}) => realmStatus({
 // A small fake of the launcher's realm host: every command answers the whole refreshed status, like the real ones.
 function fakeNative(initial) {
   // [2026-10-15] The waiting players (newest first) and the answer of the request list (`requestsError` for a failed read).
-  const native = { status: initial, fail: {}, refuse: {}, calls: [], requests: [] };
+  // [2026-10-16] The allowed players and unanswered invites (`peopleError` for a failed read).
+  const native = { status: initial, fail: {}, refuse: {}, calls: [], requests: [], members: [], invites: [] };
   const patch = (changes) => (native.status = { ...native.status, ...changes });
   native.invoke = (command, args) => {
     native.calls.push([command, args]);
@@ -1036,7 +1061,9 @@ function fakeNative(initial) {
         case 'realm_host_start': return patch({ state: 'starting', notice: null, capacity: { ...status.capacity, ...args.options } });
         case 'realm_host_stop': return patch({ state: 'stopping' });
         // A member action answers its own notice, as realm.rs does (an earlier refusal does not linger).
-        case 'realm_host_kick': return patch({ players: status.players.filter((player) => player.accountId !== args.accountId), notice: 'The player was removed from the realm.', noticeKind: 'info' });
+        case 'realm_host_kick':
+          native.members = native.members.filter((member) => member.accountId !== args.accountId);
+          return patch({ players: status.players.filter((player) => player.accountId !== args.accountId), notice: 'The player was removed from the realm.', noticeKind: 'info' });
         case 'realm_host_ban': {
           const target = status.players.find((player) => player.accountId === args.accountId);
           return patch({
@@ -1058,7 +1085,17 @@ function fakeNative(initial) {
             realm: { ...status.realm, joinRequestCount: native.requests.length },
           });
         }
-        case 'realm_host_add_player': return patch({ notice: `${args.username} can now join your realm directly.`, noticeKind: 'info' });
+        case 'realm_host_invite_player': {
+          const accountId = `acc-${args.username.trim().toLowerCase()}`;
+          if (!native.invites.some((invite) => invite.accountId === accountId)) {
+            native.invites = [{ accountId, displayName: args.username.trim(), at: new Date().toISOString() }, ...native.invites];
+          }
+          return patch({ notice: `Invite sent to ${args.username.trim()}. They can join once they accept it in their launcher.`, noticeKind: 'info' });
+        }
+        case 'realm_host_cancel_invite':
+          native.invites = native.invites.filter((invite) => invite.accountId !== args.accountId);
+          return patch({ notice: 'The invite was cancelled.', noticeKind: 'info' });
+        case 'realm_host_people': return { members: native.members, invites: native.invites, error: native.peopleError ?? null };
         case 'realm_host_set_join_policy': return patch({
           realm: { ...status.realm, joinPolicy: args.joinPolicy },
           notice: args.joinPolicy === 'PUBLIC' ? 'Anyone can join your realm now.' : 'Only players you approve can join your realm now.',
@@ -1402,7 +1439,7 @@ test('Who can join: choosing Anyone sends the policy, and the control shows the 
   });
 });
 
-test('Add a player: the username is sent as typed, the success line names the player, and an unknown name is refused in the field', async () => {
+test('Invite a player: the username is sent as typed, the success line names the player, and an unknown name is refused in the field', async () => {
   const native = fakeNative(onlineStatus());
   await withMockTimers(async () => {
     await mount(realmPanel(native));
@@ -1415,16 +1452,81 @@ test('Add a player: the username is sent as typed, the success line names the pl
     await flushAsync();
     await act(async () => allow().click());
     await flushAsync();
-    assert.deepEqual(native.sent('realm_host_add_player'), [['realm_host_add_player', { username: 'LyraSpark' }]]);
-    assert.match(realmText(), /LyraSpark can now join your realm directly\./);
+    assert.deepEqual(native.sent('realm_host_invite_player'), [['realm_host_invite_player', { username: 'LyraSpark' }]]);
+    assert.match(realmText(), /Invite sent to LyraSpark\. They can join once they accept it in their launcher\./);
     assert.equal(inputOf('Username').value, '', 'the field is cleared once the player is in');
 
     await act(async () => typeInto(field, 'nobody'));
-    native.fail.realm_host_add_player = 'No player has that username.';
+    native.fail.realm_host_invite_player = 'No player has that username.';
     await flushAsync();
     await act(async () => allow().click());
     await flushAsync();
     assert.match(realmText(), /No player has that username\./);
+  });
+});
+
+test('Invite a player on a stopped realm: the confirmation shows once, in its section, and a confirmation is never a warning', async () => {
+  const native = fakeNative(realmStatus());
+  await withMockTimers(async () => {
+    await mount(realmPanel(native));
+    const allow = () => [...document.querySelectorAll('.rh-add button')][0];
+    await act(async () => typeInto(inputOf('Username'), 'Mysticzzz'));
+    await flushAsync();
+    await act(async () => allow().click());
+    await flushAsync();
+    const lines = realmText().match(/Invite sent to Mysticzzz\./g) ?? [];
+    assert.equal(lines.length, 1, 'the confirmation is not repeated at the top of the panel');
+    assert.equal(document.querySelector('.rh-notice'), null);
+  });
+  // Another confirmation on a stopped realm (who can join) is information, not a yellow warning.
+  const other = fakeNative(realmStatus({ notice: 'Only players you approve can join now.', noticeKind: 'info' }));
+  await withMockTimers(async () => {
+    await mount(realmPanel(other));
+    assert.equal(document.querySelector('.rh-notice').dataset.tone, 'info');
+  });
+  // The hub restarting by itself is the one notice that warns.
+  const restarting = fakeNative(realmStatus({ state: 'restarting', notice: 'The realm hub stopped. Starting it again.', noticeKind: 'info' }));
+  await withMockTimers(async () => {
+    await mount(realmPanel(restarting));
+    assert.equal(document.querySelector('.rh-notice').dataset.tone, 'warn');
+  });
+});
+
+test('the allowed players are listed with Remove (asked first), and the unanswered invites with Cancel invite', async () => {
+  const native = fakeNative(realmStatus());
+  native.members = [{ accountId: 'acc-nova', displayName: 'NovaBlade', at: '2026-10-14T10:00:00.000Z' }];
+  native.invites = [{ accountId: 'acc-mira', displayName: 'MiraVale', at: '2026-10-16T09:00:00.000Z' }];
+  await withMockTimers(async () => {
+    await mount(realmPanel(native));
+    await flushAsync();
+    assert.match(realmText(), /Allowed players1/);
+    assert.match(realmText(), /Waiting for an answer1/);
+    assert.ok(rowButton('MiraVale', 'Cancel invite'));
+
+    await act(async () => rowButton('NovaBlade', 'Remove').click());
+    assert.ok(dialogEl(), 'Remove asks first');
+    assert.match(dialogEl().textContent, /NovaBlade can no longer join your realm\. To let them back in, invite them again\./);
+    await act(async () => dialogButton('Remove').click());
+    await flushAsync();
+    assert.deepEqual(native.sent('realm_host_kick'), [['realm_host_kick', { accountId: 'acc-nova' }]]);
+    assert.ok(!dialogEl());
+    assert.match(realmText(), /No one yet\. Invite a player, or approve a join request\./);
+
+    await act(async () => rowButton('MiraVale', 'Cancel invite').click());
+    await flushAsync();
+    assert.deepEqual(native.sent('realm_host_cancel_invite'), [['realm_host_cancel_invite', { accountId: 'acc-mira' }]]);
+    assert.ok(!rowFor('MiraVale'), 'the cancelled invite is gone');
+    assert.equal((realmText().match(/The invite was cancelled\./g) ?? []).length, 0, 'a cancel has no line of its own and is not repeated at the top');
+  });
+});
+
+test('a list of players that cannot be read says so in its section', async () => {
+  const native = fakeNative(realmStatus());
+  native.peopleError = 'Couldn\'t reach the Mystic Paradox server.';
+  await withMockTimers(async () => {
+    await mount(realmPanel(native));
+    await flushAsync();
+    assert.match(realmText(), /Couldn't read your players\. Couldn't reach the Mystic Paradox server\./);
   });
 });
 
@@ -1629,13 +1731,13 @@ test('the panel shows for the official server and for Paradox realms, once the s
 
 // [2026-10-14] The Servers page: the add form first, the server list below it. The optional panels are not here; they
 // are on the Host realm page (below).
-test('Servers & realms puts the add form above the server list and shows no optional panel', async () => {
+test('the Realms page puts the add form above the server list and shows no optional panel', async () => {
   const Panel = ({ style }) => React.createElement('section', { id: 'optional-panel', 'data-i': String(style['--i']) }, 'Panel body');
   await mount(serversTab({}, serverCtx, [Panel]));
   assert.equal(document.getElementById('optional-panel'), null, 'the optional panels belong to the Host realm page');
-  assert.equal(document.querySelector('h1').textContent, 'Servers & realms');
-  const list = document.querySelector('[aria-label="Your servers"]');
-  const add = document.querySelector('[aria-label="Add a server"]');
+  assert.equal(document.querySelector('h1').textContent, 'Realms');
+  const list = document.querySelector('[aria-label="Your realms"]');
+  const add = document.querySelector('[aria-label="Add a realm"]');
   assert.ok(add.compareDocumentPosition(list) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING, 'the server list follows the add form');
   assert.ok(Number(add.style.getPropertyValue('--i')) < Number(list.style.getPropertyValue('--i')));
 });
@@ -1674,12 +1776,7 @@ test('the realm trust warning is said wherever a realm is joined, hosted or adde
   await unmountNow();
   const realmForm = addServerForm({ addServer: async () => [] }, serverCtx);
   await mount(realmForm, {});
-  assert.match(document.body.textContent, warned, 'a realm is the default kind of the add form');
-  await unmountNow();
-  const localForm = addServerForm({ addServer: async () => [] }, serverCtx);
-  await mount(localForm, {});
-  await act(async () => button('Local server').click());
-  assert.doesNotMatch(document.body.textContent, warned, 'a local server has its own warning, not this one');
+  assert.match(document.body.textContent, warned, 'the add form adds realms');
 });
 
 test('realm host helpers name places, validate limits and read memory', () => {
@@ -1933,7 +2030,7 @@ test('Servers: adding a realm asks for its host; without a sign-in the note says
   const trust = { ...noTrust(), ensureHost: async (server) => { asked.push(server.id); throw new Error('Sign in to Mystic Paradox to look up this realm.'); } };
   await mount(serversTab({ addServer: async () => [officialServer, emberRealm] }, serverCtx, [], trust));
   await act(async () => typeInto(field('Realm name'), 'ember-hold'));
-  await act(async () => button('Add server').click());
+  await act(async () => button('Add realm').click());
   assert.deepEqual(asked, ['s-realm']);
   assert.ok(document.querySelector('.server-row[data-kind="paradox_realm"]'), 'the list shows the realm that was added');
   // [2026-10-14] A realm is named by its realm name in every message.
@@ -1943,83 +2040,107 @@ test('Servers: adding a realm asks for its host; without a sign-in the note says
 test('Servers: a realm added and agreed to shows no host note', async () => {
   await mount(serversTab({ addServer: async () => [officialServer, emberRealm] }, serverCtx, [], noTrust()));
   await act(async () => typeInto(field('Realm name'), 'ember-hold'));
-  await act(async () => button('Add server').click());
+  await act(async () => button('Add realm').click());
   assert.doesNotMatch(document.body.textContent, /confirm its host/);
 });
 
-// The sign-in card's switcher, with the shared add form under it.
-function switcherContext(servers, extra = {}) {
-  const selected = servers.find((server) => server.selected) ?? servers[0];
-  return { servers, selected, select: async () => { throw new Error('a selection was not expected'); }, openWarning() {}, sync() {}, ...extra };
-}
-function serverSwitcher(api = {}, context = switcherContext([officialServer]), trust = noTrust()) {
-  return load('src/components/ServerSwitcher.tsx', {
-    '../servers/officialPlay': officialPlayLib,
-    '../servers/ServerContext': { useServer: () => context },
-    '../servers/AddServerForm': { AddServerForm: addServerForm(api, context, trust) },
-    '../servers/serverNames': serverNames,
-    './Dropdown': dropdownLib,
-    './LocalServerWarning': { LocalServerBadge },
-    './icons': icons,
-  }).ServerSwitcher;
-}
-// The launcher's dropdown: the closed control is the combobox; a choice is a row of the open list (its data-value).
-const switcherSelect = () => document.getElementById('server-switch-select');
-async function chooseInSwitcher(value) {
-  await act(async () => switcherSelect().click());
-  await act(async () => document.querySelector(`[role="option"][data-value="${value}"]`).click());
-}
+// ---- [2026-10-16] Join requests and invites, the player's side -----------------------------------------------------------
 
-test('the sign-in card offers Add a server... even when only the official server exists', async () => {
-  await mount(serverSwitcher());
-  assert.ok(switcherSelect(), 'the switcher is shown with one server');
-  assert.equal(switcherSelect().getAttribute('role'), 'combobox');
-  assert.match(switcherSelect().textContent, /Mystic Paradox/, 'the closed control shows the chosen server');
-  await act(async () => switcherSelect().click());
-  assert.ok([...document.querySelectorAll('[role="option"]')].some((option) => option.textContent === 'Add a server...'));
-});
-
-test('Add a server... on the sign-in card saves a local server and closes the form; nothing else is sent', async () => {
-  const calls = [];
-  const api = {
-    addServer: async (request) => { calls.push(['addServer', request]); return [officialServer, { ...localServer, id: 's-2', name: 'Friends' }]; },
-    acknowledgeLocalServer: async () => { calls.push(['acknowledge']); return []; },
-    selectServer: async () => { calls.push(['select']); return []; },
-  };
-  await mount(serverSwitcher(api));
-  await chooseInSwitcher('__add__');
-  assert.ok(field('Name'), 'the add form opens under the switcher');
-  await act(async () => button('Local server').click());
-  await act(async () => typeInto(field('Name'), 'Friends'));
-  await act(async () => typeInto(field('Server address'), 'https://friends.example.com'));
-  await act(async () => button('Add server').click());
-  assert.deepEqual(calls, [['addServer', { kind: 'local', name: 'Friends', backendUrl: 'https://friends.example.com' }]]);
-  assert.ok(!field('Name'), 'the form closes once the server is saved');
-  assert.match(document.body.textContent, /Added Friends\. Choose it in Server to use it\./);
-});
-
-test('Cancel on the sign-in card closes the add form without adding anything', async () => {
-  const calls = [];
-  await mount(serverSwitcher({ addServer: async (request) => { calls.push(request); return []; } }));
-  await chooseInSwitcher('__add__');
-  await act(async () => button('Cancel').click());
-  assert.ok(!field('Name'));
-  assert.deepEqual(calls, []);
-});
-
-test('a realm added on the sign-in card is stored at once; its host is confirmed at the first Play', async () => {
+test('Servers: adding a realm sends its host a join request, and the row says the request was sent', async () => {
   const asked = [];
-  const requests = [];
-  const trust = { ...noTrust(), ensureHost: async (server) => { asked.push(server.id); throw new Error('Sign in to Mystic Paradox to look up this realm.'); } };
-  await mount(serverSwitcher({
-    addServer: async (request) => { requests.push(request); return [officialServer, emberRealm]; },
-  }, switcherContext([officialServer]), trust));
-  await chooseInSwitcher('__add__');
+  await mount(serversTab({
+    addServer: async () => [officialServer, emberRealm],
+    realmRequestJoin: async (id) => { asked.push(id); return 'REQUESTED'; },
+  }, serverCtx, [], noTrust()));
   await act(async () => typeInto(field('Realm name'), 'ember-hold'));
-  await act(async () => button('Add server').click());
-  assert.deepEqual(requests, [{ kind: 'paradox_realm', name: '', realmName: 'ember-hold' }]);
+  await act(async () => button('Add realm').click());
+  await act(async () => {});
   assert.deepEqual(asked, ['s-realm']);
-  assert.match(document.querySelector('.note').textContent, /Added ember-hold\. Choose it in Server to use it\./);
+  const row = document.querySelector('.server-row[data-kind="paradox_realm"]');
+  assert.match(row.textContent, /Request sent/);
+  assert.match(row.textContent, /Request sent to the host of ember-hold\. You can play there once they approve it\./);
+});
+
+test('Servers: each realm shows where the player stands, and Ask to join sends a request', async () => {
+  const asked = [];
+  const realmA = { ...realmServer, id: 's-a', name: 'A', realmName: 'realm-a' };
+  const realmB = { ...realmServer, id: 's-b', name: 'B', realmName: 'realm-b' };
+  const realmC = { ...realmServer, id: 's-c', name: 'C', realmName: 'realm-c' };
+  const standings = { 's-a': { member: true }, 's-b': { requested: true }, 's-c': {} };
+  await mount(serversTab({
+    listServers: async () => [officialServer, realmA, realmB, realmC],
+    realmLookup: async (id) => ({ name: id, hostPublicKey: 'KEY-0123456789abcdef', fingerprint: 'x', online: true, serving: true, ownershipChanged: false, ...standings[id] }),
+    realmRequestJoin: async (id) => { asked.push(id); return 'MEMBER'; },
+  }));
+  await act(async () => {});
+  const rowOf = (name) => [...document.querySelectorAll('.server-row')].find((row) => row.querySelector('.server-name')?.textContent === name);
+  assert.match(rowOf('realm-a').textContent, /Allowed/);
+  assert.match(rowOf('realm-b').textContent, /Request sent/);
+  assert.match(rowOf('realm-c').textContent, /Not allowed yet/);
+  assert.equal(serverRowButton(rowOf('realm-a'), 'Ask to join'), undefined);
+  await act(async () => serverRowButton(rowOf('realm-c'), 'Ask to join').click());
+  assert.deepEqual(asked, ['s-c']);
+  assert.match(rowOf('realm-c').textContent, /Allowed/);
+  assert.match(rowOf('realm-c').textContent, /You can join realm-c\./);
+});
+
+function realmInvitesModule(api, ctx, trust = noTrust()) {
+  return load('src/servers/RealmInvites.tsx', {
+    '../api/tauri': api,
+    '../components/Button': { Button: TestButton },
+    '../components/icons': icons,
+    '../lib/sessions': sessionsLib,
+    './RealmTrust': { useRealmTrust: () => trust },
+    './ServerContext': { useServer: () => ctx },
+  });
+}
+
+test('Realm invitations: Accept joins and adds the realm (its host is confirmed), Decline answers no', async () => {
+  const calls = [];
+  const synced = [];
+  const added = { ...realmServer, id: 's-frost', name: 'frost-keep', realmName: 'frost-keep' };
+  let invites = [
+    { realmName: 'frost-keep', hostName: 'Brann', at: '2026-10-16T10:00:00.000Z', online: true },
+    { realmName: 'quiet-vale', hostName: null, at: null, online: false },
+  ];
+  const trust = { ...noTrust(), ensureHost: async (server) => { calls.push(['ensureHost', server.id]); } };
+  const { RealmInvitesProvider, RealmInvitations } = realmInvitesModule({
+    realmInvites: async () => invites,
+    realmAnswerInvite: async (name, accept) => { calls.push(['answer', name, accept]); invites = invites.filter((invite) => invite.realmName !== name); },
+    addServer: async (request) => { calls.push(['addServer', request]); return [officialServer, added]; },
+  }, { servers: [officialServer], officialNetwork: true, sync: (list) => synced.push(list) }, trust);
+  await mount(() => React.createElement(RealmInvitesProvider, null, React.createElement(RealmInvitations)));
+  await act(async () => {});
+  assert.match(document.body.textContent, /Realm invitations/);
+  assert.match(document.body.textContent, /frost-keep/);
+  assert.match(document.body.textContent, /Invited by Brann/);
+  assert.match(document.body.textContent, /Invited by its host/);
+
+  const rowButtons = (name) => [...[...document.querySelectorAll('.invite-row')].find((row) => row.textContent.includes(name)).querySelectorAll('button')];
+  await act(async () => rowButtons('frost-keep').find((item) => item.textContent === 'Accept').click());
+  assert.deepEqual(calls, [
+    ['answer', 'frost-keep', true],
+    ['addServer', { kind: 'paradox_realm', name: '', realmName: 'frost-keep' }],
+    ['ensureHost', 's-frost'],
+  ]);
+  assert.deepEqual(synced, [[officialServer, added]]);
+  assert.match(document.body.textContent, /You joined frost-keep\./);
+
+  await act(async () => rowButtons('quiet-vale').find((item) => item.textContent === 'Decline').click());
+  assert.deepEqual(calls.at(-1), ['answer', 'quiet-vale', false]);
+  assert.equal(document.querySelectorAll('.invite-row').length, 0);
+  assert.match(document.body.textContent, /Invite to quiet-vale declined\./);
+});
+
+test('Realm invitations: nothing is asked or shown off our network, and no card shows without an invite', async () => {
+  let asked = 0;
+  const { RealmInvitesProvider, RealmInvitations } = realmInvitesModule({
+    realmInvites: async () => { asked++; return []; },
+  }, { servers: [localServer], officialNetwork: false, sync() {} });
+  await mount(() => React.createElement(RealmInvitesProvider, null, React.createElement(RealmInvitations)));
+  await act(async () => {});
+  assert.equal(asked, 0);
+  assert.equal(document.body.textContent, '');
 });
 
 test('a refused kick keeps its dialog open and says why inside it; a kick that works closes it', async () => {
@@ -2138,7 +2259,6 @@ function registerScreen(serverState, sent) {
       AuthCard: ({ title, subtitle, children }) => React.createElement('section', null, React.createElement('h1', null, title), React.createElement('p', null, subtitle), children),
     },
     '../components/UsernameField': { UsernameField: () => React.createElement('div'), useUsernameField: () => ({ value: 'Slayer', validate: () => null }) },
-    '../components/ServerSwitcher': { ServerSwitcher: () => null },
     '../components/LegalConsentChecks': { LegalConsentChecks },
     '../components/LegalDocument': LegalDocument,
     '../legal/legalMeta': legalMeta,
@@ -2486,6 +2606,7 @@ test('About links the Terms of Use and the Privacy Policy, read in the launcher'
     '../../components/LegalDocument': LegalDocument,
     '../../components/PublicBuildCheck': { PublicBuildCheck: () => null },
     '../../legal/legalMeta': legalMeta,
+    '../../lib/buildKind': buildKindLib('official'),
   }).AboutTab;
   await mount(about);
   const row = [...document.querySelectorAll('button.link-row')].find((item) => item.textContent.startsWith('Terms of Use'));
@@ -2513,6 +2634,7 @@ test('the build check runs once at startup, is kept for the session, and the but
     '../api/updates': { verifyInstalledRuntime: async () => ({ verified: true, version: '0.2.136' }) },
     '../policy/PolicyContext': { usePolicy: () => ({ policy: { channel: 'stable' } }) },
     './Button': { Button: plainButton },
+    './icons': icons,
   });
   // [2026-10-15] The launcher asks GitHub once at startup; About shows that result and does not ask again by itself.
   buildCheck.startPublicBuildCheckAtStartup();
@@ -2535,6 +2657,34 @@ test('the build check runs once at startup, is kept for the session, and the but
   await act(async () => button('Check again').click());
   await act(async () => {});
   assert.equal(calls, 2, 'the button runs the check again');
+});
+
+// [2026-10-16] The build check's header is the section row other cards use, and a launcher GitHub has no build of reads
+// "Not on GitHub" (nothing to compare with), not a mismatch.
+test('the build check has a titled header with its button on the right, and a version GitHub has no build of reads Not on GitHub', async () => {
+  const report = {
+    repository: 'pranav158/Mystic-Paradox',
+    launcherVersion: '0.1.69',
+    files: [
+      { name: 'launcher.exe', label: 'Launcher', path: 'C:\L\launcher.exe', installedSha256: '84'.repeat(32), publishedSha256: null, release: 'launcher-v0.1.69', status: 'notPublished', note: 'GitHub has no public build of launcher 0.1.69 to compare with.' },
+    ],
+  };
+  const buildCheck = load('src/components/PublicBuildCheck.tsx', {
+    '../api/tauri': { checkPublicBuilds: async () => report },
+    '../api/updates': { verifyInstalledRuntime: async () => ({ verified: true, version: '0.2.140' }) },
+    '../policy/PolicyContext': { usePolicy: () => ({ policy: { channel: 'stable' } }) },
+    './Button': { Button: plainButton },
+    './icons': icons,
+  });
+  await mount(buildCheck.PublicBuildCheck);
+  await act(async () => button('Check against GitHub').click());
+  await act(async () => {});
+  assert.equal(document.querySelector('.section-row .section-title').textContent, 'Check this build');
+  assert.ok(document.querySelector('.section-row .section-actions').textContent.includes('Check again'), 'the button sits in the header row');
+  const row = document.querySelector('.build-check-row');
+  assert.equal(row.dataset.status, 'notPublished');
+  assert.equal(row.querySelector('.chip').textContent, 'Not on GitHub');
+  assert.equal(row.textContent.includes('Published'), false, 'no published hash to show');
 });
 
 // ---- [2026-10-14] The launcher's dropdown, and a realm named by its realm name --------------------------------------
@@ -2742,118 +2892,6 @@ test('a disabled dropdown does not open from the mouse or the keyboard', async (
   assert.equal(ddControl().getAttribute('aria-expanded'), 'false');
   assert.equal(ddListbox(), null);
   assert.deepEqual(log.changes, []);
-});
-
-test('the sign-in card names a realm by its realm name, with the player\'s name under it, and tags every server', async () => {
-  const mystic = { ...realmServer, id: 's-2', name: 'Mystic', realmName: 'mysticfox', selected: true };
-  await mount(serverSwitcher({}, switcherContext([{ ...officialServer, selected: false }, mystic, localServer])));
-  const box = switcherSelect();
-  assert.equal(box.querySelector('.dropdown-main').textContent, 'mysticfox');
-  assert.equal(box.querySelector('.dropdown-detail').textContent, 'Mystic');
-  assert.equal(box.querySelector('.dropdown-tag').textContent, 'Realm');
-  await act(async () => box.click());
-  const realmRow = document.querySelector('[role="option"][data-value="s-2"]');
-  assert.equal(realmRow.querySelector('.dropdown-main').textContent, 'mysticfox');
-  assert.equal(realmRow.querySelector('.dropdown-detail').textContent, 'Mystic');
-  assert.equal(document.querySelector('[role="option"][data-value="s-1"] .dropdown-tag').textContent, 'Local');
-  assert.doesNotMatch(document.body.textContent, /\(local\)|\(realm\)/, 'the old suffixes are gone');
-});
-
-test('the sign-in card\'s switcher works from the keyboard: a server is chosen, and Add a server... opens the form', async () => {
-  const chosen = [];
-  const context = switcherContext([officialServer, localServer], { select: async (serverId) => { chosen.push(serverId); } });
-  await mount(serverSwitcher({}, context));
-  switcherSelect().focus();
-  await pressKey(switcherSelect(), 'Enter');
-  await pressKey(switcherSelect(), 'ArrowDown');
-  await pressKey(switcherSelect(), 'Enter');
-  assert.deepEqual(chosen, ['s-1']);
-  await pressKey(switcherSelect(), 'Enter');
-  await pressKey(switcherSelect(), 'End');
-  await pressKey(switcherSelect(), 'Enter');
-  assert.ok(field('Name'), 'the add form opens under the switcher');
-});
-
-test('choosing a server with the keyboard keeps focus on the server dropdown, not on the email field', async () => {
-  // The real sign-in card, switcher and dropdown. What AppShell does is faked: a server change restores that server's
-  // session, which shows a status card in place of the sign-in card until the restore is answered.
-  const state = { servers: [officialServer, realmServer], status: 'signedOut', restore: null, bump() {} };
-  const serverState = () => {
-    const selected = state.servers.find((server) => server.selected);
-    return {
-      servers: state.servers,
-      selected,
-      officialNetwork: selected.kind !== 'local',
-      select: async (serverId) => {
-        state.servers = state.servers.map((server) => ({ ...server, selected: server.id === serverId }));
-        state.status = 'checking';
-        state.restore = deferred();
-        state.bump();
-        await state.restore.promise;
-        state.status = 'signedOut';
-        state.bump();
-      },
-      openWarning() {},
-    };
-  };
-  const switcher = load('src/components/ServerSwitcher.tsx', {
-    '../servers/officialPlay': officialPlayLib,
-    '../servers/ServerContext': { useServer: serverState },
-    '../servers/AddServerForm': { AddServerForm: () => null },
-    '../servers/serverNames': serverNames,
-    './Dropdown': dropdownLib,
-    './LocalServerWarning': { LocalServerBadge },
-    './icons': icons,
-  });
-  const textFields = load('src/components/TextField.tsx', {});
-  const LoginScreen = load('src/screens/LoginScreen.tsx', {
-    '../servers/serverNames': serverNames,
-    '../auth/AuthContext': { useAuth: () => ({ login: async () => {}, startDiscordLogin: async () => {}, authError: null }), describeAuthError: String },
-    '../components/TextField': textFields,
-    '../components/Button': { Button: plainButton },
-    '../components/Banner': { Banner: ({ children }) => React.createElement('div', null, children) },
-    '../components/AuthLayout': {
-      AuthLayout: ({ children }) => React.createElement('div', null, children),
-      AuthCard: ({ title, subtitle, children }) => React.createElement('section', null, React.createElement('h1', null, title), React.createElement('p', null, subtitle), children),
-    },
-    '../components/icons': icons,
-    '../components/ServerSwitcher': switcher,
-    '../components/LegalDocument': LegalDocument,
-    '../servers/ServerContext': { useServer: serverState },
-  }).LoginScreen;
-  function Shell() {
-    const [, setTick] = React.useState(0);
-    state.bump = () => setTick((tick) => tick + 1);
-    if (state.status === 'checking') return React.createElement('p', { role: 'status' }, 'Restoring your session');
-    return React.createElement(LoginScreen, { onCreateAccount() {} });
-  }
-  const signInEmail = () => document.querySelector('input[type="email"]');
-  const switchTrigger = () => document.getElementById('server-switch-select');
-
-  await mount(Shell);
-  // Element comparisons use assert.ok: a failing assert.equal or deepEqual would inspect the DOM in its message, without bound.
-  assert.ok(document.activeElement === signInEmail(), 'arriving on the sign-in card still puts the cursor in the email field');
-
-  switchTrigger().focus();
-  await pressKey(switchTrigger(), 'Enter');
-  await pressKey(switchTrigger(), 'ArrowDown');
-  await pressKey(switchTrigger(), 'Enter');
-  assert.equal(state.status, 'checking', 'the choice starts the restore');
-  assert.ok(signInEmail() === null, 'the sign-in card is away while the restore runs');
-
-  // Every focus that lands on an email field while the card comes back, including one that is taken again later.
-  const emailFocuses = [];
-  const recordEmailFocus = (event) => {
-    if (event.target instanceof dom.window.HTMLInputElement && event.target.type === 'email') emailFocuses.push(event.target);
-  };
-  document.addEventListener('focus', recordEmailFocus, true);
-  await act(async () => state.restore.resolve());
-  document.removeEventListener('focus', recordEmailFocus, true);
-  assert.ok(signInEmail(), 'the sign-in card is back');
-  assert.match(switchTrigger().querySelector('.dropdown-main').textContent, /ember-hold/, 'the chosen server is shown');
-  assert.ok(document.activeElement === switchTrigger(), 'focus stays on the server dropdown after the choice');
-  assert.ok(document.activeElement !== signInEmail(), 'the email field does not take the focus');
-  assert.ok(emailFocuses.length === 0, `no focus moved to the email field while the card came back (${emailFocuses.length} times)`);
 });
 
 test('Home names a realm by its realm name, and shows the player\'s own name under it only when it differs', async () => {
@@ -3197,13 +3235,6 @@ test('Servers: the official server shows a red "Currently unavailable" chip besi
   assert.ok(document.querySelector('.chip.bad').textContent === 'Currently unavailable');
 });
 
-test('the server switcher names the official server Unavailable, in the danger tone, while its play switch is off', async () => {
-  await mount(serverSwitcher({}, switcherContext([officialServer], { officialPlay: { available: false } })));
-  const tag = document.querySelector('.dropdown-tag');
-  assert.equal(tag.textContent, 'Unavailable');
-  assert.ok(tag.classList.contains('tone-danger'));
-});
-
 test('the server list reads the official play switch whichever server is selected', async () => {
   const { ServerProvider, useServer } = realServerContext({
     listServers: async () => [officialServer, localServer],
@@ -3373,13 +3404,19 @@ function nextMidnightUtcFrom(now) {
 
 // The banner, dock and tags, loaded for real over a fixed set of notices (only the shared state is replaced). The selected
 // server is on the official network unless a test says otherwise.
-function noticeComponents(notices, server = { officialNetwork: true }) {
+function noticeComponents(notices, server = { officialNetwork: true }, buildKind = 'official') {
   return load('src/components/NoticeBanner.tsx', {
     '../notices/NoticesContext': { useNotices: () => notices },
     '../servers/ServerContext': { useServer: () => server },
     '../notices/noticeTime': noticeTime,
+    '../lib/buildKind': buildKindLib(buildKind),
     './icons': icons,
   });
+}
+
+// [2026-10-16] The build badge's store, loaded for real over a native answer (one fresh copy per call: it asks once per run).
+function buildKindLib(kind) {
+  return load('src/lib/buildKind.ts', { '../api/tauri': { launcherBuildKind: async () => kind } });
 }
 
 const noticeFixture = {
@@ -3525,6 +3562,56 @@ test('the launcher notices: each tag carries its chip tone, and the tags are lis
   assert.deepEqual(chips.map((chip) => chip.textContent), ['EXPERIMENTAL BUILD', 'BETA', 'LIVE', 'UNSAFE']);
   const tones = chips.map((chip) => ['warn', 'accent', 'good', 'bad'].find((tone) => chip.classList.contains(tone)));
   assert.deepEqual(tones, ['warn', 'accent', 'good', 'bad']);
+});
+
+// [2026-10-16] The build badge: nothing on the official build; UNOFFICIAL BUILD (with its tooltip) after the backend's tags on
+// any other release build, shown even without tags and on every server (it is the launcher's, not the server's); DEVELOPMENT
+// BUILD on a debug build; and the About page says the same in one line.
+test('the build badge: none on the official build, UNOFFICIAL BUILD or DEVELOPMENT BUILD otherwise, and a line on About', async () => {
+  const chipTexts = () => [...document.querySelectorAll('.notice-tags li > .chip')].map((chip) => chip.textContent);
+
+  const official = noticeComponents(noticeFixture, { officialNetwork: true }, 'official');
+  await mount(official.NoticeTags, { className: 'brand-tags' });
+  await act(async () => {});
+  assert.deepEqual(chipTexts(), ['EXPERIMENTAL BUILD', 'BETA', 'LIVE', 'UNSAFE'], 'the official build adds nothing');
+
+  const unofficial = noticeComponents(noticeFixture, { officialNetwork: true }, 'unofficial');
+  await mount(unofficial.NoticeTags, { className: 'brand-tags' });
+  await act(async () => {});
+  assert.deepEqual(chipTexts(), ['EXPERIMENTAL BUILD', 'BETA', 'LIVE', 'UNSAFE', 'UNOFFICIAL BUILD']);
+  const badge = document.querySelector('.chip.build-badge');
+  assert.equal(badge.getAttribute('title'), 'Built from source, not by Mystic Paradox.');
+  assert.ok(badge.classList.contains('bad'));
+
+  const bare = noticeComponents({ announcements: [], tags: [] }, { officialNetwork: false }, 'unofficial');
+  await mount(bare.NoticeTags, { className: 'brand-tags' });
+  await act(async () => {});
+  assert.deepEqual(chipTexts(), ['UNOFFICIAL BUILD'], 'shown without backend tags, and on a server that is not ours');
+
+  const development = noticeComponents({ announcements: [], tags: [] }, { officialNetwork: true }, 'development');
+  await mount(development.NoticeTags, { className: 'brand-tags' });
+  await act(async () => {});
+  assert.deepEqual(chipTexts(), ['DEVELOPMENT BUILD']);
+
+  const aboutFor = (kind) => load('src/screens/dashboard/AboutTab.tsx', {
+    '@tauri-apps/api/app': { getVersion: async () => '0.1.70' },
+    '@tauri-apps/plugin-opener': { openUrl: async () => {} },
+    '../../components/AetherMark': { AetherMark: () => null },
+    '../../components/ArtBackdrop': { ArtBackdrop: () => null },
+    '../../components/icons': icons,
+    '../../services/ServicesContext': { useServices: () => services },
+    '../../lib/sessions': sessionsLib,
+    '../../components/LegalDocument': LegalDocument,
+    '../../components/PublicBuildCheck': { PublicBuildCheck: () => null },
+    '../../legal/legalMeta': legalMeta,
+    '../../lib/buildKind': buildKindLib(kind),
+  }).AboutTab;
+  await mount(aboutFor('unofficial'));
+  await act(async () => {});
+  assert.equal(document.querySelector('.about-build-kind').textContent, 'Unofficial build: compiled from source, not published by Mystic Paradox.');
+  await mount(aboutFor('official'));
+  await act(async () => {});
+  assert.equal(document.querySelector('.about-build-kind'), null, 'the official build shows no line');
 });
 
 test('the sign-in card: the banner sits above the form, and the tags sit in the header above the title', async () => {

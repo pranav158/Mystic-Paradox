@@ -231,6 +231,33 @@
   color: var(--aether-hi);
 }
 
+/* [2026-10-16] A count on a nav item (realm invites waiting). In the icon rail it sits on the icon's corner. */
+.nav-badge {
+  display: grid;
+  place-items: center;
+  min-width: 20px;
+  height: 20px;
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--ok);
+  box-shadow: 0 0 12px rgba(69, 217, 155, 0.45);
+  color: #052514;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.shell[data-compact="true"] .nav-badge {
+  position: absolute;
+  top: 5px;
+  right: 7px;
+  min-width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0 4px;
+  font-size: 10px;
+}
+
 .nav-label,
 .me-copy,
 .services-copy,

@@ -24,7 +24,7 @@
 .subpage-inner {
   display: grid;
   gap: 16px;
-  max-width: 1060px;
+  max-width: var(--page-max);
 }
 
 .page-head {
@@ -309,6 +309,11 @@
   letter-spacing: 0.06em;
 }
 
+/* [2026-10-16] The licence card: paragraphs under its section title, a little apart. */
+.about-legal .section-desc + .section-desc {
+  margin-top: 8px;
+}
+
 .link-list {
   display: grid;
   gap: 8px;
@@ -386,7 +391,8 @@ button.link-row {
 /* [2026-10-15] About -> "Check against GitHub" (components/PublicBuildCheck.tsx). */
 .build-check-list {
   list-style: none;
-  margin: 14px 0 0;
+  /* [2026-10-16] The list opens its own section under the header now, so the section's padding is the gap. */
+  margin: 0;
   padding: 0;
   display: grid;
   gap: 10px;

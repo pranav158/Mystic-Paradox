@@ -10,6 +10,7 @@ import { checkPublicBuilds, type PublicBuildCheck as FileCheck, type PublicBuild
 import { verifyInstalledRuntime, type RuntimeVerification } from "../api/updates";
 import { usePolicy } from "../policy/PolicyContext";
 import { Button } from "./Button";
+import { BuildIcon } from "./icons";
 
 // [2026-10-15] About -> "Check against GitHub": the installed launcher, runtime loader and co-op transport compared with the
 // public repository's release builds by SHA-256 (commands/provenance.rs). The launcher runs it once at startup, in the
@@ -19,7 +20,8 @@ import { Button } from "./Button";
 const STATUS: Record<PublicBuildStatus, { text: string; tone: string }> = {
   match: { text: "Matches", tone: "good" },
   differs: { text: "Differs", tone: "bad" },
-  notPublished: { text: "No public build", tone: "warn" },
+  // [2026-10-16] "Not on GitHub": there is nothing to compare with (a test build, an older release), not a mismatch.
+  notPublished: { text: "Not on GitHub", tone: "warn" },
   missing: { text: "Not installed", tone: "" },
   operatorBuild: { text: "Operator build", tone: "" },
   unavailable: { text: "Not checked", tone: "warn" },
@@ -165,40 +167,52 @@ export function PublicBuildCheck() {
   const launcherPath = report?.files.find((file) => file.name === "launcher.exe")?.path;
   const busy = status === "checking";
 
+  // [2026-10-16] The header is the section row every other card uses (icon, title and description, the button on the
+  // right); the results are a second section under it.
   return (
-    <div className="section">
-      <p className="section-desc">
-        Compare this launcher and the game&apos;s runtime loader and co-op transport with the builds GitHub made from the
-        public source. The launcher checks at startup, in the background, and the button checks again. Nothing is changed.
-      </p>
-      <div>
-        <Button
-          variant="secondary"
-          loading={busy}
-          loadingLabel="Checking…"
-          onClick={() => {
-            setRound((count) => count + 1);
-            void runPublicBuildCheck();
-          }}
-        >
-          {report ? "Check again" : "Check against GitHub"}
-        </Button>
+    <>
+      <div className="section">
+        <div className="section-row">
+          <div className="section-head">
+            <div className="section-icon"><BuildIcon /></div>
+            <div className="min-w-0">
+              <h2 className="section-title">Check this build</h2>
+              <p className="section-desc">
+                Compares this launcher, the runtime loader and the co-op transport with the builds GitHub made from the
+                public source. The launcher checks at startup, in the background. Nothing is changed.
+              </p>
+            </div>
+          </div>
+          <div className="section-actions">
+            <Button
+              variant="secondary"
+              loading={busy}
+              loadingLabel="Checking…"
+              onClick={() => {
+                setRound((count) => count + 1);
+                void runPublicBuildCheck();
+              }}
+            >
+              {report ? "Check again" : "Check against GitHub"}
+            </Button>
+          </div>
+        </div>
+        {status === "failed" && <p className="feedback bad" role="alert">The check could not run. Try again.</p>}
       </div>
-      {status === "failed" && <p className="section-desc" role="alert">The check could not run. Try again.</p>}
       {report && !busy && (
-        <>
+        <div className="section">
           <ul className="build-check-list" aria-label="Build check results">
             {report.files.map((file) => (
               <Row key={file.name} file={file} runtime={runtime} />
             ))}
           </ul>
-          <p className="section-desc">
+          <p className="note">
             A launcher can only vouch for itself. To check without it, run{" "}
             <code>gh attestation verify &quot;{launcherPath ?? "launcher.exe"}&quot; --repo {report.repository}</code>{" "}
             (GitHub CLI), which confirms the file was built by the public repository&apos;s release workflow.
           </p>
-        </>
+        </div>
       )}
-    </div>
+    </>
   );
 }

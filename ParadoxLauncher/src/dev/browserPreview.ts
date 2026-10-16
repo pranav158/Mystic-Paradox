@@ -14,9 +14,12 @@
  * "Forgot password?" opens the reset flow (?emailoff: the server cannot send mail), ?officialdown (the official server is
  * unavailable: a red badge, Play waits). Account: ?unlinked (Discord not linked), ?nodiscord (no Discord status from the
  * server). About: ?runtimebad (the installed runtime is not the signed release).
+ * [2026-10-16] ?buildkind=unofficial|development: the UNOFFICIAL BUILD / DEVELOPMENT BUILD badge (sidebar, sign-in, About).
  * [2026-10-14] Terms and deletion: ?gate (the current documents are not accepted: the consent gate opens after sign-in),
  * ?gate=outdated (the acceptance is refused: update the launcher), ?consent404 (a backend without consent routes),
  * ?deactivated (the account is deactivated, deleted 20 days from now), ?nodeletion (a backend without the deletion route).
+ * [2026-10-16] Realm invites and join requests: two invites wait by default (?noinvites shows none); a realm added in the
+ * preview answers "Request sent" (?realmpublic: "Allowed" at once); the Ember Hold realm is already "Allowed".
  * [2026-10-15] Launcher notices are on by default (the EXPERIMENTAL BUILD tag and the restart notice for the next 00:00 UTC);
  * ?nonotices shows none.
  */
@@ -118,6 +121,13 @@ const consentView = () => (params.has("consent404")
 const deletionView = () => (params.has("nodeletion")
   ? { supported: false, holdDays: 30, request: null }
   : { supported: true, holdDays: 30, request: deletionRequest });
+// [2026-10-16] Realm invites waiting for the player, and the realms whose join request waits for its host.
+let previewInvites = params.has("noinvites") ? [] : [
+  { realmName: "frost-keep", hostName: "Brann", at: iso(-25), online: true },
+  { realmName: "quiet-vale", hostName: "Mira", at: iso(-3 * 60), online: false },
+];
+const previewRequested = new Set<string>();
+
 let servers: PreviewServer[] = [
   { id: "official", kind: "official", name: "Mystic Paradox", gameExePath: "exePath" in install ? install.exePath : null },
   ...(params.has("noservers") ? [] : [
@@ -301,6 +311,11 @@ mockIPC((cmd, args) => {
       return delay(params.has("running") ? "Installs after you close the game: installing restarts the launcher, which closes the game." : null, 50);
     case "check_public_builds":
       return delay(previewBuildReport(params.has("builddiff")), 900);
+    // [2026-10-16] The build badge: official (no badge) unless ?buildkind=unofficial or ?buildkind=development.
+    case "launcher_build_kind": {
+      const kind = params.get("buildkind");
+      return delay(kind === "unofficial" || kind === "development" ? kind : "official", 50);
+    }
     case "list_servers":
       return delay(serverViews(), 150);
     case "add_server":
@@ -331,6 +346,22 @@ mockIPC((cmd, args) => {
       return delay({ sessionsRoot: "C:\\Users\\Slayer\\AppData\\Local\\MysticParadox\\Logs\\Sessions", latestSessionDir: "C:\\Users\\Slayer\\AppData\\Local\\MysticParadox\\Logs\\Sessions\\s1" });
     case "native_get_p2p_host_settings":
       return { available: !params.has("nop2p"), memoryNotice: "Hosting a party hunt uses about 4 GB of extra memory.", transportReady: false, transportStatus: "UNAVAILABLE", transportStatusDetail: "The co-op connection starts automatically when you press Play.", transportCheckedAt: iso(0) };
+    // [2026-10-16] Realm invites and join requests (the player's side).
+    case "realm_invites":
+      return delay([...previewInvites], 200);
+    case "realm_answer_invite": {
+      const name = (payload as { realmName?: string }).realmName;
+      if (!previewInvites.some((invite) => invite.realmName === name)) return Promise.reject("You have no invite to this realm.");
+      previewInvites = previewInvites.filter((invite) => invite.realmName !== name);
+      return delay(undefined, 300);
+    }
+    case "realm_request_join": {
+      const server = servers.find((candidate) => candidate.id === payload.serverId);
+      if (!server || server.kind !== "paradox_realm") return Promise.reject("Only a Paradox realm can be asked to join.");
+      const answer = params.has("realmpublic") || server.id === "s-realm" ? "MEMBER" : "REQUESTED";
+      if (answer === "REQUESTED") previewRequested.add(server.id);
+      return delay(answer, 400);
+    }
     case "realm_lookup": {
       const server = servers.find((candidate) => candidate.id === payload.serverId);
       if (!server || server.kind !== "paradox_realm" || !server.realmName) return Promise.reject("Only a Paradox realm has a host to confirm.");
@@ -344,6 +375,9 @@ mockIPC((cmd, args) => {
         online: true,
         serving: true,
         ownershipChanged: Boolean(server.hostPublicKey) && server.hostPublicKey !== key,
+        member: server.id === "s-realm",
+        requested: previewRequested.has(server.id),
+        invited: false,
       }, 300);
     }
     case "set_realm_host_key": {

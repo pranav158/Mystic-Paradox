@@ -73,27 +73,6 @@
   }
 }
 
-/* [2026-10-14] The add form inside the sign-in card (ServerSwitcher): the card is narrow, so the head, the kind switch and the
-   fields stack instead of sharing a row (side by side the description wrapped one word per line). */
-.add-server-compact {
-  padding: 14px 0 0;
-}
-
-.add-server-compact .section-row {
-  flex-direction: column;
-  align-items: stretch;
-  gap: 12px;
-}
-
-.add-server-compact .segmented {
-  align-self: flex-start;
-}
-
-.add-server-compact .server-form {
-  grid-template-columns: minmax(0, 1fr);
-  margin-top: 12px;
-}
-
 /* [2026-10-13 realms S5] The badge is a button: it opens the local server warning. */
 .chip-button {
   cursor: pointer;
@@ -109,62 +88,6 @@
   transform: scale(0.97);
 }
 
-/* "Which server am I signing in to?" on the sign-in and registration cards. */
-.server-switch {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-bottom: 16px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: rgba(0, 0, 0, 0.22);
-}
-
-.server-switch[data-kind="local"] {
-  border-color: var(--bad-line);
-  background: var(--bad-a);
-}
-
-.server-switch-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.server-switch-icon {
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  flex: none;
-  border-radius: 9px;
-  background: var(--aether-a10);
-  color: var(--aether-hi);
-}
-
-.server-switch[data-kind="local"] .server-switch-icon {
-  background: var(--bad-a);
-  color: var(--bad);
-}
-
-.server-switch-icon svg {
-  width: 16px;
-  height: 16px;
-}
-
-.server-switch-label {
-  color: var(--ink-3);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-/* [2026-10-14] The switcher's dropdown (components/Dropdown.tsx) fills the row beside its label. */
-.server-switch-dropdown {
-  flex: 1;
-  min-width: 0;
-}
-
 /* [2026-10-14] A realm's own name, under its realm name in the Servers list, when the player named it differently. */
 .server-alias {
   display: block;
@@ -175,11 +98,47 @@
   white-space: nowrap;
 }
 
-.server-switch-note {
+/* [2026-10-16] Realm invitations (servers/RealmInvites.tsx): one row per invite, the realm and who invited, Accept and Decline. */
+.invite-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.invite-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  padding: 11px 14px;
+  border: 1px solid var(--ok-line);
+  border-radius: 14px;
+  background: var(--ok-a);
+}
+
+.invite-who {
+  display: grid;
+  gap: 4px;
   min-width: 0;
+  flex: 1 1 240px;
+}
+
+.invite-name {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.invite-meta {
   color: var(--ink-3);
-  font-size: 12px;
+  font-size: 12.5px;
+}
+
+.invite-actions {
+  display: flex;
+  flex: none;
+  gap: 8px;
 }
