@@ -18,4 +18,5 @@ regexes = [
   '''MYSTICPARADOX_EMAIL_VERIFICATION''',        # an env key name (32 characters, the shape the discord-client-secret rule matches)
   '''discord-route-test-secret-that-is-long-enough-7788''', # API_KEY_HASH_SECRET in the Discord route tests
   '''sweep-test-secret-that-is-long-enough-3456789012''',   # API_KEY_HASH_SECRET in the unverified-registration sweep test
+  '''0123456789abcdef0123456789abcdef''',        # a sequential fake: the TURN key id in relayCredentials.test.ts, and the claim-body test key in launcher realm.rs at 48c3139
 ]

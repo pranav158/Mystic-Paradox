@@ -2612,7 +2612,8 @@ mod tests {
 
     #[test]
     fn a_claim_sends_no_name_and_only_a_known_join_policy() {
-        let key = "0123456789abcdef0123456789abcdef";
+        // A made-up key in the form the public secret scan allows (`.gitleaks.toml`).
+        let key = "KEY-0123456789abcdef";
         let body = create_body("INVITE_ONLY", key).unwrap();
         assert_eq!(
             body,
