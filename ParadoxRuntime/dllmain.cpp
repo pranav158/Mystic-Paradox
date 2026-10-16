@@ -22,6 +22,7 @@
 #include <cstdlib>   // atof — used by BleedoutDurationFallback()
 #include <deque>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <thread>
 #include <iostream>
@@ -2464,7 +2465,8 @@ static std::atomic<int>   g_wdIsHub{ -1 };   // -1 unknown, 0 disposable (reapab
 static std::atomic<int32_t>   g_wdConnCount{ -1 };
 static std::atomic<uint64_t>  g_wdConnStampMs{ 0 };
 static std::atomic<bool>      g_wdHadRemoteClient{ false };   // a client has connected at least once
-static constexpr float MP_WD_EMPTY_REAP_SEC = 50.0f;           // after the last client left
+// [2026-10-15 0.2.139] 50 -> 60 s (owner's call: every hunt is player-hosted now; the backend drains it meanwhile).
+static constexpr float MP_WD_EMPTY_REAP_SEC = 60.0f;           // after the last client left
 static constexpr float MP_WD_NEVER_JOINED_REAP_SEC = 300.0f;   // spawned, but nobody ever arrived
 
 /*
@@ -4444,8 +4446,8 @@ static void StartEmptyWatchdogThread() {
         const float POLL_SEC = 2.0f;
         uint64_t iter = 0;
         bool hangSampled = false;   // one-shot [HangSuspect] capture per freeze episode (reset when ticks resume)
-        MpLog("[Watchdog/thread] started (poll 2s; reaps a disposable instance with no client connection for 50s"
-              " after its last client left, or 5 min if none ever arrived)");
+        MpLog("[Watchdog/thread] started (poll 2s; reaps a disposable instance with no client connection for "
+              + std::to_string(static_cast<int>(MP_WD_EMPTY_REAP_SEC)) + "s after its last client left, or 5 min if none ever arrived)");
         // [2026-10-10 1.14.7 RAM] Read once at thread start (= listen). See the RAM block above StartEmptyWatchdogThread.
         const uint64_t wdStartMs = GetTickCount64();
         const bool keepOomPool = MpExeRelativeFlagPresent(L"KEEP_OOM_POOL.flag");
@@ -4618,8 +4620,11 @@ static void StartEmptyWatchdogThread() {
             if (empty && hub == 0) {
                 emptySec += POLL_SEC;
                 if (emptySec >= emptyLimitSec) {
-                    MpReapExit(hadRemoteClient ? "disposable instance empty 50s continuous after its last client left"
-                                               : "disposable instance never joined by a client within 5 min");
+                    const std::string reapReason = hadRemoteClient
+                        ? "disposable instance empty " + std::to_string(static_cast<int>(MP_WD_EMPTY_REAP_SEC))
+                            + "s continuous after its last client left"
+                        : std::string("disposable instance never joined by a client within 5 min");
+                    MpReapExit(reapReason.c_str());
                 }
             } else {
                 emptySec = 0.0f;
@@ -7932,12 +7937,15 @@ void GameEngineTickHook(UGameEngine* GameEngine, float DeltaTime, char CanRender
                     // (hub==-1) are NEVER self-terminated here — the DeployServer owns the hub lifecycle,
                     // and reaping a hub mid-travel would vanish it under a returning player. (The background
                     // thread applies the same hub==0 gate and is the reliable reaper once the tick stops.)
-                    if (TotalNoPlayersTime >= 50.0f && g_wdIsHub.load(std::memory_order_relaxed) == 0) {
+                    // [2026-10-16] The same limit as the background thread (MP_WD_EMPTY_REAP_SEC): 0.2.139 changed only the
+                    // thread, so this path still reaped at 50 s (verification hunt 15 Oct 18:35:39 UTC).
+                    if (TotalNoPlayersTime >= MP_WD_EMPTY_REAP_SEC && g_wdIsHub.load(std::memory_order_relaxed) == 0) {
                         // Empty for 50s CONTINUOUS -> self-terminate so the DeployServer reclaims the
                         // port + ~1GB of RAM. Fires ONLY when no one is connected/incoming, so an active
                         // hunt never triggers it no matter how long or how big the map.
                         // Same teardown reasoning as the background thread's reap — see MpReapExit.
-                        MpReapExit(("tick-path: disposable instance empty 50s continuous (gmState="
+                        MpReapExit(("tick-path: disposable instance empty " + std::to_string(static_cast<int>(MP_WD_EMPTY_REAP_SEC))
+                            + "s continuous (gmState="
                             + std::to_string(EmptyState) + ")").c_str());
                     }
                 }
@@ -14113,6 +14121,99 @@ static const std::string& CachedFunctionFullName(UFunction* Function) {
     return CachedFunctionNameEntry(Function).Name;
 }
 
+// [2026-10-16 0.2.141] Client diagnostic, read-only: which game code shows the Gauntlet panel on the hunt map. Gauntlet is
+// refused by the backend (GAUNTLET_DISABLED) but its panel still shows, fed by the season stub the client needs to finish
+// loading player data (routes/system.ts). Ghidra shows no server-side switch for it and its season loader sits in unanalyzed
+// code, so this records the UFunctions that pass ProcessEvent around the panel before anything hides it: the first
+// GAUNTLET_CENSUS_BUDGET distinct (function, object class) pairs whose function name, object class name or object name
+// mentions "auntlet", with the object, its outer, and the first bytes of the parameters before and after the call (the return
+// value lies within them; only UStruct::Size at +0x58 is read). Client only; GAUNTLET_CENSUS_OFF.flag disables it; once the
+// budget is used, every call costs one atomic read.
+namespace GauntletCensus {
+    static constexpr int kBudget = 220;
+    static constexpr int kParmBytes = 32;
+    static std::atomic<int> s_logged{ 0 };
+    static int s_enabled = -1;
+    static SRWLOCK s_seenLock = SRWLOCK_INIT;
+
+    static bool Active() {
+        if (s_enabled < 0) {
+            s_enabled = (Globals::AmServer || MpExeRelativeFlagPresent(L"GAUNTLET_CENSUS_OFF.flag")) ? 0 : 1;
+            if (!Globals::AmServer) {
+                MpLog(std::string("[GauntletCensus] ") + (s_enabled ? "ENABLED (budget " + std::to_string(kBudget) + " lines)"
+                    : "disabled (GAUNTLET_CENSUS_OFF.flag)"));
+            }
+        }
+        return s_enabled == 1 && s_logged.load(std::memory_order_relaxed) < kBudget;
+    }
+
+    static bool Mentions(const std::string& Text) { return Text.find("auntlet") != std::string::npos; }
+
+    // Once per class / per FName index, per thread (ProcessEvent can run off the game thread); bounded.
+    static bool ClassMentions(UObject* Object) {
+        thread_local std::unordered_map<const void*, bool> s_classes;
+        void* Class = Object ? reinterpret_cast<void*>(Object->Class) : nullptr;
+        if (!Class) return false;
+        const auto Found = s_classes.find(Class);
+        if (Found != s_classes.end()) return Found->second;
+        if (s_classes.size() > 20000) s_classes.clear();
+        return s_classes[Class] = Mentions(SafeObjectNameForDiagnostic(Class));
+    }
+
+    static bool NameMentions(UObject* Object) {
+        thread_local std::unordered_map<int32_t, bool> s_names;
+        if (!Object) return false;
+        const int32_t Index = Object->Name.ComparisonIndex;
+        const auto Found = s_names.find(Index);
+        if (Found != s_names.end()) return Found->second;
+        if (s_names.size() > 50000) s_names.clear();
+        return s_names[Index] = Mentions(SafeObjectNameForDiagnostic(Object));
+    }
+
+    static std::string ParmBytes(UFunction* Function, void* Parms) {
+        if (!Function || !Parms) return "-";
+        const int32_t Size = Function->Size;
+        if (Size <= 0 || Size > 0x10000) return "-";
+        const int Count = Size < kParmBytes ? Size : kParmBytes;
+        if (!IsReadablePointer(Parms, Count)) return "?";
+        static const char* const kHex = "0123456789abcdef";
+        std::string Out;
+        const auto* Bytes = static_cast<const uint8_t*>(Parms);
+        for (int i = 0; i < Count; ++i) {
+            Out += kHex[Bytes[i] >> 4];
+            Out += kHex[Bytes[i] & 15];
+        }
+        return Out + (Size > Count ? "+" : "") + "/" + std::to_string(Size);
+    }
+
+    // Returns the line number when this call is logged (pass it to Exit), else -1.
+    static int Enter(UObject* Object, UFunction* Function, const std::string& FunctionName, void* Parms) {
+        if (!Active()) return -1;
+        if (!Mentions(FunctionName) && !ClassMentions(Object) && !NameMentions(Object)) return -1;
+        const std::string ClassName = Object && Object->Class ? SafeObjectNameForDiagnostic(Object->Class) : "null";
+        {
+            static std::unordered_set<std::string> s_seen;
+            AcquireSRWLockExclusive(&s_seenLock);
+            const bool Fresh = s_seen.size() < 4096 && s_seen.insert(FunctionName + "|" + ClassName).second;
+            ReleaseSRWLockExclusive(&s_seenLock);
+            if (!Fresh) return -1;
+        }
+        const int Seq = s_logged.fetch_add(1, std::memory_order_relaxed);
+        if (Seq >= kBudget) return -1;
+        UObject* Outer = Object ? Object->Outer : nullptr;
+        MpLog("[GauntletCensus] #" + std::to_string(Seq) + " ENTER fn=" + FunctionName
+            + " obj=" + (Object ? SafeObjectNameForDiagnostic(Object) : std::string("null")) + " class=" + ClassName
+            + " outer=" + (Outer ? SafeObjectNameForDiagnostic(Outer) : std::string("null"))
+            + " parms=" + ParmBytes(Function, Parms));
+        return Seq;
+    }
+
+    static void Exit(int Seq, UFunction* Function, void* Parms) {
+        if (Seq < 0 || !Parms) return;
+        MpLog("[GauntletCensus] #" + std::to_string(Seq) + " EXIT parms=" + ParmBytes(Function, Parms));
+    }
+}
+
 void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     g_clientProcessEventCount.fetch_add(1, std::memory_order_relaxed);
     if (g_clientGameThreadId.load(std::memory_order_relaxed) == 0) {
@@ -14577,7 +14678,9 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     // (setup + budgeted trace + the client-only g_postLoginTimeMs seed, which only fed removed diagnostics).
 
 
+    const int GauntletCensusSeq = GauntletCensus::Enter(Object, Function, FunctionName, Parms);
     reinterpret_cast<void(*)(UObject*, UFunction*, void*)>(OrigProcessEventClient)(Object, Function, Parms);
+    GauntletCensus::Exit(GauntletCensusSeq, Function, Parms);
     TraceArtificerDroneEvent("Client", "EXIT", Object, FunctionName, Parms);
 
     // After the screen's own handler, so SetSplashImage / HandleGetPatchNotesPayloadSuccess cannot undo it.
