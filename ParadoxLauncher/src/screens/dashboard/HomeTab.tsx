@@ -407,7 +407,11 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     ? "Dauntless is running"
     : ready
       ? joinStepShown
-        ? realmStatus?.standing === "requested" ? "Waiting for the host" : realmStatus?.standing === "invited" ? "You're invited" : "Not in this realm yet"
+        ? realmStatus?.standing === "requested"
+          ? "Waiting for the host"
+          : realmStatus?.standing === "invited"
+            ? "You're invited"
+            : realmStatus?.standing === "solo" ? "Unavailable: solo mode" : "Not in this realm yet"
         : playBlocked ? "Play isn't available yet" : runtimeRepairRequired ? "Runtime will be repaired" : "Ready to launch"
       : located
         ? "Installation needs attention"

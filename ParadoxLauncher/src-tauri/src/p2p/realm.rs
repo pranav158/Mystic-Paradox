@@ -105,7 +105,8 @@ pub struct Location {
 pub struct RealmSummary {
     pub name: String,
     pub serving: bool,
-    /// [2026-10-15] "INVITE_ONLY" (approved players only) or "PUBLIC" (anyone); "" when the server did not say.
+    /// [2026-10-15] "INVITE_ONLY" (approved players only) or "PUBLIC" (anyone); [2026-10-16] or "SOLO" (the host alone);
+    /// "" when the server did not say.
     pub join_policy: String,
     /// [2026-10-15] Players waiting for the host's approval.
     pub join_request_count: u32,
@@ -1471,13 +1472,15 @@ fn parse_people(body: &[u8]) -> Result<RealmPeopleStatus, String> {
     })
 }
 
-/// Who may join: `INVITE_ONLY` ("Approved players only") or `PUBLIC` ("Anyone"), through the backend's settings route.
+/// Who may join, through the backend's settings route: `SOLO` (Solo mode, the host alone; [2026-10-16]), `INVITE_ONLY`
+/// (Allowlisted mode, approved players) or `PUBLIC` (Public mode, anyone).
 fn set_join_policy(app: &AppHandle, join_policy: &str) {
     let sentence = match join_policy {
+        "SOLO" => "Your realm is in solo mode now: only you can enter. Players already inside stay until they leave.",
         "PUBLIC" => "Anyone can join your realm now.",
         "INVITE_ONLY" => "Only players you approve can join your realm now.",
         _ => {
-            set_error("Choose who can join: approved players or anyone.".to_string());
+            set_error("Choose who can join: solo, allowlisted or public.".to_string());
             return;
         }
     };

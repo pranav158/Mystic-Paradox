@@ -68,6 +68,8 @@ const STANDING_CHIP: Record<Standing, { text: string; tone: string }> = {
   requested: { text: "Request sent", tone: "warn" },
   invited: { text: "Invited", tone: "live" },
   none: { text: "Not allowed yet", tone: "" },
+  // [2026-10-16] Closed to everyone but its host: no Ask to join (the request would be refused).
+  solo: { text: "Unavailable: solo mode", tone: "warn" },
 };
 
 function signInDetail(kind: ServerView["kind"]): string {

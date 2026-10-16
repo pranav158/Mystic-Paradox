@@ -83,6 +83,10 @@ pub(crate) fn realm_host_gate(
     Ok(())
 }
 
+/// [2026-10-16] A realm in solo mode (join policy SOLO): only its host enters. Shown for Play and for a join request.
+pub(crate) const REALM_SOLO_MESSAGE: &str =
+    "This realm is in solo mode: its host is playing alone right now.";
+
 /// [2026-10-14 realms] The game-session refusal of a realm entry, as the realm's own sentence. Only the realm codes
 /// are read here; anything else is `None`, so the caller keeps its existing message.
 fn realm_refusal_message(body: &[u8]) -> Option<String> {
@@ -93,6 +97,7 @@ fn realm_refusal_message(body: &[u8]) -> Option<String> {
         .filter(|message| !message.is_empty());
     let message = match code {
         "REALM_OFFLINE" => "The realm host is offline.",
+        "REALM_SOLO" => REALM_SOLO_MESSAGE,
         "REALM_BANNED" => "You cannot join this realm.",
         REALM_OWNER_CHANGED => REALM_OWNER_CHANGED,
         REALM_JOIN_REQUESTED => REALM_JOIN_REQUESTED,
@@ -784,6 +789,10 @@ mod tests {
         assert_eq!(
             realm_refusal_message(&refusal("REALM_OFFLINE", "x")).as_deref(),
             Some("The realm host is offline.")
+        );
+        assert_eq!(
+            realm_refusal_message(&refusal("REALM_SOLO", "x")).as_deref(),
+            Some(REALM_SOLO_MESSAGE)
         );
         // The owner change is a token the UI turns into its warning dialog, not a sentence.
         assert_eq!(

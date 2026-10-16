@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { Button } from "../components/Button";
-import { Dropdown, type DropdownOption } from "../components/Dropdown";
 import { Modal } from "../components/Modal";
 import { RealmTrustNote } from "../components/RealmTrustNote";
 import { TextField } from "../components/TextField";
-import { AlertIcon, InfoIcon, ServersIcon, ShieldIcon } from "../components/icons";
+import { AccountIcon, AlertIcon, CoopIcon, InfoIcon, ServersIcon, ShieldIcon } from "../components/icons";
 import { formatClock, formatDuration, formatWhen } from "../lib/sessions";
 import { useServer } from "../servers/ServerContext";
 import {
@@ -61,11 +60,54 @@ const POLL_MS = 5_000;
 /** [2026-10-16] The allowed players and the unanswered invites change only by the host or an answer: read less often. */
 const PEOPLE_POLL_MS = 30_000;
 
-// [2026-10-15] Who may join. "Approved players only" is the realm's default (invite-only): others send a request.
-const JOIN_POLICY_OPTIONS: DropdownOption[] = [
-  { value: "INVITE_ONLY", label: "Approved players only", detail: "Others send a request, and you approve it below." },
-  { value: "PUBLIC", label: "Anyone", detail: "Anyone signed in joins without asking." },
+// [2026-10-15] Who may join. Allowlisted (invite-only) is the realm's default: others send a request.
+// [2026-10-16] Three modes in one row, styled like the sidebar's items (the chosen one carries the same sliding indicator),
+// in place of the dropdown: Solo (the host alone), Allowlisted (approved players), Public (anyone).
+const JOIN_MODES: { policy: RealmJoinPolicy; label: string; detail: string; Icon: typeof AccountIcon }[] = [
+  {
+    policy: "SOLO",
+    label: "Solo mode",
+    detail: "Only you can enter. Others can't join or ask to, and see your realm as unavailable; players already inside stay until they leave.",
+    Icon: AccountIcon,
+  },
+  {
+    policy: "INVITE_ONLY",
+    label: "Allowlisted mode",
+    detail: "Players you approve can play. Others send a request, and you approve it below.",
+    Icon: ShieldIcon,
+  },
+  { policy: "PUBLIC", label: "Public mode", detail: "Anyone signed in joins and plays without asking.", Icon: CoopIcon },
 ];
+
+/** [2026-10-16] Who can join: the three modes, the chosen one marked as the sidebar marks its page; its line under the row. */
+function JoinModes({ policy, disabled, onChoose }: {
+  policy: RealmJoinPolicy | "";
+  disabled: boolean;
+  onChoose: (policy: RealmJoinPolicy) => void;
+}) {
+  const active = JOIN_MODES.findIndex((mode) => mode.policy === policy);
+  return (
+    <>
+      <div className="rh-modes" role="group" aria-label="Who can join" style={{ "--mode-index": Math.max(active, 0) } as CSSProperties}>
+        <span className="rh-mode-indicator" data-hidden={active < 0} aria-hidden="true" />
+        {JOIN_MODES.map(({ policy: mode, label, Icon }) => (
+          <button
+            key={mode}
+            type="button"
+            className="rh-mode"
+            aria-pressed={mode === policy}
+            disabled={disabled}
+            onClick={() => onChoose(mode)}
+          >
+            <Icon />
+            <span>{label}</span>
+          </button>
+        ))}
+      </div>
+      {active >= 0 && <p className="rh-mode-detail">{JOIN_MODES[active].detail}</p>}
+    </>
+  );
+}
 
 // The native messages are written for the player and are shown as they are. They are not run through sanitizeError,
 // which would turn an address or a path in them into "the update server" or "a game file".
@@ -382,9 +424,8 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
     void loadPeople();
   };
 
-  const changeJoinPolicy = (value: string) => {
-    const policy: RealmJoinPolicy | null = value === "PUBLIC" ? "PUBLIC" : value === "INVITE_ONLY" ? "INVITE_ONLY" : null;
-    if (!realm || policy === null || policy === realm.joinPolicy) return;
+  const changeJoinPolicy = (policy: RealmJoinPolicy) => {
+    if (!realm || policy === realm.joinPolicy) return;
     void run("policy", () => realmHostSetJoinPolicy(policy));
   };
 
@@ -488,15 +529,7 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
             <h3 className="rh-heading">Who can join</h3>
             <span className="rh-sub">You can change this at any time.</span>
           </div>
-          <div className="rh-policy">
-            <Dropdown
-              label="Who can join"
-              value={realm.joinPolicy || null}
-              options={JOIN_POLICY_OPTIONS}
-              onChange={changeJoinPolicy}
-              disabled={working}
-            />
-          </div>
+          <JoinModes policy={realm.joinPolicy} disabled={working} onChoose={changeJoinPolicy} />
         </div>
       )}
 

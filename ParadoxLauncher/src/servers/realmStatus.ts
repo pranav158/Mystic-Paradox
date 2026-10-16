@@ -21,7 +21,10 @@ export type RealmLiveState = "serving" | "starting" | "offline";
  * 0.1.71 then showed a ready Play to an account the host had never let in. `open`: not a member, but the realm lets anyone in
  * (Play joins it).
  */
-export type RealmStanding = "own" | "member" | "open" | "invited" | "requested" | "none";
+export type RealmStanding = "own" | "member" | "open" | "invited" | "requested" | "none" | "solo";
+
+/** [2026-10-16] A realm in solo mode (join policy SOLO): only its host enters. The same sentence as a REALM_SOLO refusal. */
+export const REALM_SOLO_LINE = "This realm is in solo mode: its host is playing alone right now."
 
 export interface RealmStatus {
   state: RealmLiveState;
@@ -70,9 +73,13 @@ export function realmStatus(
   return { state: directory.serving ? "serving" : "offline", own, standing: realmStanding(directory, own) };
 }
 
-/** The player's standing from the lookup: an invite to answer comes before a request that waits. */
+/**
+ * The player's standing from the lookup: an invite to answer comes before a request that waits. [2026-10-16] A realm in solo
+ * mode lets nobody but its host in, members included, so `solo` comes right after `own`.
+ */
 export function realmStanding(directory: RealmDirectoryAnswer, own: boolean): RealmStanding {
   if (own) return "own";
+  if (directory.joinPolicy === "SOLO") return "solo";
   if (directory.member) return "member";
   if (directory.invited) return "invited";
   if (directory.requested) return "requested";
@@ -112,6 +119,9 @@ export function realmJoinStep(status: RealmStatus | null, realmName: string, jus
       };
     case "invited":
       return { line: `You have an invite to ${realmName}. Accept it on the Realms page.`, button: "Open Realms", action: "realms" };
+    // [2026-10-16] Nobody but the host enters, and asking is refused too: Play waits, with no Ask to join.
+    case "solo":
+      return { line: REALM_SOLO_LINE, button: "Unavailable", action: null };
     default:
       return null;
   }

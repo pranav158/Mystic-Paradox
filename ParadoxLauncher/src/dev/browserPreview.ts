@@ -18,6 +18,7 @@
  * [2026-10-16] Sign-up: the username check refuses Tempest, LyraSpark, BrannOak, NovaBlade (taken, any case), Admin, AdminBob,
  * Mod7, MysticFox2 (reserved) and Sh1tLord (not allowed); ?nametaken refuses the name at submit (the race).
  * [2026-10-16] Home with ?server=s-realm: ?realmstanding=none|requested|invited (this account is not in the realm yet),
+ * ?realmpolicy=solo (the realm is in solo mode),
  * ?realmoffline (its host has not started it), ?realmown (the player's own realm, read
  * from this PC's host: stopped, or online with ?realmonline).
  * [2026-10-14] Terms and deletion: ?gate (the current documents are not accepted: the consent gate opens after sign-in),
@@ -402,7 +403,7 @@ mockIPC((cmd, args) => {
         fingerprint: previewFingerprint(key),
         online: true,
         // [2026-10-16] ?realmoffline: the host's launcher reports in but the realm is not started (Home: Offline, Play waits).
-        serving: !params.has("realmoffline"),
+        serving: !params.has("realmoffline") && params.get("realmpolicy") !== "solo",
         ownershipChanged: Boolean(server.hostPublicKey) && server.hostPublicKey !== key,
         // [2026-10-16] ?realmstanding=none|requested|invited: where this account stands (Home: Ask to join, Request sent, an invite).
         member: params.has("realmstanding") ? false : server.id === "s-realm" || params.has("realmown"),
@@ -410,7 +411,8 @@ mockIPC((cmd, args) => {
         invited: params.get("realmstanding") === "invited",
         // [2026-10-16] ?realmown: the player hosts this realm (Home then reads this PC's host: stopped unless ?realmonline).
         own: params.has("realmown"),
-        joinPolicy: "INVITE_ONLY",
+        // [2026-10-16] ?realmpolicy=solo: the realm is in solo mode (only its host enters; not serving for others).
+        joinPolicy: params.get("realmpolicy") === "solo" ? "SOLO" : "INVITE_ONLY",
       }, 300);
     }
     case "set_realm_host_key": {

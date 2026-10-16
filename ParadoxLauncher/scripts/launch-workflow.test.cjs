@@ -1104,7 +1104,11 @@ function fakeNative(initial) {
         case 'realm_host_people': return { members: native.members, invites: native.invites, error: native.peopleError ?? null };
         case 'realm_host_set_join_policy': return patch({
           realm: { ...status.realm, joinPolicy: args.joinPolicy },
-          notice: args.joinPolicy === 'PUBLIC' ? 'Anyone can join your realm now.' : 'Only players you approve can join your realm now.',
+          notice: args.joinPolicy === 'PUBLIC'
+            ? 'Anyone can join your realm now.'
+            : args.joinPolicy === 'SOLO'
+              ? 'Your realm is in solo mode now: only you can enter. Players already inside stay until they leave.'
+              : 'Only players you approve can join your realm now.',
           noticeKind: 'info',
         });
         default: throw `unknown command ${command}`;
@@ -1130,8 +1134,6 @@ function realmPanel(native, { server = officialSelected, self = 'host-account' }
     './realmHostApi': api,
     './realmHostModel': realmModel,
     './realmHost.css': {},
-    // [2026-10-15] "Who can join" uses the launcher's dropdown (src/components/Dropdown.tsx).
-    '../components/Dropdown': dropdownLib,
   }).default;
 }
 
@@ -1428,20 +1430,35 @@ test('Join requests: a list that cannot be read says why, and a refused approval
   });
 });
 
-test('Who can join: choosing Anyone sends the policy, and the control shows the answer', async () => {
+// [2026-10-16] Who can join: three modes in one row (Solo, Allowlisted, Public), the chosen one marked as the sidebar marks its page.
+test('Who can join: three modes in one row; each sends its policy and becomes the chosen one, with its line under the row', async () => {
   const native = fakeNative(onlineStatus());
   await withMockTimers(async () => {
     await mount(realmPanel(native));
-    const control = document.querySelector('.rh-policy [role="combobox"]');
-    assert.ok(control, 'the policy dropdown is there once the realm exists');
-    assert.match(control.textContent, /Approved players only/);
-    await act(async () => control.click());
-    const anyone = [...document.querySelectorAll('[role="option"]')].find((row) => row.textContent.includes('Anyone'));
-    assert.ok(anyone);
-    await act(async () => anyone.click());
+    const modes = () => [...document.querySelectorAll('.rh-modes .rh-mode')];
+    assert.deepEqual(modes().map((mode) => mode.textContent), ['Solo mode', 'Allowlisted mode', 'Public mode']);
+    assert.ok(!document.querySelector('.rh-policy [role="combobox"]'), 'no dropdown any more');
+    const pressed = () => modes().filter((mode) => mode.getAttribute('aria-pressed') === 'true').map((mode) => mode.textContent);
+    assert.deepEqual(pressed(), ['Allowlisted mode'], 'today\'s policy is the chosen mode');
+    assert.equal(document.querySelector('.rh-modes').style.getPropertyValue('--mode-index'), '1', 'the indicator sits under it');
+    assert.match(document.querySelector('.rh-mode-detail').textContent, /Others send a request, and you approve it below\./);
+    assert.ok(document.body.textContent.includes('You can change this at any time.'));
+
+    await act(async () => modes()[2].click());
     await flushAsync();
-    assert.deepEqual(native.sent('realm_host_set_join_policy'), [['realm_host_set_join_policy', { joinPolicy: 'PUBLIC' }]]);
-    assert.match(document.querySelector('.rh-policy [role="combobox"]').textContent, /Anyone/);
+    assert.deepEqual(pressed(), ['Public mode']);
+    assert.equal(document.querySelector('.rh-modes').style.getPropertyValue('--mode-index'), '2');
+    assert.match(document.querySelector('.rh-mode-detail').textContent, /Anyone signed in joins and plays without asking\./);
+
+    await act(async () => modes()[0].click());
+    await flushAsync();
+    assert.deepEqual(pressed(), ['Solo mode']);
+    assert.match(document.querySelector('.rh-mode-detail').textContent, /Only you can enter\./);
+
+    await act(async () => modes()[0].click());
+    await flushAsync();
+    assert.deepEqual(native.sent('realm_host_set_join_policy').map((call) => call[1].joinPolicy), ['PUBLIC', 'SOLO'],
+      'each choice sends its policy once; the chosen mode again sends nothing');
   });
 });
 
@@ -3582,6 +3599,42 @@ test('the standing comes from the same lookup: host, member, an invite, a reques
   assert.deepEqual(realmJoinStep(at('invited'), 'mysticfox'), { line: 'You have an invite to mysticfox. Accept it on the Realms page.', button: 'Open Realms', action: 'realms' });
   for (const standing of ['own', 'member', 'open']) assert.equal(realmJoinStep(at(standing), 'mysticfox'), null, `${standing}: Play is theirs`);
   assert.equal(realmJoinStep(null, 'mysticfox'), null, 'not known: Play is not held');
+});
+
+// [2026-10-16] A realm in solo mode lets nobody but its host in: others see it as unavailable, with no Ask to join.
+test('a realm in solo mode is closed to everyone but its host, members included', () => {
+  const { realmStanding, realmJoinStep, REALM_SOLO_LINE } = realmStatusLib;
+  const { serverStatusBadge } = officialPlayLib;
+  assert.equal(REALM_SOLO_LINE, 'This realm is in solo mode: its host is playing alone right now.');
+  assert.equal(realmStanding({ online: true, serving: false, joinPolicy: 'SOLO' }, false), 'solo');
+  assert.equal(realmStanding({ online: true, serving: false, joinPolicy: 'SOLO', member: true }, false), 'solo', 'a member too');
+  assert.equal(realmStanding({ online: true, serving: true, joinPolicy: 'SOLO', own: true }, true), 'own', 'the host enters');
+  assert.deepEqual(realmJoinStep({ state: 'offline', own: false, standing: 'solo' }, 'mysticfox'), { line: REALM_SOLO_LINE, button: 'Unavailable', action: null });
+  assert.deepEqual(serverStatusBadge({ kind: 'paradox_realm', health: 'online', officialPlay: null, realm: { state: 'offline', own: false, standing: 'solo' } }), { text: 'Solo mode', tone: 'warn' });
+});
+
+test('Home: a realm in solo mode shows Solo mode, and Play waits with the line and no Ask to join', async () => {
+  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'offline', own: false, standing: 'solo' } }));
+  await act(async () => {});
+  assert.equal(document.querySelector('[data-testid="server-status"]').textContent, 'Solo mode');
+  const play = document.querySelector('button.play');
+  assert.equal(play.textContent, 'Unavailable');
+  assert.equal(play.disabled, true);
+  assert.ok(document.body.textContent.includes('This realm is in solo mode: its host is playing alone right now.'));
+  assert.ok(document.body.textContent.includes('Unavailable: solo mode'));
+  assert.ok(!document.body.textContent.includes('Ask to join'));
+});
+
+test('Servers: a realm in solo mode says so and offers no Ask to join', async () => {
+  const realmSolo = { ...realmServer, id: 's-solo', name: 'S', realmName: 'realm-solo' };
+  await mount(serversTab({
+    listServers: async () => [officialServer, realmSolo],
+    realmLookup: async (id) => ({ name: id, hostPublicKey: 'KEY-0123456789abcdef', fingerprint: 'x', online: true, serving: false, ownershipChanged: false, joinPolicy: 'SOLO' }),
+  }));
+  await act(async () => {});
+  const row = [...document.querySelectorAll('.server-row')].find((item) => item.querySelector('.server-name')?.textContent === 'realm-solo');
+  assert.match(row.textContent, /Unavailable: solo mode/);
+  assert.equal(serverRowButton(row, 'Ask to join'), undefined);
 });
 
 // A stand-in for useRealmStatus whose markRequested turns "none" into "requested", as the real one does.

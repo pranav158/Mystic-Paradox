@@ -28,6 +28,7 @@ export interface ServerStatusBadge {
 }
 
 /**
+ * [2026-10-16] For a realm in solo mode, "Solo mode" (amber) for everyone but its host.
  * [2026-10-15] The badge for the selected server on Home: "Online" when its backend is healthy, "Degraded" when it answers
  * but is not healthy, and a red "Unavailable" when the official play switch is off or the server cannot be reached. No
  * badge while the first check is still running.
@@ -47,6 +48,8 @@ export function serverStatusBadge(input: {
   if (input.health === "degraded") return { text: "Degraded", tone: "warn" };
   if (input.kind === "paradox_realm") {
     if (input.health !== "online" || !input.realm) return null;
+    // [2026-10-16] A realm in solo mode is closed to everyone but its host (the directory says not serving for them).
+    if (input.realm.standing === "solo") return { text: "Solo mode", tone: "warn" };
     if (input.realm.state === "serving") return { text: "Online", tone: "good" };
     if (input.realm.state === "starting") return { text: "Starting", tone: "warn" };
     return { text: "Offline", tone: "neutral" };

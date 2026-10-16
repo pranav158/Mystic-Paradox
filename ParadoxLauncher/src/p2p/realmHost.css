@@ -181,10 +181,100 @@
 /* ---- Player and ban lists --------------------------------------------------- */
 
 /* [2026-10-15] Who can join: one dropdown, not wider than a limit field. */
-.rh-policy {
+/* [2026-10-16] Who can join: three modes in one row, styled like the sidebar's items (shell.css .nav-item and .nav-indicator).
+   The chosen mode carries the same indicator, which slides between them; reduced motion stops it (base.css). */
+.rh-modes {
+  --mode-gap: 6px;
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--mode-gap);
   margin-top: 14px;
-  /* [2026-10-16] Wide enough for the longest option's detail line at full length (320 px cut it by a few pixels). */
-  max-width: 360px;
+}
+
+.rh-mode-indicator {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: calc((100% - 2 * var(--mode-gap)) / 3);
+  border: 1px solid var(--aether-line);
+  border-radius: 14px;
+  background: linear-gradient(90deg, rgba(91, 163, 255, 0.2), rgba(91, 163, 255, 0.05) 70%, rgba(91, 163, 255, 0));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 10px 30px -14px rgba(91, 163, 255, 0.6);
+  pointer-events: none;
+  transform: translate3d(calc(var(--mode-index, 0) * (100% + var(--mode-gap))), 0, 0);
+  transition: transform var(--t-slow) var(--ease-spring), opacity var(--t-med);
+}
+
+.rh-mode-indicator::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: -1px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--aether);
+  box-shadow: 0 0 12px var(--aether);
+}
+
+.rh-mode-indicator[data-hidden="true"] {
+  opacity: 0;
+}
+
+.rh-mode {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-width: 0;
+  height: 48px;
+  padding: 0 14px;
+  border-radius: 14px;
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 560;
+  white-space: nowrap;
+  transition: color var(--t-med), background-color var(--t-med);
+}
+
+.rh-mode span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rh-mode svg {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  transition: transform var(--t-med) var(--ease-spring), color var(--t-med);
+}
+
+.rh-mode:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--ink);
+}
+
+.rh-mode:hover:not(:disabled) svg {
+  transform: translateY(-1px) scale(1.1);
+}
+
+.rh-mode[aria-pressed="true"] {
+  color: #fff;
+}
+
+.rh-mode[aria-pressed="true"] svg {
+  color: var(--aether-hi);
+}
+
+.rh-mode-detail {
+  margin-top: 10px;
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 /* [2026-10-15] Add a player: the username field and its button on one line.

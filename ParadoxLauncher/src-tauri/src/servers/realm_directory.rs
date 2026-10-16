@@ -108,8 +108,16 @@ fn refusal_text(status: u16, body: &[u8]) -> String {
     if let Some(sentence) = crate::commands::account::deactivated_message(body) {
         return sentence;
     }
-    let message = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok();
+    // [2026-10-16] Solo mode reads the same here as at Play.
+    if value
+        .as_ref()
+        .and_then(|value| value["error"]["code"].as_str())
+        == Some("REALM_SOLO")
+    {
+        return crate::commands::launch::REALM_SOLO_MESSAGE.to_string();
+    }
+    let message = value
         .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
         .filter(|text| !text.trim().is_empty());
     message.unwrap_or_else(|| format!("The realm directory refused the request (status {status})."))
@@ -326,6 +334,19 @@ mod tests {
         assert_eq!(view.join_policy, None);
         assert!(!view.ownership_changed);
         assert!(!view.online);
+    }
+
+    #[test]
+    fn a_solo_realm_refuses_in_the_launchers_words() {
+        let body = br#"{"error":{"code":"REALM_SOLO","message":"Solo."}}"#;
+        assert_eq!(
+            refusal_text(409, body),
+            crate::commands::launch::REALM_SOLO_MESSAGE
+        );
+        // Other refusals keep the directory's own sentence.
+        let body =
+            br#"{"error":{"code":"REALM_NAME_INVALID","message":"That realm name is not valid."}}"#;
+        assert_eq!(refusal_text(400, body), "That realm name is not valid.");
     }
 
     #[test]

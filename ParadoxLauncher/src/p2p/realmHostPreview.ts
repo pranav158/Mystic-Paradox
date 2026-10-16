@@ -42,7 +42,8 @@ let bans: RealmHostBan[] = [
   { accountId: "acc-grim", displayName: "GrimTester", reason: "Griefing in Ramsgate", at: iso(-3 * 24 * 60) },
 ];
 // [2026-10-15] Who may join, and the players waiting for approval (newest first, as the native side lists them).
-let joinPolicy: RealmJoinPolicy = "INVITE_ONLY";
+// [2026-10-16] ?hostpolicy=solo|allowlisted|public: the mode "Who can join" starts in (allowlisted by default).
+let joinPolicy: RealmJoinPolicy = params.get("hostpolicy") === "solo" ? "SOLO" : params.get("hostpolicy") === "public" ? "PUBLIC" : "INVITE_ONLY";
 let requests: RealmJoinRequest[] = [
   { accountId: "acc-lyra", displayName: "LyraSpark", at: iso(-12) },
   { accountId: "acc-brann", displayName: "BrannOak", at: iso(-95) },
@@ -156,9 +157,15 @@ export default function realmHostPreview(cmd: string, args: unknown): Promise<un
     case "realm_host_people":
       return delay({ members: [...members], invites: [...invites], error: null }, 150);
     case "realm_host_set_join_policy": {
-      if (payload.joinPolicy !== "INVITE_ONLY" && payload.joinPolicy !== "PUBLIC") return say("Choose who can join: approved players or anyone.", 250, "error");
+      if (payload.joinPolicy !== "SOLO" && payload.joinPolicy !== "INVITE_ONLY" && payload.joinPolicy !== "PUBLIC") {
+        return say("Choose who can join: solo, allowlisted or public.", 250, "error");
+      }
       joinPolicy = payload.joinPolicy;
-      return say(joinPolicy === "PUBLIC" ? "Anyone can join your realm now." : "Only players you approve can join your realm now.", 300);
+      return say(joinPolicy === "PUBLIC"
+        ? "Anyone can join your realm now."
+        : joinPolicy === "SOLO"
+          ? "Your realm is in solo mode now: only you can enter. Players already inside stay until they leave."
+          : "Only players you approve can join your realm now.", 300);
     }
     case "realm_host_status":
       return delay(status(), 120);

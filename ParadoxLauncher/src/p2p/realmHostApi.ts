@@ -72,7 +72,8 @@ export interface RealmHostCapacity {
 export type RealmHostNoticeKind = "info" | "error";
 
 /** [2026-10-15] Who may join: approved players only, or anyone signed in. */
-export type RealmJoinPolicy = "INVITE_ONLY" | "PUBLIC";
+/** [2026-10-16] "SOLO": the host alone (solo mode); "INVITE_ONLY": approved players (allowlisted); "PUBLIC": anyone. */
+export type RealmJoinPolicy = "SOLO" | "INVITE_ONLY" | "PUBLIC";
 
 /** [2026-10-15] A player waiting for the host's approval. `displayName` is null when the account has none to show. */
 export interface RealmJoinRequest {
