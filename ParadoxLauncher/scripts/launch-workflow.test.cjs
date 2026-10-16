@@ -66,6 +66,8 @@ const serverNames = load('src/servers/serverNames.ts', {});
 // [2026-10-15] The email-code and Discord rules, and the official server's play switch: pure modules, loaded for real.
 const authRules = load('src/auth/authRules.ts', {});
 const officialPlayLib = load('src/servers/officialPlay.ts', {});
+// [2026-10-16] Whether the selected realm can be entered (pure, loaded for real).
+const realmStatusLib = load('src/servers/realmStatus.ts', {});
 const dropdownLib = load('src/components/Dropdown.tsx', { './icons': icons });
 const services = { health: 'online', checkedAt: 0, refreshing: false, supportedChangelist: 647472, refresh: async () => {} };
 // [2026-10-13 realms S5] The selected-server state, as a screen under test sees it.
@@ -78,7 +80,7 @@ const install = { located: true, exeSha256: 'approved', runtimeRepairRequired: f
 const noTrust = () => ({ notice: null, dismissNotice() {}, ensureHost: async () => true, trustNewHost: async () => false });
 const Banner = ({ tone, children, onDismiss }) => React.createElement('div', { className: 'banner', 'data-tone': tone ?? 'danger' },
   children, onDismiss ? React.createElement('button', { type: 'button', onClick: onDismiss }, 'Dismiss') : null);
-function home(api, refreshPolicy = async () => policy, serviceState = services, { trust = noTrust(), selected, rules = accountRulesDefault(), officialPlay = null } = {}) {
+function home(api, refreshPolicy = async () => policy, serviceState = services, { trust = noTrust(), selected, rules = accountRulesDefault(), officialPlay = null, realm = null } = {}) {
   return load('src/screens/dashboard/HomeTab.tsx', {
     '../../auth/AuthContext': { useAuth: () => ({ account }) },
     '../../auth/AccountRules': { useAccountRules: () => rules },
@@ -107,6 +109,9 @@ function home(api, refreshPolicy = async () => policy, serviceState = services, 
     '../../components/ArtBackdrop': { ArtBackdrop: () => null, heroArt: 'art.webp' },
     '../../servers/serverNames': serverNames,
     '../../servers/officialPlay': officialPlayLib,
+    // [2026-10-16] The selected realm's own state (none unless a test gives one); the rules are loaded for real.
+    '../../servers/realmStatus': realmStatusLib,
+    '../../servers/useRealmStatus': { useRealmStatus: () => realm },
     '@tauri-apps/api/app': { getVersion: async () => '0.1.67' },
   }).HomeTab;
 }
@@ -2258,7 +2263,8 @@ function registerScreen(serverState, sent) {
       AuthLayout: ({ children }) => React.createElement('div', null, children),
       AuthCard: ({ title, subtitle, children }) => React.createElement('section', null, React.createElement('h1', null, title), React.createElement('p', null, subtitle), children),
     },
-    '../components/UsernameField': { UsernameField: () => React.createElement('div'), useUsernameField: () => ({ value: 'Slayer', validate: () => null }) },
+    // [2026-10-16] A username that passed its checks (the real field has its own tests below).
+    '../components/UsernameField': { UsernameField: () => React.createElement('div'), useUsernameField: () => ({ value: 'Slayer', ready: true, validate: () => null, setRefusal() {} }) },
     '../components/LegalConsentChecks': { LegalConsentChecks },
     '../components/LegalDocument': LegalDocument,
     '../legal/legalMeta': legalMeta,
@@ -2283,9 +2289,9 @@ test('registration waits for the age and the documents, then sends the current v
   await act(async () => checkboxOf('I agree').click());
   assert.equal(button('Create account').disabled, false);
   await act(async () => button('Create account').click());
-  // [2026-10-15] No name is asked for or sent on the official server: the account names itself after the code.
   assert.deepEqual(sent[0].slice(0, 3), ['slayer@example.com', 'a long password', { termsVersion: legalMeta.LEGAL.termsVersion, privacyVersion: legalMeta.LEGAL.privacyVersion, ageConfirmed: true }]);
-  assert.equal(sent[0][3], undefined, 'the official sign-up sends no name');
+  // [2026-10-16] The name is sent again on the official server (0.1.67-0.1.70 sent none).
+  assert.equal(sent[0][3], 'Slayer', 'the official sign-up sends the name');
 });
 
 test('the document names in the registration boxes open the documents and do not tick the box', async () => {
@@ -2312,6 +2318,196 @@ test('a local server registers as before: no document boxes, and nothing about t
   await act(async () => button('Create account').click());
   assert.equal(sent[0][2], undefined, 'the local server gets no consent');
   assert.equal(sent[0][3], 'Slayer', 'a local server takes the name on its own form');
+});
+
+// ---- [2026-10-16] launcher 0.1.71: the username is on the sign-up form again --------------------------------------------
+// An account held for approval has no session, so it could never reach the set-username step: 0.1.67-0.1.70 left three VPS
+// accounts named by their id. The local rules mirror the backend's ValidateUsername; the server decides the rest.
+
+const textFieldLib = load('src/components/TextField.tsx', {});
+function usernameFieldLib(checkUsername) {
+  return load('src/components/UsernameField.tsx', {
+    '../api/tauri': { checkUsername },
+    '../servers/ServerContext': { useServer: () => ({ serverId: 'official' }) },
+    './TextField': textFieldLib,
+  });
+}
+// The debounce timer, run by hand (the jsdom window's own setTimeout is replaced once the screen is mounted).
+function manualTimeouts() {
+  const timers = [];
+  dom.window.setTimeout = (callback, ms) => { timers.push({ callback, ms, done: false }); return timers.length; };
+  dom.window.clearTimeout = (id) => { if (timers[id - 1]) timers[id - 1].done = true; };
+  return {
+    timers,
+    async fire() {
+      const due = timers.filter((timer) => !timer.done);
+      due.forEach((timer) => { timer.done = true; });
+      await act(async () => { due.forEach((timer) => timer.callback()); });
+    },
+  };
+}
+// The real TextField puts its input beside the label (htmlFor), not inside it.
+function inputFor(label) {
+  const node = [...document.querySelectorAll('label')].find((item) => item.textContent.startsWith(label));
+  return node?.querySelector('input') ?? (node?.htmlFor ? document.getElementById(node.htmlFor) : null);
+}
+const fieldHint = () => document.querySelector('.field-hint')?.textContent ?? null;
+const fieldError = () => document.querySelector('.field-error')?.textContent ?? null;
+
+test('the username rules match the backend, in its order and words: letters and digits only', () => {
+  const { usernameFormatError, USERNAME_HELP } = usernameFieldLib(async () => ({ available: true }));
+  const LENGTH = 'Username must be 3–16 characters.';
+  const CHARACTERS = 'Username can only contain letters and numbers (no spaces or symbols).';
+  const LETTER = 'Username needs at least one letter.';
+  assert.equal(usernameFormatError('ab'), LENGTH);
+  assert.equal(usernameFormatError('a'.repeat(17)), LENGTH);
+  assert.equal(usernameFormatError('  Abc  '), null, 'the name is trimmed first');
+  assert.equal(usernameFormatError('bad name'), CHARACTERS);
+  assert.equal(usernameFormatError('Aether_Hunter'), CHARACTERS, 'no underscores');
+  assert.equal(usernameFormatError('Aether-Hunter'), CHARACTERS);
+  assert.equal(usernameFormatError('Slayer!'), CHARACTERS);
+  assert.equal(usernameFormatError('12345'), LETTER);
+  assert.equal(usernameFormatError('_a'), LENGTH, 'the length comes first');
+  assert.equal(usernameFormatError('1_2'), CHARACTERS, 'the characters come before the letter');
+  assert.equal(usernameFormatError('AetherHunter7'), null);
+  assert.equal(usernameFormatError('abc'), null);
+  assert.equal(USERNAME_HELP, '3–16 letters or numbers. This is your in-game name and how friends invite you.');
+});
+
+test('the username is checked with the server after a pause; a stale answer is ignored; the server\'s reason is shown as it is', async () => {
+  const asked = [];
+  const answers = [];
+  const lib = usernameFieldLib((name, serverId) => {
+    asked.push([name, serverId]);
+    const answer = deferred();
+    answers.push(answer);
+    return answer.promise;
+  });
+  const Harness = () => React.createElement(lib.UsernameField, { field: lib.useUsernameField() });
+  await mount(Harness);
+  const timers = manualTimeouts();
+  const input = () => inputFor('Username');
+  assert.equal(fieldHint(), lib.USERNAME_HELP);
+
+  // A wrong character shows at once, and nothing is asked.
+  await act(async () => typeInto(input(), 'bad name'));
+  assert.equal(fieldError(), 'Username can only contain letters and numbers (no spaces or symbols).');
+  // Too short waits until the field is left.
+  await act(async () => typeInto(input(), 'ab'));
+  assert.equal(fieldError(), null);
+  await act(async () => { input().dispatchEvent(new dom.window.FocusEvent('focusout', { bubbles: true })); });
+  assert.equal(fieldError(), 'Username must be 3–16 characters.');
+  await timers.fire();
+  assert.deepEqual(asked, [], 'a name that breaks a rule is never sent');
+
+  // Two names in a row: the first answer arrives last and is ignored.
+  await act(async () => typeInto(input(), 'FirstName'));
+  assert.equal(fieldHint(), 'Checking…');
+  assert.equal(timers.timers.at(-1).ms, 400);
+  await timers.fire();
+  await act(async () => typeInto(input(), 'SecondName'));
+  await timers.fire();
+  assert.deepEqual(asked, [['FirstName', 'official'], ['SecondName', 'official']]);
+  await act(async () => answers[1].resolve({ available: true }));
+  assert.equal(fieldHint(), 'Available');
+  await act(async () => answers[0].resolve({ available: false, reason: 'That username is already taken.' }));
+  assert.equal(fieldHint(), 'Available', 'the answer for the old name changes nothing');
+  assert.equal(fieldError(), null);
+
+  // The server's reasons, word for word: reserved, and not allowed (the launcher keeps no word list).
+  await act(async () => typeInto(input(), 'AdminBob'));
+  await timers.fire();
+  await act(async () => answers[2].resolve({ available: false, reason: 'That username is reserved. Choose another.' }));
+  assert.equal(fieldError(), 'That username is reserved. Choose another.');
+  await act(async () => typeInto(input(), 'Sh1tLord'));
+  await timers.fire();
+  await act(async () => answers[3].resolve({ available: false, reason: "That username isn't allowed. Choose another." }));
+  assert.equal(fieldError(), "That username isn't allowed. Choose another.");
+  assert.equal(asked.length, 4, 'both were asked: only the server judges them');
+});
+
+// The sign-up form with the real username field and text fields.
+function registerWithUsername(register, checkUsername = async () => ({ available: true })) {
+  const usernameLib = usernameFieldLib(checkUsername);
+  return load('src/screens/RegisterScreen.tsx', {
+    '../auth/authRules': authRules,
+    '../servers/serverNames': serverNames,
+    '../auth/AuthContext': { useAuth: () => ({ register }), describeAuthError: plainError },
+    '../components/TextField': { ...textFieldLib, RevealToggle: () => null },
+    '../components/Button': { Button: plainButton },
+    '../components/Banner': { Banner: ({ children }) => React.createElement('div', { className: 'banner', role: 'alert' }, children) },
+    '../components/AuthLayout': {
+      AuthLayout: ({ children }) => React.createElement('div', null, children),
+      AuthCard: ({ title, children }) => React.createElement('section', null, React.createElement('h1', null, title), children),
+    },
+    '../components/UsernameField': usernameLib,
+    '../components/LegalConsentChecks': { LegalConsentChecks },
+    '../components/LegalDocument': LegalDocument,
+    '../legal/legalMeta': legalMeta,
+    '../servers/ServerContext': { useServer: () => officialUserServer },
+  }).RegisterScreen;
+}
+async function fillSignUp(timers, name) {
+  await act(async () => {
+    typeInto(inputFor('Username'), name);
+    typeInto(inputFor('Email'), 'slayer@example.com');
+    typeInto(inputFor('Password'), 'a long password');
+    typeInto(inputFor('Confirm password'), 'a long password');
+  });
+  await act(async () => checkboxOf('I am 16').click());
+  await act(async () => checkboxOf('I agree').click());
+  await timers.fire();
+  await act(async () => {});
+}
+
+test('sign-up asks for the username and sends it, and waits until it is valid and available', async () => {
+  const sent = [];
+  const check = deferred();
+  await mount(registerWithUsername(async (...args) => { sent.push(args); }, () => check.promise), { onBackToLogin() {} });
+  const timers = manualTimeouts();
+  assert.ok(inputFor('Username'), 'the username is on the official sign-up form');
+  await fillSignUp(timers, 'AetherHunter');
+  assert.equal(button('Create account').disabled, true, 'everything else is ready, the name is still being checked');
+  await act(async () => check.resolve({ available: true }));
+  assert.equal(button('Create account').disabled, false);
+  await act(async () => button('Create account').click());
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][0], 'slayer@example.com');
+  assert.equal(sent[0][3], 'AetherHunter', 'the name goes with the registration (displayName)');
+  assert.deepEqual(sent[0][2], { termsVersion: legalMeta.LEGAL.termsVersion, privacyVersion: legalMeta.LEGAL.privacyVersion, ageConfirmed: true });
+});
+
+test('sign-up stays disabled for a name the server refuses, and a mismatch shows on its own field', async () => {
+  await mount(registerWithUsername(async () => {}, async () => ({ available: false, reason: 'That username is already taken.' })), { onBackToLogin() {} });
+  const timers = manualTimeouts();
+  await fillSignUp(timers, 'Tempest');
+  assert.equal(fieldError(), 'That username is already taken.');
+  assert.equal(button('Create account').disabled, true);
+  await act(async () => typeInto(inputFor('Confirm password'), 'another long password'));
+  assert.ok([...document.querySelectorAll('.field-error')].some((item) => item.textContent === "Passwords don't match."));
+});
+
+test('a name refused at submit (taken meanwhile) shows on the username field, not as a banner', async () => {
+  await mount(registerWithUsername(async () => { throw 'AUTH_USERNAME_REFUSED: That username is already taken.'; }), { onBackToLogin() {} });
+  const timers = manualTimeouts();
+  await fillSignUp(timers, 'AetherHunter');
+  await act(async () => button('Create account').click());
+  assert.equal(fieldError(), 'That username is already taken.');
+  assert.ok(!document.querySelector('.banner'), 'no banner: the field says it');
+  assert.equal(button('Create account').disabled, true, 'that name cannot be sent again');
+  await act(async () => typeInto(inputFor('Username'), 'AetherHunter2'));
+  await timers.fire();
+  await act(async () => {});
+  assert.equal(fieldError(), null, 'a new name clears it');
+  assert.equal(button('Create account').disabled, false);
+});
+
+test('the register call carries the username on the official server too', async () => {
+  const harness = authHarness(officialServerState, { native_register: () => Promise.resolve({ account: localAccount, verificationRequired: false }) });
+  await mount(harness.App);
+  const consent = { termsVersion: '2026-10-14', privacyVersion: '2026-10-14', ageConfirmed: true };
+  await act(async () => harness.context.register('slayer@example.com', 'a long password', consent, 'AetherHunter'));
+  assert.deepEqual(harness.calls.at(-1), ['native_register', { serverId: 'official', email: 'slayer@example.com', password: 'a long password', consent, displayName: 'AetherHunter' }]);
 });
 
 test('the official register call carries the consent, and a local one does not', async () => {
@@ -3224,6 +3420,122 @@ test('Home: a healthy official server shows Online and Play, with no note', asyn
   assert.ok(badge.classList.contains('good'));
   assert.ok(button('Play'), 'Play is enabled');
   assert.equal(document.body.textContent.includes('currently unavailable'), false);
+});
+
+// ---- [2026-10-16] A realm's state on Home: the realm itself, not only our backend's health (0.1.70 showed "Online" for a realm
+// whose host had not started it) ----------------------------------------------------------------------------------------
+
+test('a realm is enterable only while it serves; the player\'s own realm follows this PC\'s host; the badge names it', () => {
+  const { realmStatus, realmPlayBlock } = realmStatusLib;
+  const { serverStatusBadge } = officialPlayLib;
+  // The directory: online alone (the host's launcher reports in) is not enough; serving is.
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: true }, null), { state: 'serving', own: false });
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false }, null), { state: 'offline', own: false });
+  assert.equal(realmStatus('ember-hold', null, null), null, 'nothing answered: unknown');
+  // The player's own realm: this PC's host decides, even when the directory still says serving.
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: true, own: true }, { realmName: 'ember-hold', state: 'stopped' }), { state: 'offline', own: true });
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false, own: true }, { realmName: 'Ember-Hold', state: 'starting' }), { state: 'starting', own: true });
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false, own: true }, { realmName: 'ember-hold', state: 'online' }), { state: 'serving', own: true });
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: false, own: true }, null), { state: 'offline', own: true }, 'without the hosting module: the directory');
+  assert.deepEqual(realmStatus('ember-hold', { online: true, serving: true }, { realmName: 'other-realm', state: 'stopped' }), { state: 'serving', own: false }, 'another realm hosted here does not count');
+
+  // The lines under Play.
+  assert.equal(realmPlayBlock({ state: 'serving', own: false }), null);
+  assert.equal(realmPlayBlock(null), null, 'unknown: Play is not held');
+  assert.equal(realmPlayBlock({ state: 'offline', own: false }), "The realm's host hasn't started it yet. Play opens when the realm is online.");
+  assert.equal(realmPlayBlock({ state: 'offline', own: true }), 'Your realm is not running. Start it on the Host realm page, then press Play.');
+  assert.equal(realmPlayBlock({ state: 'starting', own: true }), 'Your realm is starting. Play opens when it is online.');
+
+  // The badge: our backend's trouble first, then the realm.
+  const badge = (realm, health = 'online') => serverStatusBadge({ kind: 'paradox_realm', health, officialPlay: null, realm });
+  assert.deepEqual(badge({ state: 'serving', own: false }), { text: 'Online', tone: 'good' });
+  assert.deepEqual(badge({ state: 'offline', own: false }), { text: 'Offline', tone: 'neutral' });
+  assert.deepEqual(badge({ state: 'starting', own: true }), { text: 'Starting', tone: 'warn' });
+  assert.equal(badge(null), null, 'not known yet: no badge rather than our backend\'s Online');
+  assert.deepEqual(badge({ state: 'serving', own: false }, 'unreachable'), { text: 'Unavailable', tone: 'bad' });
+  assert.deepEqual(badge({ state: 'serving', own: false }, 'degraded'), { text: 'Degraded', tone: 'warn' });
+  assert.deepEqual(serverStatusBadge({ kind: 'official', health: 'online', officialPlay: null, realm: { state: 'offline', own: false } }), { text: 'Online', tone: 'good' }, 'the official server ignores a realm state');
+});
+
+const realmInstall = { ...install, serverId: 's-2', serverKind: 'paradox_realm', serverName: 'Ember Hold', runtimeManaged: true };
+const emberHold = { id: 's-2', kind: 'paradox_realm', name: 'Ember Hold', realmName: 'ember-hold' };
+
+test('Home: a realm whose host has not started it shows Offline and Play waits with the reason', async () => {
+  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'offline', own: false } }));
+  await act(async () => {});
+  const badge = document.querySelector('[data-testid="server-status"]');
+  assert.equal(badge.textContent, 'Offline');
+  assert.equal(badge.className, 'chip', 'a plain chip: offline is not an error');
+  assert.equal(button('Realm offline').disabled, true);
+  assert.ok(document.body.textContent.includes("The realm's host hasn't started it yet."));
+});
+
+test('Home: the player\'s own stopped realm says to start it on the Host realm page', async () => {
+  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'offline', own: true } }));
+  await act(async () => {});
+  assert.equal(document.querySelector('[data-testid="server-status"]').textContent, 'Offline');
+  assert.equal(button('Realm offline').disabled, true);
+  assert.ok(document.body.textContent.includes('Your realm is not running. Start it on the Host realm page, then press Play.'));
+});
+
+test('Home: a realm that serves shows Online and Play', async () => {
+  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'serving', own: false } }));
+  await act(async () => {});
+  const badge = document.querySelector('[data-testid="server-status"]');
+  assert.equal(badge.textContent, 'Online');
+  assert.ok(badge.classList.contains('good'));
+  assert.equal(button('Play').disabled, false);
+});
+
+test('Home: a realm whose state is not known yet shows no badge and does not hold Play', async () => {
+  await mount(home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: null }));
+  await act(async () => {});
+  assert.equal(document.querySelector('[data-testid="server-status"]'), null);
+  assert.equal(button('Play').disabled, false);
+});
+
+test('the realm state is read at once and every 15 s; this PC\'s host is asked only for the player\'s own realm', async () => {
+  const lookups = [];
+  let localAsked = 0;
+  let directory = { online: true, serving: false, own: false };
+  const lib = load('src/servers/useRealmStatus.ts', {
+    '../api/tauri': { realmLookup: async (id) => { lookups.push(id); return directory; } },
+    '../lib/optionalRealmHost': { LOCAL_REALM_HOST: async () => { localAsked += 1; return { realmName: 'ember-hold', state: 'starting' }; } },
+    './realmStatus': realmStatusLib,
+  });
+  dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost' });
+  global.window = dom.window;
+  global.document = dom.window.document;
+  global.IS_REACT_ACT_ENVIRONMENT = true;
+  const intervals = [];
+  dom.window.setInterval = (callback, ms) => { intervals.push({ callback, ms }); return intervals.length; };
+  dom.window.clearInterval = () => {};
+  const seen = [];
+  const Probe = ({ server }) => {
+    const status = lib.useRealmStatus(server);
+    seen.push(status ? `${status.state}${status.own ? ' own' : ''}` : 'none');
+    return null;
+  };
+  root = createRoot(document.getElementById('root'));
+  await act(async () => root.render(React.createElement(Probe, { server: { id: 'official', kind: 'official' } })));
+  assert.deepEqual(lookups, [], 'the official server is not a realm');
+  assert.equal(seen[seen.length - 1], 'none');
+
+  await act(async () => root.render(React.createElement(Probe, { server: emberHold })));
+  assert.deepEqual(lookups, ['s-2'], 'read at once');
+  assert.equal(seen[seen.length - 1], 'offline');
+  assert.equal(localAsked, 0, 'not this player\'s realm: this PC\'s host is not asked');
+  assert.equal(intervals[intervals.length - 1].ms, 15000);
+
+  directory = { online: true, serving: false, own: true };
+  await act(async () => intervals[intervals.length - 1].callback());
+  assert.equal(localAsked, 1, 'the player\'s own realm: this PC\'s host is asked');
+  assert.equal(seen[seen.length - 1], 'starting own');
+
+  directory = { online: true, serving: true, own: false };
+  await act(async () => { dom.window.dispatchEvent(new dom.window.Event('focus')); });
+  assert.equal(lookups.length, 3, 'read again on focus');
+  assert.equal(seen[seen.length - 1], 'serving');
 });
 
 test('Servers: the official server shows a red "Currently unavailable" chip beside its Official one', async () => {

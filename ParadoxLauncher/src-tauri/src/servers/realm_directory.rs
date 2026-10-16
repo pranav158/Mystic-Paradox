@@ -66,6 +66,8 @@ pub struct RealmLookupView {
     pub requested: bool,
     /// [2026-10-16] The host invited the player and the player has not answered.
     pub invited: bool,
+    /// [2026-10-16] The player is this realm's host (Home then reads the realm's state from this PC's own host when it can).
+    pub own: bool,
 }
 
 /// Reads a successful lookup answer. A key of the wrong shape is refused, so nothing malformed is ever stored.
@@ -87,6 +89,7 @@ pub fn parse_lookup(body: &[u8]) -> Result<RealmLookupView, String> {
         online: info.online,
         serving: info.serving,
         ownership_changed: info.ownership_changed,
+        own: info.membership.as_deref() == Some("HOST"),
         member: info.membership.is_some(),
         requested: info.requested,
         invited: info.invited,
@@ -322,7 +325,12 @@ mod tests {
         let body = br#"{"realm":{"name":"ember-hold","host":{"displayName":"Tempest"},
             "hostPublicKey":"KEY-0123456789abcdef","membership":"MEMBER","requested":false,"invited":false}}"#;
         let view = parse_lookup(body).unwrap();
-        assert!(view.member && !view.requested && !view.invited);
+        assert!(view.member && !view.requested && !view.invited && !view.own);
+        // [2026-10-16] The host's own lookup: a member, and its own realm.
+        let body = br#"{"realm":{"name":"ember-hold","host":{"displayName":"Tempest"},
+            "hostPublicKey":"KEY-0123456789abcdef","membership":"HOST"}}"#;
+        let view = parse_lookup(body).unwrap();
+        assert!(view.member && view.own);
         let body = br#"{"realm":{"name":"ember-hold","host":{"displayName":"Tempest"},
             "hostPublicKey":"KEY-0123456789abcdef","membership":null,"requested":true,"invited":true}}"#;
         let view = parse_lookup(body).unwrap();
@@ -331,7 +339,7 @@ mod tests {
         let body =
             br#"{"realm":{"name":"ember-hold","host":{},"hostPublicKey":"KEY-0123456789abcdef"}}"#;
         let view = parse_lookup(body).unwrap();
-        assert!(!view.member && !view.requested && !view.invited);
+        assert!(!view.member && !view.requested && !view.invited && !view.own);
     }
 
     #[test]

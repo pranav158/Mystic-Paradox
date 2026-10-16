@@ -181,6 +181,70 @@ struct ErrorEnvelope {
 #[derive(Deserialize)]
 struct ErrorBody {
     code: Option<String>,
+    /// [2026-10-16] Read only for a refused username (`username_refusal`); every other refusal uses the launcher's own words.
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// [2026-10-16] The code of a username the server refused at register or set-username. The screens show its sentence on
+/// the username field.
+pub(crate) const USERNAME_REFUSED: &str = "AUTH_USERNAME_REFUSED";
+
+/// [2026-10-16] A refused username, as `AUTH_USERNAME_REFUSED: <the server's sentence>`: taken, reserved, not allowed, or
+/// against the format rules (the live check normally catches these first; this is the race). The server's own
+/// sentence is kept because it says which rule (one line, at most 200 characters); AUTH_VALIDATION_FAILED counts only when its
+/// sentence is about the username (the same code also refuses an email or a password).
+fn username_refusal(code: Option<&str>, message: Option<&str>) -> Option<String> {
+    let sentence = message
+        .map(|text| {
+            text.split(['\r', '\n'])
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .chars()
+                .take(200)
+                .collect::<String>()
+        })
+        .filter(|text| !text.is_empty());
+    match code {
+        Some("AUTH_DISPLAY_NAME_TAKEN") => Some(coded(
+            USERNAME_REFUSED,
+            sentence
+                .as_deref()
+                .unwrap_or("That username is already taken."),
+        )),
+        Some("AUTH_VALIDATION_FAILED") => sentence
+            .filter(|text| text.starts_with("Username") || text.starts_with("That username"))
+            .map(|text| coded(USERNAME_REFUSED, &text)),
+        _ => None,
+    }
+}
+
+/// [2026-10-16] `parse_success` for register and set-username: a refused username comes back as `username_refusal`.
+fn parse_named_success<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+    fallback: &str,
+) -> Result<T, String> {
+    if response.status().is_success() {
+        return response
+            .json::<T>()
+            .map_err(|_| "The account server returned an invalid response.".to_string());
+    }
+    let status = response.status().as_u16();
+    let body = response
+        .bytes()
+        .map(|bytes| bytes.to_vec())
+        .unwrap_or_default();
+    if let Some(message) = deactivated_message(&body) {
+        return Err(message);
+    }
+    let error = serde_json::from_slice::<ErrorEnvelope>(&body)
+        .ok()
+        .and_then(|envelope| envelope.error);
+    let code = error.as_ref().and_then(|error| error.code.as_deref());
+    let message = error.as_ref().and_then(|error| error.message.as_deref());
+    Err(username_refusal(code, message)
+        .unwrap_or_else(|| api_error_message(status, code, fallback)))
 }
 
 /// The launcher error code in a refusal body (`{ "error": { "code": ... } }`), when it has one.
@@ -962,7 +1026,7 @@ pub async fn native_register(
                     )
                     .to_string()
             })?;
-        let pending: PendingRegistration = parse_success(response, "Registration failed.")?;
+        let pending: PendingRegistration = parse_named_success(response, "Registration failed.")?;
         // [2026-10-15] Only the official backend sends codes; a local server's answer is taken as it was before.
         let verification_required = scope.is_official() && pending.verification_required;
         end_pending_sign_in(&AppHost(&app), &scope, expected_epoch)?;
@@ -1471,7 +1535,7 @@ pub async fn native_set_username(
                 .send()
                 .map_err(|_| "Couldn't set your username.".to_string())
         })?;
-        let account: NativeAccount = parse_success(response, "Couldn't set your username.")?;
+        let account: NativeAccount = parse_named_success(response, "Couldn't set your username.")?;
         // The cached token still carries the pre-username account view.
         invalidate_access_token_for(&scope);
         Ok(account)
@@ -2383,6 +2447,54 @@ mod tests {
         // [2026-10-16] An unofficial launcher build refused at Play gets the sentence, not "x (server status 403)".
         assert!(api_error_message(403, Some("LAUNCHER_UNOFFICIAL"), "x")
             .starts_with("This launcher isn't an official Mystic Paradox build."));
+    }
+
+    #[test]
+    fn a_refused_username_keeps_the_servers_sentence_for_the_username_field() {
+        let not_allowed = "That username isn't allowed. Choose another.";
+        assert_eq!(
+            username_refusal(Some("AUTH_VALIDATION_FAILED"), Some(not_allowed)),
+            Some(format!("AUTH_USERNAME_REFUSED: {not_allowed}"))
+        );
+        assert_eq!(
+            username_refusal(Some("AUTH_DISPLAY_NAME_TAKEN"), None),
+            Some("AUTH_USERNAME_REFUSED: That username is already taken.".to_string())
+        );
+        assert_eq!(
+            username_refusal(
+                Some("AUTH_VALIDATION_FAILED"),
+                Some("That username is reserved. Choose another.")
+            ),
+            Some("AUTH_USERNAME_REFUSED: That username is reserved. Choose another.".to_string())
+        );
+        assert_eq!(
+            username_refusal(
+                Some("AUTH_VALIDATION_FAILED"),
+                Some("Username needs at least one letter.\nsecond line")
+            ),
+            Some("AUTH_USERNAME_REFUSED: Username needs at least one letter.".to_string())
+        );
+        // The same code refuses an email or a password: those are not the username field's.
+        assert_eq!(
+            username_refusal(
+                Some("AUTH_VALIDATION_FAILED"),
+                Some("Enter a valid email address.")
+            ),
+            None
+        );
+        assert_eq!(username_refusal(Some("AUTH_VALIDATION_FAILED"), None), None);
+        assert_eq!(
+            username_refusal(Some("AUTH_EMAIL_TAKEN"), Some("Username x")),
+            None
+        );
+        let long = format!("Username {}", "a".repeat(400));
+        assert_eq!(
+            username_refusal(Some("AUTH_VALIDATION_FAILED"), Some(&long))
+                .unwrap()
+                .chars()
+                .count(),
+            "AUTH_USERNAME_REFUSED: ".len() + 200
+        );
     }
 
     #[test]

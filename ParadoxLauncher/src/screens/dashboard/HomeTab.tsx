@@ -32,6 +32,8 @@ import { serverNaming, statusNaming } from "../../servers/serverNames";
 import { officialUnavailable, officialUnavailableNote, serverStatusBadge } from "../../servers/officialPlay";
 import { getVersion } from "@tauri-apps/api/app";
 import { useRealmTrust } from "../../servers/RealmTrust";
+import { realmPlayBlock } from "../../servers/realmStatus";
+import { useRealmStatus } from "../../servers/useRealmStatus";
 
 function gameRootPath(exePath: string): string {
   return exePath
@@ -89,6 +91,8 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
   const services = useServices();
   const { openWarning, selected, officialPlay } = useServer();
   const realmTrust = useRealmTrust();
+  // [2026-10-16] A selected Paradox realm's own state (its host may not have started it), for the badge and Play.
+  const realmStatus = useRealmStatus(selected);
   // [2026-10-14] A deactivated account (a deletion was requested) cannot start the game: Play says why instead.
   const rules = useAccountRules();
   const [restoreError, setRestoreError] = useState<string | null>(null);
@@ -353,7 +357,9 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     : rules.deletionChecking ? "Checking your account…" : null;
   // [2026-10-15] The official server's play switch is off: Play waits there, and says so (the backend's message, if any).
   const officialBlock = serverKind === "official" && officialUnavailable(officialPlay) ? officialUnavailableNote(officialPlay) : null;
-  const playBlocked = ready ? install?.playBlockedReason ?? officialBlock ?? accountBlock : null;
+  // [2026-10-16] A realm whose host has not started it: Play waits and says so (the player's own realm: start it first).
+  const realmBlock = serverKind === "paradox_realm" ? realmPlayBlock(realmStatus) : null;
+  const playBlocked = ready ? install?.playBlockedReason ?? officialBlock ?? accountBlock ?? realmBlock : null;
   const canPlay = ready && !playBlocked && (install?.exeSha256 != null || runtimeRepairRequired) && (phase.status === "idle" || phase.status === "error");
   const canRepair = located && runtimeRepairRequired && !gameRunning && (phase.status === "idle" || phase.status === "error");
   const busy = phase.status !== "idle" && phase.status !== "error" && phase.status !== "running";
@@ -389,7 +395,9 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
       : canPlay
         ? "Play"
         : playBlocked
-          ? "Unavailable"
+          ? playBlocked === realmBlock
+            ? realmStatus?.state === "starting" ? "Realm starting" : "Realm offline"
+            : "Unavailable"
           : canRepair
             ? "Repair"
             : "Locate game";
@@ -466,7 +474,8 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
     ? "Your Slayer is out in the Shattered Isles. The launcher keeps watch until the game closes."
     : "The Shattered Isles await.\nGear up, Slayer. Your next hunt begins.";
   // [2026-10-15] One status badge for the selected server, next to its kind (the official server, a realm or a local one).
-  const statusBadge = serverStatusBadge({ kind: serverKind, health: services.health, officialPlay });
+  // [2026-10-16] A realm's badge follows the realm (its host's state), not only our backend's health.
+  const statusBadge = serverStatusBadge({ kind: serverKind, health: services.health, officialPlay, realm: realmStatus });
   const nonStableChannel = channel && channel !== "stable" ? channel : null;
   // [2026-10-14] Which server Play uses: the kind in words, then its name (the official server is "Mystic Paradox"). A
   // realm is named by its realm name; the player's own name for it is a smaller line under that, only when it differs.
@@ -549,7 +558,11 @@ export function HomeTab({ onOpenAccount = () => {}, onNavigate = () => {} }: Hom
               <div className="play-server" data-kind={serverKind}>
                 <div className="play-server-head">
                   <span className="play-server-kind">{serverKindLabel}</span>
-                  {statusBadge && <span className={`chip ${statusBadge.tone}`} data-testid="server-status">{statusBadge.text}</span>}
+                  {statusBadge && (
+                    <span className={`chip${statusBadge.tone === "neutral" ? "" : ` ${statusBadge.tone}`}`} data-testid="server-status">
+                      {statusBadge.text}
+                    </span>
+                  )}
                   {serverKind === "local" && (
                     <LocalServerBadge onOpen={() => openWarning(serverId)}>LOCAL SERVER WARNING</LocalServerBadge>
                   )}

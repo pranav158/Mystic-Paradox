@@ -15,6 +15,10 @@
  * unavailable: a red badge, Play waits). Account: ?unlinked (Discord not linked), ?nodiscord (no Discord status from the
  * server). About: ?runtimebad (the installed runtime is not the signed release).
  * [2026-10-16] ?buildkind=unofficial|development: the UNOFFICIAL BUILD / DEVELOPMENT BUILD badge (sidebar, sign-in, About).
+ * [2026-10-16] Sign-up: the username check refuses Tempest, LyraSpark, BrannOak, NovaBlade (taken, any case), Admin, AdminBob,
+ * Mod7, MysticFox2 (reserved) and Sh1tLord (not allowed); ?nametaken refuses the name at submit (the race).
+ * [2026-10-16] Home with ?server=s-realm: ?realmoffline (its host has not started it), ?realmown (the player's own realm, read
+ * from this PC's host: stopped, or online with ?realmonline).
  * [2026-10-14] Terms and deletion: ?gate (the current documents are not accepted: the consent gate opens after sign-in),
  * ?gate=outdated (the acceptance is refused: update the launcher), ?consent404 (a backend without consent routes),
  * ?deactivated (the account is deactivated, deleted 20 days from now), ?nodeletion (a backend without the deletion route).
@@ -128,6 +132,19 @@ let previewInvites = params.has("noinvites") ? [] : [
 ];
 const previewRequested = new Set<string>();
 
+// [2026-10-16] The username check, as the backend answers it. Only a few example names, never a word list: the backend alone
+// judges reserved and vulgar names (security/usernamePolicy.ts).
+const PREVIEW_TAKEN_NAMES = ["Tempest", "LyraSpark", "BrannOak", "NovaBlade"];
+const PREVIEW_RESERVED_EXAMPLES = ["admin", "adminbob", "mod7", "mysticfox2"];
+const PREVIEW_NOT_ALLOWED_EXAMPLES = ["sh1tlord"];
+function previewUsernameAnswer(name: string): { available: boolean; reason?: string } {
+  const lower = name.toLowerCase();
+  if (PREVIEW_NOT_ALLOWED_EXAMPLES.includes(lower)) return { available: false, reason: "That username isn't allowed. Choose another." };
+  if (PREVIEW_RESERVED_EXAMPLES.includes(lower)) return { available: false, reason: "That username is reserved. Choose another." };
+  if (PREVIEW_TAKEN_NAMES.some((taken) => taken.toLowerCase() === lower)) return { available: false, reason: "That username is already taken." };
+  return { available: true };
+}
+
 let servers: PreviewServer[] = [
   { id: "official", kind: "official", name: "Mystic Paradox", gameExePath: "exePath" in install ? install.exePath : null },
   ...(params.has("noservers") ? [] : [
@@ -208,7 +225,7 @@ mockIPC((cmd, args) => {
     const answer = optionalMock(cmd, args);
     if (answer !== undefined) return answer;
   }
-  const payload = (args ?? {}) as { serverId?: string; remember?: boolean; ownFolder?: boolean; hostPublicKey?: string; confirmUsername?: string; code?: string; server?: { kind?: string; name?: string; backendUrl?: string; realmName?: string } };
+  const payload = (args ?? {}) as { serverId?: string; remember?: boolean; ownFolder?: boolean; hostPublicKey?: string; confirmUsername?: string; code?: string; displayName?: string; name?: string; server?: { kind?: string; name?: string; backendUrl?: string; realmName?: string } };
   switch (cmd) {
     case "native_restore_session": {
       if (screen === "checking") return new Promise(() => {});
@@ -226,8 +243,18 @@ mockIPC((cmd, args) => {
       return delay(accountFor(payload.serverId), 500);
     }
     // [2026-10-15] ?verify: the official sign-up asks for the emailed code. Sign-up takes no name (needsUsername after the code).
-    case "native_register":
-      return delay({ account: { ...accountFor(payload.serverId), approvalStatus: "pending", needsUsername: true }, verificationRequired: params.has("verify") }, 500);
+    // [2026-10-16] Sign-up takes the name again (0.1.71). ?nametaken: the name was taken between the check and the submit.
+    case "native_register": {
+      const name = typeof payload.displayName === "string" ? payload.displayName.trim() : "";
+      const answer = name ? previewUsernameAnswer(name) : { available: true };
+      if (params.has("nametaken") || !answer.available) {
+        return Promise.reject(`AUTH_USERNAME_REFUSED: ${answer.reason ?? "That username is already taken."}`);
+      }
+      return delay({
+        account: { ...accountFor(payload.serverId), ...(name ? { displayName: name } : {}), approvalStatus: "pending", needsUsername: !name },
+        verificationRequired: params.has("verify"),
+      }, 500);
+    }
     // [2026-10-15] Email codes: 123456 is the right code in the preview; any other is refused as wrong.
     case "native_verify_email":
       if (payload.code !== "123456") return Promise.reject("AUTH_CODE_INVALID: That code is wrong or has expired. Check the latest email or resend the code.");
@@ -269,7 +296,7 @@ mockIPC((cmd, args) => {
       signedInServers.delete(payload.serverId ?? selectedServerId);
       return delay(null, 100);
     case "native_check_username":
-      return delay({ available: true }, 250);
+      return delay(previewUsernameAnswer(String(payload.name ?? "")), 250);
     case "native_consent_status":
       return delay(consentView(), 250);
     case "native_accept_consent": {
@@ -373,11 +400,14 @@ mockIPC((cmd, args) => {
         hostPublicKey: key,
         fingerprint: previewFingerprint(key),
         online: true,
-        serving: true,
+        // [2026-10-16] ?realmoffline: the host's launcher reports in but the realm is not started (Home: Offline, Play waits).
+        serving: !params.has("realmoffline"),
         ownershipChanged: Boolean(server.hostPublicKey) && server.hostPublicKey !== key,
-        member: server.id === "s-realm",
+        member: server.id === "s-realm" || params.has("realmown"),
         requested: previewRequested.has(server.id),
         invited: false,
+        // [2026-10-16] ?realmown: the player hosts this realm (Home then reads this PC's host: stopped unless ?realmonline).
+        own: params.has("realmown"),
       }, 300);
     }
     case "set_realm_host_key": {

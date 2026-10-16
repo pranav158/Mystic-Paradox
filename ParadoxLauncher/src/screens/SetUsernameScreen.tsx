@@ -4,6 +4,7 @@ import { Button } from "../components/Button";
 import { Banner } from "../components/Banner";
 import { AuthCard, AuthLayout } from "../components/AuthLayout";
 import { UsernameField, useUsernameField } from "../components/UsernameField";
+import { authErrorCode, stripAuthCode } from "../auth/authRules";
 
 // Shown when an account (typically a fresh Discord sign-in) has no username yet.
 export function SetUsernameScreen() {
@@ -24,7 +25,12 @@ export function SetUsernameScreen() {
     try {
       await setUsername(username.value);
     } catch (err) {
-      setError(describeAuthError(err));
+      // [2026-10-16] The server refused the name after the live check passed: on the field, like the sign-up form.
+      if (authErrorCode(err) === "AUTH_USERNAME_REFUSED") {
+        username.setRefusal(stripAuthCode(typeof err === "string" ? err : err instanceof Error ? err.message : ""));
+      } else {
+        setError(describeAuthError(err));
+      }
     } finally {
       setSubmitting(false);
     }
@@ -36,7 +42,7 @@ export function SetUsernameScreen() {
         <form onSubmit={handleSubmit} className="auth-form" noValidate>
           {error && <Banner>{error}</Banner>}
           <UsernameField field={username} disabled={submitting} />
-          <Button type="submit" size="lg" block loading={submitting} loadingLabel="Saving…">
+          <Button type="submit" size="lg" block loading={submitting} loadingLabel="Saving…" disabled={!username.ready}>
             Set username
           </Button>
           <p className="auth-foot">

@@ -10,7 +10,7 @@ import { LegalLinks, useLegalViewer } from "../components/LegalDocument";
 import { LEGAL } from "../legal/legalMeta";
 import { useServer } from "../servers/ServerContext";
 import { serverNaming } from "../servers/serverNames";
-import { EMAIL_PATTERN, passwordProblem } from "../auth/authRules";
+import { EMAIL_PATTERN, authErrorCode, passwordProblem, stripAuthCode } from "../auth/authRules";
 
 interface RegisterScreenProps {
   onBackToLogin: () => void;
@@ -34,17 +34,21 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
   const [termsAccepted, setTermsAccepted] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // [2026-10-16] Which fields the player has left: their mistakes show from then on (the button waits, so it must say why).
+  const [touched, setTouched] = useState({ email: false, password: false, confirm: false });
   const consentReady = !askConsent || (ageConfirmed && termsAccepted);
+  const emailError = EMAIL_PATTERN.test(email) ? null : "Enter a valid email address.";
+  // [2026-10-15] The password rule is shared with the password reset (auth/authRules.ts): its length, then the match.
+  const passwordLengthError = passwordProblem(password, password);
+  const confirmError = confirmPassword && confirmPassword !== password ? "Passwords don't match." : null;
+  // [2026-10-16] Create account waits until every field is valid and the username check says Available (0.1.71: the name is
+  // asked for here again; an account held for approval has no session, so it could never reach the set-username step).
+  const formReady = username.ready && !emailError && !passwordProblem(password, confirmPassword) && consentReady;
 
   function validate(): string | null {
-    // [2026-10-15] The official account takes no name here: it asks for its username after the email code (the set-username
-    // step). A local server keeps its own form, with its name.
-    if (!askConsent) {
-      const usernameError = username.validate();
-      if (usernameError) return usernameError;
-    }
-    if (!EMAIL_PATTERN.test(email)) return "Enter a valid email address.";
-    // [2026-10-15] The rule is shared with the password reset (auth/authRules.ts).
+    const usernameError = username.validate();
+    if (usernameError) return usernameError;
+    if (emailError) return emailError;
     const passwordError = passwordProblem(password, confirmPassword);
     if (passwordError) return passwordError;
     if (!consentReady) return `Confirm that you are ${LEGAL.minimumAge} or older and accept the Terms of Use and Privacy Policy.`;
@@ -67,10 +71,15 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
         askConsent
           ? { termsVersion: LEGAL.termsVersion, privacyVersion: LEGAL.privacyVersion, ageConfirmed: true }
           : undefined,
-        askConsent ? undefined : username.value,
+        username.value,
       );
     } catch (err) {
-      setError(describeAuthError(err));
+      // [2026-10-16] The server refused the name after the live check passed (someone took it meanwhile): on the field.
+      if (authErrorCode(err) === "AUTH_USERNAME_REFUSED") {
+        username.setRefusal(stripAuthCode(typeof err === "string" ? err : err instanceof Error ? err.message : ""));
+      } else {
+        setError(describeAuthError(err));
+      }
     } finally {
       setSubmitting(false);
     }
@@ -87,7 +96,7 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
         <form onSubmit={handleSubmit} className="auth-form" noValidate>
           {error && <Banner>{error}</Banner>}
 
-          {!askConsent && <UsernameField field={username} disabled={submitting} />}
+          <UsernameField field={username} disabled={submitting} />
 
           <TextField
             label="Email"
@@ -95,7 +104,9 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
             autoComplete="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
+            onBlur={() => setTouched((current) => ({ ...current, email: true }))}
             disabled={submitting}
+            error={touched.email && email && emailError ? emailError : undefined}
           />
 
           <TextField
@@ -104,8 +115,10 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
             autoComplete="new-password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
+            onBlur={() => setTouched((current) => ({ ...current, password: true }))}
             disabled={submitting}
             hint="At least 8 characters."
+            error={touched.password && password && passwordLengthError ? passwordLengthError : undefined}
             rightAdornment={<RevealToggle shown={showPassword} onToggle={() => setShowPassword((v) => !v)} />}
           />
 
@@ -115,7 +128,9 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
             autoComplete="new-password"
             value={confirmPassword}
             onChange={(e) => setConfirmPassword(e.target.value)}
+            onBlur={() => setTouched((current) => ({ ...current, confirm: true }))}
             disabled={submitting}
+            error={(touched.confirm || confirmPassword.length >= password.length) && confirmError ? confirmError : undefined}
           />
 
           {askConsent && (
@@ -130,7 +145,7 @@ export function RegisterScreen({ onBackToLogin }: RegisterScreenProps) {
             />
           )}
 
-          <Button type="submit" size="lg" block loading={submitting} loadingLabel="Creating account…" disabled={!consentReady}>
+          <Button type="submit" size="lg" block loading={submitting} loadingLabel="Creating account…" disabled={!formReady}>
             Create account
           </Button>
 

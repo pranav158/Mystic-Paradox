@@ -137,6 +137,8 @@ export interface RealmLookup {
   requested?: boolean;
   /** [2026-10-16] The host invited the player and the player has not answered. */
   invited?: boolean;
+  /** [2026-10-16] The player is this realm's host. */
+  own?: boolean;
 }
 
 export async function realmLookup(serverId: string): Promise<RealmLookup> {

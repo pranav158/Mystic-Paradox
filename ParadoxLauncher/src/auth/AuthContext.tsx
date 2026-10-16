@@ -325,7 +325,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     discordPendingRef.current = false;
     const operation = ++operationRef.current;
     setAuthError(null);
-    // The consent key is sent only when the player accepted (official servers); a name only for a local server's own form.
+    // The consent key is sent only when the player accepted (official servers). [2026-10-16] The name is sent again on every
+    // server (0.1.71): an account held for approval has no session, so it could not choose its name afterwards.
     const args: Record<string, unknown> = { serverId, email, password };
     if (consent) args.consent = consent;
     if (displayName !== undefined) args.displayName = displayName;
