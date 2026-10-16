@@ -103,6 +103,8 @@ export interface RealmHostStatus {
     /** [2026-10-15] Players waiting for the host's approval. */
     joinRequestCount: number;
   } | null;
+  /** [2026-10-16] The server said this account hosts no realm yet: the panel offers to create it (realmHostCreate). */
+  noRealm: boolean;
   hub: RealmHostHub | null;
   training: RealmHostTraining | null;
   hunts: RealmHostHunt[];
@@ -189,4 +191,12 @@ export function realmHostPeople(): Promise<RealmPeople> {
 /** [2026-10-15] Sets who may join (the realm's join policy). Answers the whole status. */
 export function realmHostSetJoinPolicy(joinPolicy: RealmJoinPolicy): Promise<RealmHostStatus> {
   return invoke<RealmHostStatus>("realm_host_set_join_policy", { joinPolicy });
+}
+
+/**
+ * [2026-10-16, owner] Creates this account's realm, named after its username ("MysticFox's Realm"), and adds it to the server list.
+ * A refusal (no username yet, a name already taken) comes back as the status's error notice.
+ */
+export function realmHostCreate(joinPolicy: RealmJoinPolicy): Promise<RealmHostStatus> {
+  return invoke<RealmHostStatus>("realm_host_create", { joinPolicy });
 }

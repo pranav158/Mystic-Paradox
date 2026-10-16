@@ -515,28 +515,35 @@ test('the add form adds realms only: a refusal keeps what was typed, a success c
   }));
   assert.equal(button('Local server'), undefined, 'no local server choice');
   assert.equal(field('Server address'), undefined);
-  await act(async () => typeInto(field('Realm name'), 'friends'));
+  await act(async () => typeInto(field("Host's username"), 'friends'));
   await act(async () => typeInto(field('Name'), 'Friends'));
   await act(async () => button('Add realm').click());
   assert.deepEqual(requests, [{ kind: 'paradox_realm', name: 'Friends', realmName: 'friends' }]);
   assert.match(document.body.textContent, /There is no realm with that name\./);
-  assert.equal(field('Realm name').value, 'friends', 'the form keeps what was typed');
+  assert.equal(field("Host's username").value, 'friends', 'the form keeps what was typed');
 
   outcome = null;
   await act(async () => button('Add realm').click());
   assert.equal(requests.length, 2);
-  assert.equal(field('Realm name').value, '');
+  assert.equal(field("Host's username").value, '');
   assert.equal(field('Name').value, '');
 });
 
-test('a realm is added by name and its realm name is typed in lower case', async () => {
+// [2026-10-16, owner] A realm is named after its host's username: the player types the username, the realm name is it in lower
+// case, and the realm is labelled "<username>'s Realm" unless the player names it.
+test("a realm is added by its host's username, in lower case, labelled after the host", async () => {
   const requests = [];
   await mount(serversTab({ addServer: async (request) => { requests.push(request); return [officialServer]; } }));
-  await act(async () => typeInto(field('Realm name'), 'Ember-Hold'));
-  assert.equal(field('Realm name').value, 'ember-hold');
+  await act(async () => typeInto(field("Host's username"), 'MysticFox'));
+  assert.equal(field("Host's username").value, 'MysticFox', 'the username is shown as typed');
   await act(async () => button('Add realm').click());
-  assert.deepEqual(requests, [{ kind: 'paradox_realm', name: '', realmName: 'ember-hold' }]);
+  assert.deepEqual(requests, [{ kind: 'paradox_realm', name: "MysticFox's Realm", realmName: 'mysticfox' }]);
   assert.doesNotMatch(document.body.textContent, /pick its folder/, 'a realm plays from the official install: no folder to pick');
+
+  await act(async () => typeInto(field("Host's username"), 'ab'));
+  await act(async () => button('Add realm').click());
+  assert.equal(requests.length, 1, 'a username too short for a realm name is not sent');
+  assert.match(document.body.textContent, /Enter the host's username/);
 });
 
 test('selecting reports the native refusal on the row, and works when allowed', async () => {
@@ -1064,6 +1071,14 @@ function fakeNative(initial) {
       const { status } = native;
       switch (command) {
         case 'realm_host_status': return status;
+        // [2026-10-16] The realm is named after the account's username ("Host" in realmPanel), as the backend names it.
+        case 'realm_host_create':
+          return patch({
+            realm: { name: 'host', serving: false, joinPolicy: args.joinPolicy, joinRequestCount: 0 },
+            noRealm: false,
+            notice: "Host's Realm is ready. Start it to let players in: they add it by entering your username on the Realms page.",
+            noticeKind: 'info',
+          });
         case 'realm_host_start': return patch({ state: 'starting', notice: null, capacity: { ...status.capacity, ...args.options } });
         case 'realm_host_stop': return patch({ state: 'stopping' });
         // A member action answers its own notice, as realm.rs does (an earlier refusal does not linger).
@@ -1131,6 +1146,7 @@ function realmPanel(native, { server = officialSelected, self = 'host-account' }
     '../components/icons': icons,
     '../lib/sessions': sessionsLib,
     '../servers/ServerContext': { useServer: () => server },
+    '../servers/serverNames': serverNames,
     './realmHostApi': api,
     './realmHostModel': realmModel,
     './realmHost.css': {},
@@ -1166,6 +1182,41 @@ async function unmountNow() {
     root = undefined;
   }
 }
+
+// [2026-10-16, owner] A realm is named after its host's username: an account without one creates it, with no name to choose.
+test('an account with no realm creates it, named after its username, and only then can start it', async () => {
+  const native = fakeNative(realmStatus({ realm: null, noRealm: true }));
+  await withMockTimers(async () => {
+    await mount(realmPanel(native));
+    let text = realmText();
+    assert.match(text, /You don't have a realm yet\. Create it below\./);
+    assert.match(text, /Create your realm/);
+    assert.match(text, /Your realm is named after your username: Host's Realm\. Players add it by entering Host under Realms, Add a realm\./);
+    assert.equal(button('Start realm').disabled, true, 'nothing to start yet');
+    await act(async () => button('Public mode').click());
+    await act(async () => button('Create realm').click());
+    assert.deepEqual(native.sent('realm_host_create'), [['realm_host_create', { joinPolicy: 'PUBLIC' }]]);
+    text = realmText();
+    assert.doesNotMatch(text, /Create your realm/);
+    assert.match(text, /Host's Realm · Your realm is offline/);
+    assert.match(text, /Host's Realm is ready\./);
+    assert.equal(button('Start realm').disabled, false);
+  });
+});
+
+test('a refused create is explained where the button is, and the form stays', async () => {
+  const native = fakeNative(realmStatus({ realm: null, noRealm: true }));
+  native.refuse.realm_host_create = 'That realm name is taken.';
+  await withMockTimers(async () => {
+    await mount(realmPanel(native));
+    await act(async () => button('Create realm').click());
+    assert.deepEqual(native.sent('realm_host_create'), [['realm_host_create', { joinPolicy: 'INVITE_ONLY' }]], 'Allowlisted by default');
+    const refusal = document.querySelector('.rh .feedback.bad');
+    assert.equal(refusal?.textContent, 'That realm name is taken.');
+    assert.equal(realmText().split('That realm name is taken.').length, 2, 'said once, not again at the top');
+    assert.ok(button('Create realm'));
+  });
+});
 
 test('Start realm sends the limits, shows Starting, then Online with servers and players', async () => {
   const native = fakeNative(realmStatus());
@@ -2052,17 +2103,17 @@ test('Servers: adding a realm asks for its host; without a sign-in the note says
   const asked = [];
   const trust = { ...noTrust(), ensureHost: async (server) => { asked.push(server.id); throw new Error('Sign in to Mystic Paradox to look up this realm.'); } };
   await mount(serversTab({ addServer: async () => [officialServer, emberRealm] }, serverCtx, [], trust));
-  await act(async () => typeInto(field('Realm name'), 'ember-hold'));
+  await act(async () => typeInto(field("Host's username"), 'ember-hold'));
   await act(async () => button('Add realm').click());
   assert.deepEqual(asked, ['s-realm']);
   assert.ok(document.querySelector('.server-row[data-kind="paradox_realm"]'), 'the list shows the realm that was added');
   // [2026-10-14] A realm is named by its realm name in every message.
-  assert.match(document.body.textContent, /Added ember-hold\. You will be asked to confirm its host the first time you play\./);
+  assert.match(document.body.textContent, /Added Ember Hold\. You will be asked to confirm its host the first time you play\./);
 });
 
 test('Servers: a realm added and agreed to shows no host note', async () => {
   await mount(serversTab({ addServer: async () => [officialServer, emberRealm] }, serverCtx, [], noTrust()));
-  await act(async () => typeInto(field('Realm name'), 'ember-hold'));
+  await act(async () => typeInto(field("Host's username"), 'ember-hold'));
   await act(async () => button('Add realm').click());
   assert.doesNotMatch(document.body.textContent, /confirm its host/);
 });
@@ -2075,12 +2126,12 @@ test('Servers: a join request refused after an add says so under the add form, i
     addServer: async () => [officialServer, emberRealm],
     realmRequestJoin: async () => { throw 'That realm name is not valid.'; },
   }, serverCtx, [], noTrust()));
-  await act(async () => typeInto(field('Realm name'), 'ember-hold'));
+  await act(async () => typeInto(field("Host's username"), 'ember-hold'));
   await act(async () => button('Add realm').click());
   await act(async () => {});
   const under = document.querySelector('.add-ask .feedback');
   assert.ok(under, 'the answer is under the add form');
-  assert.equal(under.textContent, 'The join request to ember-hold was not sent: That realm name is not valid.');
+  assert.equal(under.textContent, 'The join request to Ember Hold was not sent: That realm name is not valid.');
   assert.ok(under.classList.contains('bad'));
   const row = document.querySelector('.server-row[data-kind="paradox_realm"]');
   assert.match(row.textContent, /That realm name is not valid\./, 'and on the realm\'s row');
@@ -2092,13 +2143,13 @@ test('Servers: adding a realm sends its host a join request, and the row says th
     addServer: async () => [officialServer, emberRealm],
     realmRequestJoin: async (id) => { asked.push(id); return 'REQUESTED'; },
   }, serverCtx, [], noTrust()));
-  await act(async () => typeInto(field('Realm name'), 'ember-hold'));
+  await act(async () => typeInto(field("Host's username"), 'ember-hold'));
   await act(async () => button('Add realm').click());
   await act(async () => {});
   assert.deepEqual(asked, ['s-realm']);
   const row = document.querySelector('.server-row[data-kind="paradox_realm"]');
   assert.match(row.textContent, /Request sent/);
-  assert.match(row.textContent, /Request sent to the host of ember-hold\. You can play there once they approve it\./);
+  assert.match(row.textContent, /Request sent to the host of Ember Hold\. You can play there once they approve it\./);
 });
 
 test('Servers: each realm shows where the player stands, and Ask to join sends a request', async () => {
@@ -2114,14 +2165,15 @@ test('Servers: each realm shows where the player stands, and Ask to join sends a
   }));
   await act(async () => {});
   const rowOf = (name) => [...document.querySelectorAll('.server-row')].find((row) => row.querySelector('.server-name')?.textContent === name);
-  assert.match(rowOf('realm-a').textContent, /Allowed/);
-  assert.match(rowOf('realm-b').textContent, /Request sent/);
-  assert.match(rowOf('realm-c').textContent, /Not allowed yet/);
-  assert.equal(serverRowButton(rowOf('realm-a'), 'Ask to join'), undefined);
-  await act(async () => serverRowButton(rowOf('realm-c'), 'Ask to join').click());
+  // [2026-10-16] A realm row is named by its label first (serverNaming).
+  assert.match(rowOf('A').textContent, /Allowed/);
+  assert.match(rowOf('B').textContent, /Request sent/);
+  assert.match(rowOf('C').textContent, /Not allowed yet/);
+  assert.equal(serverRowButton(rowOf('A'), 'Ask to join'), undefined);
+  await act(async () => serverRowButton(rowOf('C'), 'Ask to join').click());
   assert.deepEqual(asked, ['s-c']);
-  assert.match(rowOf('realm-c').textContent, /Allowed/);
-  assert.match(rowOf('realm-c').textContent, /You can join realm-c\./);
+  assert.match(rowOf('C').textContent, /Allowed/);
+  assert.match(rowOf('C').textContent, /You can join C\./);
 });
 
 function realmInvitesModule(api, ctx, trust = noTrust()) {
@@ -2920,15 +2972,22 @@ test('the build check has a titled header with its button on the right, and a ve
 
 // ---- [2026-10-14] The launcher's dropdown, and a realm named by its realm name --------------------------------------
 
-test('a realm is named by its realm name, with the player\'s own name under it only when it differs', () => {
-  const { serverNaming, statusNaming } = serverNames;
-  assert.deepEqual(serverNaming({ kind: 'paradox_realm', name: 'Mystic', realmName: 'mysticfox' }), { primary: 'mysticfox', secondary: 'Mystic' });
+// [2026-10-16, owner] Realms are named after their hosts' usernames: the label ("MysticFox's Realm") leads and the realm name follows.
+test('a realm is shown by its label with its realm name under it, and by its realm name alone when that is its label', () => {
+  const { serverNaming, statusNaming, realmNameForUsername, realmLabelForUsername } = serverNames;
+  assert.deepEqual(serverNaming({ kind: 'paradox_realm', name: "MysticFox's Realm", realmName: 'mysticfox' }), { primary: "MysticFox's Realm", secondary: 'mysticfox' });
   assert.deepEqual(serverNaming({ kind: 'paradox_realm', name: 'MysticFox', realmName: 'mysticfox' }), { primary: 'mysticfox', secondary: null }, 'the same name in other capitals is not a second line');
   assert.deepEqual(serverNaming({ kind: 'paradox_realm', name: '  ', realmName: 'ember-hold' }), { primary: 'ember-hold', secondary: null });
   assert.deepEqual(serverNaming({ kind: 'local', name: 'My server', realmName: null }), { primary: 'My server', secondary: null });
   assert.deepEqual(serverNaming({ kind: 'official', name: 'Mystic Paradox' }), { primary: 'Mystic Paradox', secondary: null });
   const mystic = { id: 's-2', kind: 'paradox_realm', name: 'Mystic', realmName: 'mysticfox' };
-  assert.deepEqual(statusNaming({ serverId: 's-2', serverName: 'Mystic' }, mystic), { primary: 'mysticfox', secondary: 'Mystic' });
+  assert.deepEqual(statusNaming({ serverId: 's-2', serverName: 'Mystic' }, mystic), { primary: 'Mystic', secondary: 'mysticfox' });
+  // The realm name a username gives (the backend's RealmNameForUsername) and the label.
+  assert.equal(realmNameForUsername('MysticFox'), 'mysticfox');
+  assert.equal(realmNameForUsername(' Old_Name.Two '), 'old-name-two');
+  assert.equal(realmNameForUsername('ab'), '');
+  assert.equal(realmLabelForUsername('MysticFox'), "MysticFox's Realm");
+  assert.equal(realmLabelForUsername(' '), '');
   assert.deepEqual(statusNaming({ serverId: 's-9', serverName: 'Mystic' }, mystic), { primary: 'Mystic', secondary: null }, 'another server\'s status keeps its own name');
   assert.equal(statusNaming(null, mystic), null);
   assert.equal(statusNaming({ serverId: 's-2', serverName: ' ' }, null), null);
@@ -3125,14 +3184,15 @@ test('a disabled dropdown does not open from the mouse or the keyboard', async (
   assert.deepEqual(log.changes, []);
 });
 
-test('Home names a realm by its realm name, and shows the player\'s own name under it only when it differs', async () => {
+test('Home names a realm by its label, with its realm name under it only when they differ', async () => {
   const mystic = { ...realmServer, id: 's-2', name: 'Mystic', realmName: 'mysticfox', selected: true };
   const status = { ...install, serverId: 's-2', serverKind: 'paradox_realm', serverName: 'Mystic', runtimeManaged: true };
   await mount(home({ getInstallStatus: async () => status }, undefined, undefined, { selected: mystic }));
   const identity = document.querySelector('.play-server');
-  assert.equal(identity.querySelector('.play-server-name').textContent, 'mysticfox');
-  assert.equal(identity.querySelector('.play-server-name').title, 'mysticfox');
-  assert.equal(identity.querySelector('.play-server-detail').textContent, 'Mystic');
+  // [2026-10-16] The label leads; the realm name is the second line.
+  assert.equal(identity.querySelector('.play-server-name').textContent, 'Mystic');
+  assert.equal(identity.querySelector('.play-server-name').title, 'Mystic');
+  assert.equal(identity.querySelector('.play-server-detail').textContent, 'mysticfox');
   await unmountNow();
   const same = { ...mystic, name: 'MysticFox' };
   await mount(home({ getInstallStatus: async () => ({ ...status, serverName: 'MysticFox' }) }, undefined, undefined, { selected: same }));
@@ -3146,11 +3206,11 @@ test('a realm notice on Home names the realm by its realm name', async () => {
   assert.match(document.querySelector('.banner').textContent, /^mysticfox: You were removed from the realm\./);
 });
 
-test('a realm notice records the realm the player was in, by its realm name, and none outside a realm', async () => {
+test('a realm notice records the realm the player was in, by its label, and none outside a realm', async () => {
   const inRealm = trustHarness({}, emberRealm);
   await mount(inRealm.App);
   await act(async () => inRealm.log.handlers.forEach((handler) => handler({ reason: 'BANNED', message: 'You were banned from this realm.' })));
-  assert.equal(inRealm.log.trust.notice.realm, 'ember-hold');
+  assert.equal(inRealm.log.trust.notice.realm, 'Ember Hold');
   assert.equal(inRealm.log.trust.notice.reason, 'BANNED');
   const outside = trustHarness({}, officialServer);
   await mount(outside.App);
@@ -3158,15 +3218,15 @@ test('a realm notice records the realm the player was in, by its realm name, and
   assert.equal(outside.log.trust.notice.realm, null);
 });
 
-test('the Servers page names a realm by its realm name, with the player\'s own name under it', async () => {
+test('the Servers page names a realm by its label, with its realm name under it', async () => {
   const mystic = { ...realmServer, name: 'Mystic', realmName: 'mysticfox' };
   await mount(serversTab({ listServers: async () => [officialServer, mystic] }));
   const row = document.querySelector('.server-row[data-kind="paradox_realm"]');
-  assert.equal(row.querySelector('.server-name').textContent, 'mysticfox');
-  assert.equal(row.querySelector('.server-alias').textContent, 'Mystic');
+  assert.equal(row.querySelector('.server-name').textContent, 'Mystic');
+  assert.equal(row.querySelector('.server-alias').textContent, 'mysticfox');
 });
 
-test('Library names a realm by its realm name on the Installed line', async () => {
+test('Library names a realm by its label on the Installed line', async () => {
   const mystic = { ...realmServer, id: 's-2', name: 'Mystic', realmName: 'mysticfox', selected: true };
   const { LibraryTab } = load('src/screens/dashboard/LibraryTab.tsx', {
     '../../servers/ServerContext': { useServer: () => ({ selected: mystic }) },
@@ -3184,7 +3244,7 @@ test('Library names a realm by its realm name on the Installed line', async () =
     '../../components/ArtBackdrop': { ArtBackdrop: () => null, heroArt: 'art.webp' },
   });
   await mount(LibraryTab);
-  assert.match(document.body.textContent, /Installed · mysticfox/);
+  assert.match(document.body.textContent, /Installed · Mystic/);
 });
 
 // ---- [2026-10-15] launcher 0.1.67: email codes, password resets, Discord linking, the official play switch ----------
@@ -3632,7 +3692,7 @@ test('Servers: a realm in solo mode says so and offers no Ask to join', async ()
     realmLookup: async (id) => ({ name: id, hostPublicKey: 'KEY-0123456789abcdef', fingerprint: 'x', online: true, serving: false, ownershipChanged: false, joinPolicy: 'SOLO' }),
   }));
   await act(async () => {});
-  const row = [...document.querySelectorAll('.server-row')].find((item) => item.querySelector('.server-name')?.textContent === 'realm-solo');
+  const row = [...document.querySelectorAll('.server-row')].find((item) => item.querySelector('.server-name')?.textContent === 'S');
   assert.match(row.textContent, /Unavailable: solo mode/);
   assert.equal(serverRowButton(row, 'Ask to join'), undefined);
 });
@@ -3670,7 +3730,7 @@ test('Home: an account the realm has not let in asks to join; the button then wa
   assert.ok(calls.refresh >= 1, 'the standing is read again');
   assert.equal(playButton().textContent, 'Request sent');
   assert.equal(playButton().disabled, true);
-  assert.ok(document.body.textContent.includes('Request sent to ember-hold. You can play once the host approves it.'));
+  assert.ok(document.body.textContent.includes('Request sent to Ember Hold. You can play once the host approves it.'));
 });
 
 test('Home: a refused Ask to join shows the server\'s sentence, and the button stays to try again', async () => {
@@ -3688,7 +3748,7 @@ test('Home: a request that waits shows a disabled Request sent and who it waits 
   await act(async () => {});
   assert.equal(playButton().textContent, 'Request sent');
   assert.equal(playButton().disabled, true);
-  assert.ok(document.body.textContent.includes('Waiting for the host of ember-hold to approve your request.'));
+  assert.ok(document.body.textContent.includes('Waiting for the host of Ember Hold to approve your request.'));
 });
 
 test('Home: an invite is answered on the Realms page, which the button opens', async () => {
@@ -3696,7 +3756,7 @@ test('Home: an invite is answered on the Realms page, which the button opens', a
   const Home = home({ getInstallStatus: async () => realmInstall }, undefined, undefined, { selected: emberHold, realm: { state: 'serving', own: false, standing: 'invited' } });
   await mount(Home, { onNavigate: (tab) => opened.push(tab) });
   await act(async () => {});
-  assert.ok(document.body.textContent.includes('You have an invite to ember-hold. Accept it on the Realms page.'));
+  assert.ok(document.body.textContent.includes('You have an invite to Ember Hold. Accept it on the Realms page.'));
   assert.equal(playButton().textContent, 'Open Realms');
   await act(async () => playButton().click());
   assert.deepEqual(opened, ['servers']);
@@ -3754,9 +3814,9 @@ test('Servers: a realm open to all and the host\'s own realm have their own chip
   }));
   await act(async () => {});
   const rowOf = (name) => [...document.querySelectorAll('.server-row')].find((row) => row.querySelector('.server-name')?.textContent === name);
-  assert.match(rowOf('realm-open').textContent, /Open to all/);
-  assert.equal(serverRowButton(rowOf('realm-open'), 'Ask to join'), undefined, 'Play joins it');
-  assert.match(rowOf('realm-mine').textContent, /Your realm/);
+  assert.match(rowOf('O').textContent, /Open to all/);
+  assert.equal(serverRowButton(rowOf('O'), 'Ask to join'), undefined, 'Play joins it');
+  assert.match(rowOf('M').textContent, /Your realm/);
 });
 
 test('Servers: the official server shows a red "Currently unavailable" chip beside its Official one', async () => {

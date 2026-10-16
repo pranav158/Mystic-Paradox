@@ -57,6 +57,8 @@ const SESSION_WAIT: Duration = Duration::from_secs(20);
 const BAN_REASON_LIMIT: usize = 200;
 const HOST_BUSY: &str = "HOST_BUSY";
 
+/// [2026-10-16] A claim: the realm, named after the account's username.
+const CREATE: &str = "/launcher/v1/realms";
 const MINE: &str = "/launcher/v1/realms/mine";
 const HEARTBEAT: &str = "/launcher/v1/realms/mine/heartbeat";
 const HUB_START: &str = "/launcher/v1/realm-hosting/hubs/start";
@@ -227,6 +229,8 @@ pub struct RealmHostStatus {
     pub notice: Option<String>,
     pub notice_kind: NoticeKind,
     pub realm: Option<RealmSummary>,
+    /// [2026-10-16] The server said this account hosts no realm yet: the panel offers to create it (`realm_host_create`).
+    pub no_realm: bool,
     pub hub: Option<HubSummary>,
     pub training: Option<TrainingSummary>,
     pub hunts: Vec<HuntSummary>,
@@ -451,6 +455,12 @@ fn lifecycle() -> &'static Mutex<()> {
 #[serde(rename_all = "camelCase")]
 struct HostedRealm {
     name: String,
+    /// [2026-10-16] The key the realm was claimed with: pinned on the host's own entry in the server list.
+    #[serde(default)]
+    host_public_key: String,
+    /// [2026-10-16] The host's username, for the entry's label ("MysticFox's Realm").
+    #[serde(default)]
+    host: Option<HostNameView>,
     #[serde(default)]
     members: Vec<MemberView>,
     #[serde(default)]
@@ -461,6 +471,19 @@ struct HostedRealm {
     /// [2026-10-15] Players waiting for the host's approval.
     #[serde(default)]
     join_request_count: u32,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct HostNameView {
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+/// [2026-10-16] The answer of `POST /launcher/v1/realms` (a claim): the realm as its host sees it.
+#[derive(Deserialize)]
+struct CreatedView {
+    realm: HostedRealm,
 }
 
 /// [2026-10-15] The answer of `GET .../mine/requests`.
@@ -494,6 +517,9 @@ struct MineView {
 struct RealmCache {
     fetched_at: Instant,
     hosted: Option<HostedRealm>,
+    /// [2026-10-16] The last read that answered said this account hosts no realm (a failed read leaves it as it was), so the
+    /// panel offers to create one.
+    absent: bool,
 }
 
 fn realm_cache() -> &'static Mutex<Option<RealmCache>> {
@@ -676,15 +702,147 @@ fn refresh_cache(app: &AppHandle) {
         .ok()
         .and_then(|response| response.json::<MineView>().ok())
         .map(|view| view.hosted);
-    let mut cache = lock(realm_cache());
-    let hosted = match fetched {
-        Some(hosted) => hosted,
-        None => cache.as_ref().and_then(|cache| cache.hosted.clone()),
-    };
-    *cache = Some(RealmCache {
-        fetched_at: Instant::now(),
-        hosted,
+    let answered = fetched.is_some();
+    {
+        let mut cache = lock(realm_cache());
+        let (hosted, absent) = match fetched {
+            Some(hosted) => {
+                let absent = hosted.is_none();
+                (hosted, absent)
+            }
+            None => cache
+                .as_ref()
+                .map_or((None, false), |cache| (cache.hosted.clone(), cache.absent)),
+        };
+        *cache = Some(RealmCache {
+            fetched_at: Instant::now(),
+            hosted,
+            absent,
+        });
+    }
+    // [2026-10-16, owner] The host's own realm is in this PC's list without being added by hand (once per launcher run).
+    if answered {
+        if let Some(realm) = cached_realm() {
+            list_own_realm(app, &realm);
+        }
+    }
+}
+
+/// [2026-10-16, owner] The label of the host's own realm in the server list: "MysticFox's Realm", with the username as the server
+/// spells it. The realm name when the server sent no username (or the label would be too long for a server name).
+pub(crate) fn own_realm_label(display_name: Option<&str>, realm_name: &str) -> String {
+    display_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("{name}'s Realm"))
+        .filter(|label| crate::servers::model::validate_display_name(label).is_ok())
+        .unwrap_or_else(|| realm_name.to_string())
+}
+
+/// [2026-10-16, owner] Puts the host's realm in this PC's server list, with its host key pinned, so the host never adds it by
+/// hand. Once per launcher run and realm name (a host who removes it keeps it removed until the next start). An entry that is
+/// already there only gets the key when it has none. A failure is logged and never fails the caller.
+fn list_own_realm(app: &AppHandle, realm: &HostedRealm) {
+    static LISTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    {
+        let mut listed = lock(&LISTED);
+        if listed.iter().any(|name| name == &realm.name) {
+            return;
+        }
+        listed.push(realm.name.clone());
+    }
+    let label = own_realm_label(
+        realm
+            .host
+            .as_ref()
+            .and_then(|host| host.display_name.as_deref()),
+        &realm.name,
+    );
+    let key = realm.host_public_key.trim().to_string();
+    let outcome = crate::servers::store::update(app, |list, _| {
+        let existing = list
+            .servers
+            .iter()
+            .find(|entry| entry.realm_name.as_deref() == Some(realm.name.as_str()))
+            .map(|entry| (entry.id.clone(), entry.host_public_key.is_none()));
+        let added = existing.is_none();
+        let id = match existing {
+            Some((_, false)) => return Ok(false),
+            Some((id, true)) => id,
+            None => {
+                let id = crate::servers::new_server_id(list);
+                list.add(
+                    crate::servers::NewServer {
+                        kind: Some(crate::servers::ServerKind::ParadoxRealm),
+                        name: Some(label.clone()),
+                        backend_url: None,
+                        realm_name: Some(realm.name.clone()),
+                    },
+                    id.clone(),
+                )?;
+                id
+            }
+        };
+        if !key.is_empty() {
+            list.set_host_key(&id, &key)?;
+        }
+        Ok(added)
     });
+    match outcome {
+        Ok(true) => realm_log(&format!(
+            "own realm added to the server list name={}",
+            realm.name
+        )),
+        Ok(false) => {}
+        Err(error) => {
+            lock(&LISTED).retain(|name| name != &realm.name);
+            realm_log(&format!("own realm not added to the server list: {error}"));
+        }
+    }
+}
+
+/// [2026-10-16, owner] The body of a claim (`POST /launcher/v1/realms`). No name: the server names the realm after the account's
+/// username. Never listed in the directory from here. `host_key` is the random key the realm is claimed with: joiners pin it and
+/// are warned if the name later belongs to a different host (it is compared, never used to sign).
+pub(crate) fn create_body(join_policy: &str, host_key: &str) -> Result<Value, String> {
+    if !matches!(join_policy, "SOLO" | "INVITE_ONLY" | "PUBLIC") {
+        return Err("Choose who can join your realm.".to_string());
+    }
+    let key = crate::servers::model::validate_host_key(host_key)?;
+    Ok(json!({ "hostPublicKey": key, "joinPolicy": join_policy, "listed": false }))
+}
+
+/// Claims this account's realm. The answer is the realm as its host sees it, with the key it was claimed with.
+fn create_realm(app: &AppHandle, join_policy: &str) -> Result<HostedRealm, String> {
+    let key = super::session::random_hex(32)?;
+    let body = create_body(join_policy, &key)?;
+    let response = post(app, CREATE, &body).map_err(|failure| failure.readable())?;
+    let created: CreatedView = response.json().map_err(|_| {
+        "The server created the realm, but its answer could not be read. Reopen this page."
+            .to_string()
+    })?;
+    let mut realm = created.realm;
+    if realm.host_public_key.trim().is_empty() {
+        realm.host_public_key = key;
+    }
+    realm_log(&format!(
+        "realm created name={} joinPolicy={join_policy}",
+        realm.name
+    ));
+    Ok(realm)
+}
+
+fn cached_realm() -> Option<HostedRealm> {
+    lock(realm_cache())
+        .as_ref()
+        .and_then(|cache| cache.hosted.clone())
+}
+
+/// [2026-10-16] Whether the last answer said the signed-in account hosts no realm.
+fn realm_absent() -> bool {
+    lock(realm_cache())
+        .as_ref()
+        .is_some_and(|cache| cache.absent)
 }
 
 // ---- saved limits (per server) ---------------------------------------------------------------------------------------
@@ -1037,6 +1195,7 @@ pub(super) fn snapshot(app: Option<&AppHandle>, refresh: bool) -> RealmHostStatu
             join_policy: realm.join_policy.clone(),
             join_request_count: realm.join_request_count,
         }),
+        no_realm: hosted.is_none() && realm_absent(),
         hub: hub_summary,
         training,
         hunts,
@@ -1313,6 +1472,29 @@ pub async fn realm_host_people(app: AppHandle) -> RealmPeopleStatus {
             error: Some("The player list stopped unexpectedly.".to_string()),
         },
     }
+}
+
+/// [2026-10-16, owner] Creates this account's realm, named after its username, with the chosen join policy, and puts it in this
+/// PC's server list. Players add it by entering the host's username on the Realms page.
+#[tauri::command]
+pub async fn realm_host_create(app: AppHandle, join_policy: String) -> RealmHostStatus {
+    run(app, move |app| {
+        match create_realm(app, &join_policy) {
+            Ok(realm) => {
+                list_own_realm(app, &realm);
+                let label = own_realm_label(
+                    realm.host.as_ref().and_then(|host| host.display_name.as_deref()),
+                    &realm.name,
+                );
+                set_notice(Some(format!(
+                    "{label} is ready. Start it to let players in: they add it by entering your username on the Realms page."
+                )));
+            }
+            Err(message) => set_error(message),
+        }
+        snapshot(Some(app), true)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2367,6 +2549,7 @@ mod tests {
                 join_policy: "INVITE_ONLY".into(),
                 join_request_count: 2,
             }),
+            no_realm: false,
             hub: Some(HubSummary {
                 session_id: "s".into(),
                 state: "RUNNING",
@@ -2407,9 +2590,77 @@ mod tests {
         assert_eq!(value["capacity"]["maxServers"], json!(2));
         assert_eq!(value["notice"], json!("Refused."));
         assert_eq!(value["noticeKind"], json!("error"));
+        assert_eq!(value["noRealm"], json!(false));
         let options: RealmHostOptions =
             serde_json::from_value(json!({ "maxPlayers": 16, "maxServers": 2 })).unwrap();
         assert_eq!(options.afk_seconds, None);
+    }
+
+    // [2026-10-16] A realm is named after its host's username and shown as "<username>'s Realm".
+    #[test]
+    fn the_hosts_own_realm_is_labelled_after_the_username() {
+        assert_eq!(
+            own_realm_label(Some("MysticFox"), "mysticfox"),
+            "MysticFox's Realm"
+        );
+        assert_eq!(own_realm_label(Some("  Pal "), "pal"), "Pal's Realm");
+        assert_eq!(own_realm_label(None, "mysticfox"), "mysticfox");
+        assert_eq!(own_realm_label(Some(" "), "mysticfox"), "mysticfox");
+        // A label over the 40-character server-name limit falls back to the realm name.
+        assert_eq!(own_realm_label(Some(&"a".repeat(40)), "aaaa"), "aaaa");
+    }
+
+    #[test]
+    fn a_claim_sends_no_name_and_only_a_known_join_policy() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let body = create_body("INVITE_ONLY", key).unwrap();
+        assert_eq!(
+            body,
+            json!({ "hostPublicKey": key, "joinPolicy": "INVITE_ONLY", "listed": false })
+        );
+        assert!(body.get("name").is_none());
+        for policy in ["SOLO", "PUBLIC"] {
+            assert_eq!(
+                create_body(policy, key).unwrap()["joinPolicy"],
+                json!(policy)
+            );
+        }
+        for policy in ["", "OPEN", "invite_only"] {
+            assert!(create_body(policy, key).is_err(), "{policy}");
+        }
+        assert!(create_body("PUBLIC", "short").is_err());
+    }
+
+    #[test]
+    fn a_claims_answer_carries_the_name_the_key_and_the_hosts_username() {
+        let created: CreatedView = serde_json::from_value(json!({
+            "realm": {
+                "name": "mysticfox",
+                "hostPublicKey": "KEY-0123456789abcdef",
+                "host": { "displayName": "MysticFox" },
+                "joinPolicy": "INVITE_ONLY",
+                "members": [],
+                "bans": [],
+                "joinRequestCount": 0
+            }
+        }))
+        .unwrap();
+        assert_eq!(created.realm.name, "mysticfox");
+        assert_eq!(created.realm.host_public_key, "KEY-0123456789abcdef");
+        assert_eq!(
+            created
+                .realm
+                .host
+                .and_then(|host| host.display_name)
+                .as_deref(),
+            Some("MysticFox")
+        );
+        // An older answer without the new fields still reads.
+        let older: MineView =
+            serde_json::from_value(json!({ "hosted": { "name": "ember-hold" } })).unwrap();
+        let hosted = older.hosted.unwrap();
+        assert_eq!(hosted.host_public_key, "");
+        assert!(hosted.host.is_none());
     }
 
     #[test]

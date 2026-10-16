@@ -166,6 +166,7 @@ pub fn run() {
         p2p::realm_host_cancel_invite,
         p2p::realm_host_people,
         p2p::realm_host_set_join_policy,
+        p2p::realm_host_create,
     ));
     #[cfg(not(mystic_p2p))]
     let builder = builder.invoke_handler(launcher_commands!());

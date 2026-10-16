@@ -6,7 +6,8 @@
  * a refusal comes back as its `notice` (not as a rejected call). Start goes starting -> online after 2.5 s, Stop goes
  * stopping -> stopped after 1.5 s, there are two players (one in Ramsgate, one in a hunt) and one ban. Limits follow the
  * native rules (1-64 players, 1-8 servers, 0-7200 s; set_limits works while stopped too).
- * URL switches: ?realmonline (the realm is already online), ?realmfail (Start is refused), ?realmnotice (a restart notice).
+ * URL switches: ?realmonline (the realm is already online), ?realmfail (Start is refused), ?realmnotice (a restart notice),
+ * ?norealm (the account has no realm yet: the create form; [2026-10-16] create names it after the username, "mysticfox").
  */
 import type {
   RealmHostBan,
@@ -58,6 +59,8 @@ let invites: RealmPerson[] = [
   { accountId: "acc-mira", displayName: "MiraVale", at: iso(-40) },
 ];
 const KNOWN_USERNAMES = ["LyraSpark", "BrannOak", "MiraVale", "Mysticzzz", "QuietFox"];
+// [2026-10-16] The account's realm: none with ?norealm until it is created (named after the username).
+let realmName: string | null = params.has("norealm") ? null : "ember-hold";
 
 function status(): RealmHostStatus {
   const up = state === "online" || state === "restarting";
@@ -78,7 +81,8 @@ function status(): RealmHostStatus {
     state,
     notice,
     noticeKind,
-    realm: { name: "ember-hold", serving: state === "online", joinPolicy, joinRequestCount: requests.length },
+    realm: realmName === null ? null : { name: realmName, serving: state === "online", joinPolicy, joinRequestCount: requests.length },
+    noRealm: realmName === null,
     hub,
     training,
     hunts,
@@ -169,7 +173,17 @@ export default function realmHostPreview(cmd: string, args: unknown): Promise<un
     }
     case "realm_host_status":
       return delay(status(), 120);
+    case "realm_host_create": {
+      if (realmName !== null) return say("You already host a realm. Release it before claiming another name.", 250, "error");
+      if (payload.joinPolicy !== "SOLO" && payload.joinPolicy !== "INVITE_ONLY" && payload.joinPolicy !== "PUBLIC") {
+        return say("Choose who can join your realm.", 250, "error");
+      }
+      realmName = "mysticfox";
+      joinPolicy = payload.joinPolicy;
+      return say("MysticFox's Realm is ready. Start it to let players in: they add it by entering your username on the Realms page.", 500);
+    }
     case "realm_host_start": {
+      if (realmName === null) return say("This account does not host a realm yet.", 150, "error");
       if (state !== "stopped") return say("The realm host is already running.", 150, "error");
       const problem = validate(payload.options);
       if (problem) return say(problem, 150, "error");

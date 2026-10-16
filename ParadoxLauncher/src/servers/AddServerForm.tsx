@@ -6,7 +6,7 @@ import { RealmTrustNote } from "../components/RealmTrustNote";
 import { ServersIcon, ShieldIcon } from "../components/icons";
 import { useRealmTrust } from "./RealmTrust";
 import { useServer } from "./ServerContext";
-import { serverNaming } from "./serverNames";
+import { realmLabelForUsername, realmNameForUsername, serverNaming } from "./serverNames";
 
 // [2026-10-13 realms S1] The add form, on the Servers page (the only place a server is added since 16 Oct).
 // [2026-10-14 realms] A realm added here is then asked for its host (the join popup), unless no official sign-in lets the
@@ -28,11 +28,13 @@ export interface AddServerFormProps {
   style?: CSSProperties;
 }
 
+// [2026-10-16, owner] A realm is found by its host's username (its realm name is that username in lower case), and is labelled
+// "<username>'s Realm" unless the player names it.
 export function AddServerForm({ onAdded, style }: AddServerFormProps) {
   const { sync } = useServer();
   const { ensureHost } = useRealmTrust();
   const [name, setName] = useState("");
-  const [realmName, setRealmName] = useState("");
+  const [hostName, setHostName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -53,14 +55,21 @@ export function AddServerForm({ onAdded, style }: AddServerFormProps) {
     setNote(null);
     let next: ServerView[] | undefined;
     let added: ServerView | undefined;
+    const realmName = realmNameForUsername(hostName);
+    if (!realmName) {
+      setError("Enter the host's username: 3 to 24 letters or digits.");
+      busyRef.current = false;
+      setBusy(false);
+      return;
+    }
     try {
-      next = await addServer({ kind: "paradox_realm", name, realmName });
+      next = await addServer({ kind: "paradox_realm", name: name.trim() || realmLabelForUsername(hostName), realmName });
       sync(next);
       // The new server is the one this request named: a realm name is unique in the list.
-      added = next.find((server) => server.kind === "paradox_realm" && server.realmName === realmName.trim());
+      added = next.find((server) => server.kind === "paradox_realm" && server.realmName === realmName);
       if (mountedRef.current) {
         setName("");
-        setRealmName("");
+        setHostName("");
       }
     } catch (err) {
       if (mountedRef.current) setError(friendly(err));
@@ -85,17 +94,17 @@ export function AddServerForm({ onAdded, style }: AddServerFormProps) {
           <div className="section-icon"><ServersIcon /></div>
           <div>
             <h2 className="section-title">Add a realm</h2>
-            <p className="section-desc">A community realm from the Mystic Paradox directory, by its realm name. Its host gets your join request.</p>
+            <p className="section-desc">Every realm is named after the player who hosts it. Enter their username; the host gets your join request.</p>
           </div>
         </div>
       </div>
       <div className="server-form">
         <TextField
-          label="Realm name"
-          value={realmName}
-          onChange={(event) => setRealmName(event.target.value.toLowerCase())}
-          placeholder="ember-hold"
-          hint="3 to 24 lowercase letters, digits or hyphens."
+          label="Host's username"
+          value={hostName}
+          onChange={(event) => setHostName(event.target.value)}
+          placeholder="MysticFox"
+          hint="The username of the player whose realm you want to join."
           maxLength={24}
           autoComplete="off"
           spellCheck={false}
@@ -104,7 +113,7 @@ export function AddServerForm({ onAdded, style }: AddServerFormProps) {
           label="Name (optional)"
           value={name}
           onChange={(event) => setName(event.target.value)}
-          placeholder="Defaults to the realm name"
+          placeholder={realmLabelForUsername(hostName) ? `Defaults to ${realmLabelForUsername(hostName)}` : "Defaults to <username>'s Realm"}
           maxLength={40}
           autoComplete="off"
           spellCheck={false}

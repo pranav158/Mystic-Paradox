@@ -54,15 +54,19 @@ use, which have their own policies.
   for actions taken.
 - Your IP address is used to deliver data to you and, briefly and in memory, to limit abuse such as password guessing. It
   also appears in a few security logs, for example chat connections.
-- **Testers only:** if your account has tester access and you choose "Upload last session", we receive that Play session's
-  launcher and game logs (the launcher log, the session details and the game's log files). They include your username,
-  your account ID, the folder path of your game install, and what the launcher and the game did during that session.
-  Nothing is uploaded unless you press the button, and accounts without tester access cannot upload.
+- **Log files - testers only.** The launcher keeps logs of your recent sessions on your PC (section 10). We receive them only
+  from tester accounts: our operators give tester access only to players who volunteer to help test. A tester who chooses
+  "Upload last session" sends us that Play session's launcher and game logs (the launcher log, the session details and the
+  game's log files). They include the tester's username, account ID, the folder path of the game install, and what the
+  launcher and the game did during that session. Nothing is uploaded unless the tester presses the button.
+- **Every other account:** log upload is switched off. The launcher does not offer it, our servers refuse it, and we never
+  collect your launcher or game log files.
 
 **What we do not collect**
 - No real names, dates of birth, home addresses, phone numbers or payment details.
 - No precise location.
 - No advertising or analytics trackers.
+- No launcher or game log files from players without tester access.
 
 ## 2. Why we use it
 
@@ -140,7 +144,8 @@ security problem.
 ## 10. Data on your PC
 
 The launcher stores your settings, your saved sign-in (as above), the servers you added, and logs of your recent sessions
-in `%LOCALAPPDATA%\MysticParadox\Logs`. It uses no cookies or trackers. You can remove all of it by uninstalling the
+in `%LOCALAPPDATA%\MysticParadox\Logs`. These logs stay on your PC: they are sent to us only if your account has tester
+access and you press "Upload last session" (section 1). It uses no cookies or trackers. You can remove all of it by uninstalling the
 launcher and deleting those folders.
 
 ## 11. Changes

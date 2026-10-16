@@ -7,10 +7,12 @@ import { TextField } from "../components/TextField";
 import { AccountIcon, AlertIcon, CoopIcon, InfoIcon, ServersIcon, ShieldIcon } from "../components/icons";
 import { formatClock, formatDuration, formatWhen } from "../lib/sessions";
 import { useServer } from "../servers/ServerContext";
+import { realmLabelForUsername, realmNameForUsername } from "../servers/serverNames";
 import {
   realmHostApproveRequest,
   realmHostBan,
   realmHostCancelInvite,
+  realmHostCreate,
   realmHostDenyRequest,
   realmHostInvitePlayer,
   realmHostJoinRequests,
@@ -190,6 +192,9 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
   const [people, setPeople] = useState<RealmPeople | null>(null);
   const [peopleError, setPeopleError] = useState<string | null>(null);
   const [inviteError, setInviteError] = useState<string | null>(null);
+  // [2026-10-16, owner] Creating the realm: who may join from the start (Allowlisted by default) and a refusal shown in place.
+  const [createPolicy, setCreatePolicy] = useState<RealmJoinPolicy>("INVITE_ONLY");
+  const [createError, setCreateError] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const busyRef = useRef(false);
   const dirtyRef = useRef(false);
@@ -327,9 +332,25 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
   const check = validateLimits(draft);
   const state = status?.state ?? null;
   const working = busy != null;
+  // [2026-10-16, owner] A realm is named after its host's username ("mysticfox", shown as "MysticFox's Realm"). Until the account
+  // has one, the card offers to create it; an account with no username yet (its placeholder is the account id) cannot.
+  const noRealm = status?.noRealm === true && status.realm == null;
+  const username = account?.needsUsername ? "" : (account?.displayName ?? "").trim();
+  const ownRealmName = realmNameForUsername(username);
+  const ownLabel = realmLabelForUsername(username);
+
+  const createRealm = async () => {
+    setCreateError(null);
+    const answer = await run("create", () => realmHostCreate(createPolicy), { onError: setCreateError });
+    if (!answer || !mountedRef.current) return;
+    if (answer.noticeKind === "error") {
+      setCreateError(answer.notice ?? "The launcher refused the request.");
+      setNoticeShownInline(answer.notice);
+    }
+  };
 
   const startRealm = () => {
-    if (!check.limits || state !== "stopped") return;
+    if (!check.limits || state !== "stopped" || noRealm) return;
     const limits = check.limits;
     void run("start", () => realmHostStart(limits), { force: true });
   };
@@ -446,7 +467,7 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
   let headerButton;
   if (state === "stopped" || state == null) {
     headerButton = (
-      <Button onClick={startRealm} disabled={state == null || !check.limits || working} loading={busy === "start"} loadingLabel="Starting…">
+      <Button onClick={startRealm} disabled={state == null || !check.limits || working || noRealm} loading={busy === "start"} loadingLabel="Starting…">
         Start realm
       </Button>
     );
@@ -490,8 +511,8 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
                 )}
               </h2>
               <p className="section-desc">
-                {realm && <><span className="mono">{realm.name}</span> · </>}
-                {stateText(state, uptime)}
+                {realm && <><span>{realm.name === ownRealmName && ownLabel ? ownLabel : realm.name}</span> · </>}
+                {noRealm ? "You don't have a realm yet. Create it below." : stateText(state, uptime)}
               </p>
             </div>
           </div>
@@ -521,6 +542,37 @@ function RealmHostCard({ style }: { style?: CSSProperties }) {
         {statusError && <p className="feedback bad" role="alert">Couldn't read the realm status. {statusError}</p>}
         {!status && !statusError && <div className="loader-bar rh-loading" />}
       </div>
+
+      {/* [2026-10-16, owner] Creating the realm, named after the username: no name to choose. Shown until the account has one. */}
+      {noRealm && (
+        <div className="section">
+          <div className="rh-head">
+            <h3 className="rh-heading">Create your realm</h3>
+            <span className="rh-sub">Once, for this account.</span>
+          </div>
+          {ownRealmName ? (
+            <p className="note with-icon">
+              <InfoIcon />
+              <span>
+                Your realm is named after your username: <strong>{ownLabel}</strong>. Players add it by entering{" "}
+                <strong>{username}</strong> under Realms, Add a realm.
+              </span>
+            </p>
+          ) : (
+            <p className="note with-icon">
+              <AlertIcon />
+              <span>Set your username first: your realm is named after it.</span>
+            </p>
+          )}
+          <JoinModes policy={createPolicy} disabled={working} onChoose={setCreatePolicy} />
+          {createError && <p className="feedback bad" role="alert">{createError}</p>}
+          <div className="rh-create-actions">
+            <Button onClick={() => void createRealm()} disabled={working || !ownRealmName} loading={busy === "create"} loadingLabel="Creating…">
+              Create realm
+            </Button>
+          </div>
+        </div>
+      )}
 
       {/* [2026-10-15] Who may join, the players waiting for approval, and adding a player by name. Shown once the realm exists. */}
       {realm && (

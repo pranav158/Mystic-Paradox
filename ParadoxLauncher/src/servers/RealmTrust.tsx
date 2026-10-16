@@ -13,9 +13,9 @@ import { serverNaming } from "./serverNames";
 type Host = Pick<ServerView, "id" | "kind" | "hostPublicKey">;
 
 /**
- * A realm notice as Home shows it. The launcher's notice does not name the realm, so `realm` is the realm name of the
- * selected server when it is a realm: the selection cannot change while a realm session runs, so that is the realm the
- * player was in. Null when no realm is selected.
+ * A realm notice as Home shows it. The launcher's notice does not name the realm, so `realm` is the name the selected server
+ * is shown by when it is a realm (its label, [2026-10-16] "MysticFox's Realm", or its realm name: serverNaming): the selection
+ * cannot change while a realm session runs, so that is the realm the player was in. Null when no realm is selected.
  */
 export type RealmNoticeView = RealmNotice & { realm: string | null };
 

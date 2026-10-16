@@ -9,8 +9,9 @@
 import type { ServerKind } from "../api/tauri";
 
 // [2026-10-14] How a server is named for the player. A Paradox realm is known by its realm name (the directory name, for
-// example "mysticfox"): that is what the realm directory, its host and the other players use. The name the player typed
-// when adding it is only a label on this PC, so it is shown under the realm name, and only when it differs from it.
+// example "mysticfox"): that is what the realm directory, its host and the other players use.
+// [2026-10-16, owner] Realm names are the hosts' usernames now, so a realm is shown by its label ("MysticFox's Realm") with the
+// realm name under it (serverNaming).
 
 export interface NamedServer {
   kind: ServerKind;
@@ -27,12 +28,32 @@ export interface ServerNaming {
 
 const sameName = (a: string, b: string) => a.toLocaleLowerCase() === b.toLocaleLowerCase();
 
-/** The server's names for the player. Pure, so the sign-in card, Home, the Servers page and the realm notices agree. */
+/**
+ * The server's names for the player. Pure, so the sign-in card, Home, the Servers page and the realm notices agree.
+ * [2026-10-16, owner] A realm is named after its host's username and labelled "MysticFox's Realm": the label is the main line and
+ * the realm name ("mysticfox", what players type to add it) the smaller one. A realm whose label is its realm name shows that once.
+ */
 export function serverNaming(server: NamedServer): ServerNaming {
   const name = (server.name ?? "").trim();
   const realm = (server.realmName ?? "").trim();
   if (server.kind !== "paradox_realm" || !realm) return { primary: name, secondary: null };
-  return { primary: realm, secondary: name && !sameName(name, realm) ? name : null };
+  if (!name || sameName(name, realm)) return { primary: realm, secondary: null };
+  return { primary: name, secondary: realm };
+}
+
+/**
+ * [2026-10-16, owner] The realm name a host's username gives (ParadoxBackend src/realms/realmRules.ts RealmNameForUsername): lower
+ * case, any other character becomes one hyphen, none at either end. "" when the result is not 3 to 24 characters.
+ */
+export function realmNameForUsername(username: string): string {
+  const name = username.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return /^[a-z0-9-]{3,24}$/.test(name) ? name : "";
+}
+
+/** [2026-10-16] "MysticFox's Realm": a realm's label from its host's username, as the host typed or spelled it. */
+export function realmLabelForUsername(username: string): string {
+  const name = username.trim();
+  return name ? `${name}'s Realm` : "";
 }
 
 /**

@@ -341,7 +341,7 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn random_hex(bytes: usize) -> Result<String, String> {
+pub(super) fn random_hex(bytes: usize) -> Result<String, String> {
     let mut value = vec![0u8; bytes];
     let status = unsafe {
         BCryptGenRandom(

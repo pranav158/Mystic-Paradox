@@ -277,6 +277,13 @@
   line-height: 1.5;
 }
 
+/* [2026-10-16] Create your realm: the button under the join modes, at the card's right edge. */
+.rh-create-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
 /* [2026-10-15] Add a player: the username field and its button on one line.
    [2026-10-16] The field's label, input and hint (or error) are rows of this grid (subgrid), so the button sits on the
    input's own row at the input's height. Bottom-aligned, it had dropped to the hint line. */
