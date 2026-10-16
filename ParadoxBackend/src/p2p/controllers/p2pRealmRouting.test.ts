@@ -163,6 +163,25 @@ test("a member who is not in the realm is refused with REALM_NOT_MEMBER, the req
     });
 });
 
+test("[2026-10-16] a SOLO realm refuses a member's request with REALM_SOLO (no entry); the host's own request is still served", async () => {
+    await WithKit(async (kit) => {
+        await StartRunningHub(kit);
+        kit.realms.realms.get(REALM_ID)!.joinPolicy = "SOLO";
+        kit.realms.bindPresence(MEMBER, REALM_ID);
+        const member = Harness(MEMBER);
+        assert.deepEqual(await RouteP2PHunt(member.context), { handled: true, result: true });
+        assert.deepEqual(member.cancels.map((entry) => entry.reason), ["REALM_SOLO"]);
+        assert.equal(member.candidates.size, 0);
+        assert.equal(Messages(kit, HOST, "REALM_PEER_EXPECTED").length, 0, "the host is not told to expect anyone");
+
+        kit.realms.bindPresence(HOST, REALM_ID);
+        const host = Harness(HOST);
+        assert.deepEqual(await RouteP2PHunt(host.context), { handled: true, result: true });
+        assert.equal(host.candidates.get(HOST)?.Ready, true);
+        assert.deepEqual(host.cancels, []);
+    });
+});
+
 test("a banned member is refused with REALM_BANNED, even though its presence still names the realm", async () => {
     await WithKit(async (kit) => {
         await StartRunningHub(kit);

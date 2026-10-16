@@ -51,7 +51,7 @@ const VersionPattern = /^[A-Za-z0-9._+-]{1,64}$/;
 const AccountIdPattern = /^[A-Za-z0-9._:-]{1,128}$/;
 
 function ParseJoinPolicy(value: unknown): RealmJoinPolicy | undefined {
-    return value === "INVITE_ONLY" || value === "PUBLIC" ? value : undefined;
+    return value === "INVITE_ONLY" || value === "PUBLIC" || value === "SOLO" ? value : undefined;
 }
 
 /** The host launcher's public key as text (base64, base64url or hex); only its alphabet and size are checked here. */
@@ -96,7 +96,7 @@ export function ParseCreateRealmBody(body: unknown): Parsed<CreateRealmInput> {
     let joinPolicy: RealmJoinPolicy = "INVITE_ONLY";
     if (Has(source, "joinPolicy")) {
         const parsed = ParseJoinPolicy(source.joinPolicy);
-        if (parsed === undefined) return Fail("joinPolicy must be INVITE_ONLY or PUBLIC.");
+        if (parsed === undefined) return Fail("joinPolicy must be SOLO, INVITE_ONLY or PUBLIC.");
         joinPolicy = parsed;
     }
     let listed = false;
@@ -125,7 +125,7 @@ export function ParseSettingsBody(body: unknown): Parsed<RealmSettingsInput> {
     const input: RealmSettingsInput = {};
     if (Has(source, "joinPolicy")) {
         const parsed = ParseJoinPolicy(source.joinPolicy);
-        if (parsed === undefined) return Fail("joinPolicy must be INVITE_ONLY or PUBLIC.");
+        if (parsed === undefined) return Fail("joinPolicy must be SOLO, INVITE_ONLY or PUBLIC.");
         input.joinPolicy = parsed;
     }
     if (Has(source, "listed")) {

@@ -25,6 +25,8 @@ export interface RealmSummary {
     online?: boolean;
     /** Online and the realm's Ramsgate hub running (realms IsRealmServing): the realm can be entered and hunted from. */
     serving?: boolean;
+    /** [2026-10-16] The realm's join policy; SOLO means only its host may enter, hunt or be routed there. */
+    joinPolicy?: string;
 }
 
 /** A member's realm context, as presenceOf answers it. */
@@ -86,7 +88,8 @@ export function AdaptRealmsService(
             hosting: realm.hosting === undefined ? undefined
                 : { maxServers: realm.hosting.maxServers, maxPlayers: realm.hosting.maxPlayers, afkSeconds: realm.hosting.afkSeconds },
             online: realms.IsRealmOnline(realm, nowMs),
-            serving: realms.IsRealmServing(realm, nowMs)
+            serving: realms.IsRealmServing(realm, nowMs),
+            joinPolicy: realm.joinPolicy
         };
     };
     return {

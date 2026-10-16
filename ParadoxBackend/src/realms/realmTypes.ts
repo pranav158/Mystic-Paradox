@@ -12,7 +12,8 @@
 // transport (ICE / relay), and the directory never learns or serves an IP.
 // All timestamps are ISO-8601 UTC strings (as everywhere in the backend); ISO strings of this shape compare correctly as text.
 
-export type RealmJoinPolicy = "INVITE_ONLY" | "PUBLIC";
+/** [2026-10-16] SOLO: only the host enters (members, invites and requests wait until the host chooses another policy). */
+export type RealmJoinPolicy = "INVITE_ONLY" | "PUBLIC" | "SOLO";
 export type RealmMemberRole = "HOST" | "MEMBER";
 
 export interface RealmMember {

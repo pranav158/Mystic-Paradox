@@ -250,6 +250,10 @@ async function RouteRealmRequestChecked(Context: HuntRouteContext, presence: { r
     const realm = await realms.findRealm(presence.realmId);
     if (realm == undefined) throw new LauncherApiError("REALM_NOT_FOUND", "This realm no longer exists.");
     if (await realms.isBanned(realm.realmId, requester)) throw new LauncherApiError("REALM_BANNED", "You cannot join this realm.");
+    // [2026-10-16] A SOLO realm takes nobody but its host: a member already inside cannot start a hunt or move to Training there.
+    if (realm.joinPolicy === "SOLO" && requester !== realm.hostAccountId) {
+        throw new LauncherApiError("REALM_SOLO", "This realm is in solo mode: its host is playing alone right now.");
+    }
     if (!(await realms.isMember(realm.realmId, requester))) throw new LauncherApiError("REALM_NOT_MEMBER", "You are not a member of this realm.");
     await RequireRealmHosting();
     const members = await MembersInRealm(Context, realm);

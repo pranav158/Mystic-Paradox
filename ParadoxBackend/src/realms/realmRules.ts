@@ -155,20 +155,22 @@ export function BuildInvite(input: {
 
 export type JoinDecision =
     | { allow: true; via: "MEMBER" | "PUBLIC" | "INVITE" }
-    | { allow: false; reason: "BANNED" | "INVITE_REQUIRED" | "INVITE_INVALID" | "INVITE_EXPIRED" };
+    | { allow: false; reason: "BANNED" | "SOLO" | "INVITE_REQUIRED" | "INVITE_INVALID" | "INVITE_EXPIRED" };
 
 /**
  * Who may join (plan section 5.6): a banned account never, whatever else is true (so the host's ban also beats an old
- * invite); a member or the host already is in; a PUBLIC realm lets anyone in; an INVITE_ONLY realm needs a valid invite
- * of this realm. `via: "INVITE"` tells the caller to consume one use of that invite.
+ * invite); [2026-10-16] in a SOLO realm nobody but the host, members included (no invite is used, no request is stored); a member
+ * or the host already is in; a PUBLIC realm lets anyone in; an INVITE_ONLY realm needs a valid invite of this realm.
+ * `via: "INVITE"` tells the caller to consume one use of that invite.
  */
 export function DecideJoin(
-    realm: Pick<RealmRecord, "realmId" | "joinPolicy" | "members" | "bans">,
+    realm: Pick<RealmRecord, "realmId" | "joinPolicy" | "members" | "bans"> & Partial<Pick<RealmRecord, "hostAccountId">>,
     accountId: string,
     invite: RealmInviteRecord | undefined,
     nowMs: number
 ): JoinDecision {
     if (realm.bans.some((ban) => ban.accountId === accountId)) return { allow: false, reason: "BANNED" };
+    if (realm.joinPolicy === "SOLO" && accountId !== realm.hostAccountId) return { allow: false, reason: "SOLO" };
     if (realm.members.some((member) => member.accountId === accountId)) return { allow: true, via: "MEMBER" };
     if (realm.joinPolicy === "PUBLIC") return { allow: true, via: "PUBLIC" };
     if (invite === undefined) return { allow: false, reason: "INVITE_REQUIRED" };

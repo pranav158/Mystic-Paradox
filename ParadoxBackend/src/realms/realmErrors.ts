@@ -43,6 +43,8 @@ const REALM_ERROR_STATUSES = {
     // [2026-10-13 realms hub design section 2.1] Play with a realm: the host's hub is not running (the host itself is exempt), and
     // the module is switched off on this server (a request that names a realm is refused, never played as official).
     REALM_OFFLINE: 409,
+    // [2026-10-16] The realm is in solo mode: only its host enters (Play, a join request and realm routing are refused for others).
+    REALM_SOLO: 409,
     REALMS_DISABLED: 501
 } as const;
 
@@ -64,6 +66,7 @@ export type RealmEntryErrorCode =
     | "REALM_INVITE_EXPIRED"
     | "REALM_FULL"
     | "REALM_OFFLINE"
+    | "REALM_SOLO"
     | "REALM_JOIN_REQUESTED"
     | "REALM_REQUESTS_FULL";
 
@@ -77,6 +80,7 @@ export const REALM_ENTRY_MESSAGES: Readonly<Record<RealmEntryErrorCode, string>>
     REALM_INVITE_EXPIRED: "That invite has expired, was revoked or has been used up.",
     REALM_FULL: "This realm cannot take more members.",
     REALM_OFFLINE: "This realm is offline: its host is not running it right now.",
+    REALM_SOLO: "This realm is in solo mode: its host is playing alone right now.",
     REALM_JOIN_REQUESTED: "Request sent to the host. Wait for their approval, then press Play again.",
     REALM_REQUESTS_FULL: "This realm has too many join requests waiting. Try again later."
 });

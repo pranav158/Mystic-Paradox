@@ -165,6 +165,7 @@ type JoinRequestOutcome = { member: true } | { member: false; code: "REALM_JOIN_
 /** Why DecideJoin refused, as the launcher error code (shared by join and authorizeEntry). */
 const JOIN_DENIAL_CODES = {
     BANNED: "REALM_BANNED",
+    SOLO: "REALM_SOLO",
     INVITE_REQUIRED: "REALM_INVITE_REQUIRED",
     INVITE_INVALID: "REALM_INVITE_INVALID",
     INVITE_EXPIRED: "REALM_INVITE_EXPIRED"
@@ -256,7 +257,9 @@ export function CreateRealmsService(deps: RealmsServiceDeps) {
             joinPolicy: realm.joinPolicy,
             listed: realm.listed,
             online: IsRealmOnline(realm, nowMs),
-            serving: IsRealmServing(realm, nowMs),
+            // [2026-10-16] A SOLO realm cannot be entered by anyone but its host, so to everyone else it is not serving (launchers
+            // up to 0.1.71 then show it offline; 0.1.72 reads joinPolicy SOLO and says "solo mode").
+            serving: IsRealmServing(realm, nowMs) && (realm.joinPolicy !== "SOLO" || viewerId === realm.hostAccountId),
             hubReady: IsRealmHubReady(realm),
             playerCount: counts.get(realm.realmId) ?? 0,
             version: realm.version ?? null,
@@ -634,7 +637,10 @@ export function CreateRealmsService(deps: RealmsServiceDeps) {
 
         async listListed(accountId: string, page: { limit: number; offset: number }): Promise<{ realms: RealmPublicInfo[] }> {
             Throttle("read", accountId);
-            return { realms: await PublicInfos(await repo.listListed(page.limit, page.offset), accountId) };
+            // [2026-10-16] A SOLO realm is not offered to others in the directory (it cannot be joined); its host still sees it.
+            const listed = (await repo.listListed(page.limit, page.offset))
+                .filter((realm) => realm.joinPolicy !== "SOLO" || realm.hostAccountId === accountId);
+            return { realms: await PublicInfos(listed, accountId) };
         },
 
         async updateSettings(accountId: string, settings: RealmSettingsInput): Promise<{ realm: RealmHostView }> {
