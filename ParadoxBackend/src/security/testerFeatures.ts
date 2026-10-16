@@ -11,30 +11,13 @@
 // intentionally excluded so this endpoint can't be used to self-promote or demote admins.
 export const ASSIGNABLE_ROLES: readonly string[] = ["tester"];
 
-export const TESTER_ROLE = "tester";
-
-const TESTER_CHANNELS = new Set(["stable", "beta", "dev"]);
-let TesterChannelWarned = false;
-
 /**
- * [2026-10-15] The update channel of a tester account: MYSTICPARADOX_TESTER_CHANNEL, stable unless set. Testers used to be moved to
- * beta unconditionally, but the VPS publishes only stable (runtime and Guard): a tester's launcher then found no runtime or Guard
- * manifest for its channel and could not play. Set beta only once a beta runtime and a beta Guard manifest are published.
- * [2026-10-16] Moved here from controllers/launcherPolicy.ts so the policy route and Play's channel check (security/
- * runtimeAuthorization.ts) read one rule: the check still expected beta for every tester, so a tester's Play was refused with
- * AUTH_CHANNEL_MISMATCH (409) while its policy said stable.
+ * [2026-10-16, owner] The tester role unlocks the launcher log upload (routes/launcherLogs.ts) and nothing else: a tester plays the
+ * same stable account as everyone (stable channel, production diagnostics, no unofficial-launcher exemption). It is also the target
+ * check of the operator's tester tool (controllers/testerMax.ts), which only an admin runs. The tester channel
+ * (MYSTICPARADOX_TESTER_CHANNEL) is gone: every account plays stable, and only an admin may read a non-stable feed.
  */
-export function ReadTesterChannel(environment: NodeJS.ProcessEnv = process.env, warn: (message: string) => void = console.warn):
-    "stable" | "beta" | "dev" {
-    const Raw = (environment.MYSTICPARADOX_TESTER_CHANNEL ?? "").trim().toLowerCase();
-    if (Raw === "") return "stable";
-    if (TESTER_CHANNELS.has(Raw)) return Raw as "stable" | "beta" | "dev";
-    if (!TesterChannelWarned) {
-        TesterChannelWarned = true;
-        warn(`[LauncherPolicy] MYSTICPARADOX_TESTER_CHANNEL must be stable, beta or dev; testers stay on stable`);
-    }
-    return "stable";
-}
+export const TESTER_ROLE = "tester";
 
 // Server-side allow-list: the ONLY place a logical feature id maps to the exe-relative
 // .flag filename the runtime DLL checks (MpExeRelativeFlagPresent). The admin dashboard and

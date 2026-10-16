@@ -13,6 +13,7 @@ import { Router } from "express";
 import { logger } from "../logger";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { loadGameData } from "../gameData/loader";
+import { GauntletConfigPayload, GauntletGuildRewardsPayload, GauntletLeaderboardPayload, GauntletProgressionPayload } from "../gauntletPayloads";
 const progressionconfig = loadGameData<any>("progression_config.json");
 import { GetEscalationProgress, SaveEscalationProgress } from "../controllers/escalationProgress";
 import { GetEntitlementsForUser } from "../controllers/entitlements";
@@ -515,16 +516,9 @@ systemRouter.get("/config", HasParadoxBackendAuth, (req: any, res, next) => {
     // (escalation_level, next_level_xp, talents_progress, unlock_progress, update_version) - plus
     // the gauntlet_id field the client itself references (0x14512EEC0). The client's own parse log
     // is the oracle: any change in its message tells us whether this endpoint is the one it wants.
-    const ProbePayload = (process.env.GAUNTLET_CONFIG_PROBE ?? "1") === "1"
-        ? {
-            gauntlet_id: "ESC_SEASON_1",
-            escalation_level: 0,
-            next_level_xp: 0,
-            talents_progress: [],
-            unlock_progress: [],
-            update_version: 0
-        }
-        : {};
+    // [2026-10-16] The shape OnGetSeasonDataComplete parses: {gauntlet_id, start_at, end_at} (gauntletPayloads.ts). The probe's
+    // Escalation fields were never read, and without the dates the season had ended in year 1. GAUNTLET_CONFIG_PROBE=0 still serves {}.
+    const ProbePayload = (process.env.GAUNTLET_CONFIG_PROBE ?? "1") === "1" ? GauntletConfigPayload(Date.now()) : {};
     res.status(200);
     res.json({
         code: null,
@@ -548,7 +542,7 @@ systemRouter.get("/config", HasParadoxBackendAuth, (req: any, res, next) => {
 // copy. These stubs return the same envelope every other Phoenix stub uses; the client's own
 // parser log is the oracle for refining the payloads. Every handler passes through with next()
 // for any other origin host, so no existing route is shadowed.
-const GauntletEnvelope = (payload: Record<string, unknown>) => ({
+const GauntletEnvelope = (payload: Record<string, unknown> | number | unknown[]) => ({
     code: null,
     message: "OK",
     payload
@@ -565,7 +559,7 @@ function IsGauntletOrigin(req: any): boolean {
 systemRouter.get(/^\/progression\/([^/]*)\/([^/]+)$/i, HasParadoxBackendAuth, (req: any, res, next) => {
     if (!IsGauntletOrigin(req)) { next(); return; }
     logger.info(`Gauntlet progression requested season='${req.params[0]}' user='${req.params[1]}' (1.14.7 stub)`);
-    res.status(200).json(GauntletEnvelope({}));
+    res.status(200).json(GauntletEnvelope(GauntletProgressionPayload(String(req.params[0] ?? ""))));
 });
 
 systemRouter.get(/^\/rewards\/personal\/([^/]*)\/([^/]+)$/i, HasParadoxBackendAuth, (req: any, res, next) => {
@@ -577,7 +571,7 @@ systemRouter.get(/^\/rewards\/personal\/([^/]*)\/([^/]+)$/i, HasParadoxBackendAu
 systemRouter.get(/^\/rewards\/guild\/([^/]*)\/([^/]+)$/i, HasParadoxBackendAuth, (req: any, res, next) => {
     if (!IsGauntletOrigin(req)) { next(); return; }
     logger.info(`Gauntlet guild rewards requested season='${req.params[0]}' user='${req.params[1]}' (1.14.7 stub)`);
-    res.status(200).json(GauntletEnvelope({}));
+    res.status(200).json(GauntletEnvelope(GauntletGuildRewardsPayload()));
 });
 
 // NOTE: Express 5 (path-to-regexp v6+) rejects a bare "*" route; use an explicit regex so this
@@ -585,7 +579,7 @@ systemRouter.get(/^\/rewards\/guild\/([^/]*)\/([^/]+)$/i, HasParadoxBackendAuth,
 systemRouter.get(/^\/leaderboard\/get_leaderboard\//i, HasParadoxBackendAuth, (req: any, res, next) => {
     if (!IsGauntletOrigin(req)) { next(); return; }
     logger.info(`Gauntlet leaderboard requested (1.14.7 stub)`);
-    res.status(200).json(GauntletEnvelope({ entries: [] }));
+    res.status(200).json(GauntletEnvelope(GauntletLeaderboardPayload()));
 });
 
 systemRouter.get("/huntpass/:userId", HasParadoxBackendAuth, (req: any, res) => {

@@ -8,10 +8,8 @@
 
 import { GetRepositories } from "../persistence";
 import { LauncherApiError } from "../security/launcherErrors";
-import { ReadTesterChannel as ReadTesterChannelRule, TESTER_ROLE } from "../security/testerFeatures";
 import { GetOperationsPolicy } from "../services/operationsPolicy";
 import { GetP2PExtension } from "../extensions/p2p";
-import { logger } from "../logger";
 
 export interface LauncherPolicyView {
     // Changes whenever this account's roles change; the launcher can use it to skip a
@@ -27,26 +25,21 @@ export interface LauncherPolicyView {
     [field: string]: unknown;
 }
 
-/** [2026-10-16] The tester channel rule lives in security/testerFeatures.ts (shared with Play's channel check). */
-export function ReadTesterChannel(environment: NodeJS.ProcessEnv = process.env): "stable" | "beta" | "dev" {
-    return ReadTesterChannelRule(environment, (message) => logger.warn(message));
-}
-
 export async function GetLauncherPolicy(userId: string): Promise<LauncherPolicyView> {
     const Account = await GetRepositories().launcherAccounts.findByUserId(userId);
     if (Account == undefined) {
         throw new LauncherApiError("NOT_FOUND", "Account not found.");
     }
 
-    const IsTester = Account.roles.includes(TESTER_ROLE);
+    // [2026-10-16, owner] The tester role unlocks the log upload only (security/testerFeatures.ts): a tester gets the same stable
+    // channel and production diagnostics as everyone. The development profile's verbose diagnostics are for admin accounts.
     const Operations = await GetOperationsPolicy();
-    const DevelopmentDiagnostics = Operations.diagnosticsProfile === "DEVELOPMENT" &&
-        (IsTester || Account.roles.includes("admin"));
+    const DevelopmentDiagnostics = Operations.diagnosticsProfile === "DEVELOPMENT" && Account.roles.includes("admin");
 
     return {
         policyVersion: `${Account.rolesUpdatedAt ?? Account.createdAt}:ops-${Operations.version}`,
         roles: Account.roles,
-        channel: IsTester ? ReadTesterChannel() : "stable",
+        channel: "stable",
         // Verbose diagnostics are centrally controlled, audited, and restricted to tester/admin
         // accounts. Production remains the default because one verbose hunt can generate tens of
         // megabytes and recreate the historical stdout-pipe stall class.

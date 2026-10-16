@@ -12,12 +12,13 @@ import crypto from "node:crypto";
 // the normal ledgers and never by editing documents. The kit file is game-data/tester_max_kit.json (the example is committed).
 //   progression  set-to-target XP per approved track, through the progression grant ledger (GrantProgressionXp), one grant per
 //                absolute XP block of MAX_PROGRESSION_GRANT_AMOUNT, so a repeat plans the same grant ids.
-//   slayersPath  unlockAll saves every known node as unlocked (SavePlayerJourney); grantNodeRewards grants each reward item the
-//                account does not own, one inventory transaction per item.
 //   inventory    stacked adds by catalog id (instanced items are minted by the storage policy), one inventory transaction.
-//   currencies   CURRENCY_* adds in the same inventory transaction as inventory. Prestige-gated currencies and the Platinum
-//                aggregate are refused: they are earned, or granted as a storefront bucket.
+//   currencies   CURRENCY_* adds in the same inventory transaction as inventory. The Platinum aggregate is refused (grant a
+//                storefront bucket). [2026-10-16] A prestige-gated reward currency (the Reward Cache coin) is credited without
+//                banked prestige (InventoryTransactionOptions.operatorTestFunding).
 // Every grant carries the economy source OPERATOR_TEST, which the activity monitor and the economy monitor do not count.
+// [2026-10-16, owner] No Slayer's Path section any more: a tester unlocks it in game. Its unlockAll wrote ids the 1.14.7 client
+// lacks and sent the player back to the login screen (SteamDocs/RAMSGATE_KICK_AFTER_TESTER_MAX_2026_10_16.md).
 //
 // Idempotency: a call names its runId (8-64 characters, [A-Za-z0-9._-]). Every ledger id is derived from the runId and the
 // grant's position (DeriveTesterMaxId), so repeating a call with the same runId replays its ledger rows instead of granting
@@ -36,15 +37,11 @@ const MAX_INVENTORY_ENTRIES = 200;
 const MAX_ITEM_QUANTITY = 1_000;
 const MAX_CURRENCY_ENTRIES = 50;
 const MAX_CURRENCY_QUANTITY = 10_000_000;
-// Archon.EPlayerJourneyNodeStatus in the 1.12 SDK: Locked=0, LockedButClaimable=1, Unlocked=2.
-const UNLOCKED_NODE_STATUS = 2;
-const KIT_SECTIONS: readonly string[] = ["comment", "progression", "slayersPath", "inventory", "currencies"];
-const SLAYERS_PATH_FLAGS: readonly string[] = ["unlockAll", "grantNodeRewards"];
+const KIT_SECTIONS: readonly string[] = ["comment", "progression", "inventory", "currencies"];
 
 export interface TesterMaxKit {
     comment?: string;
     progression?: Array<{ progressionId: string; targetProgress: number | "max" }>;
-    slayersPath?: { unlockAll?: boolean; grantNodeRewards?: boolean };
     inventory?: Array<{ catalogId: string; quantity: number }>;
     currencies?: Array<{ catalogId: string; quantity: number }>;
 }
@@ -54,9 +51,10 @@ export interface TesterMaxKitChecks {
     isApprovedXpTrack(progressionId: string): boolean;
     /** XP to the top regular rank, or undefined when the track has none (prestige tracks). */
     trackCapXp(progressionId: string): number | undefined;
+    /** [2026-10-16] The rank a track's progress reaches on its curve (undefined for an unknown track). */
+    rankForProgress(progressionId: string, progress: number): number | undefined;
     /** The id is in the inventory storage policy (which lists every id the game data references). */
     isKnownCatalogId(catalogId: string): boolean;
-    isPrestigeGatedCurrency(catalogId: string): boolean;
     /** The aggregate CURRENCY_PLATINUM: a view over the storefront buckets, so the kit names a bucket instead. */
     isPlatinumAggregate(catalogId: string): boolean;
     /** Largest single XP grant the ledger accepts. */
@@ -68,11 +66,13 @@ export interface TesterMaxDeps {
     findCharacterId(userId: string): Promise<string | undefined>;
     readTrackProgress(userId: string, progressionId: string): Promise<number>;
     grantXp(userId: string, progressionId: string, amount: number, grantId: string, economySource: string): Promise<unknown>;
-    readJourney(userId: string): Promise<{ nodes: Record<string, any>; updateVersion: number } | undefined>;
-    saveJourney(userId: string, nodes: Record<string, any>, updateVersion: number): Promise<{ newlyUnlocked: string[] }>;
-    /** Every node id the game knows (the served graph and the definitions) and the reward items of one node. */
-    slayersPath: { nodeIds: string[]; rewardItemIds(nodeId: string): string[] };
-    readOwnedCatalogIds(userId: string, characterId: string): Promise<Set<string>>;
+    /**
+     * [2026-10-16] Confirms a rank the track's XP qualifies for (the game's own confirm, ConfirmPublicProgressionRank; it never
+     * lowers one). XP granted outside a game session is never confirmed by the game: a tester's weapons sat at 27,775 XP with rank
+     * 0 confirmed, a state normal play never produces, and the player was sent back to the login screen right after Ramsgate.
+     */
+    confirmRank(userId: string, progressionId: string, rank: number): Promise<void>;
+    /** One inventory transaction; a prestige-gated reward currency in it is operator-funded (no banked prestige is spent). */
     runInventory(userId: string, characterId: string, transactionId: string,
         stackedAdds: Array<{ catalogId: string; quantity: number }>, economySource: string): Promise<unknown>;
 }
@@ -98,18 +98,10 @@ export interface TesterMaxProgressionReport {
     startProgress: number;
     granted: number;
     grants: number;
+    /** [2026-10-16] The rank confirmed after the grants (the rank the track's progress reaches). */
+    confirmedRank?: number;
     status: "done" | "error";
     error?: string;
-}
-
-export interface TesterMaxSlayersPathReport {
-    status: "done" | "error";
-    error?: string;
-    nodesKnown: number;
-    nodesUnlockedNow: number;
-    rewardsGranted: number;
-    rewardsOwned: number;
-    rewardsFailed: string[];
 }
 
 export interface TesterMaxReport {
@@ -118,7 +110,6 @@ export interface TesterMaxReport {
     characterId: string;
     status: "done" | "partial";
     progression: TesterMaxProgressionReport[];
-    slayersPath?: TesterMaxSlayersPathReport;
     items?: { status: "done" | "error"; error?: string; stacks: number };
 }
 
@@ -165,7 +156,8 @@ export function ValidateTesterMaxKit(kit: unknown, checks: TesterMaxKitChecks): 
     if (!IsPlainObject(kit)) return ["the kit must be a JSON object"];
     const Problems: string[] = [];
     for (const Key of Object.keys(kit)) {
-        if (!KIT_SECTIONS.includes(Key)) Problems.push(`unknown section "${Key}"`);
+        if (Key === "slayersPath") Problems.push(`slayersPath was removed (16 Oct): a tester unlocks the Slayer's Path in game`);
+        else if (!KIT_SECTIONS.includes(Key)) Problems.push(`unknown section "${Key}"`);
     }
     if (kit.comment !== undefined && typeof kit.comment !== "string") Problems.push("comment must be a string");
 
@@ -195,13 +187,6 @@ export function ValidateTesterMaxKit(kit: unknown, checks: TesterMaxKitChecks): 
                 }
             });
         }
-    }
-
-    if (kit.slayersPath !== undefined) {
-        const Flags = kit.slayersPath;
-        const Valid = IsPlainObject(Flags)
-            && Object.entries(Flags).every(([Key, Value]) => SLAYERS_PATH_FLAGS.includes(Key) && typeof Value === "boolean");
-        if (!Valid) Problems.push(`slayersPath may hold only ${SLAYERS_PATH_FLAGS.join(" and ")}, as true or false`);
     }
 
     if (kit.inventory !== undefined) {
@@ -236,8 +221,6 @@ export function ValidateTesterMaxKit(kit: unknown, checks: TesterMaxKitChecks): 
                     Problems.push(`${At}: "${String(Id)}" is not a known CURRENCY_* id`);
                 } else if (checks.isPlatinumAggregate(Id)) {
                     Problems.push(`${At}: ${Id} is the Platinum aggregate; grant a storefront bucket (CURRENCY_PLATINUM_*) instead`);
-                } else if (checks.isPrestigeGatedCurrency(Id)) {
-                    Problems.push(`${At}: ${Id} is prestige-gated; earn it through its prestige track instead`);
                 }
                 if (!Number.isSafeInteger(Row.quantity) || (Row.quantity as number) < 1 || (Row.quantity as number) > MAX_CURRENCY_QUANTITY) {
                     Problems.push(`${At}: quantity must be an integer from 1 to ${MAX_CURRENCY_QUANTITY}`);
@@ -284,55 +267,17 @@ export async function RunTesterMax(input: TesterMaxInput, deps: TesterMaxDeps): 
                 Row.granted += Step.amount;
                 Row.grants += 1;
             }
+            // [2026-10-16] Confirm the rank the track now reaches, as the game does after a level-up (also on a replay: it never lowers).
+            const Reached = checks.rankForProgress(Entry.progressionId, Math.max(Start, Target));
+            if (Reached !== undefined && Reached > 0) {
+                await deps.confirmRank(userId, Entry.progressionId, Reached);
+                Row.confirmedRank = Reached;
+            }
         } catch (Err) {
             Row.status = "error";
             Row.error = Describe(Err);
             Report.status = "partial";
         }
-    }
-
-    const Wants = kit.slayersPath ?? {};
-    if (Wants.unlockAll === true || Wants.grantNodeRewards === true) {
-        const Section: TesterMaxSlayersPathReport = {
-            status: "done", nodesKnown: deps.slayersPath.nodeIds.length, nodesUnlockedNow: 0,
-            rewardsGranted: 0, rewardsOwned: 0, rewardsFailed: []
-        };
-        Report.slayersPath = Section;
-        try {
-            if (Wants.unlockAll === true) {
-                const Stored = await deps.readJourney(userId);
-                const Nodes: Record<string, any> = { ...(Stored?.nodes ?? {}) };
-                for (const NodeId of deps.slayersPath.nodeIds) {
-                    const Existing = Nodes[NodeId] && typeof Nodes[NodeId] === "object" ? Nodes[NodeId] : {};
-                    Nodes[NodeId] = { node_id: NodeId, objectives: [], ...Existing, node_status: UNLOCKED_NODE_STATUS };
-                }
-                const Saved = await deps.saveJourney(userId, Nodes, (Stored?.updateVersion ?? 0) + 1);
-                Section.nodesUnlockedNow = Saved.newlyUnlocked.length;
-            }
-            if (Wants.grantNodeRewards === true) {
-                const Rewards = [...new Set(deps.slayersPath.nodeIds.flatMap((NodeId) => deps.slayersPath.rewardItemIds(NodeId)))].sort();
-                const Owned = await deps.readOwnedCatalogIds(userId, characterId);
-                for (const CatalogId of Rewards) {
-                    if (Owned.has(CatalogId)) {
-                        Section.rewardsOwned += 1;
-                        continue;
-                    }
-                    try {
-                        const Applied = await deps.runInventory(userId, characterId, DeriveTesterMaxId(runId, `slayer:${CatalogId}`),
-                            [{ catalogId: CatalogId, quantity: 1 }], TESTER_MAX_ECONOMY_SOURCE);
-                        if (!Applied) throw new Error("the inventory transaction did not apply");
-                        Section.rewardsGranted += 1;
-                    } catch {
-                        Section.rewardsFailed.push(CatalogId);
-                    }
-                }
-                if (Section.rewardsFailed.length > 0) Section.status = "error";
-            }
-        } catch (Err) {
-            Section.status = "error";
-            Section.error = Describe(Err);
-        }
-        if (Section.status === "error") Report.status = "partial";
     }
 
     // Items and currencies: one transaction, stacks merged by catalog id.

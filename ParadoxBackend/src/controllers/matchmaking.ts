@@ -162,7 +162,10 @@ function ClientVisibleResult(Result: MatchmakingResult): MatchmakingResult {
 export function GetCandidateStatusPeriodMillis(Result: MatchmakingResult): number {
     // Poll once per second only during the post-ready release window, then return to
     // the original 10s cadence. Existing queue behavior and timers are unchanged.
-    return Result.ReadyAt > Date.now() ? 1000 : 10000;
+    // [2026-10-16] Also once per second while still matching: a realm's Ramsgate is ready ~2-3 s after the join (the member's
+    // launcher sets up its relay link), and at 10 s the game's next poll made every Play take 10-12 s. The client reads this as
+    // the candidate's candidateStatusPeriodMillis (Ghidra: the candidate parser at 0x140E87BC0).
+    return !Result.Ready || Result.ReadyAt > Date.now() ? 1000 : 10000;
 }
 
 function GetFallbackHuntId(GameMode: string, GameArgs: string, HuntId: string | undefined){

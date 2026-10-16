@@ -154,7 +154,7 @@ characterRouter.get("/character", HasParadoxBackendAuth, async (req: any, res) =
     // client holds its own 38-character character id - and blanking that id is destructive. Measured:
     //
     //   - 8379 responses carried an empty id for real players (devrepro0039 x5045, devrepro0040 x2854,
-    //     f2aaa6bf-... x480);
+    //     <userId>-... x480);
     //   - the client was then left with no character id, so GET /loadout/<account>//all took the
     //     empty-character route and answered 400 - that route rejects real accounts by design (loadout.ts:66);
     //   - character saves had no record to update and were rejected: 476 HTTP 409s;
@@ -276,8 +276,8 @@ characterRouter.post("/character", HasParadoxBackendAuth, async (req: any, res) 
     const UpdateVersion = req.body.updateVersion;
 
     // [1.14.7 FIX 2026-10-04] The hub's phantom player saves with an EMPTY characterId - the live log showed
-    //   WARN: UpdateCharacterForUid: no character record for characterId  userId f2aaa6bf-... (isGameserver=true)
-    //   WARN: Update conflict for characterId  (userId f2aaa6bf-...) - returning HTTP 409
+    //   WARN: UpdateCharacterForUid: no character record for characterId  userId <userId>-... (isGameserver=true)
+    //   WARN: Update conflict for characterId  (userId <userId>-...) - returning HTTP 409
     //   INFO: [RES] POST /__origin/dauntless-prod.steelyard.ca/character -> 409
     // repeated continuously, so every server-authoritative save was rejected and the caller retried forever
     // (nothing the player did persisted). The READ side already solves exactly this: GET /inventory resolves

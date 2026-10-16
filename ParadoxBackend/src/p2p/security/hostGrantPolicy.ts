@@ -66,6 +66,25 @@ import { IsRamsgateHubSession } from "./hubAuthorization";
 export const HOST_DRAFT_PREMIUM_ID = "TOKEN_DAILY_CHALLENGE_DRAFT_PREMIUM";
 export const HOST_DRAFT_PREMIUM_BALANCE_CAP = 1;
 
+// [2026-10-16] One COSMETIC-class exception: the game's own starter grant. On every hub arrival of an account that lacks them, the hub
+// posts one transaction (runtime [GrantTrace] source="default") with these 13 cosmetics, TOKEN_OB_PROGRESSION and 4 daily + 4 weekly
+// draft tokens; every account outside realms holds them. Refusing it (403 [HostGrantDeny] COSMETIC) was harmless at low level, but a
+// player at the hidden ExperienceTrack_PlayerLevel rank 20 is sent back to the login screen by it: the hub's inventory failure handler
+// (FUN_141CAF150, "Failed to retrieve player inventory attempting to return to main menu", reason InventoryQueryFail) is bound while that
+// player's inventory load runs, and a failed transaction calls it (SteamDocs/RAMSGATE_KICK_AFTER_TESTER_MAX_2026_10_16.md; the hub's
+// [ReturnToMenuTrace], runtime 0.2.143). Only these exact ids, one each, as an add; every other cosmetic stays refused.
+export const HOST_STARTER_COSMETIC_IDS: ReadonlySet<string> = new Set([
+    "EM_INTRO_GENERIC_001", "EM_INTRO_GENERIC_002", "EM_INTRO_GENERIC_003", "TITLE_BLANK", "EJ_SYSTEM_TYPING",
+    "EJ_PLAYER_BOSUN_JOY", "EJ_PLAYER_KAT_PRAY", "EJ_PLAYER_MOYRA_MUSCLE", "EJ_PLAYER_GREGARIO_QUESTION", "EJ_PLAYER_MIDDLEMAN_HMM",
+    "EJ_PLAYER_PRIYANI_WINK", "EJ_PLAYER_ZAI_ANGRY", "EJ_PLAYER_ZAI_SWEAT"
+]);
+
+/** An add of one starter cosmetic (the exact id, quantity 1, or no quantity on an instanced add). */
+export function IsHostStarterCosmeticAdd(item: any): boolean {
+    return typeof item?.catalogId === "string" && HOST_STARTER_COSMETIC_IDS.has(item.catalogId)
+        && (item.quantity === undefined || item.quantity === 1);
+}
+
 /** A stacked add of exactly the draft premium token, one whole token (the id is matched exactly, case included). */
 export function IsHostDraftPremiumAdd(item: any): boolean {
     return item?.catalogId === HOST_DRAFT_PREMIUM_ID && item.quantity === 1;
@@ -188,6 +207,7 @@ export function HostGrantViolations(body: any, catalog: HostGrantCatalog = Defau
             if (field === "addStackedItems" && (IsClaimFundedCoinGrant(item) || IsPrestigeFundedGrant(item, catalog))) continue;
             if (field === "addStackedItems" && allowances.draftPremium === true && DraftPremiumAddCount === 1 && IsHostDraftPremiumAdd(item)) continue;
             if (field === "removeStackedItems" && IsPlatinumSpendItem(catalogId)) continue;
+            if ((field === "addStackedItems" || field === "addInstancedItems") && IsHostStarterCosmeticAdd(item)) continue;
             const deniedClass = ClassifyHostGrant(catalogId, catalog);
             if (deniedClass != undefined && (classes == undefined || classes.has(deniedClass))) {
                 violations.push({ catalogId, deniedClass, field });

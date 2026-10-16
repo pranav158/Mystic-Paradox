@@ -15,10 +15,8 @@ import type { EconomySource } from "../diagnostics/economyLedgerMonitor";
 import { TESTER_ROLE } from "../security/testerFeatures";
 import { GetInventoryStoragePolicy } from "../inventoryStoragePolicy";
 import { PLATINUM_AGGREGATE_ID } from "../platinumWallet";
-import { GrantProgressionXp, IsApprovedXpProgressionTrack, MAX_PROGRESSION_GRANT_AMOUNT, SavePlayerJourney, TrackCapXp } from "./progression";
-import { GetInventoryForUserIdAndCharacterId, RunInventoryTransaction } from "./inventory";
-import { GetNodeRewardItemIds } from "./slayersPath";
-import { IsPrestigeGatedReward } from "./wallet";
+import { ConfirmPublicProgressionRank, GrantProgressionXp, IsApprovedXpProgressionTrack, MAX_PROGRESSION_GRANT_AMOUNT, RankForProgress, TrackCapXp } from "./progression";
+import { RunInventoryTransaction } from "./inventory";
 import {
     IsValidTesterMaxRunId,
     RunTesterMax,
@@ -54,17 +52,11 @@ export function DefaultTesterMaxChecks(): TesterMaxKitChecks {
     return {
         isApprovedXpTrack: IsApprovedXpProgressionTrack,
         trackCapXp: TrackCapXp,
+        rankForProgress: RankForProgress,
         isKnownCatalogId: (CatalogId) => GetInventoryStoragePolicy(CatalogId) !== undefined,
-        isPrestigeGatedCurrency: IsPrestigeGatedReward,
         isPlatinumAggregate: (CatalogId) => CatalogId === PLATINUM_AGGREGATE_ID,
         maxXpGrant: MAX_PROGRESSION_GRANT_AMOUNT
     };
-}
-
-function SlayersPathNodeIds(): string[] {
-    const Served = Object.keys(tryLoadGameData<any>("slayers_path.json")?.payload?.nodes ?? {});
-    const Defined = Object.keys(tryLoadGameData<Record<string, unknown>>("slayers_path_definitions.json") ?? {});
-    return [...new Set([...Served, ...Defined])].sort();
 }
 
 /** The ledgers of the real backend: every grant goes through the same functions the game's own requests use. */
@@ -81,36 +73,16 @@ export function DefaultTesterMaxDeps(): TesterMaxDeps {
             // "gameserver": the host limits do not apply; the economy source keeps the grant out of the activity counters.
             return GrantProgressionXp(UserId, ProgressionId, Amount, GrantId, GetUnitOfWork(), undefined, "gameserver", EconomySource);
         },
-        async readJourney(UserId) {
-            const Row = await GetRepositories().playerJourney.findByUserId(UserId);
-            if (Row == undefined) return undefined;
-            let Nodes: Record<string, any> = {};
-            try { Nodes = JSON.parse(Row.nodes); } catch { Nodes = {}; }
-            return { nodes: Nodes, updateVersion: Row.updateVersion };
-        },
-        async saveJourney(UserId, Nodes, UpdateVersion) {
-            const Saved = await SavePlayerJourney(UserId, Nodes, UpdateVersion);
-            return { newlyUnlocked: Saved.newlyUnlocked };
-        },
-        slayersPath: {
-            nodeIds: SlayersPathNodeIds(),
-            rewardItemIds: (NodeId) => GetNodeRewardItemIds(NodeId)
-        },
-        async readOwnedCatalogIds(UserId, CharacterId) {
-            const Inventory = await GetInventoryForUserIdAndCharacterId(UserId, CharacterId);
-            const Owned = new Set<string>();
-            for (const Item of (Inventory?.instancedItems ?? []) as any[]) {
-                if (typeof Item?.catalogId === "string") Owned.add(Item.catalogId);
-            }
-            for (const Item of (Inventory?.stackedItems ?? []) as any[]) {
-                if (typeof Item?.catalogId === "string" && Number(Item.quantity) > 0) Owned.add(Item.catalogId);
-            }
-            return Owned;
+        async confirmRank(UserId, ProgressionId, Rank) {
+            const Result = await ConfirmPublicProgressionRank(UserId, ProgressionId, Rank);
+            if (!Result.ok) throw new Error(`rank ${Rank} confirm refused: ${Result.reason}`);
         },
         async runInventory(UserId, CharacterId, TransactionId, StackedAdds, EconomySource) {
             // The character was read from this account's own records just above, so the ownership check is not repeated.
             return RunInventoryTransaction(UserId, CharacterId, TransactionId, [], StackedAdds, [], [], [], {
                 ownershipAlreadyValidated: true,
+                // [2026-10-16] The Reward Cache coin is prestige-gated; this admin tool credits it without banked prestige.
+                operatorTestFunding: true,
                 economy: { source: EconomySource as EconomySource }
             });
         }
@@ -123,13 +95,8 @@ function ReportSummary(Report: TesterMaxReport): Record<string, unknown> {
         status: Report.status,
         progression: Report.progression.map((Row) => ({
             progressionId: Row.progressionId, target: Row.target, startProgress: Row.startProgress,
-            granted: Row.granted, grants: Row.grants, status: Row.status
+            granted: Row.granted, grants: Row.grants, confirmedRank: Row.confirmedRank, status: Row.status
         })),
-        slayersPath: Report.slayersPath === undefined ? undefined : {
-            status: Report.slayersPath.status, nodesUnlockedNow: Report.slayersPath.nodesUnlockedNow,
-            rewardsGranted: Report.slayersPath.rewardsGranted, rewardsOwned: Report.slayersPath.rewardsOwned,
-            rewardsFailed: Report.slayersPath.rewardsFailed.length
-        },
         items: Report.items === undefined ? undefined : { status: Report.items.status, stacks: Report.items.stacks }
     };
 }

@@ -435,6 +435,11 @@ export type InventoryTransactionOptions = {
     // Set only by POST /inventory for dedicated-server requests; store purchases and every other caller leave it off.
     allowChallengeRewardFunding?: boolean;
 
+    // [2026-10-16] Lets the admin tester tool (controllers/testerMax.ts, economy source OPERATOR_TEST) credit a prestige-gated reward
+    // currency (the Reward Cache coin CURRENCY_SEASONAL_COIN) without banked prestige. Set by that tool only; every other caller
+    // leaves it off.
+    operatorTestFunding?: boolean;
+
     // [diagnostics 2026-10-14] Where this transaction came from, for the economy ledger (diagnostics/economyLedgerMonitor.ts):
     // a store purchase names its SKU, a player-host transaction names its P2P session and host. Absent = OTHER. Monitoring only.
     economy?: EconomyScope;
@@ -522,7 +527,7 @@ export async function RunInventoryTransaction(UserId: string, CharacterId: strin
             // whole transaction before anything below it runs.
             StepStartedAt = Date.now();
             const TouchedCurrencyBalances = await ApplyCurrencyDeltas(UserId, EffectiveStackedItemsToAdd, StackedItemsToRemove, Session,
-                TransactionId, Options.allowChallengeRewardFunding === true, Ledger);
+                TransactionId, Options.allowChallengeRewardFunding === true, Ledger, Options.operatorTestFunding === true);
             Timing.wallet += Date.now() - StepStartedAt;
 
             // Non-inventory grants (entitlements, progression) - see InventoryTransactionOptions.onGrant.

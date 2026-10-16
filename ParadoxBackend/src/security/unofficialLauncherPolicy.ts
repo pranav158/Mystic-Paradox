@@ -17,7 +17,8 @@ import type { LauncherBuildReport, LauncherBuildVerdict } from "../activity/acti
 // is raised either way. The report is the launcher's own word, so this fences off self-built and repackaged launchers, not a launcher
 // modified to lie.
 // Exempt even with refuse: hashes in MYSTICPARADOX_LAUNCHER_ALLOWED_HASHES (comma or space separated SHA-256, for local test builds), and
-// accounts with the tester or admin role unless MYSTICPARADOX_UNOFFICIAL_LAUNCHER_TESTERS_EXEMPT=off.
+// accounts with the admin role unless MYSTICPARADOX_UNOFFICIAL_LAUNCHER_TESTERS_EXEMPT=off (the tester role was exempt too until 16 Oct;
+// it now unlocks the log upload only, security/testerFeatures.ts).
 
 export const UNOFFICIAL_LAUNCHER_ENV = "MYSTICPARADOX_UNOFFICIAL_LAUNCHER";
 export const LAUNCHER_ALLOWED_HASHES_ENV = "MYSTICPARADOX_LAUNCHER_ALLOWED_HASHES";
@@ -32,7 +33,7 @@ export interface UnofficialLauncherPolicy {
     mode: UnofficialLauncherMode;
     /** Lower-case SHA-256 hashes that count as official too (local test builds). */
     allowedHashes: ReadonlySet<string>;
-    /** Accounts with the tester or admin role are exempt (default). */
+    /** Accounts with the admin role are exempt (default). The variable keeps its old name. */
     testersExempt: boolean;
     /** What was wrong with the variables, if anything (an unknown mode, malformed hashes). */
     warnings: string[];
@@ -67,7 +68,7 @@ export function UnofficialLauncherRefuses(verdict: LauncherBuildVerdict, report:
     roles: readonly string[], policy: UnofficialLauncherPolicy): boolean {
     if (policy.mode !== "refuse" || verdict !== "unofficial") return false;
     if (report !== undefined && policy.allowedHashes.has(report.sha256.toLowerCase())) return false;
-    if (policy.testersExempt && (roles.includes("tester") || roles.includes("admin"))) return false;
+    if (policy.testersExempt && roles.includes("admin")) return false;
     return true;
 }
 

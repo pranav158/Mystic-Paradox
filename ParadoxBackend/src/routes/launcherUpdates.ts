@@ -5,7 +5,6 @@ import path from "node:path";
 import { HasLauncherAuth } from "../middleware/HasLauncherAuth";
 import { GetRepositories } from "../persistence";
 import { LauncherApiError, SendLauncherError } from "../security/launcherErrors";
-import { TESTER_ROLE } from "../security/testerFeatures";
 import { IsRateLimited } from "../security/rateLimit";
 import { GetP2PExtension } from "../extensions/p2p";
 
@@ -192,7 +191,7 @@ export function segment(value: unknown, label: string): string {
 // update files: downloads are unauthenticated on the stable channel (the runtime DLL is ~3 MB, the launcher
 // installer ~5 MB), and the publish routes are IP- and key-gated but still worth bounding. Same budgets as the
 // public fix (180/min downloads, 30/min publishes), on the module's existing in-memory limiter. Called inside the
-// handlers because per-route middleware loosens Express's req.params typing (see isTesterChannelAllowed).
+// handlers because per-route middleware loosens Express's req.params typing (see isNonStableChannelAllowed).
 function rejectIfRateLimited(req: Request, res: Response, bucket: "update-download" | "update-publish"): boolean {
     const max = bucket === "update-download" ? 180 : 30;
     if (!IsRateLimited(`${bucket}:${normalizeIp(req.ip) || "unknown"}`, max, 60_000)) return false;
@@ -367,14 +366,14 @@ function serveRuntimeDownload(target: string, channel: string, platform: string,
 
 // "stable" stays fully public/unauthenticated (unchanged behavior — the launcher checks it
 // before a player has necessarily finished signing in). "beta"/"dev" require a signed-in
-// account with the tester role, closing the gap where anyone with the URL could previously
+// admin account (the tester role until 16 Oct), closing the gap where anyone with the URL could previously
 // fetch or download a non-stable manifest regardless of account state.
 //
 // Called from inside each route handler rather than registered as a separate Express
 // middleware — passing a generically-typed middleware into router.get(path, middleware,
 // handler) makes Express's overloaded .get() typings fall back to a looser req.params type
 // (string | string[] instead of the path-inferred shape), which breaks tsc.
-async function isTesterChannelAllowed(req: Request, res: Response): Promise<boolean> {
+async function isNonStableChannelAllowed(req: Request, res: Response): Promise<boolean> {
     const channel = String(req.params.channel ?? "");
     if (channel === "stable") return true;
 
@@ -382,10 +381,11 @@ async function isTesterChannelAllowed(req: Request, res: Response): Promise<bool
     await HasLauncherAuth(req, res, () => { authorized = true; });
     if (!authorized) return false; // HasLauncherAuth already sent the error response.
 
+    // [2026-10-16, owner] The tester role no longer opens a non-stable feed (security/testerFeatures.ts); only an admin account may.
     const AuthData = (req as any).LauncherAuthData;
     const Account = await GetRepositories().launcherAccounts.findByUserId(AuthData.userId);
-    if (!Account || !Account.roles.includes(TESTER_ROLE)) {
-        SendLauncherError(res, new LauncherApiError("AUTH_TESTER_REQUIRED", "Tester access is required for this channel."));
+    if (!Account || !Account.roles.includes("admin")) {
+        SendLauncherError(res, new LauncherApiError("AUTH_CHANNEL_MISMATCH", "Your account currently requires the stable runtime channel."));
         return false;
     }
     return true;
@@ -393,26 +393,26 @@ async function isTesterChannelAllowed(req: Request, res: Response): Promise<bool
 
 launcherUpdatesRouter.get("/launcher/v1/runtime/:target/:channel/:platform", async (req, res) => {
     if (!RUNTIME_TARGETS.has(req.params.target)) { res.sendStatus(400); return; }
-    if (!(await isTesterChannelAllowed(req, res))) return;
+    if (!(await isNonStableChannelAllowed(req, res))) return;
     serveRuntimeManifest(req.params.target, req.params.channel, req.params.platform, res);
 });
 
 // Backward-compatible client endpoint used by existing launchers.
 launcherUpdatesRouter.get("/launcher/v1/runtime/:channel/:platform", async (req, res) => {
-    if (!(await isTesterChannelAllowed(req, res))) return;
+    if (!(await isNonStableChannelAllowed(req, res))) return;
     serveRuntimeManifest("client", req.params.channel, req.params.platform, res);
 });
 
 launcherUpdatesRouter.get("/launcher/v1/runtime/:target/:channel/:platform/download", async (req, res) => {
     if (rejectIfRateLimited(req, res, "update-download")) return;
     if (!RUNTIME_TARGETS.has(req.params.target)) { res.sendStatus(400); return; }
-    if (!(await isTesterChannelAllowed(req, res))) return;
+    if (!(await isNonStableChannelAllowed(req, res))) return;
     serveRuntimeDownload(req.params.target, req.params.channel, req.params.platform, res);
 });
 
 launcherUpdatesRouter.get("/launcher/v1/runtime/:channel/:platform/download", async (req, res) => {
     if (rejectIfRateLimited(req, res, "update-download")) return;
-    if (!(await isTesterChannelAllowed(req, res))) return;
+    if (!(await isNonStableChannelAllowed(req, res))) return;
     serveRuntimeDownload("client", req.params.channel, req.params.platform, res);
 });
 
@@ -421,7 +421,7 @@ launcherUpdatesRouter.get("/launcher/v1/runtime/:channel/:platform/download", as
 // The sequence is strictly increasing per channel/platform and every accepted version is kept
 // immutable so clients can retain an anti-rollback floor.
 launcherUpdatesRouter.get("/launcher/v1/guard-manifests/:channel/:platform", async (req, res) => {
-    if (!(await isTesterChannelAllowed(req, res))) return;
+    if (!(await isNonStableChannelAllowed(req, res))) return;
     try {
         const file = guardManifestPath(String(req.params.channel), String(req.params.platform));
         const envelope = readJson(file);
@@ -610,7 +610,7 @@ launcherUpdatesRouter.post(
 launcherUpdatesRouter.get("/launcher/v1/runtime/:target/:channel/:platform/extra/:filename", async (req, res) => {
     if (rejectIfRateLimited(req, res, "update-download")) return;
     if (!RUNTIME_TARGETS.has(req.params.target)) { res.sendStatus(400); return; }
-    if (!(await isTesterChannelAllowed(req, res))) return;
+    if (!(await isNonStableChannelAllowed(req, res))) return;
     try {
         const target = segment(req.params.target, "target");
         const channel = segment(req.params.channel, "channel");

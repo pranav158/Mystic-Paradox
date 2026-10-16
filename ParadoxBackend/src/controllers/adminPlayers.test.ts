@@ -14,8 +14,8 @@ test("player ids from ?ids= are trimmed, de-duplicated, checked and capped at 10
     assert.equal(ParsePlayerIds(undefined), undefined);
     assert.equal(ParsePlayerIds(""), undefined);
     assert.equal(ParsePlayerIds(["a"]), undefined);
-    assert.deepEqual(ParsePlayerIds(" 0b7c3a52-1f4e-4d2a-9c61-5e8f2d7a4b10 , a9b71ec6,0b7c3a52-1f4e-4d2a-9c61-5e8f2d7a4b10"),
-        ["0b7c3a52-1f4e-4d2a-9c61-5e8f2d7a4b10", "a9b71ec6"]);
+    assert.deepEqual(ParsePlayerIds(" 0b7c3a52-1f4e-4d2a-9c61-5e8f2d7a4b10 , c0ffee01,0b7c3a52-1f4e-4d2a-9c61-5e8f2d7a4b10"),
+        ["0b7c3a52-1f4e-4d2a-9c61-5e8f2d7a4b10", "c0ffee01"]);
     assert.deepEqual(ParsePlayerIds("ok,../x,a b,$where,ok_2"), ["ok", "ok_2"]);
     const Many = Array.from({ length: 150 }, (_, index) => `id-${index}`).join(",");
     assert.equal(ParsePlayerIds(Many)?.length, 100);

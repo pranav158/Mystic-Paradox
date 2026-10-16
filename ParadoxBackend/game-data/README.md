@@ -72,3 +72,9 @@ simply stays unavailable; nothing else changes and `npm test` does not require i
 `POST /admin/v1/players/:userId/tester-max` (controllers/testerMax.ts) reads this file. Copy `tester_max_kit.example.json`
 and extend it with ids confirmed in `inventory_storage_policy.json` and `Items_Analysis/catalog_1_14_7.jsonl`. Without the file
 the route answers 503; an invalid kit answers 422 with every problem listed. The kit never names a catalog id the policy does not know.
+
+Sections: `progression` (XP targets), `inventory` and `currencies`. There is no Slayer's Path section (removed 16 Oct): a tester
+unlocks it in game. Our own kit sets player level and the seven weapon tracks to level 20 (player-level XP follows weapon XP in
+the game, so weapons at 20 need player level 20; each reached rank is confirmed) and grants Rams, Combat Merits (`CURRENCY_PJM_WEAPON`),
+Aether Dust (`CURRENCY_CELLDUST`) and Reward Cache coins (`CURRENCY_SEASONAL_COIN`, prestige-gated: this tool credits it without
+banked prestige).

@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { LiveHubStatus, MatchmakingResult } from "./matchmaking";
 import { CandidateStatusAnswerFor, REALM_FULL_RETRY_AFTER_SECONDS } from "./candidateStatus";
+import { GetCandidateStatusPeriodMillis } from "./matchmaking";
 
 // [2026-10-14 realms S2] GET /candidate/status: the answer built from the candidate. The non-realm answers are the ones the route gave
 // before the move (a dedicated or hunt candidate, the Ramsgate's live check); a realm hub candidate is answered from its own loopback
@@ -48,13 +49,13 @@ test("a missing candidate is a 404 with no body", async () => {
     assert.deepEqual(await CandidateStatusAnswerFor(USER, undefined, options), { status: 404 });
 });
 
-test("a dedicated hunt candidate that is still matching keeps its hunt id and ISLAND (unchanged)", async () => {
+test("a dedicated hunt candidate that is still matching keeps its hunt id and ISLAND, and polls once per second (16 Oct)", async () => {
     const { options, fetches } = Options();
     const answer = await CandidateStatusAnswerFor(USER, Candidate(), options);
     assert.equal(answer.status, 200);
     assert.deepEqual(answer.body, {
         candidateId: "candidate-1",
-        candidateStatusPeriodMillis: 10000,
+        candidateStatusPeriodMillis: 1000,
         gameMode: "ISLAND",
         huntId: "ShatteredIsles_IslandA",
         playerStates: { [USER]: {} },
@@ -153,4 +154,11 @@ test("a realm hub candidate cancelled with its reason says so, and a Training hu
     assert.equal(cancelled.body?.gameMode, "SHARED");
     assert.equal(cancelled.body?.huntId, null);
     assert.equal("retryAfterSeconds" in (cancelled.body ?? {}), false);
+});
+
+test("[2026-10-16] the poll period: once per second while matching and in the release window, 10 s once the server is given", () => {
+    // A realm's Ramsgate is ready ~2-3 s after the join; at 10 s the game's next poll made every Play take 10-12 s.
+    assert.equal(GetCandidateStatusPeriodMillis(Candidate({ Ready: false })), 1000);
+    assert.equal(GetCandidateStatusPeriodMillis(Candidate({ Ready: true, ReadyAt: Date.now() + 5000 })), 1000);
+    assert.equal(GetCandidateStatusPeriodMillis(Candidate({ Ready: true, ReadyAt: 0 })), 10000);
 });

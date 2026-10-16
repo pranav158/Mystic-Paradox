@@ -883,7 +883,7 @@ progressionRouter.get("/pjm/:userId", HasParadoxBackendAuth, async (req: any, re
 
 // [1.14.7 2026-10-03] GET /weapon_tracker/:userId/:itemId had no route at all, so it 404'd while the
 // client was loading player data and its weapon-tracker component logged a failure:
-//   [REQ]  GET progression-prod.steelyard.ca/weapon_tracker/f2aaa6bf-…/RHLDQHG6UNBG3KROD7MWHKZSKU
+//   [REQ]  GET progression-prod.steelyard.ca/weapon_tracker/<userId>-…/RHLDQHG6UNBG3KROD7MWHKZSKU
 //   WARN:  Unstubbed route GET /weapon_tracker/… -> 404
 //   [LogArchonWeaponTracker][Error] UWeaponTrackerComponent::ReadWeaponTrackersFromBackend::<lambda_…>
 // The SDK gives the response contract:

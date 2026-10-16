@@ -10,7 +10,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { LauncherApiError } from "./launcherErrors";
-import { ReadTesterChannel, TESTER_ROLE } from "./testerFeatures";
 
 export const RUNTIME_CHANNELS = ["stable", "beta", "dev"] as const;
 export type RuntimeChannel = typeof RUNTIME_CHANNELS[number];
@@ -117,25 +116,22 @@ function ArtifactSetDigest(artifacts: RuntimeArtifactHash[]): string {
         .digest("hex");
 }
 
-/** The channel returned by the current launcher policy for this account. */
-/** [2026-10-16] A tester's channel is MYSTICPARADOX_TESTER_CHANNEL (stable unless set), the same rule the policy route answers. */
-export function ExpectedRuntimeChannel(roles: readonly string[], environment: NodeJS.ProcessEnv = process.env): RuntimeChannel {
-    return roles.includes(TESTER_ROLE) ? ReadTesterChannel(environment) : "stable";
+/**
+ * The channel returned by the current launcher policy for this account.
+ * [2026-10-16, owner] Stable for every account: the tester role no longer moves a launcher to another channel (security/testerFeatures.ts).
+ */
+export function ExpectedRuntimeChannel(_roles: readonly string[]): RuntimeChannel {
+    return "stable";
 }
 
 /**
  * Enforces the server-derived policy channel rather than trusting the channel declared by a
- * launcher. This deliberately rejects a non-tester claiming stable while actually retaining a
+ * launcher. This deliberately rejects an account claiming stable while actually retaining a
  * cached beta DLL once the runtime hash check below is also applied.
  */
-export function AssertRuntimeChannelMatchesAccount(requested: RuntimeChannel, roles: readonly string[],
-    environment: NodeJS.ProcessEnv = process.env): void {
-    const Expected = ExpectedRuntimeChannel(roles, environment);
+export function AssertRuntimeChannelMatchesAccount(requested: RuntimeChannel, roles: readonly string[]): void {
+    const Expected = ExpectedRuntimeChannel(roles);
     if (requested === Expected) return;
-
-    if (requested !== "stable" && !roles.includes(TESTER_ROLE)) {
-        throw new LauncherApiError("AUTH_TESTER_REQUIRED", "Tester access is required for this channel.");
-    }
 
     throw new LauncherApiError(
         "AUTH_CHANNEL_MISMATCH",

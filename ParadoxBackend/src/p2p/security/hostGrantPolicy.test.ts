@@ -8,6 +8,7 @@ import {
     HostGrantCatalog,
     HostGrantDenial,
     HostGrantViolations,
+    HOST_STARTER_COSMETIC_IDS,
     IsClaimFundedCoinGrant,
     IsHostDraftPremiumAdd,
     IsPrestigeFundedGrant
@@ -331,4 +332,33 @@ test("a Training hub keeps its blanket refusal of the draft premium token, and a
     assert.deepEqual(HostGrantDenial(TRAINING_HUB, token, CATALOG, allowed)?.classes, ["NO_REWARD_SESSION"]);
     assert.equal(HostGrantDenial(RAMSGATE_HUB, token, CATALOG, allowed), undefined);
     assert.deepEqual(HostGrantDenial(RAMSGATE_HUB, token, CATALOG)?.classes, ["HUNT_PASS"], "without the decision the hub refuses it as before");
+});
+
+// [2026-10-16] The hub's starter grant (runtime [GrantTrace] source="default"), exactly as it posts it on a hub arrival.
+const STARTER_DEFAULT_GRANT = {
+    addStackedItems: [
+        ...[...HOST_STARTER_COSMETIC_IDS].map((catalogId) => ({ catalogId, quantity: 1 })),
+        { catalogId: "TOKEN_OB_PROGRESSION", quantity: 1 },
+        { catalogId: "TOKEN_DAILY_CHALLENGE_DRAFT", quantity: 4 },
+        { catalogId: "TOKEN_WEEKLY_CHALLENGE_DRAFT", quantity: 4 }
+    ]
+};
+
+test("[2026-10-16] the game's starter grant is not refused: its refusal sent a level-20 player back to the login screen", () => {
+    assert.equal(HOST_STARTER_COSMETIC_IDS.size, 13);
+    assert.deepEqual(HostGrantViolations(STARTER_DEFAULT_GRANT, CATALOG), []);
+    assert.equal(HostGrantDenial({ guardCompletionMode: "NO_COMPLETION", sessionKind: "REALM_HUB", hubKind: "RAMSGATE" } as any,
+        STARTER_DEFAULT_GRANT, CATALOG), undefined, "a realm's Ramsgate hub accepts it");
+    assert.deepEqual(HostGrantViolations({ addInstancedItems: [{ catalogId: "EM_INTRO_GENERIC_001", instanceId: "EM_INTRO_GENERIC_001" }] }, CATALOG), []);
+});
+
+test("[2026-10-16] only the starter ids, one each, are exempt: other cosmetics and larger quantities stay refused", () => {
+    const Refused = HostGrantViolations({ addStackedItems: [
+        { catalogId: "EM_INTRO_GENERIC_001", quantity: 2 },
+        { catalogId: "EM_INTRO_3POINT_00", quantity: 1 },
+        { catalogId: "TITLE_PHOENIX_00", quantity: 1 },
+        { catalogId: "em_intro_generic_001", quantity: 1 }
+    ] }, CATALOG);
+    assert.deepEqual(Refused.map((entry) => entry.catalogId), ["EM_INTRO_GENERIC_001", "EM_INTRO_3POINT_00", "TITLE_PHOENIX_00", "em_intro_generic_001"]);
+    assert.equal(Refused.every((entry) => entry.deniedClass === "COSMETIC"), true);
 });

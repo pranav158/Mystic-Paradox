@@ -7,6 +7,7 @@ import { UsePersistenceForTest } from "../persistence";
 import { gameDataDir } from "../gameData/loader";
 import { OpenTestRealm } from "../persistence/sqlite/testSupport";
 import { GrantProgressionXp } from "./progression";
+import { ApplyCurrencyDeltas, InsufficientPrestigeProgressError, IsPrestigeGatedReward } from "./wallet";
 import { FlushActivity } from "../activity/activityMonitor";
 import { DefaultTesterMaxChecks, DefaultTesterMaxDeps, TesterMaxPlayer } from "./testerMax";
 import { DeriveTesterMaxId, RunTesterMax, TesterMaxDeps, TesterMaxKit, ValidateTesterMaxKit } from "./testerMaxCore";
@@ -39,7 +40,6 @@ test("XP through the real ledger: set-to-target in absolute blocks, OPERATOR_TES
     const Deps: TesterMaxDeps = {
         ...DefaultTesterMaxDeps(),
         findCharacterId: async () => "character-1",
-        readOwnedCatalogIds: async () => new Set<string>(),
         runInventory: async () => true
     };
     const Checks = DefaultTesterMaxChecks();
@@ -47,6 +47,9 @@ test("XP through the real ledger: set-to-target in absolute blocks, OPERATOR_TES
     assert.equal(First.status, "done");
     assert.equal(First.progression[0].grants, 3);
     assert.equal((await Repos.progressionTracks.get(USER, "ExperienceTrack_PlayerLevel"))?.progress, 250_000);
+    // [2026-10-16] The reached rank is confirmed through the game's own confirm (the top rank, 20, at 141,020 XP).
+    assert.equal(First.progression[0].confirmedRank, 20);
+    assert.equal((await Repos.progressionTracks.get(USER, "ExperienceTrack_PlayerLevel"))?.confirmedFremiumRank, 20);
 
     for (let Index = 0; Index < 3; Index++) {
         const Grant = await Repos.progressionGrants.findByGrantId(DeriveTesterMaxId(RUN, `xp:ExperienceTrack_PlayerLevel:${Index}`));
@@ -76,6 +79,17 @@ test("XP through the real ledger: set-to-target in absolute blocks, OPERATOR_TES
     await FlushActivity();
     const Control = await Repos.activity.findDailyRows("control-user", "2000-01-01", "2099-12-31", 10);
     assert.equal(Control.length >= 1, true);
+});
+
+test("[2026-10-16] the Reward Cache coin: refused without banked prestige, credited by the tester tool's operator funding", async () => {
+    const Realm = OpenTestRealm("tester-max-coin");
+    Cleanups.push(Realm.cleanup);
+    UsePersistenceForTest({ repos: Realm.repos, uow: Realm.uow });
+    const Coin = [{ catalogId: "CURRENCY_SEASONAL_COIN", quantity: 500 }];
+    assert.equal(IsPrestigeGatedReward("CURRENCY_SEASONAL_COIN"), true);
+    await assert.rejects(ApplyCurrencyDeltas("coin-user", Coin, []), (Err: unknown) => Err instanceof InsufficientPrestigeProgressError);
+    const Balances = await ApplyCurrencyDeltas("coin-user", Coin, [], undefined, "tmax-coin", false, undefined, true);
+    assert.equal(Balances.CURRENCY_SEASONAL_COIN, 500);
 });
 
 // The route's refusals that come before any kit or ledger work. The repository stands in for the accounts and audit collections.

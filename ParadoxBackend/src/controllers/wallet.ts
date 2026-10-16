@@ -285,7 +285,7 @@ async function SpendBankedPrestigeForReward(userId: string, catalogId: string, q
 // client what actually happened, right now" fix already applied to non-currency stacked items in
 // RunInventoryTransaction (see inventory.ts's BUG D fix comment).
 export async function ApplyCurrencyDeltas(userId: string, adds: any[], removes: any[], session?: ClientSession, transactionId?: string, allowChallengeRewardFunding = false,
-    ledger?: EconomyLedger): Promise<Record<string, number>> {
+    ledger?: EconomyLedger, operatorTestFunding = false): Promise<Record<string, number>> {
     const TouchedBalances: Record<string, number> = {};
     if (!userId || userId === NO_PLAYER_SENTINEL) return TouchedBalances;
 
@@ -301,6 +301,11 @@ export async function ApplyCurrencyDeltas(userId: string, adds: any[], removes: 
             if (Funded) {
                 MonitorPrestigeFunding(userId, Item.catalogId, Quantity, [],
                     `funded by season challenge ${Funded.bountyId} (claimedAt ${Funded.claimedAt ?? "before 10 Oct 14:00"})`);
+            } else if (operatorTestFunding) {
+                // [2026-10-16] The admin tester tool's grant (InventoryTransactionOptions.operatorTestFunding): no prestige is spent.
+                if (IsPrestigeGatedReward(Item.catalogId)) {
+                    MonitorPrestigeFunding(userId, Item.catalogId, Quantity, [], "funded by the operator tester tool (OPERATOR_TEST)");
+                }
             } else {
                 await SpendBankedPrestigeForReward(userId, Item.catalogId, Quantity, session);
             }

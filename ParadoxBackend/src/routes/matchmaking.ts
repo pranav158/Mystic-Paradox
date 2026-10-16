@@ -14,7 +14,7 @@ import { Router } from "express";
 import crypto from "node:crypto";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { logger } from "../logger";
-import { CancelMatchmakingForLeave, CheckAndUpdateQueueStatus, FetchLiveHubStatus, HandlePlayerMatchmaking } from "../controllers/matchmaking";
+import { CancelMatchmakingForLeave, CheckAndUpdateQueueStatus, FetchLiveHubStatus, GetCandidateStatusPeriodMillis, HandlePlayerMatchmaking } from "../controllers/matchmaking";
 import { CandidateStatusAnswerFor } from "../controllers/candidateStatus";
 import { GetPartyForPlayer } from "../controllers/party";
 import { sessionRegistry } from "../realtime/SessionRegistry";
@@ -293,6 +293,8 @@ matchmakingRouter.post("/candidate/join", HasParadoxBackendAuth, async (req: any
     res.status(200);
     res.json({
         candidateId: MatchmakingEntry!.CandidateId,
+        // [2026-10-16] Without it the client waited its default 10 s before the first status poll.
+        candidateStatusPeriodMillis: GetCandidateStatusPeriodMillis(MatchmakingEntry!),
         gameMode: GameMode,
         huntId: MatchmakingEntry!.HuntId,
         status: "MATCHING",

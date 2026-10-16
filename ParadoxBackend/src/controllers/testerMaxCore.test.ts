@@ -24,8 +24,8 @@ function Checks(overrides: Partial<TesterMaxKitChecks> = {}): TesterMaxKitChecks
     return {
         isApprovedXpTrack: (Id) => Id.startsWith("ExperienceTrack_"),
         trackCapXp: (Id) => (Id === "ExperienceTrack_PrestigeLess" ? undefined : 27_775),
+        rankForProgress: (_Id, Progress) => (Progress >= 27_775 ? 20 : Math.floor(Progress / 10_000)),
         isKnownCatalogId: (Id) => ["AC_HEAD_ARMSTRONG_00", "CURRENCY_NOTES", "CURRENCY_PLATINUM", "CURRENCY_PLATINUM_CS", "CURRENCY_SEASONAL_COIN", "R1", "R2", "R3"].includes(Id),
-        isPrestigeGatedCurrency: (Id) => Id === "CURRENCY_SEASONAL_COIN",
         isPlatinumAggregate: (Id) => Id === "CURRENCY_PLATINUM",
         maxXpGrant: MAX_GRANT,
         ...overrides
@@ -35,22 +35,18 @@ function Checks(overrides: Partial<TesterMaxKitChecks> = {}): TesterMaxKitChecks
 interface Recorded {
     xp: Array<{ userId: string; progressionId: string; amount: number; grantId: string; economySource: string }>;
     inventory: Array<{ transactionId: string; stacked: Array<{ catalogId: string; quantity: number }>; economySource: string }>;
-    saves: Array<{ nodes: Record<string, any>; updateVersion: number }>;
+    confirms: Array<{ progressionId: string; rank: number }>;
 }
 
 function FakeDeps(options: {
     progress?: Record<string, number>;
     characterId?: string;
-    journal?: { nodes: Record<string, any>; updateVersion: number } | undefined;
-    owned?: string[];
-    rewardsByNode?: Record<string, string[]>;
-    nodeIds?: string[];
     failXpFor?: string;
     inventoryApplies?: boolean;
     failInventoryFor?: string;
 } = {}): { deps: TesterMaxDeps; recorded: Recorded; progress: Record<string, number> } {
     const progress: Record<string, number> = { ...(options.progress ?? {}) };
-    const recorded: Recorded = { xp: [], inventory: [], saves: [] };
+    const recorded: Recorded = { xp: [], inventory: [], confirms: [] };
     const deps: TesterMaxDeps = {
         async findCharacterId() { return options.characterId ?? CHARACTER; },
         async readTrackProgress(_userId, progressionId) { return progress[progressionId] ?? 0; },
@@ -60,16 +56,7 @@ function FakeDeps(options: {
             progress[progressionId] = (progress[progressionId] ?? 0) + amount;
             return undefined;
         },
-        async readJourney() { return options.journal; },
-        async saveJourney(_userId, nodes, updateVersion) {
-            recorded.saves.push({ nodes: JSON.parse(JSON.stringify(nodes)), updateVersion });
-            return { newlyUnlocked: Object.keys(nodes).filter((Id) => nodes[Id].node_status === 2 && !(options.journal?.nodes?.[Id]?.node_status === 2)) };
-        },
-        slayersPath: {
-            nodeIds: options.nodeIds ?? ["N1", "N2"],
-            rewardItemIds: (NodeId) => options.rewardsByNode?.[NodeId] ?? []
-        },
-        async readOwnedCatalogIds() { return new Set(options.owned ?? []); },
+        async confirmRank(_userId, progressionId, rank) { recorded.confirms.push({ progressionId, rank }); },
         async runInventory(_userId, _characterId, transactionId, stacked, economySource) {
             if (options.failInventoryFor !== undefined && stacked.some((Item) => Item.catalogId === options.failInventoryFor)) {
                 throw new Error("inventory refused");
@@ -136,7 +123,6 @@ test("run ids: 8 to 64 characters of letters, digits, dot, underscore, hyphen; a
 const GOOD_KIT: TesterMaxKit = {
     comment: "test kit",
     progression: [{ progressionId: "ExperienceTrack_PlayerLevel", targetProgress: "max" }, { progressionId: "ExperienceTrack_Weapon_Sword", targetProgress: 5_000 }],
-    slayersPath: { unlockAll: true, grantNodeRewards: true },
     inventory: [{ catalogId: "AC_HEAD_ARMSTRONG_00", quantity: 1 }],
     currencies: [{ catalogId: "CURRENCY_NOTES", quantity: 1_000_000 }, { catalogId: "CURRENCY_PLATINUM_CS", quantity: 500 }]
 };
@@ -171,10 +157,10 @@ test("progression: unapproved, duplicated, out-of-range and uncapped tracks are 
     assert.equal(Problems.length, 5);
 });
 
-test("slayersPath accepts only the two flags as booleans", () => {
-    assert.deepEqual(ValidateTesterMaxKit({ slayersPath: { unlockAll: true, grantNodeRewards: false } }, Checks()), []);
-    assert.equal(ValidateTesterMaxKit({ slayersPath: { unlockAll: "yes" } }, Checks()).length, 1);
-    assert.equal(ValidateTesterMaxKit({ slayersPath: { unlockEverything: true } }, Checks()).length, 1);
+test("[2026-10-16] a kit with a slayersPath section is refused, with the reason: the section was removed", () => {
+    // Its unlockAll wrote Slayer's Path ids the 1.14.7 client lacks, and the player was sent back to the login screen after Ramsgate.
+    assert.deepEqual(ValidateTesterMaxKit({ slayersPath: { unlockAll: true } }, Checks()),
+        ["slayersPath was removed (16 Oct): a tester unlocks the Slayer's Path in game"]);
 });
 
 test("inventory: unknown catalog ids are refused (never invented), currencies are redirected, quantities bounded", () => {
@@ -193,7 +179,7 @@ test("inventory: unknown catalog ids are refused (never invented), currencies ar
     assert.equal(Problems.length, 4);
 });
 
-test("currencies: the Platinum aggregate and prestige-gated currencies are refused with the way to grant them", () => {
+test("currencies: the Platinum aggregate is refused with the way to grant it; a prestige-gated reward coin is accepted", () => {
     const Problems = ValidateTesterMaxKit({
         currencies: [
             { catalogId: "CURRENCY_PLATINUM", quantity: 10 },
@@ -203,10 +189,9 @@ test("currencies: the Platinum aggregate and prestige-gated currencies are refus
         ]
     }, Checks());
     assert.equal(Problems[0].includes("is the Platinum aggregate; grant a storefront bucket (CURRENCY_PLATINUM_*)"), true);
-    assert.equal(Problems[1].includes("is prestige-gated; earn it through its prestige track"), true);
-    assert.equal(Problems[2].includes('"AC_HEAD_ARMSTRONG_00" is not a known CURRENCY_* id'), true);
-    assert.equal(Problems[3].includes("quantity must be an integer from 1 to 10000000"), true);
-    assert.equal(Problems.length, 4);
+    assert.equal(Problems[1].includes('"AC_HEAD_ARMSTRONG_00" is not a known CURRENCY_* id'), true);
+    assert.equal(Problems[2].includes("quantity must be an integer from 1 to 10000000"), true);
+    assert.equal(Problems.length, 3, "CURRENCY_SEASONAL_COIN (the Reward Cache coin) is not a problem any more");
 });
 
 // ---- the run ----
@@ -247,7 +232,8 @@ test("XP: each track is granted in its plan, every grant carries OPERATOR_TEST a
     ]);
     assert.equal(progress.ExperienceTrack_PlayerLevel, 250_000);
     assert.deepEqual(Report.progression[0], {
-        progressionId: "ExperienceTrack_PlayerLevel", target: 250_000, startProgress: 0, granted: 250_000, grants: 3, status: "done"
+        progressionId: "ExperienceTrack_PlayerLevel", target: 250_000, startProgress: 0, granted: 250_000, grants: 3, confirmedRank: 20,
+        status: "done"
     });
 });
 
@@ -317,54 +303,75 @@ test("items and currencies go in one inventory transaction, stacks merged by cat
     assert.deepEqual(Report.items, { status: "done", stacks: 2 });
 });
 
-test("Slayer's Path: every known node is saved unlocked with its existing fields kept and the version advanced", async () => {
-    const { deps, recorded } = FakeDeps({
-        journal: { nodes: { N1: { node_id: "N1", node_status: 0, objectives: ["kept"] } }, updateVersion: 3 },
-        nodeIds: ["N1", "N2"],
-        rewardsByNode: {}
-    });
+test("[2026-10-16] our kit: the seven weapon tracks to level 20 and four currencies in one transaction, nothing else", async () => {
+    const Weapons = ["Axe", "ChainBlades", "Hammer", "Repeaters", "Spear", "Strikers", "Sword"].map((Name) => `ExperienceTrack_Weapon_${Name}`);
+    const { deps, recorded, progress } = FakeDeps();
     const Report = await RunTesterMax({
-        userId: USER, runId: RUN, kit: { slayersPath: { unlockAll: true } }, checks: Checks()
+        userId: USER, runId: RUN,
+        kit: {
+            progression: Weapons.map((Id) => ({ progressionId: Id, targetProgress: "max" as const })),
+            currencies: [
+                { catalogId: "CURRENCY_NOTES", quantity: 8_000_000 },
+                { catalogId: "CURRENCY_SEASONAL_COIN", quantity: 50_000 }
+            ]
+        },
+        checks: Checks()
     }, deps);
-    assert.equal(recorded.saves.length, 1);
-    assert.equal(recorded.saves[0].updateVersion, 4);
-    assert.deepEqual(recorded.saves[0].nodes.N1, { node_id: "N1", objectives: ["kept"], node_status: 2 });
-    assert.deepEqual(recorded.saves[0].nodes.N2, { node_id: "N2", objectives: [], node_status: 2 });
-    assert.equal(Report.slayersPath?.status, "done");
-    assert.equal(Report.slayersPath?.nodesKnown, 2);
+    assert.equal(Report.status, "done");
+    assert.deepEqual(Weapons.map((Id) => progress[Id]), Weapons.map(() => 27_775));
+    assert.equal(recorded.xp.some((G) => G.progressionId === "ExperienceTrack_PlayerLevel"), false);
+    assert.equal(recorded.inventory.length, 1);
+    assert.deepEqual(recorded.inventory[0].stacked, [
+        { catalogId: "CURRENCY_NOTES", quantity: 8_000_000 },
+        { catalogId: "CURRENCY_SEASONAL_COIN", quantity: 50_000 }
+    ]);
+    assert.equal(Object.hasOwn(Report, "slayersPath"), false);
+    // [2026-10-16] Each weapon's level 20 is confirmed, as the game does: XP at the cap with rank 0 confirmed kicked the player.
+    assert.deepEqual(recorded.confirms, Weapons.map((Id) => ({ progressionId: Id, rank: 20 })));
+    assert.deepEqual(Report.progression.map((Row) => Row.confirmedRank), Weapons.map(() => 20));
 });
 
-test("Slayer's Path rewards: one inventory transaction per reward the account does not own, OPERATOR_TEST, no duplicates", async () => {
-    const { deps, recorded } = FakeDeps({
-        owned: ["R2"],
-        nodeIds: ["N1", "N2"],
-        rewardsByNode: { N1: ["R1", "R2"], N2: ["R2", "R3"] }
-    });
-    const Report = await RunTesterMax({
-        userId: USER, runId: RUN, kit: { slayersPath: { grantNodeRewards: true } }, checks: Checks()
-    }, deps);
-    assert.deepEqual(recorded.inventory.map((I) => I.stacked), [
-        [{ catalogId: "R1", quantity: 1 }],
-        [{ catalogId: "R3", quantity: 1 }]
-    ]);
-    assert.deepEqual(recorded.inventory.map((I) => I.transactionId), [
-        DeriveTesterMaxId(RUN, "slayer:R1"),
-        DeriveTesterMaxId(RUN, "slayer:R3")
-    ]);
-    assert.equal(recorded.inventory.every((I) => I.economySource === "OPERATOR_TEST"), true);
-    assert.equal(Report.slayersPath?.rewardsGranted, 2);
-    assert.equal(Report.slayersPath?.rewardsOwned, 1);
-    assert.equal(Report.slayersPath?.status, "done");
-    assert.equal(recorded.saves.length, 0);
+test("[2026-10-16] the reached rank is confirmed on a replay too (the confirm never lowers), and rank 0 is not confirmed", async () => {
+    const { deps, recorded } = FakeDeps({ progress: { ExperienceTrack_Weapon_Sword: 27_775 } });
+    const Kit: TesterMaxKit = { progression: [{ progressionId: "ExperienceTrack_Weapon_Sword", targetProgress: "max" }] };
+    const Replay = await RunTesterMax({ userId: USER, runId: RUN, kit: Kit, checks: Checks() }, deps);
+    assert.equal(Replay.progression[0].grants, 0);
+    assert.deepEqual(recorded.confirms, [{ progressionId: "ExperienceTrack_Weapon_Sword", rank: 20 }]);
+    const Low = FakeDeps();
+    await RunTesterMax({
+        userId: USER, runId: RUN, kit: { progression: [{ progressionId: "ExperienceTrack_Weapon_Axe", targetProgress: 500 }] }, checks: Checks()
+    }, Low.deps);
+    assert.deepEqual(Low.recorded.confirms, []);
 });
 
-test("one failing track or reward does not stop the others: the report is partial and names what failed", async () => {
+test("[2026-10-16] a refused rank confirm marks that track as an error; the other tracks and the currencies still run", async () => {
+    const { deps, recorded } = FakeDeps();
+    deps.confirmRank = async (_userId, progressionId) => {
+        if (progressionId === "ExperienceTrack_Weapon_Axe") throw new Error("rank 20 confirm refused: insufficient_xp");
+        recorded.confirms.push({ progressionId, rank: 20 });
+    };
+    const Report = await RunTesterMax({
+        userId: USER, runId: RUN,
+        kit: {
+            progression: [
+                { progressionId: "ExperienceTrack_Weapon_Axe", targetProgress: "max" },
+                { progressionId: "ExperienceTrack_Weapon_Sword", targetProgress: "max" }
+            ],
+            currencies: [{ catalogId: "CURRENCY_NOTES", quantity: 5 }]
+        },
+        checks: Checks()
+    }, deps);
+    assert.equal(Report.status, "partial");
+    assert.equal(Report.progression[0].status, "error");
+    assert.match(Report.progression[0].error ?? "", /insufficient_xp/);
+    assert.equal(Report.progression[1].confirmedRank, 20);
+    assert.equal(Report.items?.status, "done");
+});
+
+test("one failing track does not stop the others: the report is partial and names what failed", async () => {
     const { deps, recorded } = FakeDeps({
         failXpFor: "ExperienceTrack_Weapon_Sword",
-        progress: {},
-        nodeIds: ["N1"],
-        rewardsByNode: { N1: ["R1", "R2"] },
-        failInventoryFor: "R2"
+        progress: {}
     });
     const Report = await RunTesterMax({
         userId: USER, runId: RUN,
@@ -373,7 +380,6 @@ test("one failing track or reward does not stop the others: the report is partia
                 { progressionId: "ExperienceTrack_Weapon_Sword", targetProgress: 5_000 },
                 { progressionId: "ExperienceTrack_PlayerLevel", targetProgress: 5_000 }
             ],
-            slayersPath: { grantNodeRewards: true },
             currencies: [{ catalogId: "CURRENCY_NOTES", quantity: 5 }]
         },
         checks: Checks()
@@ -383,8 +389,6 @@ test("one failing track or reward does not stop the others: the report is partia
     assert.equal(Report.progression[0].error, "ledger unavailable");
     assert.equal(Report.progression[1].status, "done");
     assert.equal(recorded.xp.some((G) => G.progressionId === "ExperienceTrack_PlayerLevel"), true);
-    assert.deepEqual(Report.slayersPath?.rewardsFailed, ["R2"]);
-    assert.equal(Report.slayersPath?.status, "error");
     assert.equal(Report.items?.status, "done");
     assert.equal(recorded.inventory.some((I) => I.transactionId === DeriveTesterMaxId(RUN, "items")), true);
 });

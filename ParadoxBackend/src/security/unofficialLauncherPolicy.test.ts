@@ -27,7 +27,7 @@ test("[2026-10-16] allowed test-build hashes are read case-insensitively; malfor
     assert.equal(policy.warnings.length, 1);
 });
 
-test("[2026-10-16] with refuse, only an unofficial build is refused; outdated, unknown, allowed hashes and testers play on", () => {
+test("[2026-10-16] with refuse, only an unofficial build is refused; outdated, unknown, allowed hashes and admins play on", () => {
     const refuse = ReadUnofficialLauncherPolicy({ MYSTICPARADOX_UNOFFICIAL_LAUNCHER: "refuse",
         MYSTICPARADOX_LAUNCHER_ALLOWED_HASHES: TEST_BUILD });
     const player: string[] = ["player"];
@@ -36,10 +36,10 @@ test("[2026-10-16] with refuse, only an unofficial build is refused; outdated, u
     assert.equal(UnofficialLauncherRefuses("outdated", report(SELF_BUILT, "0.1.60"), player, refuse), false);
     assert.equal(UnofficialLauncherRefuses("unknown", undefined, player, refuse), false);
     assert.equal(UnofficialLauncherRefuses("unofficial", report(TEST_BUILD, "0.1.69"), player, refuse), false);
-    assert.equal(UnofficialLauncherRefuses("unofficial", report(SELF_BUILT), ["tester"], refuse), false);
+    // [2026-10-16, owner] The tester role is no exemption any more (it unlocks the log upload only).
     assert.equal(UnofficialLauncherRefuses("unofficial", report(SELF_BUILT), ["admin"], refuse), false);
     const strict = { ...refuse, testersExempt: false };
-    assert.equal(UnofficialLauncherRefuses("unofficial", report(SELF_BUILT), ["tester"], strict), true);
+    assert.equal(UnofficialLauncherRefuses("unofficial", report(SELF_BUILT), ["admin"], strict), true);
     // observe never refuses.
     assert.equal(UnofficialLauncherRefuses("unofficial", report(SELF_BUILT), player, ReadUnofficialLauncherPolicy({})), false);
 });
