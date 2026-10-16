@@ -191,6 +191,80 @@ struct RouteReadyRequest<'a> {
 
 enum SupervisorCommand {
     Stop,
+    /// [2026-10-16] A hunt join's member entered a realm hub: end once the game has left the hunt (`hunt_join_leave_outcome`),
+    /// not at once. A loop that does not tell the commands apart treats it as `Stop`.
+    StopWhenGameLeaves,
+}
+
+/// [2026-10-16] How long the game must send nothing to a hunt it is leaving before the hunt's join ends, and the longest a join
+/// waits for that. The transport writes `UDP_STATS` every 2 s, so 6 s is three lines without a new packet from the game.
+pub(super) const GAME_LEFT_IDLE: Duration = Duration::from_secs(6);
+pub(super) const HUNT_JOIN_LEAVE_MAX: Duration = Duration::from_secs(120);
+
+/// The game's packets into a join (`localRx` of the transport's `UDP_STATS` line), and when that count last grew.
+pub(super) struct GameTrafficWatch {
+    local_rx: Option<u64>,
+    last_change: Instant,
+}
+
+impl GameTrafficWatch {
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            local_rx: None,
+            last_change: now,
+        }
+    }
+
+    /// One diagnostic line: a `UDP_STATS` line with a larger `localRx` than the last one moves `last_change` to `now`.
+    pub(super) fn observe(&mut self, line: &str, now: Instant) {
+        if let Some(rx) = udp_stats_local_rx(line) {
+            let grew = match self.local_rx {
+                Some(previous) => rx > previous,
+                None => true,
+            };
+            if grew {
+                self.last_change = now;
+            }
+            self.local_rx = Some(rx);
+        }
+    }
+
+    /// Restarts the idle clock (when the leave is asked: the game may not have sent anything for a while before).
+    pub(super) fn restart(&mut self, now: Instant) {
+        self.last_change = now;
+    }
+
+    pub(super) fn idle(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_change)
+    }
+}
+
+/// `localRx` of a transport `UDP_STATS` line (`UDP_STATS role=join path=remote localRx=1184 ...`), or None.
+pub(super) fn udp_stats_local_rx(line: &str) -> Option<u64> {
+    if !line.contains("UDP_STATS") {
+        return None;
+    }
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("localRx="))
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+/// [2026-10-16] Whether a hunt join asked to end when its game leaves may end now: "game_left" once the game has sent nothing for
+/// `GAME_LEFT_IDLE`, "timeout" after `HUNT_JOIN_LEAVE_MAX`. The hub's entry (JOIN_RENDEZVOUS) comes when the airship's matchmaking
+/// starts, before the game travels: ending the hunt's join there cut the link the game still needed, and the game timed out to the
+/// login screen (16 Oct 09:29 UTC).
+pub(super) fn hunt_join_leave_outcome(
+    asked_at: Instant,
+    traffic: &GameTrafficWatch,
+    now: Instant,
+) -> Option<&'static str> {
+    if traffic.idle(now) >= GAME_LEFT_IDLE {
+        Some("game_left")
+    } else if now.saturating_duration_since(asked_at) >= HUNT_JOIN_LEAVE_MAX {
+        Some("timeout")
+    } else {
+        None
+    }
 }
 
 /// One supervised session. `kind`, `hub_kind`, `handle` and `live` are set once the bootstrap says what the session is
@@ -474,6 +548,15 @@ fn child_exit_reason(child: &mut HostProcess) -> String {
 
 fn drain_transport_diagnostics(log: &SharedLog, link: Link) {
     for line in link.drain_diagnostics() {
+        append_log(log, "transport", &line);
+    }
+}
+
+/// [2026-10-16] A join's diagnostics: logged, and the game's traffic counted (`GameTrafficWatch`).
+fn drain_join_diagnostics(log: &SharedLog, link: Link, traffic: &mut GameTrafficWatch) {
+    let now = Instant::now();
+    for line in link.drain_diagnostics() {
+        traffic.observe(&line, now);
         append_log(log, "transport", &line);
     }
 }
@@ -1314,38 +1397,24 @@ fn hunt_joins(
         .collect()
 }
 
-/// [2026-10-15] Ends this launcher's hunt joins before a realm hub join starts, and waits (up to three seconds) for them to
-/// unregister. The backend ends a hunt when its member asks for a hub (`NoteHubReturn`) and sends the member's launcher no
-/// fence for it, so nothing else stops the hunt's transport session: the game is back in the hub, while the host still
-/// lists the member in the hunt. The hub's entry (`JOIN_RENDEZVOUS` with `sessionKind` `REALM_HUB`) is the one signal
-/// that the account has left its hunt, and one account is in one place. False when a join did not end in time (the hub
-/// join then starts anyway, as the transport allows it for a second session).
-pub fn stop_hunt_joins_for_hub_join() -> bool {
+/// [2026-10-15] Ends this launcher's hunt joins when a realm hub join starts. The backend ends a hunt when its member asks for
+/// a hub (`NoteHubReturn`) and sends the member's launcher no fence for it, so nothing else stops the hunt's transport session:
+/// the game is back in the hub, while the host still lists the member in the hunt. The hub's entry (`JOIN_RENDEZVOUS` with
+/// `sessionKind` `REALM_HUB`) is the one signal that the account is leaving its hunt, and one account is in one place.
+/// [2026-10-16] That entry comes when the airship's matchmaking starts, while the game still plays the hunt and needs its link
+/// to travel: ending the join at once timed the game out to the login screen (16 Oct 09:29 UTC). Each hunt join is now asked to
+/// end once its game has left (`SupervisorCommand::StopWhenGameLeaves`: no packet from the game for `GAME_LEFT_IDLE`, at most
+/// `HUNT_JOIN_LEAVE_MAX`); the hub join starts alongside, as the transport runs several sessions. Returns at once.
+pub fn stop_hunt_joins_for_hub_join() {
     let joins = registry()
         .lock()
         .map(|sessions| hunt_joins(&sessions))
         .unwrap_or_default();
-    if joins.is_empty() {
-        return true;
-    }
     for (session_id, sender) in &joins {
         process::append_active_session_log(&format!(
-            "hunt join ends: the account entered a realm hub (session={session_id})"
+            "hunt join ends once the game leaves it: the account is entering a realm hub (session={session_id})"
         ));
-        let _ = sender.send(SupervisorCommand::Stop);
-    }
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if joins
-            .iter()
-            .all(|(session_id, _)| !is_session_running(session_id))
-        {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        let _ = sender.send(SupervisorCommand::StopWhenGameLeaves);
     }
 }
 
@@ -1544,6 +1613,68 @@ pub fn start_join_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STATS: &str = "UDP_STATS role=join path=remote localRx=1184 localTx=3467 transportRx=3467 transportTx=1184 \
+                         oversized=0 foreign=0";
+
+    /// [2026-10-16] The game's packets into a join are the transport's `localRx`; other lines and fields are not counted.
+    #[test]
+    fn udp_stats_local_rx_reads_the_games_packet_count() {
+        assert_eq!(udp_stats_local_rx(STATS), Some(1184));
+        assert_eq!(
+            udp_stats_local_rx("ICE_READY role=join stun=1 turn=2 relayOnly=1 peers=1"),
+            None
+        );
+        assert_eq!(udp_stats_local_rx("UDP_STATS role=join localRx=abc"), None);
+        assert_eq!(udp_stats_local_rx("localRx=5 without the stats tag"), None);
+    }
+
+    /// [2026-10-16] A hunt join asked to end when its game leaves keeps running while the game sends, ends once it has sent
+    /// nothing for GAME_LEFT_IDLE, and ends anyway after HUNT_JOIN_LEAVE_MAX (16 Oct: ending it at the hub's entry cut the link
+    /// the game still needed to travel, and the airship timed out to the login screen).
+    #[test]
+    fn a_hunt_join_ends_once_its_game_has_left_or_after_the_limit() {
+        let start = Instant::now();
+        let mut traffic = GameTrafficWatch::new(start);
+        traffic.observe(STATS, start);
+        traffic.restart(start);
+        // The game keeps sending: a larger localRx every 2 s.
+        for (step, rx) in [(2, 1205), (4, 1225), (6, 1245), (8, 1266)] {
+            let now = start + Duration::from_secs(step);
+            traffic.observe(
+                &STATS.replace("localRx=1184", &format!("localRx={rx}")),
+                now,
+            );
+            assert_eq!(
+                hunt_join_leave_outcome(start, &traffic, now),
+                None,
+                "still playing at {step}s"
+            );
+        }
+        // The game travelled: the count stops growing.
+        let last_change = start + Duration::from_secs(8);
+        traffic.observe(
+            &STATS.replace("localRx=1184", "localRx=1266"),
+            last_change + Duration::from_secs(2),
+        );
+        assert_eq!(
+            hunt_join_leave_outcome(start, &traffic, last_change + Duration::from_secs(5)),
+            None
+        );
+        assert_eq!(
+            hunt_join_leave_outcome(start, &traffic, last_change + GAME_LEFT_IDLE),
+            Some("game_left")
+        );
+
+        // A game that never stops sending still ends at the limit.
+        let mut busy = GameTrafficWatch::new(start);
+        let at_limit = start + HUNT_JOIN_LEAVE_MAX;
+        busy.observe(STATS, at_limit - Duration::from_secs(1));
+        assert_eq!(
+            hunt_join_leave_outcome(start, &busy, at_limit),
+            Some("timeout")
+        );
+    }
 
     /// [2026-10-14] A peer the transport admits to a realm's hub, and one it admits to a realm hunt, both reach the realm
     /// status with their place and route, and each session counts its own. The sessions are registered as

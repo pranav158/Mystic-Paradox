@@ -516,10 +516,40 @@ pub(super) fn start_join(
                     "launcher",
                     &format!("ROUTE_READY role=join transport=ice localHost=127.0.0.1 localPort={local_port}"),
                 );
+                // [2026-10-16] A hunt join asked to end when its game leaves (the member is entering a realm hub) keeps running
+                // until the game has sent nothing for GAME_LEFT_IDLE, so the game can still travel over it.
+                let mut traffic = GameTrafficWatch::new(Instant::now());
+                let mut leave_asked: Option<Instant> = None;
                 loop {
                     pump(&app_handle, &session_owned, generation, handle, &log, None);
-                    drain_transport_diagnostics(&log, Link::Ice(handle));
-                    if receiver.try_recv().is_ok() || !handle.session_running() {
+                    drain_join_diagnostics(&log, Link::Ice(handle), &mut traffic);
+                    match receiver.try_recv() {
+                        Ok(SupervisorCommand::StopWhenGameLeaves) => {
+                            if leave_asked.is_none() {
+                                let now = Instant::now();
+                                traffic.restart(now);
+                                leave_asked = Some(now);
+                            }
+                        }
+                        Ok(SupervisorCommand::Stop) => break,
+                        Err(_) => {}
+                    }
+                    if let Some(asked_at) = leave_asked {
+                        if let Some(outcome) =
+                            hunt_join_leave_outcome(asked_at, &traffic, Instant::now())
+                        {
+                            append_log(
+                                &log,
+                                "launcher",
+                                &format!(
+                                    "hunt join ended outcome={outcome} after={}s",
+                                    asked_at.elapsed().as_secs()
+                                ),
+                            );
+                            break;
+                        }
+                    }
+                    if !handle.session_running() {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));

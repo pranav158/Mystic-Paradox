@@ -682,12 +682,11 @@ fn handle_control(
         "JOIN_RENDEZVOUS" if !session_id.is_empty() => {
             let realm_hub =
                 message.payload.get("sessionKind").and_then(Value::as_str) == Some("REALM_HUB");
-            // [2026-10-15] A hub's entry means the account has left its hunt: the hunt's join ends first, so the host stops
-            // listing this player there (`stop_hunt_joins_for_hub_join`). A timeout is logged; the hub join still starts.
-            if realm_hub && !p2p_session::stop_hunt_joins_for_hub_join() {
-                process::append_active_session_log(
-                    "hunt join did not end in time; starting the realm hub join anyway",
-                );
+            // [2026-10-15] A hub's entry means the account is leaving its hunt: the hunt's join ends, so the host stops listing
+            // this player there (`stop_hunt_joins_for_hub_join`). [2026-10-16] It ends once the game has left the hunt, not
+            // before the hub join starts: the game still travels over it (the airship timed out to the login screen).
+            if realm_hub {
+                p2p_session::stop_hunt_joins_for_hub_join();
             }
             if p2p_session::is_session_running(&session_id) {
                 // A realm hub join that is still registered is replaced: its member re-entered the hub, and the old
