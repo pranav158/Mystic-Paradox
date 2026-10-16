@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "launcher"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "base64 0.22.1",
  "dunce",
