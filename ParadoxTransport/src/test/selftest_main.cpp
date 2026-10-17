@@ -2154,7 +2154,7 @@ int RunBackend() {
     // gone: the joiner is not admitted, and the backend hears that the peer left.
     {
         WinsockRuntime winsock;
-        const SessionBindings bindings{ "test-key", "01234567-89ab-4def-8123-456789abcd77", "party-1", "hunt-1",
+        const SessionBindings bindings{ "test-key", SessionId(44), "party-1", "hunt-1",
             "bridge-1", 1, 1001, 3, 647472, 1, 1 };
         constexpr PeerId kJoiner = 2002;
         TicketSigner signer;
