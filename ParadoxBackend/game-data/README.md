@@ -65,16 +65,14 @@ simply stays unavailable; nothing else changes and `npm test` does not require i
   whole offer, with the reason in the startup log (`[Store:fountain_daily_free_bundle]`).
 - One claim per player per window; the window resets at 17:00 UTC. A repeat claim in the same window only
   replays the first one, and the offer is left out of the player's listing until the reset.
-- Our own server uses Rams (`CURRENCY_NOTES`) x500; `fountain_daily_bundle.example.json` shows the shape.
+- `fountain_daily_bundle.example.json` shows the shape.
 
 ## Tester max kit (`tester_max_kit.json`, optional, hand-written)
 
 `POST /admin/v1/players/:userId/tester-max` (controllers/testerMax.ts) reads this file. Copy `tester_max_kit.example.json`
-and extend it with ids confirmed in `inventory_storage_policy.json` and `Items_Analysis/catalog_1_14_7.jsonl`. Without the file
+and extend it with ids confirmed in `inventory_storage_policy.json` and your own catalogue export. Without the file
 the route answers 503; an invalid kit answers 422 with every problem listed. The kit never names a catalog id the policy does not know.
 
-Sections: `progression` (XP targets), `inventory` and `currencies`. There is no Slayer's Path section (removed 16 Oct): a tester
-unlocks it in game. Our own kit sets player level and the seven weapon tracks to level 20 (player-level XP follows weapon XP in
-the game, so weapons at 20 need player level 20; each reached rank is confirmed) and grants Rams, Combat Merits (`CURRENCY_PJM_WEAPON`),
-Aether Dust (`CURRENCY_CELLDUST`) and Reward Cache coins (`CURRENCY_SEASONAL_COIN`, prestige-gated: this tool credits it without
-banked prestige).
+Sections: `progression` (XP targets), `inventory` and `currencies`. There is no Slayer's Path section: it is unlocked in game.
+Player-level XP follows weapon XP in the game, so a weapon track raised to a level needs the player level at least as high; each
+reached rank is confirmed. Prestige-gated currencies (such as `CURRENCY_SEASONAL_COIN`) are credited without banked prestige.

@@ -1,19 +1,9 @@
 {
-  "comment": "Kit for POST /admin/v1/players/:userId/tester-max (src/controllers/testerMaxCore.ts). Copy to tester_max_kit.json and adjust it. Our own server's kit: player level and weapons to level 20 (player-level XP follows weapon XP in the game, so weapons at 20 need player level 20; every rank reached is confirmed) and four currencies (Rams CURRENCY_NOTES, Combat Merits CURRENCY_PJM_WEAPON, Aether Dust CURRENCY_CELLDUST, Reward Cache coins CURRENCY_SEASONAL_COIN, which is prestige-gated and credited without banked prestige by this tool). There is no Slayer's Path section: a tester unlocks it in game. progression: targetProgress is the XP the track is set to (never lowered); \"max\" is the top regular rank (TrackCapXp); the track must be an approved XP track in progression_config.json. inventory (optional, not used here): stacked adds by catalog id; every id must be in inventory_storage_policy.json and in Items_Analysis/catalog_1_14_7.jsonl, and inventing one puts a dead row in the account. currencies: CURRENCY_* ids; the CURRENCY_PLATINUM aggregate is refused (grant a CURRENCY_PLATINUM_* bucket for Platinum). Every grant carries the economy source OPERATOR_TEST, which the activity and economy monitors do not count.",
+  "comment": "Synthetic placeholder: the shape of tester_max_kit.json for POST /admin/v1/players/:userId/tester-max. Copy it to tester_max_kit.json and set your own targets. progression: targetProgress is the XP the track is set to (never lowered), or \"max\" for the top regular rank; the track must be an approved XP track in progression_config.json. inventory (optional): stacked adds by catalog id; every id must be in inventory_storage_policy.json. currencies: CURRENCY_* ids; the CURRENCY_PLATINUM aggregate is refused (grant a CURRENCY_PLATINUM_* bucket for Platinum). Every grant carries the economy source OPERATOR_TEST, which the activity and economy monitors do not count.",
   "progression": [
-    { "progressionId": "ExperienceTrack_PlayerLevel", "targetProgress": "max" },
-    { "progressionId": "ExperienceTrack_Weapon_Axe", "targetProgress": "max" },
-    { "progressionId": "ExperienceTrack_Weapon_ChainBlades", "targetProgress": "max" },
-    { "progressionId": "ExperienceTrack_Weapon_Hammer", "targetProgress": "max" },
-    { "progressionId": "ExperienceTrack_Weapon_Repeaters", "targetProgress": "max" },
-    { "progressionId": "ExperienceTrack_Weapon_Spear", "targetProgress": "max" },
-    { "progressionId": "ExperienceTrack_Weapon_Strikers", "targetProgress": "max" },
-    { "progressionId": "ExperienceTrack_Weapon_Sword", "targetProgress": "max" }
+    { "progressionId": "ExperienceTrack_PlayerLevel", "targetProgress": "max" }
   ],
   "currencies": [
-    { "catalogId": "CURRENCY_NOTES", "quantity": 8000000 },
-    { "catalogId": "CURRENCY_PJM_WEAPON", "quantity": 110000 },
-    { "catalogId": "CURRENCY_SEASONAL_COIN", "quantity": 50000 },
-    { "catalogId": "CURRENCY_CELLDUST", "quantity": 10000 }
+    { "catalogId": "CURRENCY_NOTES", "quantity": 1000 }
   ]
 }
