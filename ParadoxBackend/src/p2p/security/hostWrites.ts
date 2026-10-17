@@ -1,10 +1,11 @@
 import { Request } from "express";
-import type { ExtensionHttpResponse, HostWriteKind, HostWriteRecordInput } from "../../extensions/p2p";
+import type { ExtensionHttpResponse, HostWriteAuthorizeOptions, HostWriteKind, HostWriteRecordInput } from "../../extensions/p2p";
 import { logger } from "../../logger";
 import { GetMongoDb } from "../../persistence/mongo/client";
 import { GetP2PRepositories, P2PHuntSessionRecord } from "../persistence";
 import { P2PCollections } from "../persistence/mongo/collections";
 import { ListHubPresentAccounts, PlayerHostRuntimeAuthData } from "./hostCapabilities";
+import { HostPolicyRefuses, NoteHostPolicyWouldRefuse } from "./hostPolicyMode";
 import { HubPresenceView, HubWriteDenialReason, HuntAllowsWriteKind, IsRealmHubSession } from "./hubAuthorization";
 
 /*
@@ -29,24 +30,33 @@ export function HostWritesEnabled(environment: NodeJS.ProcessEnv = process.env):
 const RUNNING_STATES = new Set(["RUNNING", "DRAINING"]);
 
 /**
+ * [2026-10-16] The write-kind reasons: the host policy's (hostPolicyMode.ts), which observe mode only logs. Every other reason is about
+ * who may write and always refuses.
+ */
+export const HOST_WRITE_KIND_POLICY_REASONS: ReadonlySet<string> = new Set(["WRITE_KIND_NOT_ALLOWED_IN_HUB", "WRITE_KIND_NOT_ALLOWED"]);
+
+/**
  * Why a host write of `kind` for `targetUserId` is refused, or undefined when it may proceed. `presence` is the hub's
  * present accounts and is read only for a hub session (without it, only the host is present). A call without `kind` checks
- * a hunt as before and refuses a hub, which allows only named kinds.
+ * a hunt as before and refuses a hub, which allows only named kinds. [2026-10-16] `checkKind: false` leaves the write kind out and
+ * checks only who may write (observe mode, after a write-kind refusal).
  */
 export function HostWriteDenialReason(
     auth: Partial<PlayerHostRuntimeAuthData> | undefined,
     hunt: P2PHuntSessionRecord | undefined,
     targetUserId: string,
     kind?: HostWriteKind,
-    presence?: HubPresenceView
+    presence?: HubPresenceView,
+    options: { checkKind?: boolean } = {}
 ): string | undefined {
+    const CheckKind = options.checkKind !== false;
     if (auth?.IsPlayerHostRuntime !== true || auth.IsGameserver !== false ||
         typeof auth.p2pSessionId !== "string" || !Number.isSafeInteger(auth.p2pGeneration)) return "PLAYER_HOST_AUTH_REQUIRED";
     if (hunt == undefined || hunt.sessionId !== auth.p2pSessionId || hunt.generation !== auth.p2pGeneration) return "HUNT_NOT_FOUND";
     const running = RUNNING_STATES.has(hunt.state) || (hunt.state === "SUSPECT" && hunt.preSuspectState === "RUNNING");
     if (!running) return "HUNT_NOT_RUNNING";
-    if (IsRealmHubSession(hunt)) return HubWriteDenialReason(hunt, kind, targetUserId, presence);
-    if (!HuntAllowsWriteKind(kind)) return "WRITE_KIND_NOT_ALLOWED";
+    if (IsRealmHubSession(hunt)) return HubWriteDenialReason(hunt, kind, targetUserId, presence, CheckKind);
+    if (CheckKind && !HuntAllowsWriteKind(kind)) return "WRITE_KIND_NOT_ALLOWED";
     const participant = hunt.roster.find((entry) => entry.accountId === targetUserId);
     if (participant == undefined) return "NOT_A_MEMBER";
     if (targetUserId !== hunt.hostAccountId && participant.admissionState !== "ADMITTED") return "MEMBER_NOT_ADMITTED";
@@ -77,11 +87,17 @@ function ContextOf(hunt: P2PHuntSessionRecord): HostWriteContext {
     };
 }
 
-export async function AuthorizeHostWrite(req: Request, kind: HostWriteKind, targetUserId: string): Promise<ExtensionHttpResponse | undefined> {
+export async function AuthorizeHostWrite(req: Request, kind: HostWriteKind, targetUserId: string,
+    options: HostWriteAuthorizeOptions = {}): Promise<ExtensionHttpResponse | undefined> {
     const auth = (req as any).AuthData as Partial<PlayerHostRuntimeAuthData> | undefined;
+    const quiet = options.probe === true || options.parity === true;
     if (!HostWritesEnabled()) {
-        logger.warn(`[HostWrite] refused kind=${kind} target=${targetUserId} reason=HOST_WRITES_OFF`);
+        if (!quiet) logger.warn(`[HostWrite] refused kind=${kind} target=${targetUserId} reason=HOST_WRITES_OFF`);
         return { status: 403, body: { code: "P2P_HOST_WRITE_DENIED", message: "Host writes are switched off.", payload: null } };
+    }
+    // [2026-10-17] Dedicated parity (extensions/p2p.ts HostWriteAuthorizeOptions.parity): observe mode only, never in enforce.
+    if (options.parity === true && HostPolicyRefuses()) {
+        return { status: 403, body: { code: "P2P_HOST_WRITE_DENIED", message: "This host may not do a dedicated server's work here.", payload: null } };
     }
     const hunt = typeof auth?.p2pSessionId === "string" ? await GetP2PRepositories().p2pHunts.findHunt(auth.p2pSessionId) : undefined;
     // A hub has no frozen roster: who is present comes from its presence rows (cached for a second, as the runtime's own
@@ -89,10 +105,31 @@ export async function AuthorizeHostWrite(req: Request, kind: HostWriteKind, targ
     const presence = hunt != undefined && IsRealmHubSession(hunt) && hunt.sessionId === auth?.p2pSessionId
         ? { presentAccountIds: await ListHubPresentAccounts(hunt.sessionId, hunt.generation) }
         : undefined;
-    const denial = HostWriteDenialReason(auth, hunt, targetUserId, kind, presence);
+    if (options.parity === true) {
+        // Who may write, as for every host write; the write kind is not part of a dedicated server's own work for its player.
+        if (HostWriteDenialReason(auth, hunt, targetUserId, kind, presence, { checkKind: false }) !== undefined) {
+            return { status: 403, body: { code: "P2P_HOST_WRITE_DENIED", message: "This host may not write this player's state.", payload: null } };
+        }
+        (req as any)[CONTEXT_KEY] = ContextOf(hunt!);
+        return undefined;
+    }
+    let denial = HostWriteDenialReason(auth, hunt, targetUserId, kind, presence);
+    const hubTag = hunt?.hubKind != undefined ? ` hub=${hunt.hubKind}` : "";
+    // [2026-10-16] Observe mode (hostPolicyMode.ts): a write kind this session does not take is logged, not refused, once the
+    // write passes every check of who may write. A probe (the XP route trying its kinds) is never let through this way.
+    if (denial !== undefined && HOST_WRITE_KIND_POLICY_REASONS.has(denial) && options.probe !== true && !HostPolicyRefuses()) {
+        const identity = HostWriteDenialReason(auth, hunt, targetUserId, kind, presence, { checkKind: false });
+        if (identity === undefined) {
+            NoteHostPolicyWouldRefuse(`write kind=${kind}`, `target=${targetUserId} session=${auth?.p2pSessionId ?? "-"} reason=${denial}${hubTag}`);
+            (req as any)[CONTEXT_KEY] = ContextOf(hunt!);
+            return undefined;
+        }
+        denial = identity;
+    }
     if (denial != undefined) {
-        logger.warn(`[HostWrite] refused kind=${kind} target=${targetUserId} session=${auth?.p2pSessionId ?? "-"} reason=${denial}` +
-            (hunt?.hubKind != undefined ? ` hub=${hunt.hubKind}` : ""));
+        if (options.probe !== true) {
+            logger.warn(`[HostWrite] refused kind=${kind} target=${targetUserId} session=${auth?.p2pSessionId ?? "-"} reason=${denial}${hubTag}`);
+        }
         return { status: 403, body: { code: "P2P_HOST_WRITE_DENIED", message: "This host may not write this player's state.", payload: null } };
     }
     (req as any)[CONTEXT_KEY] = ContextOf(hunt!);

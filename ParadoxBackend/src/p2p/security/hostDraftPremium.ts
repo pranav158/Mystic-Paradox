@@ -1,24 +1,28 @@
 // [2026-10-15] The daily premium draft token a player-hosted runtime may grant (hostGrantPolicy.ts HOST_DRAFT_PREMIUM_ID). Why a host
 // asks for it, and why the rule is narrow, is in hostGrantPolicy.ts. This module decides the one case the policy leaves open:
 //   - the body adds the token once, as a whole token (quantity 1), and nothing else of its kind;
-//   - the player holds the active season's premium pass (the season's premium_gating_entitlement in game-data/progression_config.json);
-//   - the balance the player ends with, after this transaction's removals, stays at or below HOST_DRAFT_PREMIUM_BALANCE_CAP;
-//   - the account has not had the token host-granted earlier on this UTC day (the game's daily reset is 00:00 UTC). The day is kept
-//     on the account's bounty record (dailyPremiumDraftGrantedOn, bountyState.ts), per account and not per character, so a second
-//     character cannot repeat it.
+//   - [2026-10-16] for EVERY account. Until then only holders of the season's premium pass were granted it (NO_PREMIUM_PASS),
+//     but the game's bounty component grants it to every player on the daily draft (the dedicated path does too), and the refusal
+//     left a new player's bounty load unfinished: the hub's player-data timeout sent new players back to the menu
+//     ~120 s after Ramsgate ([HostGrantDeny] HUNT_PASS draftPremium=NO_PREMIUM_PASS). The pass is still read
+//     (`holdsPremiumPass`, for the log) but no longer required;
+//   - the balance the player ends with, after this transaction's removals, stays at or below HOST_DRAFT_PREMIUM_BALANCE_CAP.
+// [2026-10-16] There is no once-per-day rule any more. It counted UTC days from 00:00, but the game's daily
+// period ends at 17:00 UTC (every bounty_daily cooldown is T17:00:00Z), and the game also re-adds the token itself when a drafted daily
+// bounty is lost (UBountyComponent RefundBounties, "Refund premium tokens") and drafts again. Both legitimate second grants were refused
+// (ALREADY_GRANTED_TODAY), and a refused hub transaction during a player's inventory load is the known return-to-menu trigger. The cap
+// alone bounds it: the token is hidden and the automatic draft spends it within a second, and the daily challenge's reward is still
+// paid once per game day ([2026-10-17] from 17:00 UTC) by the bounty record (dailyRewardCreditedOn, bountyState.ts). The day is no longer written, so the grant
+// no longer touches the account's bounty record (one versioned write less beside the hub's own bounty saves).
 // The decision is taken twice: before the transaction from a read (for an early refusal), and again inside the inventory
-// transaction from the session's own reads, which is the one that counts (p2pInventoryAuthorization.ts). An accepted grant writes
-// today's day to the account record in that same transaction. Two racing grants for one account both read the old day; one commits,
-// and the other's write to the same record conflicts, so Mongo retries it and the retry reads today and is refused.
+// transaction from the session's own reads, which is the one that counts (p2pInventoryAuthorization.ts).
 // A replay of an accepted transaction (same id, same body) never reaches this decision: the ledger returns its stored result
-// (RunInventoryTransaction), and the precheck skips the decision for it (p2pInventoryAuthorization.ts). Pure except for the reads and
-// the one day write.
+// (RunInventoryTransaction), and the precheck skips the decision for it (p2pInventoryAuthorization.ts). Pure except for the reads.
 
 import type { EntitlementRecord, InventoryRecord } from "../../persistence/mapping/domainTypes";
 import type { RepositoryProvider } from "../../persistence";
 import { ACTIVE_HUNTPASS_PROGRESSION_ID } from "../../controllers/progression";
 import { tryLoadGameData } from "../../gameData/loader";
-import { UtcDay, WithDraftPremiumGrantDay } from "../../bountyState";
 import { BodyAddsHostDraftPremium, HOST_DRAFT_PREMIUM_BALANCE_CAP, HOST_DRAFT_PREMIUM_ID, IsHostDraftPremiumAdd } from "./hostGrantPolicy";
 import type { ClientSession } from "mongodb";
 
@@ -29,16 +33,12 @@ export interface HostDraftPremiumInputs {
     passEntitlement: string | undefined;
     /** Whether the player holds `passEntitlement`. */
     holdsPremiumPass: boolean;
-    /** The UTC day a host last added this token for the account (dailyPremiumDraftGrantedOn), undefined when never. */
-    grantedOnDay: string | undefined;
-    /** The UTC day this decision is taken on (YYYY-MM-DD). */
-    today: string;
 }
 
 export interface HostDraftPremiumDecision {
     allowed: boolean;
-    /** NO_PREMIUM_PASS, ALREADY_GRANTED_TODAY, OVER_BALANCE_CAP, ONE_WHOLE_TOKEN_PER_TRANSACTION, BALANCE_UNREADABLE, NO_PASS_ENTITLEMENT_DATA
-     *  or PREMIUM_PASS_HELD_WITHIN_CAP_ONCE_PER_DAY. */
+    /** OVER_BALANCE_CAP, ONE_WHOLE_TOKEN_PER_TRANSACTION, BALANCE_UNREADABLE or WITHIN_BALANCE_CAP ([2026-10-16] NO_PREMIUM_PASS,
+     *  NO_PASS_ENTITLEMENT_DATA and ALREADY_GRANTED_TODAY are gone: every account may have the token, whenever its balance allows). */
     reason: string;
     balanceBefore?: number;
     balanceAfter?: number;
@@ -92,39 +92,19 @@ export function HoldsEntitlementNamed(entitlements: Pick<EntitlementRecord, "ent
  * as the repositories read them outside one.
  */
 export async function ReadHostDraftPremiumInputs(
-    repos: Pick<RepositoryProvider, "inventories" | "entitlements" | "bountyStates">,
+    repos: Pick<RepositoryProvider, "inventories" | "entitlements">,
     userId: string,
     characterId: string,
     session?: ClientSession
 ): Promise<HostDraftPremiumInputs> {
     const inventory = await repos.inventories.findByCharacterId(characterId, session);
     const entitlements = await repos.entitlements.findByUserId(userId, session);
-    const bounty = await repos.bountyStates.get(userId, session);
     const passEntitlement = ActivePremiumPassEntitlement();
     return {
         balanceBefore: StackedBalanceOf(inventory, HOST_DRAFT_PREMIUM_ID),
         passEntitlement,
         holdsPremiumPass: HoldsEntitlementNamed(entitlements, passEntitlement),
-        grantedOnDay: bounty?.dailyPremiumDraftGrantedOn,
-        today: UtcDay(),
     };
-}
-
-/**
- * Writes `day` as the day this account's premium draft token was host-granted. Called with the grant's own session, from the
- * inventory transaction's onGrant, so the day commits with the token or not at all. It is the versioned write FundChallengeReward
- * uses (controllers/challengeRewards.ts), and a missing account record is created. False when the record changed under the write;
- * the caller refuses the grant.
- */
-export async function RecordHostDraftPremiumGrant(
-    repos: Pick<RepositoryProvider, "bountyStates">,
-    userId: string,
-    day: string,
-    session: ClientSession
-): Promise<boolean> {
-    const Previous = await repos.bountyStates.get(userId, session);
-    const Saved = await repos.bountyStates.saveIfVersion(WithDraftPremiumGrantDay(Previous, userId, day), Previous?.updateVersion, session);
-    return Saved !== undefined;
 }
 
 /**
@@ -143,11 +123,8 @@ export function DecideHostDraftPremium(body: any, inputs: HostDraftPremiumInputs
         .reduce((total: number, item: any) => total + (Number.isSafeInteger(item?.quantity) && item.quantity > 0 ? item.quantity : 0), 0);
     const Figures = { balanceBefore: inputs.balanceBefore, balanceAfter: inputs.balanceBefore - Removed + 1 };
 
-    if (inputs.passEntitlement === undefined) return { allowed: false, reason: "NO_PASS_ENTITLEMENT_DATA", ...Figures };
-    if (!inputs.holdsPremiumPass) return { allowed: false, reason: "NO_PREMIUM_PASS", ...Figures };
-    // [2026-10-15] Once per account per UTC day, counted on the day of the transaction and not on the balance: a token spent and
-    // refilled in one transaction, or on a later one the same day, is refused here.
-    if (inputs.grantedOnDay === inputs.today) return { allowed: false, reason: "ALREADY_GRANTED_TODAY", ...Figures };
+    // [2026-10-16] No premium-pass condition and no once-per-day rule any more (see the header): only the balance cap. A token
+    // spent and refilled in one transaction (the game's refund and re-draft) ends at the cap and is allowed.
     if (Figures.balanceAfter > HOST_DRAFT_PREMIUM_BALANCE_CAP) return { allowed: false, reason: "OVER_BALANCE_CAP", ...Figures };
-    return { allowed: true, reason: "PREMIUM_PASS_HELD_WITHIN_CAP_ONCE_PER_DAY", ...Figures };
+    return { allowed: true, reason: "WITHIN_BALANCE_CAP", ...Figures };
 }

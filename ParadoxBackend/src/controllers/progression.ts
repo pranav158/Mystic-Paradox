@@ -16,7 +16,7 @@ import { logger } from "../logger";
 import { loadGameData } from "../gameData/loader";
 import { ComputeNewlyUnlockedNodeIds } from "./slayersPath";
 import { GetP2PExtension } from "../extensions/p2p";
-import type { ExtensionHttpResponse, HostWriteKind } from "../extensions/p2p";
+import type { ExtensionHttpResponse, HostWriteAuthorizeOptions, HostWriteKind } from "../extensions/p2p";
 import crypto from "node:crypto";
 import { ClientSession } from "mongodb";
 
@@ -218,6 +218,25 @@ export interface HostGrantRefusal {
     stored?: number;
 }
 
+/**
+ * [2026-10-17] Dedicated parity: whether a host limit only logs. A dedicated
+ * server had neither of these, so in the host policy's observe mode (the default) they log `[HostPolicyObserve] would refuse xp ...` and
+ * the grant is applied as a dedicated server's would be:
+ *   - amount_over_ceiling: a grant above the per-track ceiling (big Escalation and bounty Hunt Pass rewards may exceed 200);
+ *   - track_full: a grant to a full player level track (the game sends player XP with every weapon grant, also at the top level).
+ * The reforge rules stay refused in both modes, as the game itself applies them: a prestige grant that is not +1 (amount_not_one) and
+ * any MasteryTrack_ grant (track_not_writable; mastery arrives in the progression report). enforce refuses all of them as before.
+ */
+export function HostLimitOnlyLogs(refusal: HostGrantRefusal, hostPolicy = GetP2PExtension().hostPolicy): boolean {
+    return (refusal.reason === "amount_over_ceiling" || refusal.reason === "track_full") && !hostPolicy.refuses();
+}
+
+/** Applies a host limit: throws HostGrantLimitError, or (observe, HostLimitOnlyLogs) logs it once and lets the grant through. */
+function ApplyHostLimit(refusal: HostGrantRefusal, userId: string, grantId: string, hostPolicy = GetP2PExtension().hostPolicy): void {
+    if (!HostLimitOnlyLogs(refusal, hostPolicy)) throw new HostGrantLimitError(refusal);
+    hostPolicy.noteWouldRefuse("xp", `user=${userId} ${DescribeHostGrantRefusal(refusal)} grant=${grantId.slice(0, 96)}`);
+}
+
 /** A host's grant was refused by the limits above; the route answers with HostGrantLimitDenial. Nothing was stored. */
 export class HostGrantLimitError extends Error {
     constructor(public readonly refusal: HostGrantRefusal) {
@@ -319,9 +338,10 @@ export async function GrantProgressionXp(
     }
     // [2026-10-13 realms S3 limits] A host's per-grant ceilings (CheckHostXpGrant). Needs no stored state, so it is the same
     // answer for a retry of a grant that was accepted; the route checks it too, ahead of its own reads.
+    // [2026-10-17] In observe mode an over-ceiling amount only logs (ApplyHostLimit, HostLimitOnlyLogs).
     if(source === "host") {
         const Refusal = CheckHostXpGrant(progressionId, amount);
-        if(Refusal !== undefined) throw new HostGrantLimitError(Refusal);
+        if(Refusal !== undefined) ApplyHostLimit(Refusal, userId, grantId);
     }
     const requestHash = BuildProgressionGrantRequestHash(userId, progressionId, amount);
     const maxAttempts = 4;
@@ -341,10 +361,11 @@ export async function GrantProgressionXp(
                 // [2026-10-13 realms S3 limits] A host may not add to a player level track that is already full. Read inside
                 // the transaction and after the replay branch above, so a retry of the grant that filled the track still
                 // replays instead of being refused.
+                // [2026-10-17] In observe mode a full track only logs and the grant is applied, as a dedicated server's is.
                 if (source === "host" && HostTrackTotalCap(progressionId) !== undefined) {
                     const Current = await repos.progressionTracks.get(userId, progressionId, session);
                     const Full = CheckHostTrackTotal(progressionId, Current?.progress ?? 0, amount);
-                    if (Full !== undefined) throw new HostGrantLimitError(Full);
+                    if (Full !== undefined) ApplyHostLimit(Full, userId, grantId);
                 }
 
                 if (beforeApply) await beforeApply(repos, session);
@@ -500,14 +521,35 @@ export function IsHostRuntimeAuth(authData: any): boolean {
     return authData?.IsPlayerHostRuntime === true;
 }
 
-/** Undefined when the host may write `kind` for `targetUserId`; otherwise the response to send. */
+/**
+ * Undefined when the host may write `kind` for `targetUserId`; otherwise the response to send. [2026-10-16] `options.probe`: a quiet
+ * check of one kind among several (extensions/p2p.ts hostWrites.authorize); the route's last, plain call decides and logs.
+ */
 export async function RefuseUnauthorizedHostWrite(
     req: unknown,
     kind: HostWriteKind,
     targetUserId: string,
-    hooks: HostWriteHooks = GetP2PExtension().hostWrites
+    hooks: HostWriteHooks = GetP2PExtension().hostWrites,
+    options?: HostWriteAuthorizeOptions
 ): Promise<ExtensionHttpResponse | undefined> {
-    return hooks.authorize(req as any, kind, targetUserId);
+    return hooks.authorize(req as any, kind, targetUserId, options);
+}
+
+/**
+ * [2026-10-17] Dedicated parity: whether this request is the authoritative server
+ * for `targetUserId`, as a dedicated server is for its players - the gameserver key, or a realm hub or hunt whose session holds the player
+ * (hostWrites.authorize with `parity`: who may write only, the host policy's observe mode only). For the backend's own work for a player
+ * that only a dedicated server's request used to start: finishing an interrupted reforge at the load, the Slayer's Path catch-up at
+ * login. A realm server's accepted check sets the session context, so TagHostWrite can tag what the work did.
+ */
+export async function IsAuthoritativeServerFor(
+    req: any,
+    targetUserId: string,
+    kind: HostWriteKind,
+    hooks: HostWriteHooks = GetP2PExtension().hostWrites
+): Promise<boolean> {
+    if (IsHostRuntimeAuth(req?.AuthData)) return (await hooks.authorize(req, kind, targetUserId, { parity: true })) === undefined;
+    return req?.AuthData?.IsGameserver === true;
 }
 
 /** What a progression report carried, for the tag of a host's report: track increments (first 20) and counts, no objective rows. */

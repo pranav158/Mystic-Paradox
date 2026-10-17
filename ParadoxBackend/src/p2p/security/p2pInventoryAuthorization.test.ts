@@ -119,13 +119,12 @@ test("Platinum is refused in a Ramsgate hub by the grant rule, as in a hunt", as
     });
 });
 
-test("a Training hub refuses a grant (no-reward session) but accepts a save-only transaction", async () => {
+// [2026-10-16] A realm's Training hub grants like its Ramsgate (the Training Grounds tutorial pays its quest rewards there).
+test("a Training hub grants a reward like Ramsgate does, and accepts a save-only transaction", async () => {
     await WithHub("TRAINING", async ({ kit, hub }) => {
         await Admit(kit, hub, MEMBER);
         const granted = await AuthorizeP2PInventoryTransaction(await RuntimeRequest(hub, MEMBER, loot), { userId: MEMBER, characterId: "character-member", transactionId: "dojo-1" });
-        assert.ok(!("options" in granted));
-        assert.equal(granted.status, 403);
-        assert.deepEqual((granted.body as { payload?: unknown }).payload, { classes: ["NO_REWARD_SESSION"] });
+        assert.ok("options" in granted, "a quest-style grant is authorized in a Training hub");
         const saved = { characterId: "character-member", transactionId: "dojo-2",
             saveInstancedItems: [{ catalogId: "WP_AC_ARMSTRONG", instanceId: "w", itemData: "{}" }] };
         const result = await AuthorizeP2PInventoryTransaction(await RuntimeRequest(hub, MEMBER, saved), { userId: MEMBER, characterId: "character-member", transactionId: "dojo-2" });

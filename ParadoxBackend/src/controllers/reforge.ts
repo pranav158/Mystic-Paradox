@@ -201,29 +201,35 @@ export function PlanPurchaseRestore(progressionId: string, amount: number, exper
     return { plan: { kind: "refuse", reason: Plan.kind === "refuse" ? Plan.reason : `amount ${amount} is not the banked ${Reforge.banked - Reforge.bankedRestored}` } };
 }
 
-/** Called on each arrival's progression load: finishes this player's abandoned weapon reforges (see FinishStaleReforge). */
-export async function FinishStaleReforgesForUser(userId: string, nowMs = Date.now()): Promise<void> {
-    if (REFORGE_MODE !== "on") return;
+/**
+ * Called on each arrival's progression load: finishes this player's abandoned weapon reforges (see FinishStaleReforge).
+ * [2026-10-17] Returns the weapon tracks it finished (a realm server's load tags and logs them, routes/progression.ts).
+ */
+export async function FinishStaleReforgesForUser(userId: string, nowMs = Date.now()): Promise<string[]> {
+    if (REFORGE_MODE !== "on") return [];
+    const Finished: string[] = [];
     const Rows = await GetRepositories().progressionTracks.getAllForUser(userId);
     for (const Row of Rows) {
         if (!IsReforgeableTrack(Row.progressionId) || Row.reforge?.status !== "open") continue;
         if (nowMs - Date.parse(Row.reforge.openedAt) < STALE_REFORGE_MS) continue;
-        await FinishStaleReforge(userId, Row.progressionId, Row);
+        if (await FinishStaleReforge(userId, Row.progressionId, Row)) Finished.push(Row.progressionId);
     }
+    return Finished;
 }
 
 // A reforge whose follow-ups never arrived (the read-back failed, the hub went away): give the player what the reforge
-// owed - the banked XP back and the +1 - exactly once, then close it.
-async function FinishStaleReforge(userId: string, experienceTrack: string, row: ProgressionTrackRecord): Promise<void> {
+// owed - the banked XP back and the +1 - exactly once, then close it. True when this call closed it.
+async function FinishStaleReforge(userId: string, experienceTrack: string, row: ProgressionTrackRecord): Promise<boolean> {
     const R = row.reforge!;
     const Tracks = GetRepositories().progressionTracks;
     const Closed = await Tracks.updateReforge(userId, experienceTrack, R.reforgeId,
         { status: "open", prestigeGranted: R.prestigeGranted, bankedRestored: R.bankedRestored },
         { status: "closed", closedAt: new Date().toISOString(), prestigeGranted: true, bankedRestored: R.banked });
-    if (!Closed) return;
+    if (!Closed) return false;
     const Owed = R.banked - R.bankedRestored;
     if (Owed > 0) await Tracks.increment(userId, experienceTrack, Owed);
     if (!R.prestigeGranted) await Tracks.increment(userId, PrestigeTrackFor(experienceTrack), 1);
     logger.warn(`[Reforge] RECOVER user=${userId} track=${experienceTrack} reforge=${R.reforgeId} stale since ${R.openedAt}:`
         + ` restored ${Owed}, prestige ${R.prestigeGranted ? "already granted" : "+1"}`);
+    return true;
 }

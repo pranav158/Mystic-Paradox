@@ -29,6 +29,8 @@ const HostRuntimeAuth = Lazy(() => require("./security/hostRuntimeAuth") as type
 const HostCapabilities = Lazy(() => require("./security/hostCapabilities") as typeof import("./security/hostCapabilities"));
 const InventoryAuthorization = Lazy(() => require("./security/p2pInventoryAuthorization") as typeof import("./security/p2pInventoryAuthorization"));
 const HostWrites = Lazy(() => require("./security/hostWrites") as typeof import("./security/hostWrites"));
+const HostPolicyMode = Lazy(() => require("./security/hostPolicyMode") as typeof import("./security/hostPolicyMode"));
+const HuntEvidence = Lazy(() => require("./config/huntEvidence") as typeof import("./config/huntEvidence"));
 const RealmHubPolicy = Lazy(() => require("./realm/realmHubPolicy") as typeof import("./realm/realmHubPolicy"));
 const RealmsPort = Lazy(() => require("./realm/realmsPort") as typeof import("./realm/realmsPort"));
 const RealmHubLifecycle = Lazy(() => require("./controllers/realmHubLifecycle") as typeof import("./controllers/realmHubLifecycle"));
@@ -99,7 +101,11 @@ export function CreateP2PExtension(): P2PExtension {
                 // [2026-10-13] ICE co-op transport: whether STUN/TURN, the quota and the pair-key secret are set.
                 ...IcePolicy().P2PIceSummary(IcePolicy().ReadP2PIceConfig()),
                 // [2026-10-13 realms S1] MYSTICPARADOX_REALMS_HOSTING: realm hubs on players' PCs (needs the ICE switches above).
-                realmHostingEnabled: RealmHubPolicy().IsRealmHostingEnabled()
+                realmHostingEnabled: RealmHubPolicy().IsRealmHostingEnabled(),
+                // [2026-10-16] MYSTICPARADOX_HOST_POLICY: observe (default) lets host grant classes, the draft token cap and write kinds through.
+                hostPolicy: HostPolicyMode().ResolveHostPolicyMode().mode,
+                // [2026-10-17] MYSTICPARADOX_HUNT_EVIDENCE: hosted hunts send Hunt Guard evidence (off by default at tier 0).
+                huntEvidence: HuntEvidence().HuntEvidenceEnabled()
             }),
             ensureDatabase: (db) => Indexes().EnsureP2PDatabase(db),
             // [2026-10-14] The account deletion plan's steps: this module's collections, then the anti-cheat module's.
@@ -111,6 +117,10 @@ export function CreateP2PExtension(): P2PExtension {
                 // [2026-10-14] Loud when hunts run without relay-only traffic (players could see each other's IP address).
                 const RelayWarning = Policy().RelayOnlyWarning(process.env);
                 if (RelayWarning !== undefined) logger.warn(`[P2P] ${RelayWarning}`);
+                // [2026-10-16] One line: whether host policy refusals refuse (enforce) or are only logged (observe, the default).
+                HostPolicyMode().LogHostPolicyMode();
+                // [2026-10-17] One line: whether hosted hunts send Hunt Guard evidence (config/huntEvidence.ts).
+                HuntEvidence().LogHuntEvidence();
                 const { RegisterMetricsSection } = require("../observability/metrics") as typeof import("../observability/metrics");
                 const { P2PMetricsSection } = require("./observability/p2pMetrics") as typeof import("./observability/p2pMetrics");
                 RegisterMetricsSection(P2PMetricsSection);
@@ -166,8 +176,13 @@ export function CreateP2PExtension(): P2PExtension {
             authorizeTransaction: (req, context) => InventoryAuthorization().AuthorizeP2PInventoryTransaction(req, context)
         },
         hostWrites: {
-            authorize: (req, kind, targetUserId) => HostWrites().AuthorizeHostWrite(req, kind, targetUserId),
+            authorize: (req, kind, targetUserId, options) => HostWrites().AuthorizeHostWrite(req, kind, targetUserId, options),
             record: (req, write) => HostWrites().RecordHostWrite(req, write)
+        },
+        // [2026-10-17] The host policy for the core's own host limits (the XP ceilings, a full player-level track).
+        hostPolicy: {
+            refuses: () => HostPolicyMode().HostPolicyRefuses(),
+            noteWouldRefuse: (what, detail) => HostPolicyMode().NoteHostPolicyWouldRefuse(what, detail)
         },
         matchmaking: {
             dedicatedHuntsDisabled: () => Policy().ReadP2PPolicy().dedicatedHuntsDisabled,

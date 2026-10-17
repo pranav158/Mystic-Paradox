@@ -390,13 +390,25 @@ inventoryRouter.post("/inventory/instanceditem", HasParadoxBackendAuth, async (r
         return;
     }
 
-    // This endpoint persists item state, so a runtime authenticated by an optional module must not
-    // be able to write through it. Keep the check ahead of sentinel handling for the same reason as
-    // POST /inventory; standalone dedicated gameservers remain unaffected.
-    if (req.AuthData.IsPlayerHostRuntime === true) {
-        logger.warn("POST /inventory/instanceditem rejected: a module runtime cannot mutate inventory");
-        res.status(403).json({ code: "forbidden", message: "Player-host runtime cannot mutate inventory.", payload: null });
-        return;
+    // This endpoint persists item state, so a runtime authenticated by an optional module writes through it only when that module's
+    // hostWrites hook accepts it. Keep the check ahead of sentinel handling for the same reason as POST /inventory; standalone dedicated
+    // gameservers remain unaffected.
+    // [2026-10-16] A realm hub or hunt saves an item here as a dedicated server does: the cells slotted into gear from the
+    // armoury (itemData EquippedCells). Every such save was refused until now (403, next to the loadout saves; the game retried
+    // each). The hook decides who may write
+    // (the session runs; the player is present in the hub or admitted to the hunt; kind ITEM_SAVE), the item must belong to that player's
+    // character (UpdateInstancedItem), and the save is tagged. Without the module the hook refuses, as before.
+    const IsHostRuntime = req.AuthData.IsPlayerHostRuntime === true;
+    if (IsHostRuntime) {
+        const Target = req.AuthData.userId;
+        const Denial = typeof Target === "string" && Target.length > 0
+            ? await GetP2PExtension().hostWrites.authorize(req, "ITEM_SAVE", Target)
+            : { status: 403, body: { code: "forbidden", message: "Player-host runtime cannot mutate inventory.", payload: null } };
+        if (Denial !== undefined) {
+            logger.warn(`POST /inventory/instanceditem rejected: the host write was refused (${Denial.status})`);
+            res.status(Denial.status).json(Denial.body);
+            return;
+        }
     }
 
     const CharacterId = req.body.characterId;
@@ -446,6 +458,12 @@ inventoryRouter.post("/inventory/instanceditem", HasParadoxBackendAuth, async (r
     });
 
     const Item = await UpdateInstancedItem(CharacterId, UserId, InstanceId, CatalogId, ItemData, UpdateVersion);
+    if (IsHostRuntime && Item !== undefined) {
+        await GetP2PExtension().hostWrites.record(req, { kind: "ITEM_SAVE", targetUserId: UserId, summary: {
+            instanceId: String(InstanceId).slice(0, 64), catalogId: String(CatalogId).slice(0, 128), updateVersion: UpdateVersion,
+            itemDataBytes: typeof ItemData === "string" ? ItemData.length : 0
+        } });
+    }
 
     res.status(200);
     res.json(Item);

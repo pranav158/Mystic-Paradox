@@ -199,10 +199,13 @@ test("a gated id is still denied when it is classed as Platinum, a cosmetic or a
     assert.deepEqual(HostGrantViolations({ addStackedItems: [{ catalogId: "season43_premium", quantity: 1 }] }, odd).map((entry) => entry.deniedClass), ["ENTITLEMENT"]);
 });
 
-test("the prestige-gated exception never waives a removal, and a Training hub still refuses it", () => {
+test("the prestige-gated exception never waives a removal; a hosted Training hunt still refuses the grant", () => {
     assert.deepEqual(HostGrantViolations({ removeStackedItems: [{ catalogId: "CURRENCY_PRESTIGE", quantity: 2 }] }, CATALOG), []);
-    assert.deepEqual(HostGrantDenial(TRAINING_HUB, { addStackedItems: [{ catalogId: "CURRENCY_PJM_PRESTIGE_FILLED", quantity: 1 }] }, CATALOG)?.classes,
+    assert.deepEqual(HostGrantDenial({ guardCompletionMode: "NO_COMPLETION" }, { addStackedItems: [{ catalogId: "CURRENCY_PJM_PRESTIGE_FILLED", quantity: 1 }] }, CATALOG)?.classes,
         ["NO_REWARD_SESSION"]);
+    // [2026-10-16] A realm's Training hub decides it as its Ramsgate does.
+    assert.deepEqual(HostGrantDenial(TRAINING_HUB, { addStackedItems: [{ catalogId: "CURRENCY_PJM_PRESTIGE_FILLED", quantity: 1 }] }, CATALOG),
+        HostGrantDenial(RAMSGATE_HUB, { addStackedItems: [{ catalogId: "CURRENCY_PJM_PRESTIGE_FILLED", quantity: 1 }] }, CATALOG));
 });
 
 test("a no-reward session (Training) still refuses the claim-funded coin like any grant", () => {
@@ -237,18 +240,22 @@ test("a Ramsgate hub's claim-funded season coin is judged exactly as a hunt judg
     assert.deepEqual(HostGrantDenial({ guardCompletionMode: "FIRST_DEFEAT" }, beyondOneClaim, CATALOG)?.classes, ["HUNT_PASS"]);
 });
 
-test("a Training hub keeps the blanket refusal of every grant and spend, Platinum included; saves pass", () => {
+// [2026-10-16] A realm's Training hub grants like its Ramsgate: the Training Grounds tutorial's quest reward (100 Rams) was
+// refused there, so the quest step never completed. The class deny list still applies (Platinum stays refused).
+test("a Training hub grants a quest reward and keeps the class deny list, as Ramsgate does; saves pass", () => {
     const loot = { addStackedItems: [{ catalogId: "CURRENCY_NOTES", quantity: 100 }] };
-    assert.deepEqual(HostGrantDenial(TRAINING_HUB, loot, CATALOG)?.classes, ["NO_REWARD_SESSION"]);
+    assert.equal(HostGrantDenial(TRAINING_HUB, loot, CATALOG), undefined);
     assert.deepEqual(HostGrantDenial(TRAINING_HUB, { addStackedItems: [{ catalogId: "CURRENCY_PLATINUM", quantity: 1 }] }, CATALOG)?.classes,
-        ["NO_REWARD_SESSION"]);
-    assert.deepEqual(HostGrantDenial(TRAINING_HUB, { removeStackedItems: [{ catalogId: "QI_ATTACK_SPEED_POTION", quantity: 1 }] }, CATALOG)?.classes,
-        ["NO_REWARD_SESSION"]);
+        HostGrantDenial(RAMSGATE_HUB, { addStackedItems: [{ catalogId: "CURRENCY_PLATINUM", quantity: 1 }] }, CATALOG)?.classes);
+    assert.notDeepEqual(HostGrantDenial(TRAINING_HUB, { addStackedItems: [{ catalogId: "CURRENCY_PLATINUM", quantity: 1 }] }, CATALOG), undefined,
+        "a Platinum grant is still refused by class");
+    assert.equal(HostGrantDenial(TRAINING_HUB, { removeStackedItems: [{ catalogId: "QI_ATTACK_SPEED_POTION", quantity: 1 }] }, CATALOG),
+        HostGrantDenial(RAMSGATE_HUB, { removeStackedItems: [{ catalogId: "QI_ATTACK_SPEED_POTION", quantity: 1 }] }, CATALOG));
     assert.equal(HostGrantDenial(TRAINING_HUB, { saveInstancedItems: [{ catalogId: "WP_AC_ARMSTRONG", instanceId: "w", itemData: "{}" }] }, CATALOG),
         undefined);
 });
 
-test("only a realm session of kind Ramsgate escapes the no-reward refusal", () => {
+test("only a realm session of kind Ramsgate or Training escapes the no-reward refusal", () => {
     const loot = { addStackedItems: [{ catalogId: "CURRENCY_NOTES", quantity: 100 }] };
     assert.deepEqual(HostGrantDenial({ guardCompletionMode: "NO_COMPLETION", sessionKind: "REALM_HUB" }, loot, CATALOG)?.classes,
         ["NO_REWARD_SESSION"], "a realm hub with no hub kind");
@@ -257,14 +264,14 @@ test("only a realm session of kind Ramsgate escapes the no-reward refusal", () =
 });
 // [2026-10-14 owner decision, coordinator scope] A host may spend Platinum in a hunt and in a realm's Ramsgate hub. The spend is a
 // stacked removal of a Platinum id; the wallet refuses it past the balance, and the Training hub keeps its blanket refusal.
-test("a stacked Platinum removal is a spend: allowed in a hunt and a Ramsgate hub, refused by a Training hub", () => {
+test("a stacked Platinum removal is a spend: allowed in a hunt and a realm hub, refused by a hosted Training hunt", () => {
     const spend = { removeStackedItems: [{ catalogId: "CURRENCY_PLATINUM_EPIC", quantity: 5 }, { catalogId: "CURRENCY_PLATINUM", quantity: 40 },
         { catalogId: "id_currency_platinum", quantity: 1 }] };
     assert.deepEqual(HostGrantViolations(spend, CATALOG), []);
     assert.equal(HostGrantDenial({ guardCompletionMode: "END_OF_HUNT" }, spend, CATALOG), undefined);
     assert.equal(HostGrantDenial({ guardCompletionMode: "FIRST_DEFEAT" }, spend, CATALOG), undefined);
     assert.equal(HostGrantDenial(RAMSGATE_HUB, spend, CATALOG), undefined);
-    assert.deepEqual(HostGrantDenial(TRAINING_HUB, spend, CATALOG)?.classes, ["NO_REWARD_SESSION"]);
+    assert.equal(HostGrantDenial(TRAINING_HUB, spend, CATALOG), undefined, "[2026-10-16] a Training hub as its Ramsgate");
     assert.deepEqual(HostGrantDenial({ guardCompletionMode: "NO_COMPLETION" }, spend, CATALOG)?.classes, ["NO_REWARD_SESSION"], "a hosted Training hunt too");
 });
 
@@ -326,10 +333,11 @@ test("the draft premium exemption never waives another Hunt Pass item, a second 
     assert.equal(HostGrantViolations({ addStackedItems: [{ catalogId: "TOKEN_DAILY_CHALLENGE_DRAFT_PREMIUM ", quantity: 1 }] }, CATALOG, allowed).length, 1);
 });
 
-test("a Training hub keeps its blanket refusal of the draft premium token, and a Ramsgate hub takes it with the decision", () => {
+test("a Training hub, like a Ramsgate hub, takes the draft premium token with the decision; a hosted Training hunt refuses it", () => {
     const token = { addStackedItems: [{ catalogId: "TOKEN_DAILY_CHALLENGE_DRAFT_PREMIUM", quantity: 1 }] };
     const allowed = { draftPremium: true };
-    assert.deepEqual(HostGrantDenial(TRAINING_HUB, token, CATALOG, allowed)?.classes, ["NO_REWARD_SESSION"]);
+    assert.equal(HostGrantDenial(TRAINING_HUB, token, CATALOG, allowed), undefined);
+    assert.deepEqual(HostGrantDenial({ guardCompletionMode: "NO_COMPLETION" }, token, CATALOG, allowed)?.classes, ["NO_REWARD_SESSION"]);
     assert.equal(HostGrantDenial(RAMSGATE_HUB, token, CATALOG, allowed), undefined);
     assert.deepEqual(HostGrantDenial(RAMSGATE_HUB, token, CATALOG)?.classes, ["HUNT_PASS"], "without the decision the hub refuses it as before");
 });

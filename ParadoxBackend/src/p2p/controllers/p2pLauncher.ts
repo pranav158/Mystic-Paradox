@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { GetAntiCheatExtension } from "../antiCheat";
 import { ReadP2PPolicy } from "../config/p2pPolicy";
+import { HuntEvidenceEnabled } from "../config/huntEvidence";
 import { GetP2PRepositories, WithP2PTransaction, P2PArtifactHashes, P2PHuntSessionRecord, P2PHuntState } from "../persistence";
 import { GenerateHostCapabilitySecret, InvalidateHubPresence } from "../security/hostCapabilities";
 import { LauncherApiError } from "../security/p2pErrors";
@@ -78,7 +79,9 @@ function Common(hunt: P2PHuntSessionRecord, bridgeInstanceId: string) {
         forceRelay: ReadP2PPolicy().forceSdr,
         artifacts: WireArtifacts(ReadP2PArtifactPolicy()),
         // False without the anti-cheat module: the launcher then opts no process into hunt evidence.
-        evidenceCollection: GetAntiCheatExtension().loaded,
+        // [2026-10-17] And false while MYSTICPARADOX_HUNT_EVIDENCE is off (the tier 0 default; config/huntEvidence.ts): the host's
+        // transport posted each event on its packet thread and every hosted hunt lagged.
+        evidenceCollection: GetAntiCheatExtension().loaded && HuntEvidenceEnabled(),
         // Older names, read by launchers before plan step 4.2.
         hostSteamId: hunt.hostSteamId,
         forceSdr: ReadP2PPolicy().forceSdr

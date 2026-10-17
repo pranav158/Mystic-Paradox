@@ -26,6 +26,8 @@ import {
     HostGrantLimitError,
     HostWriteHooks,
     HostXpGrantCeiling,
+    HostLimitOnlyLogs,
+    IsAuthoritativeServerFor,
     IsAuthorizedProgressionReporter,
     IsHostRuntimeAuth,
     MAX_PROGRESSION_GRANT_AMOUNT,
@@ -288,4 +290,40 @@ test("a refused host grant is described without the account, sanitised, and answ
     assert.equal((Denial.body as any).payload, null);
     assert.match(new HostGrantLimitError(Refusal).message, /amount_over_ceiling/);
     assert.equal(new HostGrantLimitError(Refusal).refusal, Refusal);
+});
+
+// ---- [2026-10-17] dedicated parity ----------------------------------------------------------------------------------------------
+
+test("dedicated parity: the authoritative server for a player is the gameserver key, or a realm server the module accepts with parity", async () => {
+    const Calls: { kind: HostWriteKind; target: string; parity: boolean | undefined }[] = [];
+    const Hooks = {
+        authorize: async (_req: unknown, kind: HostWriteKind, target: string, options?: { parity?: boolean }) => {
+            Calls.push({ kind, target, parity: options?.parity });
+            return target === "member" ? undefined : { status: 403, body: {} };
+        },
+        record: async () => undefined
+    } as unknown as HostWriteHooks;
+    const Host = { AuthData: { IsPlayerHostRuntime: true, IsGameserver: false } };
+    assert.equal(await IsAuthoritativeServerFor({ AuthData: { IsGameserver: true } }, "anyone", "REFORGE", Hooks), true);
+    assert.equal(await IsAuthoritativeServerFor({ AuthData: { userId: "member" } }, "member", "REFORGE", Hooks), false, "a player's own token is no server");
+    assert.equal(await IsAuthoritativeServerFor(Host, "member", "REFORGE", Hooks), true, "a realm server, for a player of its session");
+    assert.equal(await IsAuthoritativeServerFor(Host, "stranger", "SLAYERS_PATH", Hooks), false, "never for anyone else");
+    assert.deepEqual(Calls, [{ kind: "REFORGE", target: "member", parity: true }, { kind: "SLAYERS_PATH", target: "stranger", parity: true }]);
+    // Without the module (this file runs with it off) a realm runtime is never authoritative.
+    assert.equal(await IsAuthoritativeServerFor(Host, "member", "REFORGE"), false);
+});
+
+test("dedicated parity: only the ceiling and the full track can only-log, and only when the host policy does not refuse", () => {
+    const Observe = { refuses: () => false, noteWouldRefuse: () => undefined };
+    const Enforce = { refuses: () => true, noteWouldRefuse: () => undefined };
+    const Over = CheckHostXpGrant("ExperienceTrack_Weapon_Axe", 1001)!;
+    const Full = { reason: "track_full" as const, progressionId: "ExperienceTrack_PlayerLevel", amount: 98, limit: 141020, stored: 141020 };
+    assert.equal(HostLimitOnlyLogs(Over, Observe), true);
+    assert.equal(HostLimitOnlyLogs(Full, Observe), true);
+    assert.equal(HostLimitOnlyLogs(Over, Enforce), false);
+    assert.equal(HostLimitOnlyLogs(Full, Enforce), false);
+    assert.equal(HostLimitOnlyLogs(CheckHostXpGrant("PrestigeTrack_Weapon_Axe", 2)!, Observe), false, "a prestige grant that is not +1 always refuses");
+    assert.equal(HostLimitOnlyLogs(CheckHostXpGrant("MasteryTrack_PlayerLevel", 1)!, Observe), false, "a mastery grant always refuses");
+    // Without the module the defaults are strict.
+    assert.equal(HostLimitOnlyLogs(Over), false);
 });

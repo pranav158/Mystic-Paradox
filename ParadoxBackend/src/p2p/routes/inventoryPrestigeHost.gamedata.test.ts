@@ -244,14 +244,74 @@ test("in a hunt the host's prestige-gated reward is paid the same way: the hunt'
     });
 });
 
-test("a Training hub refuses the prestige-gated reward too: a no-reward session grants nothing", async () => {
+// [2026-10-17] The Sparkforge's "forge Aetherhearts" (wallet.ts SparkforgeFundedHearts): one transaction that removes Aethersparks
+// and adds Aether Hearts, 200 Sparks a Heart (the Heart's catalog price). It was refused as an unfunded reforge reward
+// (source "convert_aethersparks_to_aetherhearts").
+const AETHERSPARK = "CURRENCY_PJM_PRESTIGE_EMPTY";
+const Convert = (hub: Kit.RunningHub, transactionId: string, hearts: number, sparks: number) =>
+    Post(hub, transactionId, [{ catalogId: AETHERHEART, quantity: hearts }],
+        { removeStackedItems: [{ catalogId: AETHERSPARK, quantity: sparks }], source: "convert_aethersparks_to_aetherhearts" });
+
+test("the Sparkforge converts 800 Aethersparks into 4 Aether Hearts without banked prestige", async () => {
+    await WithRealm("RAMSGATE", async ({ hub }) => {
+        await Realm!.repos.wallets.incrementBalance(Kit_.MEMBER, AETHERSPARK, 1000);
+        const Result = await Convert(hub, "forge-aether-1", 4, 800);
+        assert.equal(Result.status, 200, JSON.stringify(Result.json));
+        assert.equal(await Balance(AETHERHEART), 4);
+        assert.equal(await Balance(AETHERSPARK), 200, "the Sparks are taken");
+        assert.equal(await Claimed(), 0, "no reforge level is claimed");
+    });
+});
+
+test("a conversion leaves banked reforge levels unclaimed, so the reforge's own Heart is still paid after it", async () => {
+    await WithRealm("RAMSGATE", async ({ hub }) => {
+        await Realm!.repos.wallets.incrementBalance(Kit_.MEMBER, AETHERSPARK, 400);
+        await Realm!.repos.progressionTracks.increment(Kit_.MEMBER, PRESTIGE_SWORD, 1);
+        const Converted = await Convert(hub, "forge-aether-2", 2, 400);
+        assert.equal(Converted.status, 200, JSON.stringify(Converted.json));
+        assert.equal(await Claimed(), 0, "the conversion did not use the banked level");
+        const Reward = await Post(hub, "reforge-reward-1", [{ catalogId: AETHERHEART, quantity: 1 }]);
+        assert.equal(Reward.status, 200, JSON.stringify(Reward.json));
+        assert.equal(await Balance(AETHERHEART), 3);
+        assert.equal(await Claimed(), 1);
+    });
+});
+
+test("a conversion short of Sparks is refused whole: 600 Sparks pay 3 Hearts, the 4th needs prestige; too few owned is an overspend", async () => {
+    await WithRealm("RAMSGATE", async ({ hub }) => {
+        await Realm!.repos.wallets.incrementBalance(Kit_.MEMBER, AETHERSPARK, 700);
+        const Short = await Convert(hub, "forge-aether-short", 4, 600);
+        assert.equal(Short.status, 409, JSON.stringify(Short.json));
+        assert.equal(Short.json.message, "Insufficient banked prestige progress");
+        const Overspend = await Convert(hub, "forge-aether-overspend", 4, 800);
+        assert.equal(Overspend.status, 409, JSON.stringify(Overspend.json));
+        assert.equal(Overspend.json.message, "Insufficient balance");
+        assert.equal(await Balance(AETHERHEART), 0, "neither refused transaction paid a Heart");
+        assert.equal(await Balance(AETHERSPARK), 700, "nor took a Spark");
+    });
+});
+
+test("Sparks removed alone (a reforge's cost, 100) fund nothing, and a Heart alone still needs banked prestige", async () => {
+    await WithRealm("RAMSGATE", async ({ hub }) => {
+        await Realm!.repos.wallets.incrementBalance(Kit_.MEMBER, AETHERSPARK, 300);
+        const Cost = await Send("POST", "/inventory", HostHeaders(hub), { characterId: CHARACTER, transactionId: "reforge-cost-1",
+            removeStackedItems: [{ catalogId: AETHERSPARK, quantity: 100 }], source: "UPlayerExperienceComponent::ServerPrestigeExperience_Implementation" });
+        assert.equal(Cost.status, 200, JSON.stringify(Cost.json));
+        assert.equal(await Balance(AETHERSPARK), 200);
+        const Heart = await Post(hub, "reforge-reward-unbanked", [{ catalogId: AETHERHEART, quantity: 1 }]);
+        assert.equal(Heart.status, 409, "the earlier cost does not pay for a later Heart");
+        assert.equal(await Balance(AETHERHEART), 0);
+    });
+});
+
+// [2026-10-16] A realm's Training hub grants as its Ramsgate does (it was a no-reward session, which stalled the Training
+// Grounds tutorial): the prestige-gated reward is paid there the same way, funded by banked prestige.
+test("a Training hub pays the prestige-gated reward the way a Ramsgate hub does", async () => {
     await WithRealm("TRAINING", async ({ hub }) => {
         await Realm!.repos.progressionTracks.increment(Kit_.MEMBER, PRESTIGE_SWORD, 1);
         const Result = await Post(hub, "dojo-aether-1", [{ catalogId: AETHERHEART, quantity: 1 }]);
-        assert.equal(Result.status, 403, JSON.stringify(Result.json));
-        assert.equal(Result.json.code, "P2P_HOST_GRANT_DENIED");
-        assert.deepEqual(Result.json.payload, { classes: ["NO_REWARD_SESSION"] });
-        assert.equal(await Balance(AETHERHEART), 0);
-        assert.equal(await Claimed(), 0);
+        assert.equal(Result.status, 200, JSON.stringify(Result.json));
+        assert.equal(await Balance(AETHERHEART), 1);
+        assert.equal(await Claimed(), 1);
     });
 });

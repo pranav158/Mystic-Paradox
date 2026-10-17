@@ -15,7 +15,7 @@ import { loadGameData } from "../gameData/loader";
 import { WidenHuntPassWindows } from "./system";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
 import { logger } from "../logger";
-import { AddEncounteredContent, GetBreadcrumbsForCharacterIdAndUserId, GetPlayerJourney, QueryEncounteredContent, SavePlayerJourney, SetBreadcrumbsForCharacterIdAndUserId, GrantProgressionXp, GetPersistedProgressionForUser, CaptureProgressionObjectiveEvent, GetPersistedObjectivesForUser, ConfirmPublicProgressionRank, IsAuthorizedProgressionReader, IsAuthorizedProgressionReporter, IsApprovedXpProgressionTrack, IsValidProgressionGrantId, ProgressionGrantConflictError, IsCharacterOwnedByUser, DescribeUnapprovedXpTrack, IsHuntPassXpTrack, RankForProgress, ServedHuntPassProgressionId, IsHostRuntimeAuth, RefuseUnauthorizedHostWrite, TagHostWrite, SummarizeObjectiveReport, CheckHostXpGrant, DescribeHostGrantRefusal, HostGrantLimitDenial, HostGrantLimitError, MAX_PROGRESSION_GRANT_AMOUNT } from "../controllers/progression";
+import { AddEncounteredContent, GetBreadcrumbsForCharacterIdAndUserId, GetPlayerJourney, QueryEncounteredContent, SavePlayerJourney, SetBreadcrumbsForCharacterIdAndUserId, GrantProgressionXp, GetPersistedProgressionForUser, CaptureProgressionObjectiveEvent, GetPersistedObjectivesForUser, ConfirmPublicProgressionRank, IsAuthorizedProgressionReader, IsAuthorizedProgressionReporter, IsApprovedXpProgressionTrack, IsValidProgressionGrantId, ProgressionGrantConflictError, IsCharacterOwnedByUser, DescribeUnapprovedXpTrack, IsHuntPassXpTrack, RankForProgress, ServedHuntPassProgressionId, IsHostRuntimeAuth, RefuseUnauthorizedHostWrite, TagHostWrite, SummarizeObjectiveReport, CheckHostXpGrant, DescribeHostGrantRefusal, HostGrantLimitDenial, HostGrantLimitError, MAX_PROGRESSION_GRANT_AMOUNT, ACTIVE_HUNTPASS_PROGRESSION_ID, IsAuthoritativeServerFor, HostLimitOnlyLogs } from "../controllers/progression";
 import { ApplyMasteryReport, ApplyMasteryReportWithPlan, HostMasteryLimits, MASTERY_PERSISTENCE, SummarizeMasteryPlan } from "../controllers/masteryReport";
 import { ClassifyReforgeGrant, ExperienceTrackForPrestige, FinishStaleReforgesForUser, IsReforgeableTrack, PlanPurchaseRestore, ReforgeConflictError, ReforgeGrantHook, ReforgeGrantPlan, ReforgeReset } from "../controllers/reforge";
 import { GetRepositories } from "../persistence";
@@ -482,12 +482,24 @@ progressionRouter.post("/progression/:userId/:progressionId/:amount", HasParadox
     // it as XP, as before. Whether the +1 is granted at all is still the reforge rules' call (below).
     let HostWriteAs: HostWriteKind = "XP";
     if(IsHost){
-        let Denial = await RefuseUnauthorizedHostWrite(req, "XP", RequestedUserId);
+        // [2026-10-16] The kinds are tried quietly (probe) in order, so a grant the session takes as REFORGE or HUNT_PASS_XP is
+        // tagged as that kind; only when none fits does the plain XP call below decide (and log). In the module's observe mode
+        // (MYSTICPARADOX_HOST_POLICY) that last call lets a kind the session does not take through as XP, logged.
+        const Probe = { probe: true };
+        let Denial = await RefuseUnauthorizedHostWrite(req, "XP", RequestedUserId, undefined, Probe);
         if(Denial !== undefined && ExperienceTrackForPrestige(ProgressionId) !== undefined
-            && await RefuseUnauthorizedHostWrite(req, "REFORGE", RequestedUserId) === undefined){
+            && await RefuseUnauthorizedHostWrite(req, "REFORGE", RequestedUserId, undefined, Probe) === undefined){
             HostWriteAs = "REFORGE";
             Denial = undefined;
         }
+        // [2026-10-16] A realm hub takes no XP but the active Hunt Pass track's, which the game awards in town.
+        // The per-track ceiling below still applies.
+        if(Denial !== undefined && ProgressionId === ACTIVE_HUNTPASS_PROGRESSION_ID
+            && await RefuseUnauthorizedHostWrite(req, "HUNT_PASS_XP", RequestedUserId, undefined, Probe) === undefined){
+            HostWriteAs = "HUNT_PASS_XP";
+            Denial = undefined;
+        }
+        if(Denial !== undefined) Denial = await RefuseUnauthorizedHostWrite(req, "XP", RequestedUserId);
         if(Denial !== undefined){
             res.status(Denial.status).json(Denial.body);
             return;
@@ -498,8 +510,10 @@ progressionRouter.post("/progression/:userId/:progressionId/:amount", HasParadox
         // authorization check above, so a host that may not write this player learns nothing about the limits; before any
         // read of the player's tracks. 403, like the module's own refusals: the request is well formed, this host may not
         // write it. Never clamped: a clamped grant would still be recorded under its grant id.
+        // [2026-10-17] Dedicated parity: an over-ceiling amount only logs in observe mode (HostLimitOnlyLogs); GrantProgressionXp
+        // logs it once. The reforge rules (a prestige grant that is not +1, MasteryTrack_) are refused here in both modes.
         const Refusal = CheckHostXpGrant(ProgressionId, Amount);
-        if(Refusal !== undefined){
+        if(Refusal !== undefined && !HostLimitOnlyLogs(Refusal)){
             logger.warn(`[HostWrite] refused kind=${HostWriteAs} target=${LogSafe(RequestedUserId)} ${DescribeHostGrantRefusal(Refusal)} grant=${LogSafe(GrantId)}`);
             const Limit = HostGrantLimitDenial();
             res.status(Limit.status).json(Limit.body);
@@ -818,13 +832,19 @@ progressionRouter.get("/progression/:userId", HasParadoxBackendAuth, async (req:
     // never saving even after the grant endpoint started persisting it.
     // [1.14.7 2026-10-11] A weapon reforge whose follow-ups never arrived is finished before the load (banked XP back,
     // +1), so the arriving server starts from the right level. Only on a game server's load; failures never block it.
-    if(req.AuthData?.IsGameserver === true){
-        try{
-            await FinishStaleReforgesForUser(RequestorAccountId);
+    // [2026-10-17] Dedicated parity: a realm hub's or hunt's load of a player in its session does it too (IsAuthoritativeServerFor);
+    // the repair works only from the player's own stored reforge record. A realm repair is logged and tagged.
+    try{
+        if(await IsAuthoritativeServerFor(req, RequestorAccountId, "REFORGE")){
+            const Finished = await FinishStaleReforgesForUser(RequestorAccountId);
+            if(Finished.length > 0 && IsHostRuntimeAuth(req.AuthData)){
+                logger.info(`[HostParity] reforge repair at a realm load user=${RequestorAccountId} tracks=[${Finished.join(", ")}]`);
+                await TagHostWrite(req, "REFORGE", RequestorAccountId, { staleReforgesFinished: Finished });
+            }
         }
-        catch(error){
-            logger.error(`[Reforge] stale-reforge recovery failed for ${RequestorAccountId}: ${error instanceof Error ? error.message : String(error)}`);
-        }
+    }
+    catch(error){
+        logger.error(`[Reforge] stale-reforge recovery failed for ${RequestorAccountId}: ${error instanceof Error ? error.message : String(error)}`);
     }
     const Payload = await GetPersistedProgressionForUser(RequestorAccountId, DEFAULT_PROGRESSION_IDS);
 
@@ -863,12 +883,18 @@ progressionRouter.get("/pjm/:userId", HasParadoxBackendAuth, async (req: any, re
         // Backfill rewards that were missed before the server knew how to apply Slayer's Path
         // unlock effects. Limit this to a validated game-server request: bearer-only clients may
         // read their map, but must never be able to cause inventory grants through a GET.
-        if(req.AuthData?.IsGameserver === true){
+        // [2026-10-17] Dedicated parity: a realm server's read for a player in its session too (IsAuthoritativeServerFor). The
+        // rewards come from the stored map only (each node's reward once, idempotent), as on every journey save.
+        if(await IsAuthoritativeServerFor(req, RequestedUserId, "SLAYERS_PATH")){
             const RewardEligibleNodeIds = GetUnlockedNodeIds(Saved.nodes);
             logger.info(`[slayers-path] login reconciliation evaluating ${RewardEligibleNodeIds.length} reward-eligible nodes for ${RequestedUserId}`);
             const Granted = await GrantSlayersPathRewards(RequestedUserId, RewardEligibleNodeIds);
             if(Granted.length > 0){
                 logger.info(`Slayer's Path login reconciliation granted [${Granted.join(", ")}] to ${RequestedUserId}`);
+                if(IsHostRuntimeAuth(req.AuthData)){
+                    logger.info(`[HostParity] Slayer's Path catch-up at a realm login user=${RequestedUserId} granted=[${Granted.join(", ")}]`);
+                    await TagHostWrite(req, "SLAYERS_PATH", RequestedUserId, { loginCatchUp: Granted });
+                }
             }
         }
 

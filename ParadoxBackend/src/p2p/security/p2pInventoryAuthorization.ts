@@ -9,8 +9,10 @@ import { ListHubPresentAccounts, PlayerHostRuntimeAuthData } from "./hostCapabil
 import { HubPresenceView, IsRealmHubSession } from "./hubAuthorization";
 import { P2PInventoryTransactionDenialReason } from "./p2pInventoryTransactions";
 import { BodyAddsHostDraftPremium, HOST_DRAFT_PREMIUM_BALANCE_CAP, HOST_DRAFT_PREMIUM_ID, HostGrantDenial } from "./hostGrantPolicy";
-import { DecideHostDraftPremium, HostDraftPremiumDecision, ReadHostDraftPremiumInputs, RecordHostDraftPremiumGrant } from "./hostDraftPremium";
+import { DecideHostDraftPremium, HostDraftPremiumDecision, ReadHostDraftPremiumInputs } from "./hostDraftPremium";
+import { HostPolicyRefuses, NoteHostPolicyWouldRefuse } from "./hostPolicyMode";
 import { GetRepositories } from "../../persistence";
+import { UtcDay } from "../../bountyState";
 
 const LOOT_DENIED = "Player-hosted hunt loot grant is not authorized.";
 const HOST_GRANT_DENIED = "A player host may not grant this item class.";
@@ -77,8 +79,8 @@ const DRAFT_PREMIUM_DENIAL_PREFIX = "P2P_LOOT_GRANT_DRAFT_PREMIUM_";
 
 /**
  * Whether this transaction (same id, same body) was already accepted. The ledger then replays its stored result and applies nothing
- * (RunInventoryTransaction), so the draft premium decision must not refuse it now that the token it granted is the balance and today's
- * day. [2026-10-15] Only a completed row with the same request hash counts; a changed body is not a replay and is decided as before.
+ * (RunInventoryTransaction), so the draft premium decision must not refuse it now that the token it granted is in the balance.
+ * [2026-10-15] Only a completed row with the same request hash counts; a changed body is not a replay and is decided as before.
  */
 async function IsAcceptedReplay(context: InventoryTransactionContext, body: any): Promise<boolean> {
     const Stored = await GetRepositories().inventoryTransactions.findRecord(context.userId, context.characterId, context.transactionId);
@@ -110,7 +112,9 @@ export async function AuthorizeP2PInventoryTransaction(req: Request, context: In
     // [2026-10-11 B9, decision 1 of 39_ §13] Hard deny list (hostGrantPolicy.ts): Platinum and premium currency, Hunt
     // Pass items, cosmetics and entitlements never come from a host, and a no-reward session (Training, B7) grants and
     // spends nothing. The whole transaction is refused - a legitimate hunt never sends these, so a transaction that does
-    // is not trusted with the rest of its contents either.
+    // is not trusted with the rest of its contents either. [2026-10-16] Only in enforce mode (MYSTICPARADOX_HOST_POLICY): in
+    // observe, the default, the refusal is logged as [HostPolicyObserve] and the transaction proceeds (hostPolicyMode.ts). Who may
+    // write (the denial above, the character check below, the emergency stop) is enforced in both modes.
     // [2026-10-13 realms S3] The one Hunt Pass item let through is the claim-funded season-challenge coin grant
     // (hostGrantPolicy.ts IsClaimFundedCoinGrant); whether it is paid is the wallet's call (one claim, one grant).
     // [2026-10-15] The daily premium draft token (hostDraftPremium.ts): read here for the early refusal, and decided again inside the
@@ -122,10 +126,18 @@ export async function AuthorizeP2PInventoryTransaction(req: Request, context: In
         : undefined;
     const grantDenial = HostGrantDenial(hunt, body, undefined, { draftPremium: DraftPremiumReplay || DraftPremiumPrecheck?.allowed === true });
     if (grantDenial != undefined) {
-        logger.warn(`[HostGrantDeny] account=${context.userId} session=${runtimeAuth.p2pSessionId} generation=${runtimeAuth.p2pGeneration} ` +
+        const grantTags = `account=${context.userId} session=${runtimeAuth.p2pSessionId} generation=${runtimeAuth.p2pGeneration} ` +
             `transaction=${context.transactionId} classes=${grantDenial.classes.join(",")} denied=${grantDenial.summary}` +
-            (DraftPremiumPrecheck !== undefined && !DraftPremiumPrecheck.allowed ? ` draftPremium=${DraftPremiumPrecheck.reason}` : ""));
-        return { status: 403, body: { code: "P2P_HOST_GRANT_DENIED", message: HOST_GRANT_DENIED, payload: { classes: grantDenial.classes } } };
+            (DraftPremiumPrecheck !== undefined && !DraftPremiumPrecheck.allowed ? ` draftPremium=${DraftPremiumPrecheck.reason}` : "") +
+            (hunt?.hubKind != undefined ? ` hub=${hunt.hubKind}` : "");
+        // [2026-10-16] Observe mode (MYSTICPARADOX_HOST_POLICY, the default): the
+        // class deny list and the no-reward session are logged and the transaction proceeds; the ledger row and [GrantMon] record it.
+        if (!HostPolicyRefuses()) {
+            NoteHostPolicyWouldRefuse("grant", grantTags);
+        } else {
+            logger.warn(`[HostGrantDeny] ${grantTags}`);
+            return { status: 403, body: { code: "P2P_HOST_GRANT_DENIED", message: HOST_GRANT_DENIED, payload: { classes: grantDenial.classes } } };
+        }
     }
     // Bind the transaction to the character frozen for this admitted participant. The
     // inventory controller also verifies account ownership before entering its transaction.
@@ -157,16 +169,21 @@ export async function AuthorizeP2PInventoryTransaction(req: Request, context: In
                 const currentDenial = P2PInventoryTransactionDenialReason(runtimeAuth, currentHunt, body,
                     await HubPresenceInTransaction(currentHunt, runtimeAuth.userId, session));
                 if (currentDenial != undefined) throw new Error(`P2P_LOOT_GRANT_${currentDenial}`);
-                // The draft premium token is decided again from this transaction's reads: the balance, the pass and today's day as
-                // they are now. An accepted grant records today's day on the account in this same transaction (hostDraftPremium.ts).
+                // The draft premium token is decided again from this transaction's reads: the balance and the pass as they are now.
+                // [2026-10-16] Nothing is recorded on the account any more (no once-per-day rule, hostDraftPremium.ts); the day is kept
+                // for the [HostGrantAllow] line only.
                 if (BodyAddsHostDraftPremium(body)) {
                     const Inputs = await ReadHostDraftPremiumInputs(repos, context.userId, context.characterId, session);
                     const Decision = DecideHostDraftPremium(body, Inputs);
-                    if (Decision === undefined || !Decision.allowed) throw new Error(`${DRAFT_PREMIUM_DENIAL_PREFIX}${Decision?.reason ?? "NOT_A_GRANT"}`);
-                    if (!await RecordHostDraftPremiumGrant(repos, context.userId, Inputs.today, session)) {
-                        throw new Error(`${DRAFT_PREMIUM_DENIAL_PREFIX}ACCOUNT_RECORD_CONFLICT`);
+                    if (Decision === undefined || !Decision.allowed) {
+                        const Reason = Decision?.reason ?? "NOT_A_GRANT";
+                        if (HostPolicyRefuses()) throw new Error(`${DRAFT_PREMIUM_DENIAL_PREFIX}${Reason}`);
+                        // [2026-10-16] Observe mode: the cap is logged, the token is granted.
+                        NoteHostPolicyWouldRefuse("draft premium", `${tags} item=${HOST_DRAFT_PREMIUM_ID} reason=${Reason} at=transaction` +
+                            (Decision?.balanceBefore !== undefined ? ` balance=${Decision.balanceBefore}->${Decision.balanceAfter} cap=${HOST_DRAFT_PREMIUM_BALANCE_CAP}` : ""));
+                    } else {
+                        GrantedDraftPremium = { decision: Decision, day: UtcDay() };
                     }
-                    GrantedDraftPremium = { decision: Decision, day: Inputs.today };
                 }
 
                 // Record the accepted item additions with the existing idempotency ledger completion.

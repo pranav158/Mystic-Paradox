@@ -62,6 +62,10 @@ interface PendingDaily {
 
 const Pending = new Map<string, PendingDaily>();
 const PlaytimeLastTouch = new Map<string, number>();
+// [2026-10-16] When each account's running game last touched the backend (the same touches as PlaytimeLastTouch), kept whether
+// or not the monitor is on: matchmaking asks it whether a party member's game is running (IsGameRecentlyActive), because a game
+// on a realm or player-hosted server holds no XMPP socket, and the release gate counts it as playing (RecentlyActiveAccountIds).
+const GameLastSeen = new Map<string, number>();
 const RaisedFlags = new Set<string>();
 let FlushTimer: ReturnType<typeof setTimeout> | undefined;
 let Flushing: Promise<void> | undefined;
@@ -150,6 +154,9 @@ export async function FlushActivity(): Promise<void> {
         for (const [UserId, Last] of PlaytimeLastTouch) {
             if (Last < Cutoff) PlaytimeLastTouch.delete(UserId);
         }
+        for (const [UserId, Last] of GameLastSeen) {
+            if (Last < Cutoff) GameLastSeen.delete(UserId);
+        }
     })().finally(() => { Flushing = undefined; });
     await Flushing;
 }
@@ -207,7 +214,11 @@ function Quietly(label: string, userId: string, work: () => Promise<void>): Prom
  */
 export function TouchGameSession(userId: string, nowMs: number = Date.now()): void {
     try {
-        if (!CurrentActivitySettings().enabled || typeof userId !== "string" || userId.length === 0) return;
+        if (typeof userId !== "string" || userId.length === 0) return;
+        // [2026-10-16] Recorded first, monitor or not (GameLastSeen); only the playtime counting below is the monitor's.
+        GameLastSeen.set(userId, Math.max(nowMs, GameLastSeen.get(userId) ?? nowMs));
+        if (GameLastSeen.size > 100_000) PruneGameLastSeen(nowMs);
+        if (!CurrentActivitySettings().enabled) return;
         const Step = AdvancePlaytime(PlaytimeLastTouch.get(userId), nowMs);
         PlaytimeLastTouch.set(userId, Math.max(nowMs, PlaytimeLastTouch.get(userId) ?? nowMs));
         if (Step.sessionStarted) AddDaily(userId, DayOf(nowMs), { sessions: 1 });
@@ -222,15 +233,33 @@ export function TouchGameSession(userId: string, nowMs: number = Date.now()): vo
 /**
  * [2026-10-15] The accounts whose running game touched the backend within `withinMs` (the presence touches above: the
  * matchmaking heartbeat about every 5 s, the realm presence heartbeat every 30 s, a game session's start). The operator
- * dashboard counts them as online: a game on a realm or player-hosted server holds no XMPP socket. Empty while the monitor
- * is off.
+ * dashboard counts them as online: a game on a realm or player-hosted server holds no XMPP socket. [2026-10-16] Read from
+ * GameLastSeen, so it answers with the monitor off too (it was empty then).
  */
 export function RecentlyActiveAccountIds(withinMs: number, nowMs: number = Date.now()): string[] {
     const Active: string[] = [];
-    for (const [UserId, LastTouch] of PlaytimeLastTouch) {
+    for (const [UserId, LastTouch] of GameLastSeen) {
         if (nowMs - LastTouch <= withinMs) Active.push(UserId);
     }
     return Active;
+}
+
+/**
+ * [2026-10-16] Whether `userId`'s running game touched the backend within `withinMs` (TouchGameSession: a game session's start, the
+ * matchmaking heartbeat, the realm presence heartbeat every 30 s). Matchmaking counts such a party member as online: on this backend
+ * no game holds an XMPP socket, so the chat registry alone counted
+ * every member but the leader as offline and left them out of an ISLAND hunt.
+ */
+export function IsGameRecentlyActive(userId: string, withinMs: number, nowMs: number = Date.now()): boolean {
+    const Last = GameLastSeen.get(userId);
+    return Last !== undefined && nowMs - Last <= withinMs;
+}
+
+function PruneGameLastSeen(nowMs: number): void {
+    const Cutoff = nowMs - 2 * 60 * 60 * 1000;
+    for (const [UserId, Last] of GameLastSeen) {
+        if (Last < Cutoff) GameLastSeen.delete(UserId);
+    }
 }
 
 // ---- inventory (loot, currency, Platinum) ----

@@ -254,8 +254,9 @@ test("hub presence cache: bounded", async () => {
 });
 
 // [2026-10-14 realms S4] Host write kinds by hub (SteamDocs/PARADOX_REALMS_HUB_DESIGN_2026_10_13.md section 7.2).
-const ALL_WRITE_KINDS: readonly HostWriteKind[] = ["XP", "MASTERY", "OBJECTIVES", "ESCALATION", "COOLDOWN", "BOUNTY", "SLAYERS_PATH", "REFORGE", "RANK_CONFIRM"];
-const RAMSGATE_WRITE_KINDS: readonly HostWriteKind[] = ["BOUNTY", "COOLDOWN", "SLAYERS_PATH", "ESCALATION", "OBJECTIVES", "MASTERY", "REFORGE", "RANK_CONFIRM"];
+// [2026-10-16] HUNT_PASS_XP: the active Hunt Pass track's XP, which a hub takes (the game awards it in town).
+const ALL_WRITE_KINDS: readonly HostWriteKind[] = ["XP", "MASTERY", "OBJECTIVES", "ESCALATION", "COOLDOWN", "BOUNTY", "SLAYERS_PATH", "REFORGE", "RANK_CONFIRM", "HUNT_PASS_XP"];
+const RAMSGATE_WRITE_KINDS: readonly HostWriteKind[] = ["BOUNTY", "COOLDOWN", "SLAYERS_PATH", "ESCALATION", "OBJECTIVES", "MASTERY", "REFORGE", "RANK_CONFIRM", "HUNT_PASS_XP"];
 const RAMSGATE_HUB = { sessionKind: "REALM_HUB" as const, hubKind: "RAMSGATE" as const, hostAccountId: HOST };
 const TRAINING_HUB = { sessionKind: "REALM_HUB" as const, hubKind: "TRAINING" as const, hostAccountId: HOST };
 
@@ -266,8 +267,15 @@ test("a realm's Ramsgate hub accepts exactly the section 7.2 write kinds, and ne
     assert.equal(HubAllowsWriteKind("RAMSGATE", "XP"), false);
 });
 
-test("a Training hub accepts no write kind; an unknown hub kind or a missing kind accepts none either", () => {
-    for (const kind of ALL_WRITE_KINDS) assert.equal(HubAllowsWriteKind("TRAINING", kind), false, kind);
+// [2026-10-16] A Training hub writes what Ramsgate writes, except the reforge (the Training Grounds tutorial saves its quest
+// step through the bounty component).
+test("a Training hub accepts Ramsgate's write kinds but the reforge; an unknown hub kind or a missing kind accepts none", () => {
+    for (const kind of ALL_WRITE_KINDS) {
+        assert.equal(HubAllowsWriteKind("TRAINING", kind), kind !== "REFORGE" && HubAllowsWriteKind("RAMSGATE", kind), kind);
+    }
+    assert.equal(HubAllowsWriteKind("TRAINING", "BOUNTY"), true);
+    assert.equal(HubAllowsWriteKind("TRAINING", "REFORGE"), false);
+    assert.equal(HubAllowsWriteKind("TRAINING", "XP"), false, "no XP source in a hub");
     assert.equal(HubAllowsWriteKind("SOMETHING_ELSE", "BOUNTY"), false);
     assert.equal(HubAllowsWriteKind(undefined, "BOUNTY"), false);
     assert.equal(HubAllowsWriteKind("RAMSGATE", undefined), false);
@@ -279,22 +287,23 @@ test("a hunt refuses only the hub-only REFORGE kind; the per-write rules stay wi
 });
 
 // [2026-10-14 realms S4] A rank confirm (RANK_CONFIRM) is the one kind a Ramsgate hub takes that a hunt takes too, for a present member.
-test("a rank confirm is allowed in a Ramsgate hub for a present member and the host, and refused in a Training hub", () => {
+test("a rank confirm is allowed in a Ramsgate or Training hub for a present member and the host", () => {
     const presence = { presentAccountIds: [MEMBER] };
     assert.equal(HubWriteDenialReason(RAMSGATE_HUB, "RANK_CONFIRM", MEMBER, presence), undefined);
     assert.equal(HubWriteDenialReason(RAMSGATE_HUB, "RANK_CONFIRM", HOST, undefined), undefined);
     assert.equal(HubWriteDenialReason(RAMSGATE_HUB, "RANK_CONFIRM", LATE, presence), "MEMBER_NOT_PRESENT");
-    assert.equal(HubWriteDenialReason(TRAINING_HUB, "RANK_CONFIRM", MEMBER, presence), "WRITE_KIND_NOT_ALLOWED_IN_HUB");
+    assert.equal(HubWriteDenialReason(TRAINING_HUB, "RANK_CONFIRM", MEMBER, presence), undefined);
+    assert.equal(HubWriteDenialReason(TRAINING_HUB, "RANK_CONFIRM", LATE, presence), "MEMBER_NOT_PRESENT");
     assert.equal(HuntAllowsWriteKind("RANK_CONFIRM"), true);
 });
 
 // [2026-10-15] A loadout unlock: a Ramsgate hub's write for a present member and the host; a Training hub refuses it; a hunt allows it.
-test("a loadout unlock is allowed in a Ramsgate hub for a present member and the host, refused in a Training hub, allowed in a hunt", () => {
+test("a loadout unlock is allowed in a Ramsgate or Training hub for a present member and the host, and in a hunt", () => {
     const presence = { presentAccountIds: [MEMBER] };
     assert.equal(HubWriteDenialReason(RAMSGATE_HUB, "LOADOUT_UNLOCK", MEMBER, presence), undefined);
     assert.equal(HubWriteDenialReason(RAMSGATE_HUB, "LOADOUT_UNLOCK", HOST, undefined), undefined);
     assert.equal(HubWriteDenialReason(RAMSGATE_HUB, "LOADOUT_UNLOCK", LATE, presence), "MEMBER_NOT_PRESENT");
-    assert.equal(HubWriteDenialReason(TRAINING_HUB, "LOADOUT_UNLOCK", MEMBER, presence), "WRITE_KIND_NOT_ALLOWED_IN_HUB");
+    assert.equal(HubWriteDenialReason(TRAINING_HUB, "LOADOUT_UNLOCK", MEMBER, presence), undefined);
     assert.equal(HuntAllowsWriteKind("LOADOUT_UNLOCK"), true);
 });
 
@@ -306,8 +315,10 @@ test("a hub write needs its kind in that hub and a target present in it (the hos
     assert.equal(HubWriteDenialReason(RAMSGATE_HUB, "BOUNTY", MEMBER, undefined), "MEMBER_NOT_PRESENT", "no view: only the host");
     assert.equal(HubWriteDenialReason(RAMSGATE_HUB, "XP", MEMBER, presence), "WRITE_KIND_NOT_ALLOWED_IN_HUB");
     assert.equal(HubWriteDenialReason(RAMSGATE_HUB, undefined, MEMBER, presence), "WRITE_KIND_NOT_ALLOWED_IN_HUB");
-    assert.equal(HubWriteDenialReason(TRAINING_HUB, "BOUNTY", MEMBER, presence), "WRITE_KIND_NOT_ALLOWED_IN_HUB");
-    assert.equal(HubWriteDenialReason(TRAINING_HUB, "BOUNTY", HOST, undefined), "WRITE_KIND_NOT_ALLOWED_IN_HUB", "the host does not change a Training hub");
+    // [2026-10-16] A Training hub takes a present member's bounty (the tutorial's quest step); the reforge stays Ramsgate's.
+    assert.equal(HubWriteDenialReason(TRAINING_HUB, "BOUNTY", MEMBER, presence), undefined);
+    assert.equal(HubWriteDenialReason(TRAINING_HUB, "BOUNTY", LATE, presence), "MEMBER_NOT_PRESENT");
+    assert.equal(HubWriteDenialReason(TRAINING_HUB, "REFORGE", HOST, undefined), "WRITE_KIND_NOT_ALLOWED_IN_HUB", "the reforge is Ramsgate's");
 });
 
 test("the realm-hub and Ramsgate predicates read the session kind and the hub kind only", () => {

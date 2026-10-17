@@ -39,7 +39,8 @@ const ARTIFACT_PINS = ["P2P_GAME_EXE_SHA256", "P2P_INTERNAL_SERVER_SHA256", "P2P
 const MANAGED_ENVIRONMENT = [
     "P2P_HUNTS_ENABLED", "MYSTICPARADOX_REALMS_HOSTING", "P2P_BACKEND_URL", "P2P_TRANSPORT_KEY_SECRET", "P2P_TURN_PROVIDER",
     "P2P_ADMISSION_KEY_ID", "P2P_ADMISSION_SIGNING_PRIVKEY_B64", "P2P_ADMISSION_VERIFY_PUBKEY_B64", "P2P_FORCE_SDR",
-    "P2P_REALM_HUB_CAPABILITY_TTL_HOURS", "P2P_LAUNCHER_GUARD_REQUIRED", "MYSTICPARADOX_GUARD_MODE", "LAUNCHER_UPDATE_ROOT", ...ARTIFACT_PINS
+    "P2P_REALM_HUB_CAPABILITY_TTL_HOURS", "P2P_LAUNCHER_GUARD_REQUIRED", "MYSTICPARADOX_GUARD_MODE", "MYSTICPARADOX_HOST_POLICY",
+    "LAUNCHER_UPDATE_ROOT", ...ARTIFACT_PINS
 ] as const;
 
 /** Sets the environment the hub code reads (a fresh throwaway ES256 key pair for tickets); returns the function that restores it. */
@@ -59,6 +60,9 @@ export function InstallHubTestEnvironment(): () => void {
     delete process.env.P2P_LAUNCHER_GUARD_REQUIRED;
     // [2026-10-14] The Guard mode is the default (observe) unless a test sets it.
     delete process.env.MYSTICPARADOX_GUARD_MODE;
+    // [2026-10-16] The host policy runs in enforce here: these tests pin each rule's refusal. The live default is observe
+    // (hostPolicyMode.ts), which hostPolicyObserve.gamedata.test.ts covers by setting it.
+    process.env.MYSTICPARADOX_HOST_POLICY = "enforce";
     for (const pin of ARTIFACT_PINS) process.env[pin] = "a".repeat(64);
     process.env.LAUNCHER_UPDATE_ROOT = path.join(os.tmpdir(), "paradox-realm-hub-tests-no-feed");
     return () => {

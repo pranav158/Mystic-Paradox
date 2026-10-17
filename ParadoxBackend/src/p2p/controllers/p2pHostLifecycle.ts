@@ -26,7 +26,7 @@ import { ParseSteamTransportId } from "../security/steamTransportIdentity";
 import { DeriveIcePeerId, ParseIcePeerReport } from "../security/transportPeerIds";
 import { LauncherGuardRole, LauncherGuardSessionRecord } from "../../persistence/contracts/LauncherGuardRepository";
 import { FenceP2PEmergencyStop, GetP2POperationsPolicy } from "../services/p2pOperationsPolicy";
-import { DecideRealmCapacity, IsRealmHub } from "../realm/realmHubRules";
+import { DecideRealmCapacity, IsRealmHub, RealmLowMemoryNote } from "../realm/realmHubRules";
 import { IsRealmHostingEnabled, ReadRealmHubPolicy, RealmHostIneligibilityReason } from "../realm/realmHubPolicy";
 import { GetRealmsPort } from "../realm/realmsPort";
 import { EndRealmHub, TickRealmHub } from "./realmHubLifecycle";
@@ -488,6 +488,12 @@ export async function RankRealmHost(hunt: P2PHuntSessionRecord, nowMs = Date.now
     if (!capacity.ok) {
         logger.info(`[P2P] realm ${realmId} has no room on its host right now reason=${capacity.reason} servers=${otherServers}`);
         return { ranked: [], refusal: "REALM_FULL" };
+    }
+    if (capacity.lowFreeMemory) {
+        logger.warn(RealmLowMemoryNote(realmId, `hunt ${hunt.sessionId}`, {
+            freePhysicalMemoryMiB: presence.freePhysicalMemoryMiB, commitHeadroomMiB: presence.commitHeadroomMiB,
+            minimumFreeMemoryMiB: realmPolicy.minimumFreeMemoryMiB
+        }));
     }
     const scored = ScoreHost(presence, undefined, hostPolicy, 0);
     return { ranked: [{ accountId: host, steamId: DeriveIcePeerId(host), ...scored }] };

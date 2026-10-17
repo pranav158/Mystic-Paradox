@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test, { afterEach, beforeEach } from "node:test";
+import { GameDailyWindowKey } from "../bountyState";
 import { RunInventoryTransaction } from "../controllers/inventory";
 import { InsufficientBalanceError } from "../controllers/wallet";
 import { logger } from "../logger";
@@ -158,7 +159,9 @@ test("season challenge coins funded by their claim are logged as a QUEST reward"
     assert.equal(Record?.bounties[0].rewardCredit?.amount, 400, "the claim is credited once");
 });
 
-test("a claimed daily challenge pays its Cache Coins once per UTC day; a second daily the same day is refused", async () => {
+// [2026-10-17] Once per game day (from 17:00 UTC, bountyState.ts GameDailyWindowKey); a second daily's coins the same game day are
+// skipped and the transaction kept (it was refused whole, and the game sent it again to be refused again).
+test("a claimed daily challenge pays its Cache Coins once per game day; a second daily's coins the same day are skipped, not refused", async () => {
     const DAILY_USER = "economy-daily-user";
     const Now = new Date().toISOString();
     await Realm.repos.bountyStates.saveIfVersion({
@@ -172,10 +175,15 @@ test("a claimed daily challenge pays its Cache Coins once per UTC day; a second 
     await RunInventoryTransaction(DAILY_USER, CHARACTER, "daily-coins-1", [], [{ catalogId: "CURRENCY_SEASONAL_COIN", quantity: 100 }], [], [], [],
         { ownershipAlreadyValidated: true, allowChallengeRewardFunding: true, economy: { source: "INVENTORY_GAMESERVER" } });
     const Paid = await Realm.repos.bountyStates.get(DAILY_USER);
-    assert.equal(Paid?.dailyRewardCreditedOn, Now.slice(0, 10), "the account records the day a daily paid");
+    assert.equal(Paid?.dailyRewardCreditedOn, GameDailyWindowKey(Date.parse(Now)), "the account records the game day a daily paid");
     assert.equal(Paid?.bounties.filter((Entry) => Entry.rewardCredit).length, 1, "exactly one daily is credited");
-    await assert.rejects(
-        RunInventoryTransaction(DAILY_USER, CHARACTER, "daily-coins-2", [], [{ catalogId: "CURRENCY_SEASONAL_COIN", quantity: 100 }], [], [], [],
-            { ownershipAlreadyValidated: true, allowChallengeRewardFunding: true, economy: { source: "INVENTORY_GAMESERVER" } }),
-        "a second daily's coins the same UTC day are refused (nothing funds them)");
+    const NotesBefore = (await Realm.repos.wallets.findByUserId(DAILY_USER))?.balances.CURRENCY_NOTES ?? 0;
+    await RunInventoryTransaction(DAILY_USER, CHARACTER, "daily-coins-2", [],
+        [{ catalogId: "CURRENCY_SEASONAL_COIN", quantity: 100 }, { catalogId: "CURRENCY_NOTES", quantity: 50 }], [], [], [],
+        { ownershipAlreadyValidated: true, allowChallengeRewardFunding: true, economy: { source: "INVENTORY_GAMESERVER" } });
+    const Wallet = await Realm.repos.wallets.findByUserId(DAILY_USER);
+    assert.equal(Wallet?.balances.CURRENCY_SEASONAL_COIN, 100, "the second daily's coins were skipped");
+    assert.equal(Wallet?.balances.CURRENCY_NOTES, NotesBefore + 50, "and the rest of its transaction applied");
+    assert.equal((await Realm.repos.bountyStates.get(DAILY_USER))?.bounties.filter((Entry) => Entry.rewardCredit).length, 1,
+        "still exactly one daily credited");
 });

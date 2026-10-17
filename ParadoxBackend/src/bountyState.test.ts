@@ -33,7 +33,9 @@ import {
     WEEKLY_PREVIOUS_WINDOW_GRACE_MS,
     WeeklyScheduleStampMs,
     UtcDay,
-    WithDraftPremiumGrantDay,
+    GameDailyWindowKey,
+    DailyChallengeRewardPaid,
+    DailyChallengeRewardLimited,
     WithRewardCredit
 } from "./bountyState";
 import { IsChallengeRewardGrant } from "./controllers/challengeRewards";
@@ -241,7 +243,9 @@ test("a new drafted instance of a challenge starts unclaimed and uncredited", ()
     assert.equal(Axe.claimedAt, undefined);
 });
 
-test("a claimed daily challenge funds one reward per UTC day; the day survives later saves and resets at 00:00 UTC", () => {
+// [2026-10-17] The once-a-day key is the game's day, from 17:00 UTC (the game's bounty_daily cooldown): under the UTC-date key the
+// first daily reward of a new game day was refused whenever one was paid earlier that UTC date.
+test("a claimed daily challenge funds one reward per game day (from 17:00 UTC); the day survives later saves", () => {
     const DayOne = Date.parse(NOW);
     let Record = ApplyAt(undefined, {
         bounties: [Daily("Challenge_Daily_Bronze_KillBlazeFrost", NOW, 1, true)],
@@ -250,28 +254,36 @@ test("a claimed daily challenge funds one reward per UTC day; the day survives l
     assert.equal(FindFundableSeasonClaim(Record, DayOne)!.bounty.bounty_id, "Challenge_Daily_Bronze_KillBlazeFrost");
     Record = WithRewardCredit(Record, "Challenge_Daily_Bronze_KillBlazeFrost",
         { catalogId: "CURRENCY_SEASONAL_COIN", amount: 100, transactionId: "T1", at: NOW });
-    assert.equal(Record.dailyRewardCreditedOn, "2026-10-10");
+    assert.equal(Record.dailyRewardCreditedOn, "2026-10-09T17:00:00.000Z", "a morning instant belongs to the game day that began the day before");
 
-    // A re-drafted daily claimed the same day (the game's own top-up gives +4 draft tokens) is not paid again.
+    // A re-drafted daily claimed the same game day (the game's own top-up gives +4 draft tokens) is not paid again.
     Record = ApplyAt(Record, { bounties: [Daily("Challenge_Daily_Bronze_KillBlazeWeapon", NOW, 1, true)] }, "2026-10-10T07:00:00.000Z");
-    assert.equal(Record.dailyRewardCreditedOn, "2026-10-10", "a bounty save keeps the day");
-    assert.equal(FindFundableSeasonClaim(Record, Date.parse("2026-10-10T23:59:59.000Z")), undefined, "the same UTC day pays no second daily");
+    assert.equal(Record.dailyRewardCreditedOn, "2026-10-09T17:00:00.000Z", "a bounty save keeps the day");
+    const LastSecond = Date.parse("2026-10-10T16:59:59.000Z");
+    assert.equal(FindFundableSeasonClaim(Record, LastSecond), undefined, "the same game day pays no second daily");
+    assert.equal(DailyChallengeRewardLimited(Record, LastSecond), true, "its coins are skipped, not refused (controllers/wallet.ts)");
 
-    // The next UTC day pays the next claimed daily.
-    const Next = FindFundableSeasonClaim(Record, Date.parse("2026-10-11T00:00:01.000Z"));
-    assert.equal(Next!.bounty.bounty_id, "Challenge_Daily_Bronze_KillBlazeWeapon");
+    // At 17:00 UTC the next game day pays the next claimed daily.
+    const NextDay = Date.parse("2026-10-10T17:00:01.000Z");
+    assert.equal(FindFundableSeasonClaim(Record, NextDay)!.bounty.bounty_id, "Challenge_Daily_Bronze_KillBlazeWeapon");
+    assert.equal(DailyChallengeRewardLimited(Record, NextDay), false);
 });
 
-test("the host's daily premium-token day survives bounty saves; an empty record answers the board as a missing one does", () => {
-    // [2026-10-15] Written before any bounty exists: the record is empty at version 1, and the board answers it exactly as it answers none.
-    const Empty = WithDraftPremiumGrantDay(undefined, USER, "2026-10-10", NOW);
-    assert.equal(Empty.updateVersion, 1);
-    assert.deepEqual(BountyStatePayload(Empty), BountyStatePayload(undefined));
-    let Record = ApplyAt(Empty, { bounties: [Daily("Challenge_Daily_Bronze_KillBlazeWeapon", NOW, 1, true)] }, "2026-10-10T07:00:00.000Z");
+test("the game day runs 17:00 to 17:00 UTC, and a day stored in the old UTC-date form never matches it", () => {
+    assert.equal(GameDailyWindowKey("2026-10-16T16:59:59.999Z"), "2026-10-15T17:00:00.000Z");
+    assert.equal(GameDailyWindowKey("2026-10-16T17:00:00.000Z"), "2026-10-16T17:00:00.000Z");
+    assert.equal(GameDailyWindowKey(Date.parse("2026-10-16T18:30:00.000Z")), "2026-10-16T17:00:00.000Z");
+    const Old = { userId: USER, bounties: [], draftData: {}, dailyRewardCreditedOn: "2026-10-16", updateVersion: 1, createdAt: NOW, updatedAt: NOW } as BountyStateRecord;
+    assert.equal(DailyChallengeRewardPaid(Old, Date.parse("2026-10-16T12:00:00.000Z")), false, "an old value pays at most one extra daily, once");
+});
+
+test("a record that still carries the host's premium-token day (an older record) keeps it through bounty saves; it answers the board as none", () => {
+    // [2026-10-16] Nothing writes the day any more (hostDraftPremium.ts keeps only the balance cap); records written before still have it.
+    const Old: BountyStateRecord = { userId: USER, bounties: [], draftData: {}, dailyPremiumDraftGrantedOn: "2026-10-10", updateVersion: 1,
+        createdAt: NOW, updatedAt: NOW };
+    assert.deepEqual(BountyStatePayload(Old), BountyStatePayload(undefined));
+    const Record = ApplyAt(Old, { bounties: [Daily("Challenge_Daily_Bronze_KillBlazeWeapon", NOW, 1, true)] }, "2026-10-10T07:00:00.000Z");
     assert.equal(Record.dailyPremiumDraftGrantedOn, "2026-10-10", "a bounty save keeps the day");
-    Record = WithDraftPremiumGrantDay(Record, USER, "2026-10-11", "2026-10-11T08:00:00.000Z");
-    assert.equal(Record.dailyPremiumDraftGrantedOn, "2026-10-11");
-    assert.equal(Record.updateVersion, 3, "each day write is one version");
     assert.equal(Record.bounties.length, 1, "the bounties are kept");
     assert.equal(Record.dailyRewardCreditedOn, undefined, "the daily reward day is a different key");
 });
@@ -751,7 +763,7 @@ test("a bounty is filed by its id for a host, so no other id becomes a fundable 
     const Found = FindFundableSeasonClaim(Host, Date.parse(H_NOW));
     assert.equal(Found?.group, "daily");
     assert.equal(Found?.bounty.bounty_id, "Challenge_Daily_Bronze_Fake");
-    assert.equal(FindFundableSeasonClaim({ ...Host, dailyRewardCreditedOn: UtcDay(Date.parse(H_NOW)) }, Date.parse(H_NOW)), undefined,
+    assert.equal(FindFundableSeasonClaim({ ...Host, dailyRewardCreditedOn: GameDailyWindowKey(Date.parse(H_NOW)) }, Date.parse(H_NOW)), undefined,
         "with today's daily paid, nothing here is fundable");
     // The dedicated merge files them under the weekly key, as before.
     const Dedicated = MergeBountyState(USER, undefined, Body, H_NOW).record;

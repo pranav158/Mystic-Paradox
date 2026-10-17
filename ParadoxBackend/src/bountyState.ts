@@ -278,7 +278,8 @@ function ApplyBountySave(
             draftData: DraftData,
             // The once-a-day daily reward key belongs to the account, not to a save: every save keeps it.
             ...(previous?.dailyRewardCreditedOn !== undefined ? { dailyRewardCreditedOn: previous.dailyRewardCreditedOn } : {}),
-            // [2026-10-15] The host's daily premium draft token day is the account's too: every save keeps it.
+            // [2026-10-15] The host's daily premium draft token day is the account's too: every save keeps it. [2026-10-16] Nothing writes
+            // or reads it any more (hostDraftPremium.ts keeps only the balance cap); older records still carry it.
             ...(previous?.dailyPremiumDraftGrantedOn !== undefined ? { dailyPremiumDraftGrantedOn: previous.dailyPremiumDraftGrantedOn } : {}),
             updateVersion: (previous?.updateVersion ?? 0) + 1,
             createdAt: previous?.createdAt ?? now,
@@ -598,8 +599,8 @@ export function MergeHostBountyState(
 // challenge (`Challenge_Daily_*`, bounty_game_data_daily: one bronze, automatic draft and claim, one
 // TOKEN_DAILY_CHALLENGE_DRAFT per draft) pays its 100 Cache Coins when its objective is completed and it is claimed - per
 // completion, not per day - and the game's own top-up grants +4 draft tokens, so paying every claimed daily could pay
-// several a day. A daily claim therefore funds at most ONE reward per UTC day (the game's daily reset is 00:00 UTC,
-// bounty_token_grant_hour 0), recorded durably on the account (`dailyRewardCreditedOn`), not only on the instance a
+// several a day. A daily claim therefore funds at most ONE reward per game day ([2026-10-17] from 17:00 UTC, GameDailyWindowKey
+// below; it was the UTC date), recorded durably on the account (`dailyRewardCreditedOn`), not only on the instance a
 // re-draft can replace. Weekly season challenges keep their rule (one reward per claimed instance).
 
 export const CHALLENGE_REWARD_CURRENCIES: ReadonlySet<string> = new Set(["CURRENCY_SEASONAL_COIN"]);
@@ -609,16 +610,44 @@ function GroupOf(entry: StoredBounty): Exclude<BountyGroup, "unassigned"> {
     return entry.group === "unassigned" ? InferBountyGroup(String(entry.bounty.bounty_id)) : entry.group;
 }
 
-/** The UTC day of an instant, as YYYY-MM-DD (the daily challenge reward's once-a-day key). */
+/** The UTC day of an instant, as YYYY-MM-DD. */
 export function UtcDay(at: number | string = Date.now()): string {
     return new Date(at).toISOString().slice(0, 10);
 }
 
+// [2026-10-17] The daily challenge reward's once-a-day key is the GAME's day, which starts at 17:00 UTC: the game writes its
+// `bounty_daily` cooldown as the next 17:00 UTC, the same reset the store's daily claims use (controllers/store.ts
+// DailyResetWindow). The UTC-date key (00:00 UTC, read from bounty_token_grant_hour 0, which is the draft tokens' hour) refused
+// the first daily reward of a new game day whenever one was paid earlier that UTC date (source UBountyComponent::GrantBounty,
+// each re-sent and refused again). Stored values of the old form
+// ("2026-10-16") never equal a new key, so on the first day an account may be paid one extra daily reward.
+const GAME_DAY_OFFSET_MS = 17 * 60 * 60 * 1000;
+
+/** The game day of an instant: its 17:00 UTC start as an ISO string ("2026-10-16T17:00:00.000Z"). */
+export function GameDailyWindowKey(at: number | string = Date.now()): string {
+    const Ms = typeof at === "number" ? at : Date.parse(at);
+    return new Date(Math.floor((Ms - GAME_DAY_OFFSET_MS) / DAY_MS) * DAY_MS + GAME_DAY_OFFSET_MS).toISOString();
+}
+
+/** True when this game day's daily challenge reward was already paid. */
+export function DailyChallengeRewardPaid(record: BountyStateRecord | undefined, nowMs: number = Date.now()): boolean {
+    return record?.dailyRewardCreditedOn === GameDailyWindowKey(nowMs);
+}
+
+/**
+ * [2026-10-17] True when a claimed daily challenge waits for its reward but this game day's daily reward was already paid: the one case
+ * in which the wallet skips the coins (once a day) instead of refusing the whole transaction (controllers/wallet.ts).
+ */
+export function DailyChallengeRewardLimited(record: BountyStateRecord | undefined, nowMs: number = Date.now()): boolean {
+    if (!DailyChallengeRewardPaid(record, nowMs)) return false;
+    return (record?.bounties ?? []).some((Entry) => GroupOf(Entry) === "daily" && Entry.bounty.claimed === true && !Entry.rewardCredit);
+}
+
 /** The claimed, uncredited challenge a reward grant should be charged to: the most recently claimed weekly season
  *  challenge or daily challenge (claims stored before claimedAt existed count as the oldest); a daily one only while no
- *  daily reward was paid on this UTC day. Undefined when none is fundable. */
+ *  daily reward was paid on this game day (from 17:00 UTC). Undefined when none is fundable. */
 export function FindFundableSeasonClaim(record: BountyStateRecord | undefined, nowMs: number = Date.now()): StoredBounty | undefined {
-    const DailyAllowed = record?.dailyRewardCreditedOn !== UtcDay(nowMs);
+    const DailyAllowed = !DailyChallengeRewardPaid(record, nowMs);
     let Best: StoredBounty | undefined;
     for (const Entry of record?.bounties ?? []) {
         const Group = GroupOf(Entry);
@@ -649,29 +678,8 @@ export function WithRewardCredit(
     return {
         ...record,
         bounties: Bounties,
-        ...(Daily ? { dailyRewardCreditedOn: UtcDay(credit.at) } : {}),
+        ...(Daily ? { dailyRewardCreditedOn: GameDailyWindowKey(credit.at) } : {}),
         updateVersion: record.updateVersion + 1,
         updatedAt: now
     };
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// [2026-10-15] The host-granted daily premium draft token. A realm host may add TOKEN_DAILY_CHALLENGE_DRAFT_PREMIUM once per UTC day
-// per account (p2p/security/hostDraftPremium.ts decides). The day lives on the account's bounty record, next to dailyRewardCreditedOn,
-// so the grant reads and writes it with the same versioned save as the rest of the record, inside its inventory transaction.
-
-/**
- * Returns the record with `day` recorded as the day this account's premium draft token was last host-granted. A missing record
- * becomes an empty one at version 1: the bounty board answers an empty record exactly as it answers a missing one (BountyStatePayload).
- */
-export function WithDraftPremiumGrantDay(
-    record: BountyStateRecord | undefined,
-    userId: string,
-    day: string,
-    now: string = new Date().toISOString()
-): BountyStateRecord {
-    if (record === undefined) {
-        return { userId, bounties: [], draftData: {}, dailyPremiumDraftGrantedOn: day, updateVersion: 1, createdAt: now, updatedAt: now };
-    }
-    return { ...record, dailyPremiumDraftGrantedOn: day, updateVersion: record.updateVersion + 1, updatedAt: now };
 }

@@ -361,15 +361,27 @@ export interface RealmCapacityInput {
 }
 
 export type RealmCapacityDecision =
-    | { ok: true }
-    | { ok: false; reason: "REALM_SERVER_LIMIT" | "HOST_MEMORY_LOW" | "HOST_COMMIT_LOW" };
+    | { ok: true; lowFreeMemory?: true }
+    | { ok: false; reason: "REALM_SERVER_LIMIT" | "HOST_COMMIT_LOW" };
 
-/** Whether the host can take one more server: under the realm's limit and with the memory the policy asks for. */
+/**
+ * Whether the host can take one more server: under the realm's limit and with the commit headroom the policy asks for.
+ * [2026-10-16] Realm servers start like a dedicated server's: low FREE physical memory no longer refuses, it is reported as
+ * `lowFreeMemory` for the caller to log. A hub or hunt server uses about 1.4 GB (private commit ~1.4 GB); Windows pages to make
+ * room, and what can actually end a server is running out of commit, which still refuses (HOST_COMMIT_LOW). The old 3 GB
+ * free-memory floor refused every Training and island start on PCs with little free memory and plenty of commit headroom.
+ */
 export function DecideRealmCapacity(input: RealmCapacityInput): RealmCapacityDecision {
     if (input.activeServers >= input.maxServers) return { ok: false, reason: "REALM_SERVER_LIMIT" };
-    if (input.freePhysicalMemoryMiB < input.minimumFreeMemoryMiB) return { ok: false, reason: "HOST_MEMORY_LOW" };
     if (input.commitHeadroomMiB < input.minimumCommitHeadroomMiB) return { ok: false, reason: "HOST_COMMIT_LOW" };
+    if (input.freePhysicalMemoryMiB < input.minimumFreeMemoryMiB) return { ok: true, lowFreeMemory: true };
     return { ok: true };
+}
+
+/** [2026-10-16] The log line of a start that goes ahead on a host short of free physical memory (DecideRealmCapacity). */
+export function RealmLowMemoryNote(realmId: string, what: string, input: Pick<RealmCapacityInput, "freePhysicalMemoryMiB" | "commitHeadroomMiB" | "minimumFreeMemoryMiB">): string {
+    return `[RealmCapacity] realm ${realmId} ${what} starts on a host with ${input.freePhysicalMemoryMiB} MiB free physical memory ` +
+        `(floor ${input.minimumFreeMemoryMiB} MiB, logged only) and ${input.commitHeadroomMiB} MiB commit headroom`;
 }
 
 /** A hub with `presentCount` members present is full when it holds `maxPeers`; a member already present is never refused. */

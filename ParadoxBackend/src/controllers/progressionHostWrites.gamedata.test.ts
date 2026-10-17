@@ -84,7 +84,55 @@ test("a host cannot reuse a grant id for a different request, nor skip the id, n
 
 const REFUSED = (Reason: string) => (Error: unknown) => Error instanceof HostGrantLimitError && Error.refusal.reason === Reason;
 
-test("a host's grant above its ceiling is refused before anything is stored, a dedicated server's identical grant is not", async () => {
+// [2026-10-17] Dedicated parity: in the host policy's observe mode (the default) the ceilings and the full track only log
+// (HostLimitOnlyLogs); the enforce-mode refusals are pinned below with MYSTICPARADOX_HOST_POLICY=enforce.
+async function WithHostPolicy(mode: "observe" | "enforce", body: () => Promise<void>): Promise<void> {
+    const Previous = process.env.MYSTICPARADOX_HOST_POLICY;
+    process.env.MYSTICPARADOX_HOST_POLICY = mode;
+    try {
+        await body();
+    } finally {
+        if (Previous === undefined) delete process.env.MYSTICPARADOX_HOST_POLICY;
+        else process.env.MYSTICPARADOX_HOST_POLICY = Previous;
+    }
+}
+
+async function CaptureWarn(action: () => Promise<unknown>): Promise<string[]> {
+    const Lines: string[] = [];
+    const Original = logger.warn;
+    (logger as any).warn = (Message: unknown) => { Lines.push(String(Message)); };
+    try {
+        await action();
+    } finally {
+        (logger as any).warn = Original;
+    }
+    return Lines;
+}
+
+test("observe: a host's over-ceiling grant and a grant to a full player level are applied and logged; the reforge rules still refuse", async () => {
+    await WithHostPolicy("observe", async () => {
+        for (const [Track, Amount, Initial] of [
+            ["ExperienceTrack_PlayerLevel", 1001, 0],
+            ["season43", 201, 0],
+            ["ExperienceTrack_PlayerLevel", 98, 141_020],   // player level full
+        ] as [string, number, number][]) {
+            const Host = FakeUnitOfWork(Initial);
+            let Result: any;
+            const Lines = await CaptureWarn(async () => {
+                Result = await GrantProgressionXp("player-1", Track, Amount, `host-observe-${Track}-${Initial}`, Host.UnitOfWork, undefined, "host");
+            });
+            assert.equal(Result.replayed, false, `${Track} ${Amount}`);
+            assert.equal(Host.progress(), Initial + Amount, "applied as a dedicated server's grant");
+            assert.ok(Lines.some((Line) => Line.startsWith("[HostPolicyObserve] would refuse xp")), Lines.join("\n"));
+        }
+        await assert.rejects(GrantProgressionXp("player-1", "PrestigeTrack_Weapon_Axe", 2, "host-observe-prestige", FakeUnitOfWork().UnitOfWork, undefined, "host"),
+            REFUSED("amount_not_one"));
+        await assert.rejects(GrantProgressionXp("player-1", "MasteryTrack_PlayerLevel", 1, "host-observe-mastery", FakeUnitOfWork().UnitOfWork, undefined, "host"),
+            REFUSED("track_not_writable"));
+    });
+});
+
+test("enforce: a host's grant above its ceiling is refused before anything is stored, a dedicated server's identical grant is not", () => WithHostPolicy("enforce", async () => {
     for (const [Track, Amount, Reason] of [
         ["ExperienceTrack_PlayerLevel", 1001, "amount_over_ceiling"],
         ["ExperienceTrack_Weapon_Sword", 26005, "amount_over_ceiling"],
@@ -101,7 +149,7 @@ test("a host's grant above its ceiling is refused before anything is stored, a d
         assert.equal(Result.replayed, false, `${Track} ${Amount} on a dedicated server`);
         assert.equal(Dedicated.increments(), 1);
     }
-});
+}));
 
 test("a host's grants at the ceiling are accepted, and a retry of an accepted one still replays", async () => {
     for (const [Track, Amount] of [["ExperienceTrack_PlayerLevel", 1000], ["ExperienceTrack_Weapon_Sword", 225], ["season43", 200], ["PrestigeTrack_Weapon_Axe", 1]] as [string, number][]) {
@@ -130,7 +178,7 @@ test("a host may not add to a full player level track, but the grant that crosse
     assert.equal(CheckHostTrackTotal("ExperienceTrack_PlayerLevel", 150_000, 1)?.reason, "track_full");
 });
 
-test("GrantProgressionXp refuses a host on a full player level track inside the transaction, stores nothing, and still replays the grant that filled it", async () => {
+test("enforce: GrantProgressionXp refuses a host on a full player level track inside the transaction, stores nothing, and still replays the grant that filled it", () => WithHostPolicy("enforce", async () => {
     const Full = FakeUnitOfWork(141_020);
     await assert.rejects(GrantProgressionXp("player-1", "ExperienceTrack_PlayerLevel", 98, "host-full-1", Full.UnitOfWork, undefined, "host"), REFUSED("track_full"));
     assert.deepEqual([Full.increments(), Full.ledger(), Full.progress()], [0, 0, 141_020]);
@@ -150,7 +198,7 @@ test("GrantProgressionXp refuses a host on a full player level track inside the 
     assert.equal(Near.progress(), 141_098);
     await assert.rejects(GrantProgressionXp("player-1", "ExperienceTrack_PlayerLevel", 98, "host-cross-2", Near.UnitOfWork, undefined, "host"), REFUSED("track_full"));
     assert.equal(Near.progress(), 141_098);
-});
+}));
 
 test("a weapon track past its level 20 total is not capped for a host (prestige levels and banked XP keep earning)", async () => {
     const Past = FakeUnitOfWork(60_000);

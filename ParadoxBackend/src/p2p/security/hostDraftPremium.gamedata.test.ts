@@ -6,11 +6,11 @@ import { after, before, beforeEach, test } from "node:test";
  * with the season's pass name read from game-data/progression_config.json (a .gamedata test). The hub, presence and character reads are
  * the realm hub test kit's; the core repositories (inventory, entitlements, the account's bounty record) are in memory. The logger
  * records its lines, so the [HostGrantAllow] and [HostGrantDeny] lines are checked too. The replay path needs the real ledger and is in
- * hostDraftPremiumDaily.gamedata.test.ts.
+ * hostDraftPremiumDaily.gamedata.test.ts. [2026-10-16] Only the balance cap decides; the bounty record is kept in memory to show that the
+ * grant neither reads a day from it nor writes one.
  */
 
 const TodayUtc = () => new Date().toISOString().slice(0, 10);
-const YesterdayUtc = () => new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
 
 const Lines: string[] = [];
 const Quiet = () => undefined;
@@ -141,8 +141,8 @@ test("a realm hub grants the daily premium token to a member who holds the pass 
         (result as any).report("accepted");
         const allow = Lines.filter((line) => line.includes("[HostGrantAllow]"));
         assert.equal(allow.length, 1);
-        assert.ok(allow[0].includes(`item=${TOKEN} quantity=1 reason=PREMIUM_PASS_HELD_WITHIN_CAP_ONCE_PER_DAY day=${TodayUtc()} balance=0->1 cap=1`), allow[0]);
-        assert.equal(Bounties.get("member-1")?.dailyPremiumDraftGrantedOn, TodayUtc(), "the account records today");
+        assert.ok(allow[0].includes(`item=${TOKEN} quantity=1 reason=WITHIN_BALANCE_CAP day=${TodayUtc()} balance=0->1 cap=1`), allow[0]);
+        assert.equal(Bounties.get("member-1"), undefined, "nothing is written on the account");
         assert.ok(allow[0].includes("transaction=draft-premium-1"));
     });
 });
@@ -174,20 +174,23 @@ test("the balance is read again inside the transaction: a token that arrived aft
     });
 });
 
-test("a member without the season's pass is refused before the transaction, as a HUNT_PASS grant, and no grant is logged", async () => {
+// [2026-10-16] Every account may have the daily token: a member without the season's pass is granted it like anyone else (the
+// refusal left a new player's bounty load unfinished and the hub sent them back to the menu).
+test("a member without the season's pass is granted the daily token too, and the grant is logged", async () => {
     Lines.length = 0;
     await WithHub("RAMSGATE", async ({ kit, hub }) => {
         await Admit(kit, hub, "member-1");
         Holds("member-1", "season42_premium");
         Inventories.set("character-member", { stackedItems: StackOf() });
-        const result = await Authorization.AuthorizeP2PInventoryTransaction(await RuntimeRequest(hub, "member-1", grant("character-member")),
+        const result = await Authorization.AuthorizeP2PInventoryTransaction(await RuntimeRequest(hub, "member-1", grant("character-member", { transactionId: "draft-nopass-1" })),
             { userId: "member-1", characterId: "character-member", transactionId: "draft-nopass-1" });
-        assert.ok(!("options" in result));
-        assert.equal(result.status, 403);
-        assert.equal((result.body as { code?: string }).code, "P2P_HOST_GRANT_DENIED");
-        assert.deepEqual((result.body as { payload?: { classes?: string[] } }).payload?.classes, ["HUNT_PASS"]);
+        assert.ok("options" in result, "authorized");
+        await (result.options.onGrant as any)(CoreRepos, {});
+        (result as any).report("accepted");
     });
-    assert.deepEqual(Lines.filter((line) => line.includes("[HostGrantAllow]")), []);
+    const allow = Lines.filter((line) => line.includes("[HostGrantAllow]"));
+    assert.equal(allow.length, 1);
+    assert.ok(allow[0].includes("reason=WITHIN_BALANCE_CAP"), allow[0]);
 });
 
 test("a member who already holds an unspent token is refused before the transaction", async () => {
@@ -220,67 +223,35 @@ test("the token next to another Hunt Pass item, or as an instanced add, is refus
     });
 });
 
-test("a Training hub refuses the token for a member with the pass, as it refuses every grant", async () => {
+// [2026-10-16] A Training hub decides the token as its Ramsgate does.
+test("a Training hub grants the daily token like a Ramsgate hub", async () => {
     await WithHub("TRAINING", async ({ kit, hub }) => {
         await Admit(kit, hub, "member-1");
         Holds("member-1", PassName!);
         Inventories.set("character-member", { stackedItems: StackOf() });
-        const result = await Authorization.AuthorizeP2PInventoryTransaction(await RuntimeRequest(hub, "member-1", grant("character-member")),
+        const result = await Authorization.AuthorizeP2PInventoryTransaction(await RuntimeRequest(hub, "member-1", grant("character-member", { transactionId: "draft-training-1" })),
             { userId: "member-1", characterId: "character-member", transactionId: "draft-training-1" });
-        assert.ok(!("options" in result));
-        assert.equal(result.status, 403);
-        assert.deepEqual((result.body as { payload?: { classes?: string[] } }).payload?.classes, ["NO_REWARD_SESSION"]);
-    });
-});
-
-test("a second grant on the same UTC day is refused before the transaction, and the [HostGrantDeny] line names the day's reason", async () => {
-    Lines.length = 0;
-    await WithHub("RAMSGATE", async ({ kit, hub }) => {
-        await Admit(kit, hub, "member-1");
-        Holds("member-1", PassName!);
-        Inventories.set("character-member", { stackedItems: StackOf() });
-        Bounties.set("member-1", RecordOf("member-1", TodayUtc()));
-        const result = await Authorization.AuthorizeP2PInventoryTransaction(await RuntimeRequest(hub, "member-1", grant("character-member", { transactionId: "draft-again-1" })),
-            { userId: "member-1", characterId: "character-member", transactionId: "draft-again-1" });
-        assert.ok(!("options" in result));
-        assert.equal(result.status, 403);
-        assert.equal((result.body as { code?: string }).code, "P2P_HOST_GRANT_DENIED");
-    });
-    assert.ok(Lines.some((line) => line.includes("[HostGrantDeny]") && line.includes("draftPremium=ALREADY_GRANTED_TODAY")), Lines.join("\n"));
-});
-
-test("the day after an earlier grant the token is granted again, and the account records the new day", async () => {
-    await WithHub("RAMSGATE", async ({ kit, hub }) => {
-        await Admit(kit, hub, "member-1");
-        Holds("member-1", PassName!);
-        Inventories.set("character-member", { stackedItems: StackOf() });
-        Bounties.set("member-1", RecordOf("member-1", YesterdayUtc(), 2));
-        const result = await Authorization.AuthorizeP2PInventoryTransaction(await RuntimeRequest(hub, "member-1", grant("character-member", { transactionId: "draft-next-day-1" })),
-            { userId: "member-1", characterId: "character-member", transactionId: "draft-next-day-1" });
         assert.ok("options" in result, "authorized");
-        await (result.options.onGrant as any)(CoreRepos, {});
-        assert.equal(Bounties.get("member-1")?.dailyPremiumDraftGrantedOn, TodayUtc());
-        assert.equal(Bounties.get("member-1")?.updateVersion, 3, "the day is one version write");
     });
 });
 
-test("a grant refused inside its transaction (the day was recorded after the early check) writes nothing and is logged as a host-grant refusal", async () => {
+// [2026-10-16] No once-per-day rule: the game's daily period ends at 17:00 UTC and its RefundBounties re-adds the token, so a record that
+// still names today (an older record) must neither refuse the grant, early or inside the transaction, nor be rewritten.
+test("an account record that already names today's day does not refuse the grant, and the grant does not rewrite it", async () => {
     Lines.length = 0;
     await WithHub("RAMSGATE", async ({ kit, hub }) => {
         await Admit(kit, hub, "member-1");
         Holds("member-1", PassName!);
         Inventories.set("character-member", { stackedItems: StackOf() });
-        const result = await Authorization.AuthorizeP2PInventoryTransaction(await RuntimeRequest(hub, "member-1", grant("character-member", { transactionId: "draft-inside-1" })),
-            { userId: "member-1", characterId: "character-member", transactionId: "draft-inside-1" });
-        assert.ok("options" in result, "the early check passed");
-        // [2026-10-15] Another transaction of the same account records today between the early check and this transaction.
         const Recorded = RecordOf("member-1", TodayUtc(), 5);
         Bounties.set("member-1", Recorded);
-        await assert.rejects((result.options.onGrant as any)(CoreRepos, {}), /P2P_LOOT_GRANT_DRAFT_PREMIUM_ALREADY_GRANTED_TODAY/);
-        const denial = (result as any).errorResponse(new Error("P2P_LOOT_GRANT_DRAFT_PREMIUM_ALREADY_GRANTED_TODAY"));
-        assert.equal(denial?.status, 403);
-        assert.equal(denial?.body.code, "P2P_LOOT_GRANT_DRAFT_PREMIUM_ALREADY_GRANTED_TODAY");
-        assert.deepEqual(Bounties.get("member-1"), Recorded, "the refused grant writes nothing");
+        const result = await Authorization.AuthorizeP2PInventoryTransaction(await RuntimeRequest(hub, "member-1", grant("character-member", { transactionId: "draft-again-1" })),
+            { userId: "member-1", characterId: "character-member", transactionId: "draft-again-1" });
+        assert.ok("options" in result, "authorized: the day is not a condition any more");
+        await (result.options.onGrant as any)(CoreRepos, {});
+        (result as any).report("accepted");
+        assert.deepEqual(Bounties.get("member-1"), Recorded, "the record is untouched");
     });
-    assert.ok(Lines.some((line) => line.includes("[HostGrantDeny]") && line.includes("reason=ALREADY_GRANTED_TODAY at=transaction")), Lines.join("\n"));
+    assert.ok(!Lines.some((line) => line.includes("[HostGrantDeny]")), Lines.join("\n"));
+    assert.equal(Lines.filter((line) => line.includes("[HostGrantAllow]") && line.includes("reason=WITHIN_BALANCE_CAP")).length, 1, Lines.join("\n"));
 });

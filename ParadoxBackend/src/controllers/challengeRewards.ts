@@ -7,7 +7,7 @@
  */
 
 import { ClientSession } from "mongodb";
-import { CHALLENGE_REWARD_CURRENCIES, FindFundableSeasonClaim, MAX_CHALLENGE_REWARD_PER_CLAIM, WithRewardCredit } from "../bountyState";
+import { CHALLENGE_REWARD_CURRENCIES, DailyChallengeRewardLimited, FindFundableSeasonClaim, MAX_CHALLENGE_REWARD_PER_CLAIM, WithRewardCredit } from "../bountyState";
 import { GetRepositories } from "../persistence";
 
 // Season-challenge reward funding (see the block comment in bountyState.ts).
@@ -46,6 +46,16 @@ export async function FundChallengeReward(
     // inventory transaction; a plain version mismatch means the claim is no longer ours to charge.
     const Saved = await Repository.saveIfVersion(Next, Record.updateVersion, session);
     return Saved ? { bountyId: BountyId, claimedAt: Claim.claimedAt } : undefined;
+}
+
+/**
+ * [2026-10-17] True when a challenge-reward grant finds no fundable claim only because this game day's daily reward was already paid
+ * (bountyState.ts DailyChallengeRewardLimited). The wallet then skips the coins and keeps the rest of the transaction: refusing it
+ * paid nothing either, and the game sent it again to be refused again.
+ */
+export async function IsDailyChallengeRewardLimited(userId: string, catalogId: string, quantity: number, session?: ClientSession): Promise<boolean> {
+    if (!IsChallengeRewardGrant(catalogId, quantity)) return false;
+    return DailyChallengeRewardLimited(await GetRepositories().bountyStates.get(userId, session));
 }
 
 /**

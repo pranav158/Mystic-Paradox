@@ -397,6 +397,47 @@ test("a hub's host takes no XP: a weapon or player XP grant is refused, and a pr
     });
 });
 
+// [2026-10-16] The one XP a hub takes: the active Hunt Pass track's, which the game awards in town.
+// It is authorized as HUNT_PASS_XP; every other track stays refused.
+test("a hub's host may grant Hunt Pass XP on the active season track, tagged HUNT_PASS_XP; a weapon track stays refused", async () => {
+    await WithRealm("RAMSGATE", async ({ hub, rows }) => {
+        const HuntPass = await Send("POST", GrantPath(Kit_.MEMBER, "season43", 5), WithGrantId(HostHeaders(hub, Kit_.MEMBER), "hub-hp-xp-1"));
+        assert.equal(HuntPass.status, 200, JSON.stringify(HuntPass.json));
+        assert.deepEqual(rows.map((Row) => Row.kind), ["HUNT_PASS_XP"]);
+        Seed(Kit_.MEMBER, SWORD, 100);
+        const Weapon = await Send("POST", GrantPath(Kit_.MEMBER, SWORD, 5), WithGrantId(HostHeaders(hub, Kit_.MEMBER), "hub-weapon-xp-1"));
+        assert.equal(Weapon.status, 403);
+        assert.equal(Weapon.json.code, "P2P_HOST_WRITE_DENIED");
+    });
+    await WithRealm("TRAINING", async ({ hub, rows }) => {
+        const HuntPass = await Send("POST", GrantPath(Kit_.MEMBER, "season43", 5), WithGrantId(HostHeaders(hub, Kit_.MEMBER), "dojo-hp-xp-1"));
+        assert.equal(HuntPass.status, 200, JSON.stringify(HuntPass.json));
+        assert.deepEqual(rows.map((Row) => Row.kind), ["HUNT_PASS_XP"]);
+    });
+});
+
+// [2026-10-16] MYSTICPARADOX_HOST_POLICY observe (the live default; the hub test kit sets enforce): the XP route still tries
+// its kinds quietly first, so the Hunt Pass grant keeps its HUNT_PASS_XP tag, and a weapon grant the hub does not take goes through as
+// XP (logged by the module as [HostPolicyObserve]) instead of 403.
+test("observe: a hub's weapon XP grant is accepted and tagged XP, and the Hunt Pass grant keeps its HUNT_PASS_XP tag", async () => {
+    const Saved = process.env.MYSTICPARADOX_HOST_POLICY;
+    delete process.env.MYSTICPARADOX_HOST_POLICY;
+    try {
+        await WithRealm("RAMSGATE", async ({ hub, rows }) => {
+            const HuntPass = await Send("POST", GrantPath(Kit_.MEMBER, "season43", 5), WithGrantId(HostHeaders(hub, Kit_.MEMBER), "observe-hp-xp-1"));
+            assert.equal(HuntPass.status, 200, JSON.stringify(HuntPass.json));
+            Seed(Kit_.MEMBER, SWORD, 100);
+            const Weapon = await Send("POST", GrantPath(Kit_.MEMBER, SWORD, 5), WithGrantId(HostHeaders(hub, Kit_.MEMBER), "observe-weapon-xp-1"));
+            assert.equal(Weapon.status, 200, JSON.stringify(Weapon.json));
+            assert.equal(Tracks.get(Key(Kit_.MEMBER, SWORD)).progress, 105);
+            assert.deepEqual(rows.map((Row) => Row.kind), ["HUNT_PASS_XP", "XP"]);
+        });
+    } finally {
+        if (Saved === undefined) delete process.env.MYSTICPARADOX_HOST_POLICY;
+        else process.env.MYSTICPARADOX_HOST_POLICY = Saved;
+    }
+});
+
 test("in a hunt the prestige +1 stays XP: accepted and tagged as XP, as before", async () => {
     await WithRealm("RAMSGATE", async ({ kit, hub, rows }) => {
         TurnIntoHunt(kit, hub);
@@ -443,7 +484,7 @@ test("a Ramsgate hub's host confirms a present member's rank: accepted and tagge
     });
 });
 
-test("the Ramsgate host confirms its own rank, and a stranger or a Training hub's member is refused", async () => {
+test("the Ramsgate host confirms its own rank, a stranger is refused, and a Training hub's member is confirmed too", async () => {
     await WithRealm("RAMSGATE", async ({ hub, rows }) => {
         Seed(Kit_.HOST, SWORD, CAP + 500);
         assert.equal((await Send("POST", ConfirmPath(Kit_.HOST, SWORD, 5), HostHeaders(hub))).status, 200);
@@ -454,13 +495,12 @@ test("the Ramsgate host confirms its own rank, and a stranger or a Training hub'
         assert.equal(Tracks.get(Key(Kit_.STRANGER, SWORD)).confirmedFremiumRank, 0);
         assert.deepEqual(rows.map((Row) => [Row.kind, Row.targetUserId]), [["RANK_CONFIRM", Kit_.HOST]]);
     });
+    // [2026-10-16] A Training hub writes what Ramsgate writes, the rank confirm included (only the reforge stays Ramsgate's).
     await WithRealm("TRAINING", async ({ hub, rows }) => {
         Seed(Kit_.MEMBER, SWORD, CAP + 500);
-        const Refused = await Send("POST", ConfirmPath(Kit_.MEMBER, SWORD, 5), HostHeaders(hub, Kit_.MEMBER));
-        assert.equal(Refused.status, 403);
-        assert.equal(Refused.json.code, "P2P_HOST_WRITE_DENIED");
-        assert.equal(Tracks.get(Key(Kit_.MEMBER, SWORD)).confirmedFremiumRank, 0);
-        assert.equal(rows.length, 0);
+        const Confirmed = await Send("POST", ConfirmPath(Kit_.MEMBER, SWORD, 5), HostHeaders(hub, Kit_.MEMBER));
+        assert.equal(Confirmed.status, 200, JSON.stringify(Confirmed.json));
+        assert.deepEqual(rows.map((Row) => [Row.kind, Row.targetUserId]), [["RANK_CONFIRM", Kit_.MEMBER]]);
     });
 });
 

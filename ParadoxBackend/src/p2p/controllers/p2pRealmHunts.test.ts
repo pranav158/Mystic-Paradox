@@ -126,14 +126,25 @@ async function Admit(kit: HubKit, hub: RunningHub, accountId: string) {
 // Selection and capacity
 // ---------------------------------------------------------------------------------------------------------------
 
-test("a realm hunt is refused by the host's own capacity when the host has no memory to spare, and no candidate is offered", async () => {
+test("a realm hunt is refused by the host's own capacity when the host has no commit headroom to spare, and no candidate is offered", async () => {
     await WithKit(async (kit) => {
         const presence = kit.hunts.hostPresences.get(HOST)!;
-        kit.hunts.hostPresences.set(HOST, { ...presence, freePhysicalMemoryMiB: 512, observedAt: iso(), expiresAt: iso(25_000) });
+        kit.hunts.hostPresences.set(HOST, { ...presence, commitHeadroomMiB: 1024, observedAt: iso(), expiresAt: iso(25_000) });
         const { hunt } = await RealmHunt(kit, "party-memory", [MEMBER, FRIEND]);
         assert.equal(hunt?.state, "ABORTED");
         assert.equal(hunt?.failureReason, "REALM_FULL");
         assert.equal(Messages(kit, HOST, "HOST_OFFERED").length, 0);
+    });
+});
+
+// [2026-10-16] Low free physical memory alone no longer refuses a realm hunt (a PC with little free memory and plenty of commit headroom).
+test("a realm hunt on a host short of free physical memory but with commit headroom is offered to the host", async () => {
+    await WithKit(async (kit) => {
+        const presence = kit.hunts.hostPresences.get(HOST)!;
+        kit.hunts.hostPresences.set(HOST, { ...presence, freePhysicalMemoryMiB: 512, observedAt: iso(), expiresAt: iso(25_000) });
+        const { hunt } = await RealmHunt(kit, "party-low-free", [MEMBER, FRIEND]);
+        assert.notEqual(hunt?.failureReason, "REALM_FULL");
+        assert.equal(Messages(kit, HOST, "HOST_OFFERED").length, 1, "the host is asked to start it");
     });
 });
 

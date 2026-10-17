@@ -14,16 +14,17 @@ import { DeriveIcePeerId } from "./transportPeerIds";
 
 /*
  * [2026-10-15] The host's daily premium draft token, end to end: the real authorization of a realm's Ramsgate hub, the real inventory
- * transaction (its onGrant records the account's day in the same transaction), and a temporary SQLite realm for the repositories and
- * the idempotency ledger. Covers the once-a-day rule per account (two characters of one account), the idempotent replay of an accepted
- * transaction (with the token still held, and after it was spent), a changed body under a reused id, the next UTC day, and the
- * dedicated gameserver path, which the rule does not touch. The season's pass name comes from game-data (.gamedata suffix).
+ * transaction (its onGrant decides again from the transaction's own reads), and a temporary SQLite realm for the repositories and the
+ * idempotency ledger. [2026-10-16] Only the balance cap decides (no once-per-day rule, no day on the account): a later grant the same day
+ * (the game's 17:00 UTC reset, its refund and re-draft) is accepted once the token was spent, two racing grants for one character end
+ * with one token, an old record's day is ignored, the idempotent replay of an accepted transaction (with the token still held, and after
+ * it was spent), a changed body under a reused id, and the dedicated gameserver path, which the rule does not touch. The season's pass
+ * name comes from game-data (.gamedata suffix).
  */
 
 const TOKEN = "TOKEN_DAILY_CHALLENGE_DRAFT_PREMIUM";
 const PASS = ActivePremiumPassEntitlement();
 const TodayUtc = () => new Date().toISOString().slice(0, 10);
-const YesterdayUtc = () => new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
 const iso = (offsetMs = 0) => new Date(Date.now() + offsetMs).toISOString();
 
 const OWNED_BY: Record<string, string> = { "character-member": MEMBER, "character-member-2": MEMBER, "character-host": HOST };
@@ -130,19 +131,17 @@ async function Tokens(realm: TestRealm, characterId: string): Promise<number> {
     return Items.filter((Item) => Item.catalogId === TOKEN).reduce((Total, Item) => Total + Item.quantity, 0);
 }
 
-const Marker = async (realm: TestRealm) => (await realm.repos.bountyStates.get(MEMBER))?.dailyPremiumDraftGrantedOn;
-
-test("the first grant of the day is accepted: the token is granted, the account records today, and the grant is logged with its day", async () => {
+test("the first grant is accepted: the token is granted, nothing is written on the account, and the grant is logged with its day", async () => {
     await WithScenario(async ({ realm, hub }) => {
         const Body = Grant("character-member", "daily-1");
         let Result: unknown;
         const Lines = await Capture(async () => { Result = await Commit(await Authorize(hub, Body), Body); });
         assert.ok(Result, "the transaction is accepted");
         assert.equal(await Tokens(realm, "character-member"), 1);
-        assert.equal(await Marker(realm), TodayUtc());
+        assert.equal(await realm.repos.bountyStates.get(MEMBER), undefined, "the grant no longer touches the account's bounty record");
         const Allowed = Lines.filter((line) => line.includes("[HostGrantAllow]"));
         assert.equal(Allowed.length, 1, Lines.join("\n"));
-        assert.ok(Allowed[0].includes(`transaction=daily-1 item=${TOKEN} quantity=1 reason=PREMIUM_PASS_HELD_WITHIN_CAP_ONCE_PER_DAY day=${TodayUtc()} balance=0->1 cap=1`), Allowed[0]);
+        assert.ok(Allowed[0].includes(`transaction=daily-1 item=${TOKEN} quantity=1 reason=WITHIN_BALANCE_CAP day=${TodayUtc()} balance=0->1 cap=1`), Allowed[0]);
     });
 });
 
@@ -150,12 +149,10 @@ test("an accepted transaction replayed while the token is still held succeeds, g
     await WithScenario(async ({ realm, hub }) => {
         const Body = Grant("character-member", "daily-2");
         await Commit(await Authorize(hub, Body), Body);
-        const Record = await realm.repos.bountyStates.get(MEMBER);
         let Replayed: unknown;
         const Lines = await Capture(async () => { Replayed = await Commit(await Authorize(hub, Body), Body); });
         assert.ok(Replayed, "the stored result is returned, not refused");
         assert.equal(await Tokens(realm, "character-member"), 1, "no second token");
-        assert.deepEqual(await realm.repos.bountyStates.get(MEMBER), Record, "the account record is untouched");
         assert.deepEqual(Lines.filter((line) => line.includes("[HostGrantAllow]")), []);
     });
 });
@@ -172,83 +169,108 @@ test("an accepted transaction replayed after the token was spent the same day st
     });
 });
 
-test("a new transaction on the same UTC day is refused before the transaction once the token was spent, and the [HostGrantDeny] line names the day", async () => {
+// [2026-10-16] The game's daily period ends at 17:00 UTC, and its RefundBounties re-adds the token after a drafted daily bounty is lost,
+// then drafts again: a new grant the same UTC day, once the earlier token was spent, is the game's own and must not be refused.
+test("a new transaction the same UTC day is accepted once the earlier token was spent", async () => {
     await WithScenario(async ({ realm, hub }) => {
         const First = Grant("character-member", "daily-4a");
         await Commit(await Authorize(hub, First), First);
         await Spend("character-member", "spend-4");
         const Again = Grant("character-member", "daily-4b");
+        let Result: unknown;
+        const Lines = await Capture(async () => { Result = await Commit(await Authorize(hub, Again), Again); });
+        assert.ok(Result, "the second grant of the day is accepted");
+        assert.equal(await Tokens(realm, "character-member"), 1);
+        assert.ok(Lines.some((line) => line.includes("[HostGrantAllow]") && line.includes("transaction=daily-4b") &&
+            line.includes("reason=WITHIN_BALANCE_CAP")), Lines.join("\n"));
+        assert.ok(!Lines.some((line) => line.includes("[HostGrantDeny]")), Lines.join("\n"));
+    });
+});
+
+test("a grant while the earlier token is still unspent is refused before the transaction, over the cap", async () => {
+    await WithScenario(async ({ realm, hub }) => {
+        const First = Grant("character-member", "daily-5a");
+        await Commit(await Authorize(hub, First), First);
+        const Again = Grant("character-member", "daily-5b");
         let Refused: any;
         const Lines = await Capture(async () => { Refused = await Authorize(hub, Again); });
         assert.ok(!("options" in Refused));
         assert.equal(Refused.status, 403);
         assert.equal(Refused.body.code, "P2P_HOST_GRANT_DENIED");
-        assert.equal(await Tokens(realm, "character-member"), 0);
-        assert.ok(Lines.some((line) => line.includes("[HostGrantDeny]") && line.includes("transaction=daily-4b") &&
-            line.includes("draftPremium=ALREADY_GRANTED_TODAY")), Lines.join("\n"));
+        assert.equal(await Tokens(realm, "character-member"), 1);
+        assert.ok(Lines.some((line) => line.includes("[HostGrantDeny]") && line.includes("transaction=daily-5b") &&
+            line.includes("draftPremium=OVER_BALANCE_CAP")), Lines.join("\n"));
     });
 });
 
-test("two characters of one account cannot both take the day's token: the second is refused inside its transaction and writes nothing", async () => {
+test("two racing grants for one character end with one token: the second is refused inside its transaction and writes nothing", async () => {
     await WithScenario(async ({ realm, hub }) => {
         const First = Grant("character-member", "race-first");
-        const Second = Grant("character-member-2", "race-second");
-        // [2026-10-15] Both pass the early check: neither grant is recorded yet when both are authorized.
+        const Second = Grant("character-member", "race-second");
+        // Both pass the early check: neither token is in the balance yet when both are authorized.
         const FirstAuthorized = await Authorize(hub, First);
         const SecondAuthorized = await Authorize(hub, Second);
         assert.ok("options" in FirstAuthorized && "options" in SecondAuthorized, "both pass the early check");
         await Commit(FirstAuthorized, First);
-        const Record = await realm.repos.bountyStates.get(MEMBER);
         let Refused: unknown;
         let Denial: any;
         const Lines = await Capture(async () => {
             Refused = await Commit(SecondAuthorized, Second).then(() => undefined, (Err: unknown) => Err);
-            // [2026-10-15] The route maps the refusal to a response in the same request, so its [HostGrantDeny] line is written here.
+            // The route maps the refusal to a response in the same request, so its [HostGrantDeny] line is written here.
             if (Refused instanceof Error) Denial = SecondAuthorized.errorResponse(Refused);
         });
         assert.ok(Refused instanceof Error, "the second grant is refused in its transaction");
-        assert.equal(Refused.message, "P2P_LOOT_GRANT_DRAFT_PREMIUM_ALREADY_GRANTED_TODAY");
+        assert.equal(Refused.message, "P2P_LOOT_GRANT_DRAFT_PREMIUM_OVER_BALANCE_CAP");
         assert.equal(Denial?.status, 403);
-        assert.equal(Denial?.body.code, "P2P_LOOT_GRANT_DRAFT_PREMIUM_ALREADY_GRANTED_TODAY");
-        assert.equal(await Tokens(realm, "character-member"), 1, "the first grant stands");
-        assert.equal(await Tokens(realm, "character-member-2"), 0, "the second writes no token");
-        assert.deepEqual(await realm.repos.bountyStates.get(MEMBER), Record, "the account record is the first grant's, unchanged");
-        assert.equal(await realm.repos.inventoryTransactions.findRecord(MEMBER, "character-member-2", "race-second"), undefined,
+        assert.equal(Denial?.body.code, "P2P_LOOT_GRANT_DRAFT_PREMIUM_OVER_BALANCE_CAP");
+        assert.equal(await Tokens(realm, "character-member"), 1, "the first grant stands, the second adds nothing");
+        assert.equal(await realm.repos.inventoryTransactions.findRecord(MEMBER, "character-member", "race-second"), undefined,
             "the refused transaction's ledger row is rolled back");
         assert.ok(Lines.some((line) => line.includes("[HostGrantDeny]") && line.includes("transaction=race-second") &&
-            line.includes("reason=ALREADY_GRANTED_TODAY at=transaction")), Lines.join("\n"));
+            line.includes("reason=OVER_BALANCE_CAP at=transaction")), Lines.join("\n"));
     });
 });
 
-test("the next UTC day the account may be granted again, and the new day is recorded in one version", async () => {
+test("each character's balance is its own: a second character of the account may hold its token too", async () => {
+    await WithScenario(async ({ realm, hub }) => {
+        const First = Grant("character-member", "chars-1");
+        const Second = Grant("character-member-2", "chars-2");
+        await Commit(await Authorize(hub, First), First);
+        await Commit(await Authorize(hub, Second), Second);
+        assert.equal(await Tokens(realm, "character-member"), 1);
+        assert.equal(await Tokens(realm, "character-member-2"), 1);
+    });
+});
+
+test("a bounty record that still carries an earlier grant's day (an older record) does not refuse the grant, and is not changed", async () => {
     await WithScenario(async ({ realm, hub }) => {
         const Now = iso();
-        await realm.repos.bountyStates.saveIfVersion({ userId: MEMBER, bounties: [], draftData: {}, dailyPremiumDraftGrantedOn: YesterdayUtc(),
+        await realm.repos.bountyStates.saveIfVersion({ userId: MEMBER, bounties: [], draftData: {}, dailyPremiumDraftGrantedOn: TodayUtc(),
             updateVersion: 1, createdAt: Now, updatedAt: Now }, undefined);
+        const Record = await realm.repos.bountyStates.get(MEMBER);
         const Body = Grant("character-member", "daily-6");
         await Commit(await Authorize(hub, Body), Body);
         assert.equal(await Tokens(realm, "character-member"), 1);
-        assert.equal(await Marker(realm), TodayUtc());
-        assert.equal((await realm.repos.bountyStates.get(MEMBER))?.updateVersion, 2);
+        assert.deepEqual(await realm.repos.bountyStates.get(MEMBER), Record, "the record is untouched");
     });
 });
 
-test("the same transaction id with a different body is not a replay: it is decided as a new grant, and refused for the day", async () => {
+test("the same transaction id with a different body is not a replay: it is decided as a new grant, by the balance", async () => {
     await WithScenario(async ({ realm, hub }) => {
         const Body = Grant("character-member", "daily-7");
         await Commit(await Authorize(hub, Body), Body);
-        // [2026-10-15] The same id, now also spending the token it was granted: a different body, so the stored result does not apply.
+        // The same id, now also spending the token it was granted: a different body, so the stored result does not apply. It is decided
+        // as a new grant from the balance (1 held, 1 spent, 1 added: within the cap), not passed through as a replay.
         const Changed = Grant("character-member", "daily-7", { removeStackedItems: [{ catalogId: TOKEN, quantity: 1 }] });
-        let Refused: any;
-        const Lines = await Capture(async () => { Refused = await Authorize(hub, Changed); });
-        assert.ok(!("options" in Refused));
-        assert.equal(Refused.status, 403);
-        assert.equal(await Tokens(realm, "character-member"), 1, "nothing changed");
-        assert.ok(Lines.some((line) => line.includes("draftPremium=ALREADY_GRANTED_TODAY")), Lines.join("\n"));
+        let Decided: any;
+        const Lines = await Capture(async () => { Decided = await Authorize(hub, Changed); });
+        assert.ok("options" in Decided, "decided by the balance: within the cap");
+        assert.equal(await Tokens(realm, "character-member"), 1, "authorizing changes nothing");
+        assert.ok(!Lines.some((line) => line.includes("[HostGrantDeny]")), Lines.join("\n"));
     });
 });
 
-test("a dedicated gameserver's token grants are not limited by the day, and write no day on the account", async () => {
+test("a dedicated gameserver's token grants are not limited by the cap rule, and write nothing on the account", async () => {
     await WithScenario(async ({ realm }) => {
         await RunInventoryTransaction(MEMBER, "character-member", "gameserver-1", [], [{ catalogId: TOKEN, quantity: 1 }], [], [], [], { ownershipAlreadyValidated: true });
         await RunInventoryTransaction(MEMBER, "character-member", "gameserver-2", [], [{ catalogId: TOKEN, quantity: 1 }], [], [], [], { ownershipAlreadyValidated: true });

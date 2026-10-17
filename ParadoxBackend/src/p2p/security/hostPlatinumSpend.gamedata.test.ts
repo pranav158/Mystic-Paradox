@@ -104,14 +104,13 @@ test("a host's Platinum grant in a Ramsgate hub stays refused", async () => {
     });
 });
 
-test("a Training hub refuses a Platinum spend, as it refuses every grant and spend", async () => {
+// [2026-10-16] A Training hub decides a spend as its Ramsgate does (it was a no-reward session).
+test("a Training hub authorizes a Platinum spend the way a Ramsgate hub does", async () => {
     await WithHub("TRAINING", async ({ kit, hub }) => {
         await Admit(kit, hub, MEMBER);
         const req = await HubRequest(hub, MEMBER, { characterId: "character-member", ...SPEND, transactionId: "training-spend-1" });
         const result = await AuthorizeP2PInventoryTransaction(req, { userId: MEMBER, characterId: "character-member", transactionId: "training-spend-1" });
-        assert.ok(!("options" in result));
-        assert.equal(result.status, 403);
-        assert.equal((result.body as { code?: string }).code, "P2P_HOST_GRANT_DENIED");
+        assert.ok("options" in result, "authorized");
     });
 });
 

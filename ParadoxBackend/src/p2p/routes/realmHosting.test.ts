@@ -227,10 +227,11 @@ test("hubs/start asks the host's PC to be eligible, and says why when it is not"
         ExpectError(none, 409, "REALM_HOST_INELIGIBLE");
         assert.equal(none.json.error.reason, "HOST_PRESENCE_MISSING");
 
-        kit.seedHostPresence(HOST, { freePhysicalMemoryMiB: 2048 });
+        // [2026-10-16] Commit headroom is what can end a server; low free physical memory is only logged (below).
+        kit.seedHostPresence(HOST, { commitHeadroomMiB: 2048 });
         const memory = await Call("POST", START, HOST, { hubKind: "RAMSGATE" });
         ExpectError(memory, 409, "REALM_HOST_INELIGIBLE");
-        assert.equal(memory.json.error.reason, "HOST_MEMORY_LOW");
+        assert.equal(memory.json.error.reason, "HOST_COMMIT_LOW");
 
         kit.seedHostPresence(HOST, { consentToHost: false });
         assert.equal((await Call("POST", START, HOST, { hubKind: "RAMSGATE" })).json.error.reason, "HOST_CONSENT_REQUIRED");
@@ -250,6 +251,15 @@ test("hubs/start asks the host's PC to be eligible, and says why when it is not"
         kit.seedHostPresence(HOST, { worstPeerRttMs: 1500, jitterMs: 500, packetLossPercent: 40, freePhysicalMemoryMiB: 3100, commitHeadroomMiB: 4200,
             guardVerified: false });
         assert.equal((await Call("POST", START, HOST, { hubKind: "RAMSGATE" })).status, 200);
+    });
+});
+
+// [2026-10-16] Realm servers start like a dedicated server's: a PC with little free physical memory and plenty of commit headroom
+// was refused every Training start with REALM_HOST_INELIGIBLE HOST_MEMORY_LOW. Low free memory now starts, with a warning line.
+test("hubs/start on a PC short of free physical memory but with commit headroom starts the hub", async () => {
+    await WithKit(async (kit) => {
+        kit.seedHostPresence(HOST, { freePhysicalMemoryMiB: 2006, commitHeadroomMiB: 15460 });
+        assert.equal((await Call("POST", START, HOST, { hubKind: "TRAINING" })).status, 200);
     });
 });
 

@@ -59,9 +59,9 @@ test("P2P_HOST_WRITES=off switches host writes off; anything else keeps them on"
 // roster: its members are the ones present in it, and the host counts.
 
 const ALL_WRITE_KINDS: readonly HostWriteKind[] = ["XP", "MASTERY", "OBJECTIVES", "ESCALATION", "COOLDOWN", "BOUNTY", "SLAYERS_PATH", "REFORGE", "RANK_CONFIRM",
-    "LOADOUT_UNLOCK"];
+    "LOADOUT_UNLOCK", "HUNT_PASS_XP"];
 const RAMSGATE_WRITE_KINDS: readonly HostWriteKind[] = ["BOUNTY", "COOLDOWN", "SLAYERS_PATH", "ESCALATION", "OBJECTIVES", "MASTERY", "REFORGE", "RANK_CONFIRM",
-    "LOADOUT_UNLOCK"];
+    "LOADOUT_UNLOCK", "HUNT_PASS_XP"];
 const PRESENT = { presentAccountIds: ["friend"] };
 
 const hub = (overrides: Partial<P2PHuntSessionRecord> = {}): P2PHuntSessionRecord => ({
@@ -83,10 +83,13 @@ test("a Ramsgate hub takes its write kinds for a present member and for the host
     }
 });
 
-test("a Ramsgate hub refuses XP (no XP source in a hub, decision D4); a Training hub refuses every kind", () => {
+// [2026-10-16] A Training hub writes what Ramsgate writes, except the reforge (the tutorial's quest step is a bounty write).
+test("a Ramsgate hub refuses XP (no XP source in a hub, decision D4); a Training hub also refuses XP and the reforge", () => {
     assert.equal(HostWriteDenialReason(auth, hub(), "friend", "XP", PRESENT), "WRITE_KIND_NOT_ALLOWED_IN_HUB");
     for (const kind of ALL_WRITE_KINDS) {
-        assert.equal(HostWriteDenialReason(auth, hub({ hubKind: "TRAINING" }), "friend", kind, PRESENT), "WRITE_KIND_NOT_ALLOWED_IN_HUB", kind);
+        const refused = kind === "XP" || kind === "REFORGE" || HostWriteDenialReason(auth, hub(), "friend", kind, PRESENT) !== undefined;
+        assert.equal(HostWriteDenialReason(auth, hub({ hubKind: "TRAINING" }), "friend", kind, PRESENT),
+            refused ? "WRITE_KIND_NOT_ALLOWED_IN_HUB" : undefined, kind);
     }
 });
 
@@ -269,17 +272,31 @@ test("XP is refused in a Ramsgate hub even for a present member", async () => {
     });
 });
 
-test("a Training hub refuses every write kind for a present member, and stores nothing", async () => {
-    await WithHub("TRAINING", async ({ kit, hub, rows }) => {
+test("a Training hub takes a present member's bounty write (the tutorial's quest step) and refuses XP and the reforge", async () => {
+    await WithHub("TRAINING", async ({ kit, hub }) => {
         await Admit(kit, hub, MEMBER);
         const req = await RuntimeRequest(hub, MEMBER);
-        for (const kind of ALL_WRITE_KINDS) {
+        assert.equal(await AuthorizeHostWrite(req, "BOUNTY", MEMBER), undefined);
+        assert.equal(await AuthorizeHostWrite(req, "SLAYERS_PATH", MEMBER), undefined);
+        for (const kind of ["XP", "REFORGE"] as const) {
             const denial = await AuthorizeHostWrite(req, kind, MEMBER);
             assert.equal(denial?.status, 403, kind);
             assert.equal((denial?.body as { code?: string }).code, "P2P_HOST_WRITE_DENIED", kind);
         }
-        assert.equal(rows.length, 0);
     });
+});
+
+// [2026-10-16] POST /inventory/instanceditem (the cells slotted into gear from the armoury) is a host write kind every hub takes, so a
+// realm saves an item as a dedicated server does; the target must still be present (every such save was refused until now).
+test("every hub takes a present member's item save (ITEM_SAVE), even under enforce, and refuses it for an absent player", async () => {
+    for (const hubKind of ["RAMSGATE", "TRAINING"] as const) {
+        await WithHub(hubKind, async ({ kit, hub }) => {
+            await Admit(kit, hub, MEMBER);
+            const req = await RuntimeRequest(hub, MEMBER);
+            assert.equal(await AuthorizeHostWrite(req, "ITEM_SAVE", MEMBER), undefined, hubKind);
+            assert.equal((await AuthorizeHostWrite(req, "ITEM_SAVE", STRANGER))?.status, 403, `${hubKind}: an absent player`);
+        });
+    }
 });
 
 test("P2P_HOST_WRITES=off refuses a Ramsgate hub's writes as well", async () => {

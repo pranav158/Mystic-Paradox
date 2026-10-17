@@ -17,7 +17,7 @@ import { loadGameData } from "../gameData/loader";
 import { PLATINUM_AGGREGATE_ID, ProjectBalances, ResolvePlatinumSpend, SumPlatinum } from "../platinumWallet";
 import { MonitorPrestigeFunding, PrestigeSourceState } from "../diagnostics/economyMonitor";
 import { EconomyLedger, IsPlatinumMovement } from "../diagnostics/economyLedgerMonitor";
-import { FundChallengeReward } from "./challengeRewards";
+import { FundChallengeReward, IsDailyChallengeRewardLimited } from "./challengeRewards";
 
 const NO_PLAYER_SENTINEL = "INVALID";
 
@@ -276,6 +276,30 @@ async function SpendBankedPrestigeForReward(userId: string, catalogId: string, q
     }
 }
 
+// [2026-10-17] The Sparkforge's "forge Aetherhearts" (USparkforgeViewModel::ForgeAetherhearts 0x14214A030, the inventory's
+// convert_aethersparks_to_aetherhearts) turns Aethersparks into Aether Hearts at the Heart's catalog price: its view model asks
+// AArchonInventory::GetCurrencyExchangeRate (0x141B57EB0), which reads CURRENCY_PJM_PRESTIGE_FILLED's virtualCurrencyPrices -
+// 200 of currency 2 (EPlayFabCatalogCurrency::CURRENCY_PJM_PRESTIGE_EMPTY) in the 1.14.7 catalog.
+// The conversion arrives as ONE transaction that removes the Sparks and adds the Hearts. The prestige gate (above) took every
+// Heart for a reforge reward: without unclaimed reforge levels the conversion was refused (on every server,
+// not only realms), and with them it claimed those levels, so the player's later reforge Hearts were refused.
+// A weapon reforge pays its Spark cost and its Heart in two separate transactions (controllers/reforge.ts: ServerConsumeItem
+// first, the Heart last), so Sparks removed in the same transaction as Hearts are a conversion: they fund floor(Sparks / 200) of
+// those Hearts; the rest still needs banked prestige. The Sparks are taken in the same transaction (an overspend aborts it).
+export const AETHERHEART_CATALOG_ID = "CURRENCY_PJM_PRESTIGE_FILLED";
+export const AETHERSPARK_CATALOG_ID = "CURRENCY_PJM_PRESTIGE_EMPTY";
+export const AETHERSPARKS_PER_AETHERHEART = 200;
+
+/** Pure: how many Aether Hearts the Aethersparks this transaction removes pay for (whole Hearts at the catalog price). */
+export function SparkforgeFundedHearts(removes: any[] | undefined): number {
+    let Sparks = 0;
+    for (const Item of (removes ?? [])) {
+        const Quantity = Number(Item?.quantity ?? 0);
+        if (Item?.catalogId === AETHERSPARK_CATALOG_ID && Number.isSafeInteger(Quantity) && Quantity > 0) Sparks += Quantity;
+    }
+    return Math.floor(Sparks / AETHERSPARKS_PER_AETHERHEART);
+}
+
 // Applies CURRENCY_* stacked-item deltas from an inventory transaction to the wallet.
 // Non-currency stacked items (TOKEN_*, cosmetics, etc.) are left to the inventory layer.
 // Accepts an optional session so the currency mutation is part of the caller's transaction.
@@ -288,6 +312,8 @@ export async function ApplyCurrencyDeltas(userId: string, adds: any[], removes: 
     ledger?: EconomyLedger, operatorTestFunding = false): Promise<Record<string, number>> {
     const TouchedBalances: Record<string, number> = {};
     if (!userId || userId === NO_PLAYER_SENTINEL) return TouchedBalances;
+    // [2026-10-17] Hearts this transaction's own Aethersparks pay for (the Sparkforge conversion, SparkforgeFundedHearts).
+    let SparkforgeHearts = SparkforgeFundedHearts(removes);
 
     for (const Item of (adds ?? [])) {
         if (typeof Item?.catalogId === "string" && Item.catalogId.startsWith("CURRENCY_")) {
@@ -301,11 +327,25 @@ export async function ApplyCurrencyDeltas(userId: string, adds: any[], removes: 
             if (Funded) {
                 MonitorPrestigeFunding(userId, Item.catalogId, Quantity, [],
                     `funded by season challenge ${Funded.bountyId} (claimedAt ${Funded.claimedAt ?? "before 10 Oct 14:00"})`);
+            } else if (allowChallengeRewardFunding && await IsDailyChallengeRewardLimited(userId, Item.catalogId, Quantity, session)) {
+                // [2026-10-17] Today's daily challenge reward was already paid (one per game day, from 17:00 UTC): the coins are skipped
+                // and the rest of the transaction kept. The prestige gate below refused the whole transaction for them, which paid
+                // nothing either and made the game send it again.
+                MonitorPrestigeFunding(userId, Item.catalogId, Quantity, [],
+                    "skipped: this game day's daily challenge reward was already paid (the rest of the transaction is kept)");
+                continue;
             } else if (operatorTestFunding) {
                 // [2026-10-16] The admin tester tool's grant (InventoryTransactionOptions.operatorTestFunding): no prestige is spent.
                 if (IsPrestigeGatedReward(Item.catalogId)) {
                     MonitorPrestigeFunding(userId, Item.catalogId, Quantity, [], "funded by the operator tester tool (OPERATOR_TEST)");
                 }
+            } else if (Item.catalogId === AETHERHEART_CATALOG_ID && SparkforgeHearts > 0 && Number.isSafeInteger(Quantity) && Quantity > 0) {
+                // [2026-10-17] Paid by the Sparks removed in this transaction first; any Hearts beyond them need banked prestige.
+                const Converted = Math.min(Quantity, SparkforgeHearts);
+                SparkforgeHearts -= Converted;
+                MonitorPrestigeFunding(userId, Item.catalogId, Converted, [],
+                    `funded by the Sparkforge (${Converted * AETHERSPARKS_PER_AETHERHEART} ${AETHERSPARK_CATALOG_ID} in this transaction)`);
+                if (Quantity > Converted) await SpendBankedPrestigeForReward(userId, Item.catalogId, Quantity - Converted, session);
             } else {
                 await SpendBankedPrestigeForReward(userId, Item.catalogId, Quantity, session);
             }

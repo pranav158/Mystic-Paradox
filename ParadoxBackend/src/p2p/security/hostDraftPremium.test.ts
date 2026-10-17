@@ -1,21 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ActivePremiumPassEntitlement, DecideHostDraftPremium, HoldsEntitlementNamed, RecordHostDraftPremiumGrant, StackedBalanceOf } from "./hostDraftPremium";
+import { ActivePremiumPassEntitlement, DecideHostDraftPremium, HoldsEntitlementNamed, StackedBalanceOf } from "./hostDraftPremium";
 import type { HostDraftPremiumInputs } from "./hostDraftPremium";
-import { UtcDay } from "../../bountyState";
 
 /*
- * [2026-10-15] The decision for a host's daily premium draft token (hostDraftPremium.ts). Pure: the progression data, the player's
- * balance and pass, and the account's last host-granted day and today are passed in. The game-data reads (the real season's pass name)
- * are in hostDraftPremium.gamedata.test.ts; the account record and the replay path are in hostDraftPremiumDaily.gamedata.test.ts.
+ * [2026-10-15] The decision for a host's daily premium draft token (hostDraftPremium.ts). Pure: the progression data and the player's
+ * balance and pass are passed in. The game-data reads (the real season's pass name) are in hostDraftPremium.gamedata.test.ts; the
+ * transaction and the replay path are in hostDraftPremiumDaily.gamedata.test.ts. [2026-10-16] Only the balance cap decides: no pass and
+ * no once-per-day rule.
  */
 
 const PASS = "season43_premium";
 const TOKEN = { catalogId: "TOKEN_DAILY_CHALLENGE_DRAFT_PREMIUM", quantity: 1 };
-const TODAY = "2026-10-15";
-const YESTERDAY = "2026-10-14";
 const inputs = (overrides: Partial<HostDraftPremiumInputs> = {}): HostDraftPremiumInputs => ({
-    balanceBefore: 0, passEntitlement: PASS, holdsPremiumPass: true, grantedOnDay: undefined, today: TODAY, ...overrides,
+    balanceBefore: 0, passEntitlement: PASS, holdsPremiumPass: true, ...overrides,
 });
 
 test("the active season's premium pass comes from its progression path, and nothing when the data names none", () => {
@@ -54,9 +52,9 @@ test("a body that does not add the token is not decided at all", () => {
         "an instanced add is the policy's to refuse, not a decision");
 });
 
-test("a whole token for a player with the pass and no unspent token is allowed, and the balance after is 1", () => {
+test("a whole token for a player with no unspent token is allowed, and the balance after is 1", () => {
     assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs()),
-        { allowed: true, reason: "PREMIUM_PASS_HELD_WITHIN_CAP_ONCE_PER_DAY", balanceBefore: 0, balanceAfter: 1 });
+        { allowed: true, reason: "WITHIN_BALANCE_CAP", balanceBefore: 0, balanceAfter: 1 });
 });
 
 test("a player who already holds an unspent token is over the cap, so the second is refused", () => {
@@ -67,17 +65,30 @@ test("a player who already holds an unspent token is over the cap, so the second
 test("a token spent in the same transaction keeps the balance within the cap, so the grant is allowed", () => {
     const spend = { addStackedItems: [TOKEN], removeStackedItems: [{ catalogId: TOKEN.catalogId, quantity: 1 }] };
     assert.deepEqual(DecideHostDraftPremium(spend, inputs({ balanceBefore: 1 })),
-        { allowed: true, reason: "PREMIUM_PASS_HELD_WITHIN_CAP_ONCE_PER_DAY", balanceBefore: 1, balanceAfter: 1 });
+        { allowed: true, reason: "WITHIN_BALANCE_CAP", balanceBefore: 1, balanceAfter: 1 });
 });
 
-test("a player without the season's premium pass is refused, whatever the balance", () => {
+// [2026-10-16] Every account may have the token (the game grants it to every player on the daily draft); refusing players without
+// the premium pass left a new player's bounty load unfinished and the hub sent them back to the menu.
+test("a player without the season's premium pass is granted the token too, within the same cap", () => {
     assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ holdsPremiumPass: false })),
-        { allowed: false, reason: "NO_PREMIUM_PASS", balanceBefore: 0, balanceAfter: 1 });
+        { allowed: true, reason: "WITHIN_BALANCE_CAP", balanceBefore: 0, balanceAfter: 1 });
+    assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ holdsPremiumPass: false, balanceBefore: 1 })),
+        { allowed: false, reason: "OVER_BALANCE_CAP", balanceBefore: 1, balanceAfter: 2 });
 });
 
-test("without a pass entitlement in the game data nothing is granted (fail closed)", () => {
+test("game data that names no pass entitlement does not matter any more", () => {
     assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ passEntitlement: undefined, holdsPremiumPass: false })),
-        { allowed: false, reason: "NO_PASS_ENTITLEMENT_DATA", balanceBefore: 0, balanceAfter: 1 });
+        { allowed: true, reason: "WITHIN_BALANCE_CAP", balanceBefore: 0, balanceAfter: 1 });
+});
+
+// [2026-10-16] The game's daily period ends at 17:00 UTC and its RefundBounties re-adds the token after a drafted daily bounty is lost:
+// the decision has no day to compare, so a later grant on the same UTC day is decided by the balance alone.
+test("a later grant on the same UTC day is allowed whenever the balance is within the cap", () => {
+    const first = DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ balanceBefore: 0 }));
+    const refund = DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ balanceBefore: 0 }));
+    assert.deepEqual(first, refund, "the same balance gives the same decision, whatever was granted earlier");
+    assert.equal(refund?.allowed, true);
 });
 
 test("one whole token per transaction: a second add, a quantity other than 1, or a list of tokens is refused", () => {
@@ -94,49 +105,4 @@ test("one whole token per transaction: a second add, a quantity other than 1, or
 test("an unreadable balance is refused, never taken as zero", () => {
     assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ balanceBefore: undefined })),
         { allowed: false, reason: "BALANCE_UNREADABLE" });
-});
-
-test("the first grant of a UTC day is allowed, and so is a grant after an earlier day's grant", () => {
-    assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ grantedOnDay: undefined })),
-        { allowed: true, reason: "PREMIUM_PASS_HELD_WITHIN_CAP_ONCE_PER_DAY", balanceBefore: 0, balanceAfter: 1 });
-    assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ grantedOnDay: YESTERDAY })),
-        { allowed: true, reason: "PREMIUM_PASS_HELD_WITHIN_CAP_ONCE_PER_DAY", balanceBefore: 0, balanceAfter: 1 });
-});
-
-test("a second grant on the same UTC day is refused ALREADY_GRANTED_TODAY, also when the token was spent in the same transaction", () => {
-    assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ grantedOnDay: TODAY })),
-        { allowed: false, reason: "ALREADY_GRANTED_TODAY", balanceBefore: 0, balanceAfter: 1 });
-    const spend = { addStackedItems: [TOKEN], removeStackedItems: [{ catalogId: TOKEN.catalogId, quantity: 1 }] };
-    assert.deepEqual(DecideHostDraftPremium(spend, inputs({ balanceBefore: 1, grantedOnDay: TODAY })),
-        { allowed: false, reason: "ALREADY_GRANTED_TODAY", balanceBefore: 1, balanceAfter: 1 });
-});
-
-test("the day is checked after the pass and before the balance cap", () => {
-    assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ balanceBefore: 1, grantedOnDay: TODAY })),
-        { allowed: false, reason: "ALREADY_GRANTED_TODAY", balanceBefore: 1, balanceAfter: 2 }, "granted today and over the cap: the day is named");
-    assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ holdsPremiumPass: false, grantedOnDay: TODAY })),
-        { allowed: false, reason: "NO_PREMIUM_PASS", balanceBefore: 0, balanceAfter: 1 });
-});
-
-test("the next UTC day allows the grant again, and the day is the UTC day of the instant", () => {
-    assert.deepEqual(DecideHostDraftPremium({ addStackedItems: [TOKEN] }, inputs({ grantedOnDay: TODAY, today: "2026-10-16" })),
-        { allowed: true, reason: "PREMIUM_PASS_HELD_WITHIN_CAP_ONCE_PER_DAY", balanceBefore: 0, balanceAfter: 1 });
-    assert.equal(UtcDay(Date.parse("2026-10-15T23:59:59.999Z")), TODAY);
-    assert.equal(UtcDay(Date.parse("2026-10-16T00:00:00.000Z")), "2026-10-16");
-});
-
-test("the day write is conditional on the version the grant read: a record that moved under it refuses the grant", async () => {
-    const Writes: [any, number | undefined][] = [];
-    const Stored = { userId: "member", bounties: [], draftData: {}, updateVersion: 3, createdAt: YESTERDAY, updatedAt: YESTERDAY };
-    const Repos = (answer: unknown) => ({ bountyStates: {
-        get: async () => Stored,
-        saveIfVersion: async (record: any, expectedVersion: number | undefined) => { Writes.push([record, expectedVersion]); return answer; },
-    } });
-    const Session = {} as any;
-    assert.equal(await RecordHostDraftPremiumGrant(Repos(undefined) as any, "member", TODAY, Session), false);
-    assert.equal(await RecordHostDraftPremiumGrant(Repos({ ...Stored, updateVersion: 4 }) as any, "member", TODAY, Session), true);
-    const [Record, Expected] = Writes[1];
-    assert.equal(Expected, 3, "the write names the version it read");
-    assert.equal(Record.dailyPremiumDraftGrantedOn, TODAY);
-    assert.equal(Record.updateVersion, 4);
 });

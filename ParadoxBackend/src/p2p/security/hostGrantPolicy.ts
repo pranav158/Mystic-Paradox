@@ -53,12 +53,14 @@ import { IsPrestigeGatedReward } from "../../controllers/wallet";
 import { tryLoadGameData } from "../../gameData/loader";
 import { InventoryBodyHasGrantOrSpend } from "../../validation";
 import type { P2PHuntSessionRecord } from "../persistence";
-import { IsRamsgateHubSession } from "./hubAuthorization";
+import { IsRealmHubSession } from "./hubAuthorization";
 
 // [2026-10-15] One HUNT_PASS-class exception: the daily premium draft token (TOKEN_DAILY_CHALLENGE_DRAFT_PREMIUM). The game's bounty
 // component grants one on the daily draft (UBountyComponent::ServerInitializeBounties, +1, and -1 when a premium draft is chosen), so a
-// realm's Ramsgate hub asks for it on every daily reset. Whether a host may grant it depends on the player: it is allowed only for an
-// account that holds the active season's premium pass, and only up to the balance cap below (hostDraftPremium.ts decides). The
+// realm's Ramsgate hub asks for it on every daily reset. [2026-10-16] A host may grant it to every account (until then only to
+// premium pass holders, which kicked new players ~120 s after Ramsgate), and only up to the balance cap below (no once-per-day rule
+// any more: the game's own 17:00 UTC reset and its refund re-adds were refused by it)
+// (hostDraftPremium.ts decides). The
 // catalogue gives it no cap (maxQuantity 0 in catalog_1_14_7.jsonl and inventory_storage_policy.json) and the dedicated path enforces
 // none beyond the 1e9 per-grant validation, so the cap is the owner's fallback of 1. Only this exact shape is exempt: the id, a
 // stacked add, a quantity of 1, and one such add per transaction. Every other HUNT_PASS item, and the token in any other operation,
@@ -228,8 +230,10 @@ export function HostGrantViolations(body: any, catalog: HostGrantCatalog = Defau
  *
  * [2026-10-14 realms S4] A realm hub carries NO_COMPLETION too (it produces no hunt evidence and never completes), but the
  * realm's Ramsgate is not a no-reward session: crafting, the reforge cost, store spends and claim-funded coins happen there
- * (hub design section 7.3). It keeps the class deny list above and the claim-funded coin rule, exactly as a hunt; only a
- * session that is not a Ramsgate hub - a Training hub, a hosted Training hunt - keeps the blanket refusal.
+ * (hub design section 7.3). It keeps the class deny list above and the claim-funded coin rule, exactly as a hunt.
+ * [2026-10-16] So does the realm's Training hub: the Training Grounds tutorial pays its quest rewards there (the trainer's
+ * "reach me" step, 100 Rams) and the step does not complete while the reward is refused. Only a session that is not a realm hub - a
+ * hosted Training hunt - keeps the blanket refusal.
  */
 export function HostGrantDenial(
     hunt: Pick<P2PHuntSessionRecord, "guardCompletionMode" | "sessionKind" | "hubKind"> | undefined,
@@ -237,7 +241,8 @@ export function HostGrantDenial(
     catalog: HostGrantCatalog = DefaultHostGrantCatalog(),
     allowances: HostGrantAllowances = {}
 ): { classes: string[]; violations: HostGrantViolation[]; summary: string } | undefined {
-    if (hunt?.guardCompletionMode === "NO_COMPLETION" && !IsRamsgateHubSession(hunt) && InventoryBodyHasGrantOrSpend(body)) {
+    const RealmHubOfKnownKind = IsRealmHubSession(hunt) && (hunt?.hubKind === "RAMSGATE" || hunt?.hubKind === "TRAINING");
+    if (hunt?.guardCompletionMode === "NO_COMPLETION" && !RealmHubOfKnownKind && InventoryBodyHasGrantOrSpend(body)) {
         return { classes: ["NO_REWARD_SESSION"], violations: [], summary: "any grant or spend" };
     }
     const violations = HostGrantViolations(body, catalog, allowances);

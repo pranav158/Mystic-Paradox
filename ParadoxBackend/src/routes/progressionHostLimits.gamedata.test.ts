@@ -64,6 +64,9 @@ const Hooks = {
     authorized: [] as { kind: HostWriteKind; target: string }[],
     records: [] as HostWriteRecordInput[],
     denial: undefined as ExtensionHttpResponse | undefined,
+    // [2026-10-17] The host policy: enforce (true) pins the limits as refusals; observe (false) only logs them (dedicated parity).
+    policyRefuses: true,
+    notes: [] as string[],
 };
 
 function Replace(modulePath: string, overrides: Record<string, unknown>): void {
@@ -89,6 +92,10 @@ Replace("../extensions/p2p", {
         hostWrites: {
             authorize: async (_req: unknown, kind: HostWriteKind, target: string) => { Hooks.authorized.push({ kind, target }); return Hooks.denial; },
             record: async (_req: unknown, write: HostWriteRecordInput) => { Hooks.records.push(write); },
+        },
+        hostPolicy: {
+            refuses: () => Hooks.policyRefuses,
+            noteWouldRefuse: (what: string, detail: string) => { Hooks.notes.push(`${what} ${detail}`); },
         },
     }),
 });
@@ -127,6 +134,8 @@ function Reset(): void {
     Hooks.authorized.length = 0;
     Hooks.records.length = 0;
     Hooks.denial = undefined;
+    Hooks.policyRefuses = true;
+    Hooks.notes.length = 0;
 }
 
 function Send(method: string, path: string, role: string | undefined, body?: unknown, extraHeaders: Record<string, string> = {}): Promise<{ status: number; json: any }> {
@@ -247,6 +256,29 @@ test("a host cannot push a full player level track further; the grant that cross
 
     // A dedicated server's grant on the same full track still goes through.
     assert.equal((await Grant("gs", "ExperienceTrack_PlayerLevel", 98, "cross-gs")).status, 200);
+});
+
+// [2026-10-17] Dedicated parity (observe, the live default): the ceiling and the full player level only log; the grant is applied and
+// tagged like any other host grant. The reforge rules (MasteryTrack_, a prestige grant that is not +1) still refuse.
+test("observe: a host's over-ceiling grant and a grant to a full player level are applied, tagged and logged", async () => {
+    Reset();
+    Hooks.policyRefuses = false;
+    const Over = await Grant("host", "season43", 260, "observe-over-1");
+    assert.equal(Over.status, 200, JSON.stringify(Over.json));
+    assert.equal(Over.json.payload.progress, 260);
+    Tracks.set("player-1|ExperienceTrack_PlayerLevel", { userId: "player-1", progressionId: "ExperienceTrack_PlayerLevel", progress: 141_020, confirmedFremiumRank: 0, confirmedPremiumRank: 0, updatedAt: "2026-10-13T00:00:00.000Z" });
+    const Full = await Grant("host", "ExperienceTrack_PlayerLevel", 98, "observe-full-1");
+    assert.equal(Full.status, 200, "no 403 for a max-level player");
+    assert.equal(Full.json.payload.progress, 141_118);
+    assert.deepEqual(Hooks.records.map((Write) => Write.summary.grantId), ["observe-over-1", "observe-full-1"]);
+    assert.equal(Hooks.notes.length, 2, Hooks.notes.join("\n"));
+    assert.ok(Hooks.notes[0].includes("reason=amount_over_ceiling") && Hooks.notes[1].includes("reason=track_full"), Hooks.notes.join("\n"));
+
+    for (const [Track, Amount] of [["MasteryTrack_PlayerLevel", 1], ["PrestigeTrack_Weapon_Axe", 2]] as [string, number][]) {
+        const Refused = await Grant("host", Track, Amount, `observe-refused-${Track}`);
+        assert.equal(Refused.status, 403, `${Track} ${Amount}`);
+        assert.equal(Refused.json.code, LIMIT_CODE);
+    }
 });
 
 // ---- mastery reports -----------------------------------------------------------------------------------------------------------

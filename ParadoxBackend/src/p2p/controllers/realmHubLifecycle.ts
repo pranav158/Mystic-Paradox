@@ -32,7 +32,8 @@ import {
     ParseHubStartBody,
     ParseHubStopBody,
     PresencePurgeAt,
-    REALM_HUB_KINDS
+    REALM_HUB_KINDS,
+    RealmLowMemoryNote
 } from "../realm/realmHubRules";
 import {
     IsRealmHostingEnabled,
@@ -156,22 +157,26 @@ export async function CreateRealmHubSession(accountId: string, body: unknown, no
     // game running. Guard then follows the running hub through the host presence (GUARD_REQUIRED there); realm hunts still
     // ask for it at their start (RankRealmHost), when the hub's host-role session exists.
     void guardRequired;
-    const ineligible = RealmHostIneligibilityReason(presence, hostPolicy, realmPolicy, false, nowMs);
+    // [2026-10-16] The memory floors are the capacity's (below), as for a realm hunt (RankRealmHost): eligibility gets none, so a host
+    // short of free physical memory is no longer REALM_HOST_INELIGIBLE.
+    const ineligible = RealmHostIneligibilityReason(presence, hostPolicy, { minimumFreeMemoryMiB: 0, minimumCommitHeadroomMiB: 0 }, false, nowMs);
     if (ineligible != undefined) {
         throw new DetailedLauncherApiError("REALM_HOST_INELIGIBLE", `This PC cannot host the realm right now (${ineligible}).`, { reason: ineligible });
     }
-    const capacity = DecideRealmCapacity({
+    const capacityInput = {
         activeServers: await repos.p2pHunts.countActiveRealmServers(realm.realmId),
         maxServers: realm.hosting?.maxServers ?? realmPolicy.defaultMaxServers,
         freePhysicalMemoryMiB: presence.freePhysicalMemoryMiB,
         commitHeadroomMiB: presence.commitHeadroomMiB,
         minimumFreeMemoryMiB: realmPolicy.minimumFreeMemoryMiB,
         minimumCommitHeadroomMiB: realmPolicy.minimumCommitHeadroomMiB
-    });
+    };
+    const capacity = DecideRealmCapacity(capacityInput);
     if (!capacity.ok) {
         if (capacity.reason === "REALM_SERVER_LIMIT") throw new LauncherApiError("REALM_FULL", "This realm already runs the most servers its host allows.");
         throw new DetailedLauncherApiError("REALM_HOST_INELIGIBLE", `This PC cannot host the realm right now (${capacity.reason}).`, { reason: capacity.reason });
     }
+    if (capacity.lowFreeMemory) logger.warn(RealmLowMemoryNote(realm.realmId, `${parsed.hubKind} hub`, capacityInput));
 
     const manifest = REALM_HUB_MANIFESTS[parsed.hubKind];
     const partyKey = HubPartyKey(realm.realmId, parsed.hubKind);

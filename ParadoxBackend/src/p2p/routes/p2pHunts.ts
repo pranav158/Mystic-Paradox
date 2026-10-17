@@ -62,10 +62,27 @@ p2pHuntsRouter.use((req, res, next) => {
     next();
 });
 
+export type P2PHuntOperation = "event-batch" | "completion" | "shadow" | "lifecycle";
+
+export function P2PHuntOperationOf(path: string): P2PHuntOperation {
+    return path.includes("event-batches") ? "event-batch" :
+        path.includes("completion") ? "completion" :
+            path.includes("shadow-comparisons") ? "shadow" : "lifecycle";
+}
+
+/**
+ * [2026-10-17] Whether a host-capability call counts against the Guard traffic windows (the host's and the hunt session's). Only Guard
+ * traffic does. The lease and the other lifecycle calls (host-ready, admissions, peer disconnects, abort, end) used to share the windows
+ * with the evidence, so a busy hunt's event batches used them up and its lease renewals got 429 too: 10 s later the hunt went SUSPECT and
+ * was fenced under its players. The in-flight Guard request budget and the
+ * app-wide request limit (security/rateLimit.ts, the host capability's own bucket) still bound them.
+ */
+export function CountsAgainstGuardTraffic(operation: P2PHuntOperation): boolean {
+    return operation !== "lifecycle";
+}
+
 async function Handle(req: Request, res: Response, action: () => Promise<unknown>): Promise<void> {
-    const operation = req.path.includes("event-batches") ? "event-batch" :
-        req.path.includes("completion") ? "completion" :
-            req.path.includes("shadow-comparisons") ? "shadow" : "lifecycle";
+    const operation = P2PHuntOperationOf(req.path);
     IncrementMetric("mysticparadox_p2p_requests_total", 1, { operation });
     try {
         const capability = (req as any).HostCapabilityAuthData as HostCapabilityAuthData | undefined;
@@ -78,7 +95,7 @@ async function Handle(req: Request, res: Response, action: () => Promise<unknown
                 throw new LauncherApiError("GUARD_REQUEST_BUDGET_EXHAUSTED", "Guard request capacity is currently exhausted; retry shortly.");
             }
             try {
-                await EnforceP2PGuardTraffic(hostKey, sessionKey, bodyBytes);
+                if (CountsAgainstGuardTraffic(operation)) await EnforceP2PGuardTraffic(hostKey, sessionKey, bodyBytes);
                 res.status(200).json(await action());
             } finally {
                 releaseRequestBudget();

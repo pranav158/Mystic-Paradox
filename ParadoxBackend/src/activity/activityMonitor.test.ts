@@ -22,6 +22,7 @@ import {
     RecordReforgeActivity,
     RecordSlayersPathUnlocksActivity,
     RecordXpActivity,
+    IsGameRecentlyActive,
     RecentlyActiveAccountIds,
     StepFlushLog,
     TouchGameSession,
@@ -419,5 +420,25 @@ test("the accounts whose game reported in within a window count as online", asyn
     const Online = RecentlyActiveAccountIds(60 * 1000, T0 + 100 * 1000);
     assert.ok(Online.includes("u-online-new"), "reported in 10 s ago");
     assert.ok(!Online.includes("u-online-old"), "reported in 100 s ago");
+    await WaitForActivityWrites();
+});
+
+// [2026-10-16] Matchmaking asks whether a party member's game is running: no game holds an XMPP socket on this backend, so the
+// realm presence heartbeat (every 30 s) and the matchmaking heartbeat are the signal. It answers with the monitor off too.
+test("a game that reported in within the window counts as running, with the monitor on or off, and drops out after it", async () => {
+    const Store = new FakeActivityStore();
+    Monitor(Store);
+    TouchGameSession("u-party-on", T0);
+    assert.equal(IsGameRecentlyActive("u-party-on", 75 * 1000, T0 + 30 * 1000), true, "one heartbeat ago");
+    assert.equal(IsGameRecentlyActive("u-party-on", 75 * 1000, T0 + 76 * 1000), false, "past the window: the game closed");
+    assert.equal(IsGameRecentlyActive("u-never-seen", 75 * 1000, T0), false);
+    await WaitForActivityWrites();   // the monitor-on touch queued a session count
+
+    UseActivitySettingsForTest({ ...ReadActivitySettings({ MYSTICPARADOX_ACTIVITY_MONITOR: "off" }) });
+    TouchGameSession("u-party-off", T0);
+    assert.equal(IsGameRecentlyActive("u-party-off", 75 * 1000, T0 + 10 * 1000), true, "the monitor's switch does not hide a running game");
+    assert.ok(RecentlyActiveAccountIds(75 * 1000, T0 + 10 * 1000).includes("u-party-off"), "nor from the release gate");
+    assert.equal(PendingActivityKeysForTest(), 0, "with the monitor off nothing is counted");
+    UseActivitySettingsForTest(undefined);
     await WaitForActivityWrites();
 });

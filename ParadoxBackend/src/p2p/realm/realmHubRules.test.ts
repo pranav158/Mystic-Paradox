@@ -272,14 +272,18 @@ test("every ticket denial maps to a launcher error", () => {
     }
 });
 
-test("capacity: under the server limit with the memory the policy asks for", () => {
+// [2026-10-16] Low free physical memory is reported (lowFreeMemory) and no longer refuses; commit headroom and the server limit do.
+test("capacity: under the server limit with the commit headroom the policy asks for; low free memory is only reported", () => {
     const base = { activeServers: 1, maxServers: 3, freePhysicalMemoryMiB: 8192, commitHeadroomMiB: 8192, minimumFreeMemoryMiB: 3072, minimumCommitHeadroomMiB: 4096 };
     assert.deepEqual(DecideRealmCapacity(base), { ok: true });
     assert.deepEqual(DecideRealmCapacity({ ...base, activeServers: 2 }), { ok: true });
     assert.deepEqual(DecideRealmCapacity({ ...base, activeServers: 3 }), { ok: false, reason: "REALM_SERVER_LIMIT" });
-    assert.deepEqual(DecideRealmCapacity({ ...base, freePhysicalMemoryMiB: 3071 }), { ok: false, reason: "HOST_MEMORY_LOW" });
+    assert.deepEqual(DecideRealmCapacity({ ...base, freePhysicalMemoryMiB: 3071 }), { ok: true, lowFreeMemory: true });
+    assert.deepEqual(DecideRealmCapacity({ ...base, freePhysicalMemoryMiB: 2006, commitHeadroomMiB: 15460 }), { ok: true, lowFreeMemory: true },
+        "little free memory, plenty of commit headroom");
     assert.deepEqual(DecideRealmCapacity({ ...base, freePhysicalMemoryMiB: 3072 }), { ok: true });
     assert.deepEqual(DecideRealmCapacity({ ...base, commitHeadroomMiB: 4095 }), { ok: false, reason: "HOST_COMMIT_LOW" });
+    assert.deepEqual(DecideRealmCapacity({ ...base, freePhysicalMemoryMiB: 0, commitHeadroomMiB: 4095 }), { ok: false, reason: "HOST_COMMIT_LOW" });
     assert.deepEqual(DecideRealmCapacity({ ...base, activeServers: 3, freePhysicalMemoryMiB: 0 }), { ok: false, reason: "REALM_SERVER_LIMIT" });
 });
 

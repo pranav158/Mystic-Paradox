@@ -48,14 +48,22 @@ export function IsRamsgateHubSession(session: SessionShape | undefined): boolean
  * player: bounty drafts, claims and progress, cooldowns (the daily gate and the fountain), Slayer's Path, escalation, the
  * progression report (objectives) and mastery, the weapon reforge and its rank confirms. XP is not here: a hub has no XP
  * source (decision D4). The one XP-shaped write a Ramsgate hub takes is a weapon's prestige +1, which the route authorises as
- * REFORGE (the reforge's own step, routes/progression.ts). A Training hub writes nothing (no-reward session). A hub of an
+ * REFORGE (the reforge's own step, routes/progression.ts). (Until 16 Oct a Training hub wrote nothing; see below.) A hub of an
  * unknown kind allows nothing.
  * [2026-10-15] A loadout slot unlock is Ramsgate's too: the player's loadout station (the slot count stays the persisted Slayer's Path).
+ * [2026-10-16] The Training hub no longer writes nothing: it writes what Ramsgate writes, except the reforge. As a no-reward
+ * session the Training Grounds tutorial could not progress: the trainer's quest step ("reach the trainer", then the combos) is saved
+ * through the bounty component and paid by an inventory grant, both refused, so the trainer offered the same step again
+ * (BOUNTY WRITE_KIND_NOT_ALLOWED_IN_HUB, quest NOTES NO_REWARD_SESSION, nothing saved).
  */
 const HUB_WRITE_KINDS: Readonly<Record<HubKind, ReadonlySet<HostWriteKind>>> = {
+    // [2026-10-16] HUNT_PASS_XP: the active Hunt Pass track's XP, which the game awards in town (extensions/p2p.ts).
+    // [2026-10-16] ITEM_SAVE: an owned item's itemData (the cells slotted into gear from the armoury; POST /inventory/instanceditem).
     RAMSGATE: new Set<HostWriteKind>(["BOUNTY", "COOLDOWN", "SLAYERS_PATH", "ESCALATION", "OBJECTIVES", "MASTERY", "REFORGE",
-        "RANK_CONFIRM", "LOADOUT_UNLOCK"]),
-    TRAINING: new Set<HostWriteKind>()
+        "RANK_CONFIRM", "LOADOUT_UNLOCK", "HUNT_PASS_XP", "ITEM_SAVE"]),
+    // [2026-10-16] What Ramsgate writes, except the reforge (Ramsgate's station): see the note above.
+    TRAINING: new Set<HostWriteKind>(["BOUNTY", "COOLDOWN", "SLAYERS_PATH", "ESCALATION", "OBJECTIVES", "MASTERY",
+        "RANK_CONFIRM", "LOADOUT_UNLOCK", "HUNT_PASS_XP", "ITEM_SAVE"])
 };
 
 /** Kinds a hunt's runtime never writes: the reforge is a hub action (a hunt has no reforge station). */
@@ -81,15 +89,17 @@ export interface HubPresenceView {
  * Why a host write of `kind` for `targetUserId` is refused in this hub session, or undefined. The session's own state,
  * generation and the runtime's identity are checked by the caller (hostWrites.ts); this is the hub's rule: the write kind
  * belongs to this kind of hub, and the target is present in it (ADMITTED; the host counts, as in the runtime roster).
- * Without a presence view only the host passes.
+ * Without a presence view only the host passes. [2026-10-16] `checkKind` false leaves the write kind out (observe mode re-checks only
+ * who may write, hostWrites.ts).
  */
 export function HubWriteDenialReason(
     hub: Pick<P2PHuntSessionRecord, "sessionKind" | "hubKind" | "hostAccountId">,
     kind: HostWriteKind | undefined,
     targetUserId: string,
-    presence: HubPresenceView | undefined
+    presence: HubPresenceView | undefined,
+    checkKind = true
 ): string | undefined {
-    if (!HubAllowsWriteKind(hub.hubKind, kind)) return "WRITE_KIND_NOT_ALLOWED_IN_HUB";
+    if (checkKind && !HubAllowsWriteKind(hub.hubKind, kind)) return "WRITE_KIND_NOT_ALLOWED_IN_HUB";
     if (!IsHubRuntimeAccount(hub.hostAccountId, presence?.presentAccountIds ?? [], targetUserId)) return "MEMBER_NOT_PRESENT";
     return undefined;
 }

@@ -9,7 +9,7 @@
  * Additional terms under AGPLv3 Section 7 apply. See ADDITIONAL_TERMS.md.
  */
 
-import { TouchGameSession } from "../activity/activityMonitor";
+import { IsGameRecentlyActive, TouchGameSession } from "../activity/activityMonitor";
 import { Router } from "express";
 import crypto from "node:crypto";
 import { HasParadoxBackendAuth } from "../middleware/HasParadoxBackendAuth";
@@ -27,6 +27,9 @@ import { GetRealmsService, IsRealmsModuleEnabled } from "../realms";
 export const matchmakingRouter = Router();
 
 const QOS_TARGET_URL = process.env.QOS_TARGET_URL;
+// [2026-10-16] How recently a party member's game must have touched the backend to follow the leader into a hunt: 2.5 realm presence
+// heartbeats (every 30 s). Shorter than the release gate's 2 minutes, so a member who just closed the game is not frozen into a roster.
+const PARTY_MEMBER_ACTIVE_WINDOW_MS = 75_000;
 
 /**
  * [2026-10-14 realms S2] A matchmaking request of a realm member keeps its realm presence alive (presence lapses 120 s after the
@@ -253,8 +256,14 @@ matchmakingRouter.post("/candidate/join", HasParadoxBackendAuth, async (req: any
             : undefined;
     // [2026-10-11] A Training request the P2P module may host also drops offline members (false without the module).
     const FilterOffline = GetP2PExtension().matchmaking.filtersOfflinePartyMembers(GameMode, HuntId);
-    const Party = ResolveMatchmakingParty(
-        GameMode, UserId, RequestedPartyId, PartyForPlayer, (Member) => sessionRegistry.isOnline(Member), FilterOffline);
+    // [2026-10-16] A party member follows the leader as on a dedicated server: a member is online while their game holds an XMPP
+    // socket OR touched the backend within PARTY_MEMBER_ACTIVE_WINDOW_MS (the realm presence heartbeat every 30 s, the matchmaking
+    // heartbeat). No game holds an XMPP socket on this backend, so the socket alone left
+    // every member but the leader out of an Escalation (ISLAND) launch: the realm's host stayed in Ramsgate and the hunt ran on that
+    // host's PC without them. A member whose game closed stops touching and drops out
+    // after the window.
+    const Party = ResolveMatchmakingParty(GameMode, UserId, RequestedPartyId, PartyForPlayer,
+        (Member) => sessionRegistry.isOnline(Member) || IsGameRecentlyActive(Member, PARTY_MEMBER_ACTIVE_WINDOW_MS), FilterOffline);
 
     if(Party.partyIdMismatch && PartyForPlayer != undefined && PartyForPlayer.members.length > 1){
         logger.warn(
