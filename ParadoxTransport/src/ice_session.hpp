@@ -10,6 +10,7 @@
 
 #include "admission_client.hpp"
 #include "admission_ticket.hpp"
+#include "backend_lane.hpp"
 #include "ice_link.hpp"
 #include "ice_transport.hpp"
 #include "session_types.hpp"
@@ -18,8 +19,10 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -27,6 +30,10 @@
 #include <vector>
 
 namespace mystic::bridge {
+
+// [2026-10-17] Where a host session's own Hunt Guard events go (transport_app.cpp: the GuardPublisher's queue). False when
+// the event was not taken.
+using GuardEventSink = std::function<bool(std::string_view type, std::string_view account_id, std::string_view payload_json)>;
 
 // One side of a host-joiner pair as the backend described it (transport-config): the other side's account, the
 // 64-bit peer id its admission ticket carries, and the pair key.
@@ -71,10 +78,16 @@ public:
     [[nodiscard]] const SessionStats& stats() const { return stats_; }
     [[nodiscard]] std::uint32_t admitted_count() const;
 
+    // [2026-10-17] Hands the event to the sink (set_guard_sink); true without hunt evidence. It never waits for the network.
     bool publish_guard_event(std::string_view type, std::string_view account_id,
         std::string_view payload_json, std::string& error);
-    bool complete_guard(std::string& error);
-    [[nodiscard]] bool guard_evidence_incomplete() const { return guard_evidence_incomplete_; }
+    void set_guard_sink(GuardEventSink sink) { guard_sink_ = std::move(sink); }
+    // [2026-10-17] With a lane, the backend calls this session makes while it runs (an admission's ticket consume, a
+    // disconnect notice) go through the lane, so pump_once never waits for the backend; without one they are made in
+    // place (the unit tests). finish_after_stop, after stop() and after the lane drained: the consumes that came back
+    // late are settled and the last disconnect notices are sent in place.
+    void set_backend_lane(BackendLane* lane) { lane_ = lane; }
+    void finish_after_stop();
 
 private:
     struct Peer {
@@ -89,6 +102,8 @@ private:
         std::chrono::steady_clock::time_point admission_deadline{};
         std::chrono::steady_clock::time_point close_at{};
         bool closing = false;
+        // Non-zero while this link's ticket consume is with the backend (lane_).
+        std::uint64_t admission_token = 0;
     };
     // std::list: pointers to peers stay valid while others are added and removed.
     using PeerList = std::list<Peer>;
@@ -106,6 +121,23 @@ private:
         PeerId peer_id = 0;
         std::string admission_id;
         std::size_t index = 0;
+        // The notice's request id when it is not the usual disc-<generation>-<peer>-<link>.
+        std::string request_id;
+    };
+    // A ticket consume sent through the lane: what the answer is for, and where the lane puts it.
+    struct PendingAdmission {
+        std::string account_id;
+        PeerId peer_id = 0;
+        std::size_t link_index = 0;
+        std::array<std::uint8_t, 16> jti{};
+    };
+    struct ConsumeOutcome {
+        std::uint64_t token = 0;
+        AdmissionConsumeResult result;
+    };
+    struct ConsumeMailbox {
+        std::mutex mutex;
+        std::vector<ConsumeOutcome> done;
     };
 
     PeerList::iterator find_peer(std::string_view account_id);
@@ -115,6 +147,8 @@ private:
     void close_link(Peer& peer, bool notify_backend, std::string_view reason);
     void handle_frames(Peer& peer);
     void admit(Peer& peer, std::string ticket);
+    void complete_admission(Peer& peer, const std::array<std::uint8_t, 16>& jti, const AdmissionConsumeResult& consumed);
+    void finish_admissions();
     void reject(Peer& peer, std::string_view code);
     void hold_signal(std::string_view from_account_id, std::string_view kind, std::string_view data);
     void replay_held_signals(std::string_view account_id);
@@ -138,13 +172,11 @@ private:
     SessionStats stats_;
     std::deque<PeerId> disconnected_peers_;
     std::deque<BackendDisconnect> backend_disconnects_;
-    std::uint64_t guard_sequence_ = 0;
-    std::string guard_head_hash_ = std::string(64, '0');
-    // A retry after a network failure must replay the same batch id at the same chain position.
-    std::uint64_t guard_pending_sequence_ = 0;
-    std::string guard_pending_batch_id_;
-    bool guard_evidence_incomplete_ = false;
-    std::chrono::steady_clock::time_point guard_started_{ std::chrono::steady_clock::now() };
+    GuardEventSink guard_sink_;
+    BackendLane* lane_ = nullptr;
+    std::shared_ptr<ConsumeMailbox> consume_mailbox_ = std::make_shared<ConsumeMailbox>();
+    std::unordered_map<std::uint64_t, PendingAdmission> pending_admissions_;
+    std::uint64_t last_admission_token_ = 0;
 };
 
 // The joiner's side: one link to the host. It sends its DESCRIPTION first, then (once connected) its admission

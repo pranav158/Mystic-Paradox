@@ -204,12 +204,24 @@ void IceHostSession::expire_held_signals(std::chrono::steady_clock::time_point n
 
 void IceHostSession::flush_backend_disconnects() {
     while (!backend_disconnects_.empty()) {
-        BackendDisconnect item = std::move(backend_disconnects_.front());
-        backend_disconnects_.pop_front();
+        BackendDisconnect& item = backend_disconnects_.front();
         // The link index keeps the request id unique when the same peer id leaves and rejoins.
-        admission_client_.notify_disconnected(bindings_.session_id, item.admission_id,
+        std::string request_id = !item.request_id.empty() ? item.request_id :
             "disc-" + std::to_string(bindings_.generation) + '-' + std::to_string(item.peer_id) + '-' +
-            std::to_string(item.index));
+            std::to_string(item.index);
+        if (lane_ != nullptr) {
+            // [2026-10-17] Through the lane: the notice is a round trip to the backend, and this thread relays packets.
+            // A full lane keeps the notice for the next pump.
+            if (!lane_->post([session_id = bindings_.session_id, admission_id = item.admission_id,
+                    request_id = std::move(request_id)](IAdmissionClient& client) {
+                    client.notify_disconnected(session_id, admission_id, request_id);
+                })) {
+                return;
+            }
+        } else {
+            admission_client_.notify_disconnected(bindings_.session_id, item.admission_id, request_id);
+        }
+        backend_disconnects_.pop_front();
     }
 }
 
@@ -226,6 +238,7 @@ bool IceHostSession::open_link(Peer& peer, std::string_view remote_description) 
     peer.was_connected = false;
     peer.admitted = false;
     peer.closing = false;
+    peer.admission_token = 0;
     peer.admission_id.clear();
     peer.admission_result.clear();
     return true;
@@ -248,6 +261,8 @@ void IceHostSession::close_link(Peer& peer, bool notify_backend, std::string_vie
     peer.was_connected = false;
     peer.admitted = false;
     peer.closing = false;
+    // A consume still with the backend is settled when it comes back (finish_admissions): this link is gone.
+    peer.admission_token = 0;
     peer.admission_id.clear();
     peer.admission_result.clear();
 }
@@ -312,7 +327,7 @@ void IceHostSession::admit(Peer& peer, std::string ticket) {
         reject(peer, "wrong_account");
         return;
     }
-    const AdmissionConsumeResult consumed = admission_client_.consume({
+    auto request = std::make_shared<AdmissionConsumeRequest>(AdmissionConsumeRequest{
         bindings_.session_id,
         ticket,
         bindings_.bridge_instance_id,
@@ -321,13 +336,42 @@ void IceHostSession::admit(Peer& peer, std::string ticket) {
         peer.config.peer_id
     });
     std::fill(ticket.begin(), ticket.end(), '\0');
+    if (lane_ == nullptr) {
+        const AdmissionConsumeResult consumed = admission_client_.consume(*request);
+        std::fill(request->ticket.begin(), request->ticket.end(), '\0');
+        complete_admission(peer, verified.claims.jti_bytes, consumed);
+        return;
+    }
+    // [2026-10-17] The consume is a round trip to the backend: it goes through the lane, and the link waits for the answer
+    // (pump_once -> finish_admissions) while the other players' packets keep flowing. Its repeated requests meanwhile are
+    // ignored (handle_frames), so a ticket is still consumed once.
+    const std::uint64_t token = ++last_admission_token_;
+    const auto mailbox = consume_mailbox_;
+    const bool posted = lane_->post([request, mailbox, token](IAdmissionClient& client) {
+        ConsumeOutcome outcome{ token, client.consume(*request) };
+        std::fill(request->ticket.begin(), request->ticket.end(), '\0');
+        std::lock_guard lock(mailbox->mutex);
+        mailbox->done.push_back(std::move(outcome));
+    });
+    if (!posted) {
+        std::fill(request->ticket.begin(), request->ticket.end(), '\0');
+        reject(peer, "central_consume_busy");
+        return;
+    }
+    peer.admission_token = token;
+    pending_admissions_[token] = PendingAdmission{ peer.config.account_id, peer.config.peer_id, peer.index,
+        verified.claims.jti_bytes };
+}
+
+void IceHostSession::complete_admission(Peer& peer, const std::array<std::uint8_t, 16>& jti,
+    const AdmissionConsumeResult& consumed) {
     if (!consumed.admitted || consumed.admission_id.size() != 64) {
         reject(peer, consumed.code.empty() ? "central_consume_failed" : consumed.code);
         return;
     }
-    if (!verifier_.mark_consumed(verified.claims.jti_bytes)) {
-        admission_client_.notify_disconnected(bindings_.session_id, consumed.admission_id,
-            "disc-replay-" + std::to_string(bindings_.generation) + "-ice" + std::to_string(peer.index));
+    if (!verifier_.mark_consumed(jti)) {
+        backend_disconnects_.push_back(BackendDisconnect{ peer.config.peer_id, consumed.admission_id, peer.index,
+            "disc-replay-" + std::to_string(bindings_.generation) + "-ice" + std::to_string(peer.index) });
         reject(peer, "local_replay");
         return;
     }
@@ -362,7 +406,8 @@ void IceHostSession::handle_frames(Peer& peer) {
             (void)peer.link->send(FrameType::Control, peer.admission_result);
             continue;
         }
-        if (peer.closing) {
+        if (peer.closing || peer.admission_token != 0) {
+            // Closing, or this link's consume is still with the backend: never consume twice.
             std::fill(ticket.begin(), ticket.end(), '\0');
             continue;
         }
@@ -371,8 +416,46 @@ void IceHostSession::handle_frames(Peer& peer) {
     }
 }
 
+void IceHostSession::finish_admissions() {
+    std::vector<ConsumeOutcome> done;
+    {
+        std::lock_guard lock(consume_mailbox_->mutex);
+        done.swap(consume_mailbox_->done);
+    }
+    for (ConsumeOutcome& outcome : done) {
+        const auto pending = pending_admissions_.find(outcome.token);
+        if (pending == pending_admissions_.end()) continue;
+        const PendingAdmission admission = std::move(pending->second);
+        pending_admissions_.erase(pending);
+        Peer* peer = find(admission.account_id);
+        if (peer && peer->link && peer->index == admission.link_index && peer->admission_token == outcome.token) {
+            peer->admission_token = 0;
+            if (!peer->closing) {
+                complete_admission(*peer, admission.jti, outcome.result);
+                continue;
+            }
+        }
+        // The link closed, was replaced or was refused (its admission deadline passed) while the backend answered. Settle it
+        // as the old in-place consume would have ended: admitted, then gone (the ticket is spent here too, and the backend
+        // hears that the peer left).
+        if (outcome.result.admitted && outcome.result.admission_id.size() == 64) {
+            (void)verifier_.mark_consumed(admission.jti);
+            backend_disconnects_.push_back(BackendDisconnect{ admission.peer_id, outcome.result.admission_id,
+                admission.link_index, {} });
+        }
+    }
+}
+
+void IceHostSession::finish_after_stop() {
+    lane_ = nullptr;
+    finish_admissions();
+    pending_admissions_.clear();
+    flush_backend_disconnects();
+}
+
 void IceHostSession::pump_once() {
     const auto now = std::chrono::steady_clock::now();
+    finish_admissions();
     expire_held_signals(now);
     for (Peer& peer : peers_) {
         if (!peer.link) continue;
@@ -424,59 +507,16 @@ bool IceHostSession::publish_guard_event(std::string_view type, std::string_view
     std::string_view payload_json, std::string& error) {
     error.clear();
     if (!limits_.hunt_evidence) return true;
-    const auto monotonic_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - guard_started_).count());
-    const std::uint64_t sequence = guard_sequence_ + 1;
-    if (guard_pending_sequence_ != sequence || guard_pending_batch_id_.empty()) {
-        guard_pending_batch_id_ = RandomUuid();
-        guard_pending_sequence_ = sequence;
-    }
-    if (guard_pending_batch_id_.empty()) {
-        error = "Guard batch randomness failed";
-        ++stats_.guard_publish_failures;
-        if (!guard_evidence_incomplete_) {
-            guard_evidence_incomplete_ = true;
-            ++stats_.guard_evidence_loss;
-            diagnostic("GUARD_EVIDENCE_LOSS action=completion_fenced reason=batch_id_generation");
-        }
+    // [2026-10-17] Queued for the GuardPublisher (its own thread, in batches): this thread never waits for the backend.
+    if (!guard_sink_) {
+        error = "no Guard event publisher";
         return false;
     }
-    GuardEventBatchResult result = admission_client_.publish_guard_event({ bindings_.session_id,
-        guard_pending_batch_id_, guard_head_hash_, std::string(type), std::string(account_id), std::string(payload_json),
-        "guard-" + std::to_string(bindings_.generation) + '-' + std::to_string(sequence), sequence, monotonic_ms });
-    if (!result.accepted || result.batch_hash.size() != 64) {
-        error = result.error.empty() ? "Guard event was rejected" : result.error;
-        ++stats_.guard_publish_failures;
-        if (!guard_evidence_incomplete_) {
-            guard_evidence_incomplete_ = true;
-            ++stats_.guard_evidence_loss;
-            diagnostic("GUARD_EVIDENCE_LOSS action=completion_fenced reason=publish_failure");
-        }
+    if (!guard_sink_(type, account_id, payload_json)) {
+        error = "the Guard event queue did not take the event";
         return false;
     }
-    guard_sequence_ = sequence;
-    guard_head_hash_ = std::move(result.batch_hash);
-    guard_pending_sequence_ = 0;
-    guard_pending_batch_id_.clear();
     return true;
-}
-
-bool IceHostSession::complete_guard(std::string& error) {
-    if (!limits_.hunt_evidence) {
-        error = "Hunt evidence is off on this server";
-        return false;
-    }
-    if (guard_evidence_incomplete_) {
-        error = "Guard evidence is incomplete after a publish failure";
-        return false;
-    }
-    if (guard_sequence_ == 0 || guard_head_hash_.size() != 64) {
-        error = "Guard event chain is empty";
-        return false;
-    }
-    return admission_client_.request_guard_completion(bindings_.session_id, guard_sequence_,
-        guard_head_hash_, "complete-" + std::to_string(bindings_.generation) + '-' +
-        std::to_string(guard_sequence_), error);
 }
 
 // ---- joiner -----------------------------------------------------------------------------------------------------

@@ -10,7 +10,9 @@
 
 #include "admission_client.hpp"
 #include "admission_ticket.hpp"
+#include "backend_lane.hpp"
 #include "guard_event_pipe.hpp"
+#include "guard_publisher.hpp"
 #include "ice_transport.hpp"
 #include "pair_crypto.hpp"
 #include "udp_bridge.hpp"
@@ -21,6 +23,8 @@
 #include <charconv>
 #include <chrono>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <thread>
@@ -33,6 +37,18 @@ namespace {
 constexpr auto kTelemetryInterval = std::chrono::seconds(2);
 constexpr auto kHeartbeatInterval = std::chrono::seconds(2);
 constexpr auto kAdmissionDeadline = std::chrono::seconds(60);
+// [2026-10-17] At the end of a hosted session: how long the last Guard events and backend notices may take to go.
+constexpr auto kShutdownFlush = std::chrono::milliseconds(3000);
+// Backend calls a host session may have queued at once (consumes and disconnect notices of up to 64 hub peers).
+constexpr std::size_t kWorkLaneCapacity = 256;
+
+// [2026-10-17] One lease renewal's answer, written by the lease lane, read by the session thread.
+struct LeaseMailbox {
+    std::mutex mutex;
+    bool in_flight = false;
+    std::optional<HeartbeatOutcome> outcome;
+    std::string error;
+};
 
 void Notify(const std::function<void(std::string_view)>& sink, std::string_view line) {
     if (sink && !line.empty()) sink(line.substr(0, 1023));
@@ -398,6 +414,15 @@ int RunIceHost(const std::filesystem::path& public_key_path, const std::filesyst
     auto transport = std::make_shared<IceMessageTransport>();
     SessionLimits limits{ *maximum_peers, kAdmissionDeadline, force_relay, hunt_evidence };
     limits.hub = hub;
+    // [2026-10-17] The session's backend calls run on these threads, never on this one, which relays every packet of the
+    // session (backend_lane.hpp): the lease on a lane of its own, so nothing queues in front of a renewal; the consumes and
+    // disconnect notices on the other; the Hunt Guard evidence on the publisher's. Declared before the session, so they
+    // outlive it on every way out of this function.
+    BackendLane lease_lane(admission_client, 2);
+    BackendLane work_lane(admission_client, kWorkLaneCapacity);
+    std::optional<GuardPublisher> guard_publisher;
+    if (hunt_evidence) guard_publisher.emplace(admission_client, bindings->session_id, bindings->generation, observer.diagnostic);
+    const auto lease_mailbox = std::make_shared<LeaseMailbox>();
     std::optional<IceHostSession> session;
     try {
         session.emplace(material.servers, material.peers, transport, verifier, admission_client, *bindings, limits,
@@ -405,6 +430,11 @@ int RunIceHost(const std::filesystem::path& public_key_path, const std::filesyst
     } catch (const std::exception&) {
         Notify(observer.diagnostic, "HOST SESSION FAIL: invalid session configuration");
         return 3;
+    }
+    if (guard_publisher) {
+        session->set_guard_sink([&guard_publisher](std::string_view type, std::string_view account, std::string_view payload) {
+            return guard_publisher->enqueue(type, account, payload);
+        });
     }
     GuardEventPipe guard_pipe;
     if (use_guard_pipe && !guard_pipe.initialize(*guard_pipe_name, *expected_server_pid, error)) {
@@ -444,6 +474,9 @@ int RunIceHost(const std::filesystem::path& public_key_path, const std::filesyst
         }
         Notify(observer.diagnostic, "ADMISSION_ACCEPTED role=host peer=" + std::to_string(bindings->host_peer_id) + " source=local");
     }
+    // The host-ready and the host's own consume above came before any packet; from here on the session thread relays
+    // packets, and its backend calls go through the lanes.
+    session->set_backend_lane(&work_lane);
     std::string guard_error;
     if (session->publish_guard_event("SESSION_STARTED", host_account_id,
             "{\"source\":\"ice_transport\"}", guard_error)) {
@@ -469,54 +502,50 @@ int RunIceHost(const std::filesystem::path& public_key_path, const std::filesyst
     std::uint64_t lease_sequence = 0;
     LeaseTracker lease(std::chrono::steady_clock::now());
     bool heartbeat_failed_closed = false;
-    bool guard_completed = false;
-    bool guard_completion_pending = false;
-    bool guard_publish_failure_reported = false;
-    std::optional<LocalGuardEvent> pending_guard_event;
-    auto next_guard_publish_attempt = std::chrono::steady_clock::now();
+    bool lease_wait_reported = false;
+    bool guard_queue_failure_reported = false;
     auto next_heartbeat = std::chrono::steady_clock::now();
     auto next_telemetry = std::chrono::steady_clock::now();
+    // [2026-10-15] A refusal ends the lease after two in a row; a backend that is only away (a restart, a release push) is
+    // waited out for LeaseTracker::kUnavailableGrace while the players keep playing. True when the lease failed closed.
+    const auto record_lease = [&](HeartbeatOutcome outcome, const std::string& heartbeat_error,
+        std::chrono::steady_clock::time_point now) {
+        if (lease.record(outcome, now)) {
+            Notify(observer.diagnostic, outcome == HeartbeatOutcome::Rejected
+                ? "HOST LEASE FAIL: the backend refused the lease (" + heartbeat_error + ')'
+                : "HOST LEASE FAIL: central authority unavailable for " +
+                    std::to_string(lease.seconds_since_renewal(now)) + " s (" + heartbeat_error + ')');
+            Notify(observer.failure, "host:lease_failed");
+            return true;
+        }
+        if (outcome != HeartbeatOutcome::Renewed) {
+            Notify(observer.diagnostic, "HOST LEASE WARN: " + heartbeat_error +
+                (outcome == HeartbeatOutcome::Unavailable
+                    ? " (waiting; last renewal " + std::to_string(lease.seconds_since_renewal(now)) + " s ago)"
+                    : std::string()));
+        }
+        return false;
+    };
     while (!StopRequested(observer)) {
         ApplyPeerCommands(observer, *session);
         ApplyInbound(observer, *session);
         session->pump_once();
         guard_pipe.pump_once();
-        while (std::chrono::steady_clock::now() >= next_guard_publish_attempt) {
-            if (!pending_guard_event.has_value()) {
-                const std::uint64_t dropped = guard_pipe.take_dropped_count();
-                if (dropped > 0) {
-                    pending_guard_event = LocalGuardEvent{ "EVIDENCE_LOSS", "",
-                        "{\"droppedEvents\":" + std::to_string(dropped) + ",\"reason\":\"bridge_queue_overflow\"}" };
-                } else {
-                    LocalGuardEvent next;
-                    if (!guard_pipe.pop(next)) break;
-                    pending_guard_event = std::move(next);
-                }
-            }
-            std::string publish_error;
-            if (!session->publish_guard_event(pending_guard_event->type, pending_guard_event->actor_account_id,
-                    pending_guard_event->payload_json, publish_error)) {
-                if (!guard_publish_failure_reported) {
-                    Notify(observer.diagnostic, "HUNT GUARD OBSERVE WARN: " + publish_error +
-                        " (completion fenced until this hunt ends)");
-                    guard_publish_failure_reported = true;
-                }
-                // The same event is retried at the same chain position; later events stay queued.
-                next_guard_publish_attempt = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-                break;
-            }
-            next_guard_publish_attempt = std::chrono::steady_clock::now();
-            if (pending_guard_event->type == "COMPLETION_REQUESTED") guard_completion_pending = true;
-            pending_guard_event.reset();
+        // [2026-10-17] The server's evidence goes into the publisher's queue; nothing here waits for the backend.
+        const std::uint64_t dropped = guard_pipe.take_dropped_count();
+        std::string publish_error;
+        bool queued = true;
+        if (dropped > 0) {
+            queued = session->publish_guard_event("EVIDENCE_LOSS", "",
+                "{\"droppedEvents\":" + std::to_string(dropped) + ",\"reason\":\"bridge_queue_overflow\"}", publish_error);
         }
-        if (guard_completion_pending && !guard_completed) {
-            std::string completion_error;
-            if (session->complete_guard(completion_error)) {
-                guard_completed = true;
-                guard_completion_pending = false;
-            } else {
-                Notify(observer.diagnostic, "HUNT GUARD COMPLETION WARN: " + completion_error);
-            }
+        LocalGuardEvent next;
+        while (guard_pipe.pop(next)) {
+            queued = session->publish_guard_event(next.type, next.actor_account_id, next.payload_json, publish_error) && queued;
+        }
+        if (!queued && !guard_queue_failure_reported) {
+            Notify(observer.diagnostic, "HUNT GUARD OBSERVE WARN: " + publish_error + " (completion fenced until this hunt ends)");
+            guard_queue_failure_reported = true;
         }
         // Completion is an evidence milestone, not a transport stop: result screens and travel still need the
         // connection. The central lifecycle owns the stop.
@@ -526,45 +555,98 @@ int RunIceHost(const std::filesystem::path& public_key_path, const std::filesyst
         if (local_host_udp) local_host_udp->pump_once();
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_telemetry) {
-            if (local_host_udp) {
-                Notify(observer.diagnostic, UdpStatsLine("host", "local", local_host_udp->stats(), session->stats()));
+            SessionStats stats = session->stats();
+            if (guard_publisher) {
+                const GuardPublisherStats guard = guard_publisher->stats();
+                stats.guard_publish_failures = guard.publish_failures;
+                stats.guard_evidence_loss = guard.evidence_loss;
             }
-            Notify(observer.diagnostic, UdpStatsLine("host", "remote", udp.stats(), session->stats()));
+            if (local_host_udp) {
+                Notify(observer.diagnostic, UdpStatsLine("host", "local", local_host_udp->stats(), stats));
+            }
+            Notify(observer.diagnostic, UdpStatsLine("host", "remote", udp.stats(), stats));
             next_telemetry = now + kTelemetryInterval;
         }
-        if (now >= next_heartbeat) {
-            ++lease_sequence;
-            std::string heartbeat_error;
-            const HeartbeatOutcome outcome = admission_client.publish_heartbeat({ bindings->session_id,
-                "lease-" + std::to_string(bindings->generation) + '-' + std::to_string(lease_sequence), lease_sequence,
-                session->admitted_count(), 0, true, true }, heartbeat_error);
-            // [2026-10-15] A refusal ends the lease after two in a row; a backend that is only away (a restart, a release
-            // push) is waited out for LeaseTracker::kUnavailableGrace while the players keep playing.
-            if (lease.record(outcome, now)) {
-                Notify(observer.diagnostic, outcome == HeartbeatOutcome::Rejected
-                    ? "HOST LEASE FAIL: the backend refused the lease (" + heartbeat_error + ')'
-                    : "HOST LEASE FAIL: central authority unavailable for " +
-                        std::to_string(lease.seconds_since_renewal(now)) + " s (" + heartbeat_error + ')');
-                Notify(observer.failure, "host:lease_failed");
+        // [2026-10-17] The lease: one renewal at a time on its own lane, its answer read here.
+        std::optional<HeartbeatOutcome> answered;
+        std::string heartbeat_error;
+        {
+            std::lock_guard lock(lease_mailbox->mutex);
+            if (lease_mailbox->outcome.has_value()) {
+                answered = lease_mailbox->outcome;
+                heartbeat_error = std::move(lease_mailbox->error);
+                lease_mailbox->outcome.reset();
+                lease_mailbox->error.clear();
+                lease_mailbox->in_flight = false;
+            }
+        }
+        if (answered.has_value()) {
+            lease_wait_reported = false;
+            if (record_lease(*answered, heartbeat_error, now)) {
                 heartbeat_failed_closed = true;
                 break;
             }
-            if (outcome != HeartbeatOutcome::Renewed) {
-                Notify(observer.diagnostic, "HOST LEASE WARN: " + heartbeat_error +
-                    (outcome == HeartbeatOutcome::Unavailable
-                        ? " (waiting; last renewal " + std::to_string(lease.seconds_since_renewal(now)) + " s ago)"
-                        : std::string()));
-            }
+        }
+        if (now >= next_heartbeat) {
             next_heartbeat = now + kHeartbeatInterval;
+            bool in_flight = false;
+            {
+                std::lock_guard lock(lease_mailbox->mutex);
+                in_flight = lease_mailbox->in_flight;
+            }
+            if (in_flight) {
+                // The last renewal has not come back yet: this beat counts as the backend being away, so a backend that
+                // never answers still ends the lease once LeaseTracker::kUnavailableGrace has passed.
+                if (lease.record(HeartbeatOutcome::Unavailable, now)) {
+                    Notify(observer.diagnostic, "HOST LEASE FAIL: central authority unavailable for " +
+                        std::to_string(lease.seconds_since_renewal(now)) + " s (no answer to the renewal)");
+                    Notify(observer.failure, "host:lease_failed");
+                    heartbeat_failed_closed = true;
+                    break;
+                }
+                if (!lease_wait_reported) {
+                    Notify(observer.diagnostic, "HOST LEASE WARN: the last renewal has not been answered yet (last renewal " +
+                        std::to_string(lease.seconds_since_renewal(now)) + " s ago)");
+                    lease_wait_reported = true;
+                }
+            } else {
+                ++lease_sequence;
+                const HostHeartbeatRequest request{ bindings->session_id,
+                    "lease-" + std::to_string(bindings->generation) + '-' + std::to_string(lease_sequence), lease_sequence,
+                    session->admitted_count(), 0, true, true };
+                {
+                    std::lock_guard lock(lease_mailbox->mutex);
+                    lease_mailbox->in_flight = true;
+                }
+                const bool posted = lease_lane.post([request, lease_mailbox](IAdmissionClient& client) {
+                    std::string error;
+                    const HeartbeatOutcome outcome = client.publish_heartbeat(request, error);
+                    std::lock_guard lock(lease_mailbox->mutex);
+                    lease_mailbox->outcome = outcome;
+                    lease_mailbox->error = std::move(error);
+                });
+                if (!posted) {
+                    std::lock_guard lock(lease_mailbox->mutex);
+                    lease_mailbox->in_flight = false;
+                }
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    guard_error.clear();
-    if (!guard_completed && !session->publish_guard_event("HUNT_ABORTED", host_account_id,
-            heartbeat_failed_closed ? "{\"reason\":\"LEASE_FAILED\"}" : "{\"reason\":\"HOST_STOPPED\"}", guard_error)) {
-        Notify(observer.diagnostic, "HUNT GUARD OBSERVE WARN: " + guard_error);
-    }
+    // The peers' PLAYER_LOST first, then the terminal event last in the chain (the backend wants it last).
     session->stop();
+    if (guard_publisher && !guard_publisher->completed()) {
+        guard_error.clear();
+        if (!session->publish_guard_event("HUNT_ABORTED", host_account_id,
+                heartbeat_failed_closed ? "{\"reason\":\"LEASE_FAILED\"}" : "{\"reason\":\"HOST_STOPPED\"}", guard_error)) {
+            Notify(observer.diagnostic, "HUNT GUARD OBSERVE WARN: " + guard_error);
+        }
+    }
+    if (guard_publisher) guard_publisher->flush_and_stop(kShutdownFlush);
+    work_lane.drain_and_stop(kShutdownFlush);
+    lease_lane.drain_and_stop(std::chrono::milliseconds(0));
+    // Consumes that came back after the stop, and notices that did not fit the lane, are settled in place now.
+    session->finish_after_stop();
     return heartbeat_failed_closed ? 5 : 0;
 }
 

@@ -111,10 +111,10 @@ bool WinHttpAdmissionClient::initialize(std::string_view base_url,
 }
 
 WinHttpAdmissionClient::HttpResult WinHttpAdmissionClient::post(std::string_view path,
-    std::string_view body, std::string_view request_id) const {
+    std::string_view body, std::string_view request_id, std::size_t maximum_body) const {
     HttpResult result;
     if (!session_ || !SafeToken(path, 512, "._:/-") ||
-        !SafeToken(request_id, 96, "._:-") || body.size() > 8192) {
+        !SafeToken(request_id, 96, "._:-") || body.size() > maximum_body) {
         result.error = "invalid admission HTTP request";
         return result;
     }
@@ -251,28 +251,61 @@ HeartbeatOutcome WinHttpAdmissionClient::publish_heartbeat(const HostHeartbeatRe
     return outcome;
 }
 
-GuardEventBatchResult WinHttpAdmissionClient::publish_guard_event(const GuardEventBatchRequest& request) {
-    GuardEventBatchResult result;
+namespace {
+
+std::string GuardBatchBody(const GuardEventBatchRequest& request) {
+    std::string body = "{\"schema\":1,\"batchId\":\"" + request.batch_id +
+        "\",\"firstSequence\":" + std::to_string(request.events.front().sequence) +
+        ",\"lastSequence\":" + std::to_string(request.events.back().sequence) +
+        ",\"previousHash\":\"" + request.previous_hash + "\",\"events\":[";
+    for (std::size_t index = 0; index < request.events.size(); ++index) {
+        const GuardEvent& event = request.events[index];
+        if (index > 0) body.push_back(',');
+        body += "{\"sequence\":" + std::to_string(event.sequence) + ",\"monotonicMs\":" + std::to_string(event.monotonic_ms) +
+            ",\"type\":\"" + event.type + "\"";
+        if (!event.actor_account_id.empty()) body += ",\"actorAccountId\":\"" + event.actor_account_id + "\"";
+        body += ",\"payload\":" + event.payload_json + "}";
+    }
+    body += "]}";
+    return body;
+}
+
+bool ValidGuardBatch(const GuardEventBatchRequest& request) {
     if (!SafeToken(request.session_id, 64, "-") || !SafeToken(request.batch_id, 64, "-") ||
         !SafeToken(request.previous_hash, 64, "") || request.previous_hash.size() != 64 ||
-        !SafeToken(request.event_type, 64, "_") || request.sequence == 0 ||
-        (!request.actor_account_id.empty() && !SafeToken(request.actor_account_id, 96, "._:-")) ||
-        request.payload_json.empty() || request.payload_json.size() > 4096 ||
-        request.payload_json.front() != '{' || request.payload_json.back() != '}') {
-        result.error = "invalid Guard event batch";
+        request.events.empty() || request.events.size() > kMaximumGuardBatchEvents ||
+        request.events.front().sequence == 0) {
+        return false;
+    }
+    for (std::size_t index = 0; index < request.events.size(); ++index) {
+        const GuardEvent& event = request.events[index];
+        if (event.sequence != request.events.front().sequence + index || !SafeToken(event.type, 64, "_") ||
+            (index > 0 && event.monotonic_ms < request.events[index - 1].monotonic_ms) ||
+            (!event.actor_account_id.empty() && !SafeToken(event.actor_account_id, 96, "._:-")) ||
+            event.payload_json.empty() || event.payload_json.size() > 4096 ||
+            event.payload_json.front() != '{' || event.payload_json.back() != '}') {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+GuardEventBatchResult WinHttpAdmissionClient::publish_guard_batch(const GuardEventBatchRequest& request) {
+    GuardEventBatchResult result;
+    const std::string body = ValidGuardBatch(request) ? GuardBatchBody(request) : std::string{};
+    if (body.empty() || body.size() > kMaximumGuardBatchBodyBytes) {
+        // Answered: the batch itself is wrong, so sending it again cannot help (IsRetryableGuardAnswer).
+        result.answered = true;
+        result.error = body.empty() ? "invalid Guard event batch" : "Guard event batch exceeds its size limit";
         return result;
     }
-    const std::string actor = request.actor_account_id.empty() ? "" :
-        ",\"actorAccountId\":\"" + request.actor_account_id + "\"";
-    const std::string body = "{\"schema\":1,\"batchId\":\"" + request.batch_id +
-        "\",\"firstSequence\":" + std::to_string(request.sequence) +
-        ",\"lastSequence\":" + std::to_string(request.sequence) +
-        ",\"previousHash\":\"" + request.previous_hash + "\",\"events\":[{\"sequence\":" +
-        std::to_string(request.sequence) + ",\"monotonicMs\":" + std::to_string(request.monotonic_ms) +
-        ",\"type\":\"" + request.event_type + "\"" + actor + ",\"payload\":" + request.payload_json + "}]}";
     const HttpResult response = post("/mystic/v1/hunts/" + request.session_id +
-        "/event-batches", body, request.request_id);
+        "/event-batches", body, request.request_id, kMaximumGuardBatchBodyBytes);
     if (!response.error.empty()) { result.error = response.error; return result; }
+    result.answered = true;
+    result.status = response.status;
     if (response.status != 200 || response.body.find("\"accepted\":true") == std::string::npos) {
         result.error = "Guard event backend rejected active generation (HTTP " + std::to_string(response.status) + ')';
         return result;

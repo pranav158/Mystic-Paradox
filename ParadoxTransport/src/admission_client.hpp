@@ -8,9 +8,11 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mystic::bridge {
 
@@ -110,23 +112,43 @@ struct HostHeartbeatRequest {
     bool server_ready = true;
 };
 
+/// One Hunt Guard event of a batch.
+struct GuardEvent {
+    std::uint64_t sequence = 0;
+    std::uint64_t monotonic_ms = 0;
+    std::string type;
+    std::string actor_account_id;
+    std::string payload_json;
+};
+
+/// [2026-10-17] Consecutive events in one request (they were one request each). The backend takes 1-128 events and at most
+/// 64 KiB per batch, each payload at most 8 KiB, a terminal event last (the backend's Hunt Guard limits).
 struct GuardEventBatchRequest {
     std::string session_id;
     std::string batch_id;
     std::string previous_hash;
-    std::string event_type;
-    std::string actor_account_id;
-    std::string payload_json;
     std::string request_id;
-    std::uint64_t sequence = 0;
-    std::uint64_t monotonic_ms = 0;
+    std::vector<GuardEvent> events;
 };
+
+/// The largest request body a batch may have (the backend's P2P router parses 72 KiB, its batch limit is 64 KiB).
+inline constexpr std::size_t kMaximumGuardBatchBodyBytes = 56 * 1024;
+inline constexpr std::size_t kMaximumGuardBatchEvents = 128;
 
 struct GuardEventBatchResult {
     bool accepted = false;
+    /// [2026-10-17] False when no HTTP answer arrived at all; `status` is the answer's status otherwise.
+    bool answered = false;
+    unsigned long status = 0;
     std::string batch_hash;
     std::string error;
 };
+
+/// [2026-10-17] Whether a refused batch is worth sending again unchanged: no answer, a timeout, the request budget (429) or a
+/// backend that is away (5xx). Any other answer refuses the batch itself, and resending it would only repeat the refusal.
+inline bool IsRetryableGuardAnswer(bool answered, unsigned long status) {
+    return !answered || status == 408 || status == 429 || (status >= 500 && status <= 599);
+}
 
 class IAdmissionClient {
 public:
@@ -136,7 +158,7 @@ public:
         std::string& error) = 0;
     [[nodiscard]] virtual HeartbeatOutcome publish_heartbeat(const HostHeartbeatRequest& request,
         std::string& error) = 0;
-    [[nodiscard]] virtual GuardEventBatchResult publish_guard_event(const GuardEventBatchRequest& request) = 0;
+    [[nodiscard]] virtual GuardEventBatchResult publish_guard_batch(const GuardEventBatchRequest& request) = 0;
     [[nodiscard]] virtual bool request_guard_completion(std::string_view session_id,
         std::uint64_t final_sequence, std::string_view final_hash, std::string_view request_id,
         std::string& error) = 0;
@@ -154,7 +176,7 @@ public:
         std::string& error) override;
     [[nodiscard]] HeartbeatOutcome publish_heartbeat(const HostHeartbeatRequest& request,
         std::string& error) override;
-    [[nodiscard]] GuardEventBatchResult publish_guard_event(const GuardEventBatchRequest& request) override;
+    [[nodiscard]] GuardEventBatchResult publish_guard_batch(const GuardEventBatchRequest& request) override;
     [[nodiscard]] bool request_guard_completion(std::string_view session_id,
         std::uint64_t final_sequence, std::string_view final_hash, std::string_view request_id,
         std::string& error) override;
@@ -164,7 +186,7 @@ public:
 private:
     struct HttpResult { unsigned long status = 0; std::string body; std::string error; };
     [[nodiscard]] HttpResult post(std::string_view path, std::string_view body,
-        std::string_view request_id) const;
+        std::string_view request_id, std::size_t maximum_body = 8192) const;
     void reset();
 
     void* session_ = nullptr;

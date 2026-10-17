@@ -57,8 +57,10 @@
   <ItemGroup>
     <ClCompile Include="src\admission_client.cpp" />
     <ClCompile Include="src\admission_ticket.cpp" />
+    <ClCompile Include="src\backend_lane.cpp" />
     <ClCompile Include="src\control_codec.cpp" />
     <ClCompile Include="src\guard_event_pipe.cpp" />
+    <ClCompile Include="src\guard_publisher.cpp" />
     <ClCompile Include="src\ice_link.cpp" />
     <ClCompile Include="src\ice_session.cpp" />
     <ClCompile Include="src\ice_transport.cpp" />

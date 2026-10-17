@@ -22,11 +22,16 @@
 //   hub [--relay-local]         a hub host (session_role=HUB, host_local_client=0) with six loopback joiners one
 //                               after another, a remove, a rejoin of the same account, a signal before AddPeer;
 //                               direct, or relay only through a TURN server started in this process
+//   backend                     [2026-10-17] the host's backend calls off its packet thread: the lane, the Guard
+//                               publisher (batches, the chain, retries, a refusal, a full queue, the completion), and a
+//                               hosted hunt whose every backend call takes 400 ms while game traffic keeps its pace
 // The admission backend is a fake in this process (the real client is HTTPS only). Files go into folders next to
 // this exe (some PCs run these binaries without %TEMP% access). No line printed here contains a credential or a key.
 
 #include "admission_client.hpp"
 #include "admission_ticket.hpp"
+#include "backend_lane.hpp"
+#include "guard_publisher.hpp"
 #include "ice_link.hpp"
 #include "ice_session.hpp"
 #include "ice_transport.hpp"
@@ -46,8 +51,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -583,8 +590,16 @@ public:
     int consumes = 0;
     int disconnects = 0;
     std::vector<std::uint64_t> consumed_ids;
+    // [2026-10-17] A slow backend: each call (but the host-ready) waits this long first, as a far or busy backend does.
+    std::atomic<int> delay_ms{ 0 };
+
+    void delay() const {
+        const int milliseconds = delay_ms.load();
+        if (milliseconds > 0) std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+    }
 
     AdmissionConsumeResult consume(const AdmissionConsumeRequest& request) override {
+        delay();
         std::lock_guard lock(mutex_);
         ++consumes;
         consumed_ids.push_back(request.authenticated_steam_id);
@@ -598,18 +613,27 @@ public:
         return true;
     }
     HeartbeatOutcome publish_heartbeat(const HostHeartbeatRequest& request, std::string&) override {
+        delay();
         std::lock_guard lock(mutex_);
         ++heartbeats_;
         last_admitted_[request.session_id] = request.admitted_peer_count;
         return HeartbeatOutcome::Renewed;
     }
-    GuardEventBatchResult publish_guard_event(const GuardEventBatchRequest&) override {
-        return GuardEventBatchResult{ true, std::string(64, 'b'), "" };
+    GuardEventBatchResult publish_guard_batch(const GuardEventBatchRequest& request) override {
+        delay();
+        std::lock_guard lock(mutex_);
+        guard_batches_.push_back(request);
+        std::string hash(64, 'b');
+        const std::string count = std::to_string(guard_batches_.size());
+        hash.replace(hash.size() - count.size(), count.size(), count);
+        return GuardEventBatchResult{ true, true, 200, hash, "" };
     }
     bool request_guard_completion(std::string_view, std::uint64_t, std::string_view, std::string_view, std::string&) override {
+        delay();
         return true;
     }
     void notify_disconnected(std::string_view, std::string_view, std::string_view request_id) override {
+        delay();
         std::lock_guard lock(mutex_);
         ++disconnects;
         disconnect_request_ids_.emplace_back(request_id);
@@ -636,9 +660,18 @@ public:
         std::lock_guard lock(mutex_);
         return std::find(ready_sessions_.begin(), ready_sessions_.end(), session_id) != ready_sessions_.end();
     }
+    [[nodiscard]] std::vector<GuardEventBatchRequest> guard_batches() const {
+        std::lock_guard lock(mutex_);
+        return guard_batches_;
+    }
+    [[nodiscard]] int heartbeat_count() const {
+        std::lock_guard lock(mutex_);
+        return heartbeats_;
+    }
 
 private:
     mutable std::mutex mutex_;
+    std::vector<GuardEventBatchRequest> guard_batches_;
     std::vector<Consume> consume_log_;
     std::vector<std::string> disconnect_request_ids_;
     std::vector<std::string> ready_sessions_;
@@ -805,8 +838,8 @@ public:
     HeartbeatOutcome publish_heartbeat(const HostHeartbeatRequest& request, std::string& error) override {
         return target_.publish_heartbeat(request, error);
     }
-    GuardEventBatchResult publish_guard_event(const GuardEventBatchRequest& request) override {
-        return target_.publish_guard_event(request);
+    GuardEventBatchResult publish_guard_batch(const GuardEventBatchRequest& request) override {
+        return target_.publish_guard_batch(request);
     }
     bool request_guard_completion(std::string_view session_id, std::uint64_t sequence, std::string_view hash,
         std::string_view request_id, std::string& error) override {
@@ -1871,6 +1904,399 @@ void RunLocalBridge() {
     closesocket(server);
 }
 
+// ---- backend calls off the packet thread (17 Oct) ---------------------------------------------------------------
+// Until 17 Oct a host session made every backend call on the thread that relays its packets (backend_lane.hpp): players
+// far from the server rubber-banded in every hosted hunt.
+
+// The Guard side of a backend, scripted. Every batch attempt is recorded; the scripted answers go to the next attempts
+// (0 = no answer at all, 200 = taken); with no script left a batch is taken.
+class ScriptedGuardBackend final : public IAdmissionClient {
+public:
+    std::atomic<int> delay_ms{ 0 };
+
+    void script(std::initializer_list<unsigned long> answers) {
+        std::lock_guard lock(mutex_);
+        answers_.assign(answers.begin(), answers.end());
+    }
+    AdmissionConsumeResult consume(const AdmissionConsumeRequest&) override { return {}; }
+    bool publish_host_ready(const HostReadyRequest&, std::string&) override { return true; }
+    HeartbeatOutcome publish_heartbeat(const HostHeartbeatRequest&, std::string&) override { return HeartbeatOutcome::Renewed; }
+    GuardEventBatchResult publish_guard_batch(const GuardEventBatchRequest& request) override {
+        const int milliseconds = delay_ms.load();
+        if (milliseconds > 0) std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+        std::lock_guard lock(mutex_);
+        attempts_.push_back(request);
+        if (!answers_.empty()) {
+            const unsigned long status = answers_.front();
+            answers_.pop_front();
+            if (status != 200) {
+                GuardEventBatchResult refused;
+                refused.answered = status != 0;
+                refused.status = status;
+                refused.error = "scripted answer " + std::to_string(status);
+                return refused;
+            }
+        }
+        accepted_.push_back(request);
+        std::string hash(64, 'c');
+        const std::string count = std::to_string(accepted_.size());
+        hash.replace(hash.size() - count.size(), count.size(), count);
+        hashes_.push_back(hash);
+        return GuardEventBatchResult{ true, true, 200, hash, "" };
+    }
+    bool request_guard_completion(std::string_view, std::uint64_t final_sequence, std::string_view final_hash,
+        std::string_view, std::string&) override {
+        std::lock_guard lock(mutex_);
+        completions_.emplace_back(final_sequence, std::string(final_hash));
+        return true;
+    }
+    void notify_disconnected(std::string_view, std::string_view, std::string_view) override {}
+
+    [[nodiscard]] std::vector<GuardEventBatchRequest> attempts() const { std::lock_guard lock(mutex_); return attempts_; }
+    [[nodiscard]] std::vector<GuardEventBatchRequest> accepted() const { std::lock_guard lock(mutex_); return accepted_; }
+    [[nodiscard]] std::vector<std::string> hashes() const { std::lock_guard lock(mutex_); return hashes_; }
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, std::string>> completions() const {
+        std::lock_guard lock(mutex_);
+        return completions_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::deque<unsigned long> answers_;
+    std::vector<GuardEventBatchRequest> attempts_;
+    std::vector<GuardEventBatchRequest> accepted_;
+    std::vector<std::string> hashes_;
+    std::vector<std::pair<std::uint64_t, std::string>> completions_;
+};
+
+// The backend's Hunt Guard chain rules over the batches it took: sequences 1..n with no gap, each batch naming
+// the one before, times in order, at most 128 events, a terminal event only last in its batch. `events` = how many.
+bool ValidGuardChain(const std::vector<GuardEventBatchRequest>& batches, const std::vector<std::string>& hashes,
+    std::uint64_t& events) {
+    std::string previous(64, '0');
+    std::uint64_t next = 1;
+    std::uint64_t last_ms = 0;
+    events = 0;
+    if (batches.size() != hashes.size()) return false;
+    for (std::size_t index = 0; index < batches.size(); ++index) {
+        const GuardEventBatchRequest& batch = batches[index];
+        if (batch.previous_hash != previous || batch.events.empty() || batch.events.size() > kMaximumGuardBatchEvents) return false;
+        for (std::size_t at = 0; at < batch.events.size(); ++at) {
+            const GuardEvent& event = batch.events[at];
+            if (event.sequence != next++ || event.monotonic_ms < last_ms) return false;
+            if ((event.type == "COMPLETION_REQUESTED" || event.type == "HUNT_ABORTED") && at + 1 != batch.events.size()) return false;
+            last_ms = event.monotonic_ms;
+            ++events;
+        }
+        previous = hashes[index];
+    }
+    return true;
+}
+
+// A thread-safe diagnostic sink for the publisher's own thread.
+struct DiagnosticLog {
+    std::mutex mutex;
+    std::vector<std::string> lines;
+    SessionDiagnosticSink sink() {
+        return [this](std::string_view line) {
+            std::lock_guard lock(mutex);
+            lines.emplace_back(line);
+        };
+    }
+    bool contains(std::string_view needle) {
+        std::lock_guard lock(mutex);
+        return std::any_of(lines.begin(), lines.end(), [needle](const std::string& line) { return Contains(line, needle); });
+    }
+};
+
+int RunBackend() {
+    std::cout << "backend calls off the packet thread (lane, Guard publisher)\n";
+    using std::chrono::milliseconds;
+    using Clock = std::chrono::steady_clock;
+    const auto elapsed_ms = [](Clock::time_point since) {
+        return std::chrono::duration_cast<milliseconds>(Clock::now() - since).count();
+    };
+
+    // The lane: posting returns at once, the jobs run in order on its own thread, a full or stopped lane says no.
+    {
+        ScriptedGuardBackend backend;
+        BackendLane lane(backend, 3);
+        std::mutex order_mutex;
+        std::vector<int> order;
+        const auto job = [&](int number) {
+            return [&order_mutex, &order, number](IAdmissionClient&) {
+                std::this_thread::sleep_for(milliseconds(150));
+                std::lock_guard lock(order_mutex);
+                order.push_back(number);
+            };
+        };
+        const auto started = Clock::now();
+        const bool posted = lane.post(job(1)) && lane.post(job(2)) && lane.post(job(3));
+        const auto posting = elapsed_ms(started);
+        Check(posted && posting < 50, "lane: posting three 150 ms jobs does not wait for them");
+        Check(!lane.post(job(4)), "lane: a full lane refuses a job instead of growing");
+        lane.drain_and_stop(milliseconds(5000));
+        Check(order == std::vector<int>{ 1, 2, 3 }, "lane: the jobs ran in order before the stop");
+        Check(!lane.post(job(5)), "lane: a stopped lane takes no job");
+    }
+
+    GuardPublisherTiming fast;
+    fast.batch_window = milliseconds(200);
+    fast.first_retry = milliseconds(20);
+    fast.retry_ceiling = milliseconds(80);
+
+    // Batches, an unbroken chain, and enqueue never waits for a slow backend.
+    {
+        ScriptedGuardBackend backend;
+        backend.delay_ms = 300;
+        DiagnosticLog log;
+        GuardPublisher publisher(backend, SessionId(40), 3, log.sink(), fast);
+        const auto started = Clock::now();
+        bool taken = true;
+        for (int index = 0; index < 250; ++index) {
+            taken = publisher.enqueue("DAMAGE", "host-account", "{\"amount\":" + std::to_string(index) + "}") && taken;
+        }
+        const auto queueing = elapsed_ms(started);
+        Check(taken && queueing < 50, "publisher: 250 events are queued without waiting for a 300 ms backend");
+        taken = publisher.enqueue("COMPLETION_REQUESTED", "host-account", "{\"source\":\"selftest\"}") &&
+            publisher.enqueue("PLAYER_LOST", "join-account", "{\"transport\":\"ice\"}");
+        publisher.flush_and_stop(milliseconds(20000));
+        std::uint64_t events = 0;
+        const auto accepted = backend.accepted();
+        const auto hashes = backend.hashes();
+        Check(taken && ValidGuardChain(accepted, hashes, events) && events == 252,
+            "publisher: all 252 events reached the backend in one unbroken chain");
+        std::cout << "  batches=" << accepted.size() << " for 252 events\n";
+        Check(accepted.size() >= 3 && accepted.size() <= 8, "publisher: in a few batches, not one request per event");
+        const auto completions = backend.completions();
+        bool head = false;
+        for (std::size_t index = 0; index < accepted.size() && completions.size() == 1; ++index) {
+            head = head || (hashes[index] == completions[0].second && accepted[index].events.back().sequence == completions[0].first);
+        }
+        Check(completions.size() == 1 && completions[0].first >= 251 && head,
+            "publisher: the completion is requested once, with the chain's head");
+        const GuardPublisherStats stats = publisher.stats();
+        Check(publisher.completed() && !publisher.evidence_incomplete() && stats.events_published == 252 &&
+                stats.batches_published == accepted.size() && stats.publish_failures == 0 && stats.evidence_loss == 0,
+            "publisher: completed, nothing lost, nothing failed");
+    }
+
+    // A batch the backend did not take (429, no answer, 503) goes again unchanged, and the chain stays whole.
+    {
+        ScriptedGuardBackend backend;
+        backend.script({ 429, 0, 503 });
+        DiagnosticLog log;
+        GuardPublisher publisher(backend, SessionId(41), 3, log.sink(), fast);
+        for (int index = 0; index < 5; ++index) (void)publisher.enqueue("DAMAGE", "host-account", "{\"amount\":1}");
+        publisher.flush_and_stop(milliseconds(10000));
+        const auto attempts = backend.attempts();
+        bool same = attempts.size() == 4;
+        for (std::size_t index = 1; same && index < attempts.size(); ++index) {
+            same = attempts[index].batch_id == attempts[0].batch_id && attempts[index].previous_hash == attempts[0].previous_hash &&
+                attempts[index].events.size() == attempts[0].events.size() &&
+                attempts[index].events.front().sequence == attempts[0].events.front().sequence;
+        }
+        Check(same, "publisher: a batch the backend did not take is sent again with the same id and events");
+        std::uint64_t events = 0;
+        const GuardPublisherStats stats = publisher.stats();
+        Check(ValidGuardChain(backend.accepted(), backend.hashes(), events) && events == 5 && !publisher.evidence_incomplete() &&
+                stats.publish_failures == 3 && stats.evidence_loss == 0,
+            "publisher: and once it is taken the chain is whole, nothing lost");
+        Check(log.contains("sending the same batch again") && log.contains("was taken after 3 failed send(s)"),
+            "publisher: the retries are reported once, and the recovery");
+    }
+
+    // A refused batch (409) ends this hunt's evidence: not sent again, nothing more taken, no completion.
+    {
+        ScriptedGuardBackend backend;
+        backend.script({ 409 });
+        DiagnosticLog log;
+        GuardPublisher publisher(backend, SessionId(42), 3, log.sink(), fast);
+        for (int index = 0; index < 3; ++index) (void)publisher.enqueue("DAMAGE", "host-account", "{\"amount\":1}");
+        (void)publisher.enqueue("COMPLETION_REQUESTED", "host-account", "{\"source\":\"selftest\"}");
+        const bool refused = PumpUntil(milliseconds(5000), []() {}, [&publisher]() { return publisher.evidence_incomplete(); });
+        Check(refused && !publisher.enqueue("DAMAGE", "host-account", "{\"amount\":1}"),
+            "publisher: after a refusal no further event is taken");
+        publisher.flush_and_stop(milliseconds(5000));
+        Check(backend.attempts().size() == 1 && backend.accepted().empty() && backend.completions().empty() &&
+                !publisher.completed() && publisher.stats().evidence_loss == 5,
+            "publisher: the refused batch is not sent again and no completion is requested");
+        Check(log.contains("GUARD_EVIDENCE_LOSS action=completion_fenced reason=batch_refused status=409"),
+            "publisher: the refusal is reported");
+    }
+
+    // A full queue: refused events are counted, and the gap reaches the backend as EVIDENCE_LOSS.
+    {
+        GuardPublisherTiming small = fast;
+        small.max_queued_events = 8;
+        small.batch_window = milliseconds(10000);
+        ScriptedGuardBackend backend;
+        DiagnosticLog log;
+        GuardPublisher publisher(backend, SessionId(43), 3, log.sink(), small);
+        int taken = 0;
+        for (int index = 0; index < 12; ++index) taken += publisher.enqueue("DAMAGE", "host-account", "{\"amount\":1}") ? 1 : 0;
+        Check(taken == 8 && publisher.stats().evidence_loss == 4 && publisher.evidence_incomplete(),
+            "publisher: a full queue refuses events and counts them as lost");
+        publisher.flush_and_stop(milliseconds(5000));
+        std::uint64_t events = 0;
+        const auto accepted = backend.accepted();
+        bool marker = false;
+        for (const auto& batch : accepted) {
+            for (const auto& event : batch.events) {
+                marker = marker || (event.type == "EVIDENCE_LOSS" && Contains(event.payload_json, "\"droppedEvents\":4"));
+            }
+        }
+        Check(ValidGuardChain(accepted, backend.hashes(), events) && events == 9 && marker,
+            "publisher: and the gap reaches the backend as EVIDENCE_LOSS");
+    }
+
+    // A consume answered after its link was refused (the admission deadline passed meanwhile) is settled as admitted, then
+    // gone: the joiner is not admitted, and the backend hears that the peer left.
+    {
+        WinsockRuntime winsock;
+        const SessionBindings bindings{ "test-key", "01234567-89ab-4def-8123-456789abcd77", "party-1", "hunt-1",
+            "bridge-1", 1, 1001, 3, 647472, 1, 1 };
+        constexpr PeerId kJoiner = 2002;
+        TicketSigner signer;
+        const std::filesystem::path key_path = ExeDirectory() /
+            (L"selftest-late-consume-" + std::to_wstring(GetCurrentProcessId()) + L".xy");
+        std::string error;
+        AdmissionTicketVerifier host_verifier;
+        AdmissionTicketVerifier join_verifier;
+        Check(signer.write_public_key(key_path) && host_verifier.load_public_key(key_path, error) &&
+                join_verifier.load_public_key(key_path, error),
+            "late consume: writes and loads the test signing key");
+        const auto pair_key = RandomKey();
+        // 1.5 s: the answer comes while the refused link still lingers (refused at 1 s, closed at 2 s), the case that must
+        // not admit it.
+        FakeBackend backend;
+        backend.delay_ms = 1500;
+        BackendLane lane(backend, 8);
+        SignalBox box;
+        auto host_transport = std::make_shared<IceMessageTransport>();
+        auto join_transport = std::make_shared<IceMessageTransport>();
+        IceHostSession host(IceServerConfig{}, { IcePeerConfig{ "join-account", kJoiner, pair_key } }, host_transport,
+            host_verifier, backend, bindings, SessionLimits{ 4, std::chrono::seconds(1), false, false },
+            [&box](std::string_view to, std::string_view kind, std::string_view data) {
+                if (to == "join-account") box.to_join.push_back({ "host-account", std::string(kind), std::string(data) });
+            }, {}, {});
+        host.set_backend_lane(&lane);
+        IceJoinSession join(IceServerConfig{}, IcePeerConfig{ "host-account", 1001, pair_key }, join_transport,
+            join_verifier, bindings, kJoiner, "join-account", signer.ticket(bindings, "join-account", kJoiner),
+            SessionLimits{ 1, std::chrono::seconds(20), false, false },
+            [&box](std::string_view to, std::string_view kind, std::string_view data) {
+                if (to == "host-account") box.to_host.push_back({ "join-account", std::string(kind), std::string(data) });
+            }, {}, {});
+        const bool started = join.start(error);
+        const bool settled = started && PumpUntil(milliseconds(12000), [&]() {
+            join.pump_once();
+            for (auto& signal : box.to_host) host.apply_signal(signal.from_account_id, signal.kind, signal.data);
+            box.to_host.clear();
+            host.pump_once();
+            for (auto& signal : box.to_join) join.apply_signal(signal.from_account_id, signal.kind, signal.data);
+            box.to_join.clear();
+        }, [&backend]() { return backend.disconnect_count() == 1; });
+        Check(settled && !join.admitted() && host.admitted_count() == 0 && backend.consume_log().size() == 1,
+            "late consume: the refused link stays refused; its late consume becomes a disconnect notice");
+        host.stop();
+        lane.drain_and_stop(milliseconds(5000));
+        host.finish_after_stop();
+        std::error_code ignored;
+        std::filesystem::remove(key_path, ignored);
+    }
+    return 0;
+}
+
+// A hosted hunt whose every backend call takes 400 ms: the lease, the consume, the Guard batches and the disconnect notice
+// all happen while the game's packets keep their pace (before 17 Oct each call stopped them for its whole length).
+int RunSlowBackend() {
+    std::cout << "a hosted hunt whose backend answers in 400 ms\n";
+    using std::chrono::milliseconds;
+    using Clock = std::chrono::steady_clock;
+    WinsockRuntime winsock;
+    ModuleRig rig("slowbackend");
+    Check(rig.ok(), "writes the test signing key");
+    rig.write("capability.txt", std::string(43, 'A'));
+    EchoServer echo;
+    TransportModule host_module(SharedBackend(rig.backend));
+    TransportModule join_module;
+    const std::string host_account = "host-account";
+    const std::string join_account = "join-account";
+    constexpr PeerId kJoiner = 2002;
+    const SessionBindings bindings{ "test-key", SessionId(21), "party-slow", "hunt-1", "bridge-slow", 1, 1001, 3, 647472, 1, 1 };
+    const auto key = RandomKey();
+    rig.write("hunt.conf", HostConfigText(HostSpec{ bindings, "HUNT", true, 2, echo.port(), {},
+        "selftest-guard-slow-" + std::to_string(GetCurrentProcessId()) }));
+    rig.write("hunt.secret", PeerLine(join_account, kJoiner, key));
+    rig.write("hunt.ticket", rig.signer.ticket(bindings, host_account, bindings.host_peer_id));
+    rig.backend.delay_ms = 400;
+    char error[256]{};
+    const int hunt = host_module.host_open(rig.key_path().c_str(), rig.path("hunt.conf").c_str(),
+        rig.path("capability.txt").c_str(), rig.path("hunt.ticket").c_str(), rig.path("hunt.secret").c_str(), error, sizeof(error));
+    char line[512]{};
+    Check(hunt > 0 && host_module.wait_ready(hunt, 20000, line, sizeof(line)) == 1,
+        "the hunt host is ready (its own ticket consume took 400 ms)");
+    if (hunt <= 0) return 0;
+    const int join = OpenJoin(join_module, rig, "slow", bindings, join_account, kJoiner, host_account, key, {});
+    if (join <= 0) return 0;
+    const std::vector<Route> routes{ Route{ &host_module, hunt, host_account, &join_module, join, join_account } };
+    Feed feed;
+    const auto pump = [&]() {
+        CarrySignals(routes);
+        echo.pump();
+        feed.drain(host_module, hunt);
+    };
+    char join_line[512]{};
+    const bool ready = PumpUntil(std::chrono::seconds(30), pump,
+        [&]() { return join_module.wait_ready(join, 0, join_line, sizeof(join_line)) == 1; });
+    Check(ready, "the joiner is admitted although its ticket consume takes 400 ms");
+    if (!ready) return 0;
+
+    // Five seconds of game traffic, with lease renewals (every 2 s) and Guard batches going out meanwhile.
+    GameClient client;
+    const int renewals_before = rig.backend.heartbeat_count();
+    long long worst = 0;
+    int round_trips = 0;
+    bool flowed = true;
+    const auto until = Clock::now() + std::chrono::seconds(5);
+    while (Clock::now() < until) {
+        const auto sent = Clock::now();
+        flowed = client.roundtrip(LocalPortOf(join_line), Pattern(600, static_cast<std::uint8_t>(round_trips)), pump,
+            std::chrono::seconds(2)) && flowed;
+        worst = std::max<long long>(worst, std::chrono::duration_cast<milliseconds>(Clock::now() - sent).count());
+        ++round_trips;
+        std::this_thread::sleep_for(milliseconds(20));
+    }
+    const int renewals = rig.backend.heartbeat_count() - renewals_before;
+    std::cout << "  round trips=" << round_trips << " worst=" << worst << " ms; lease renewals meanwhile=" << renewals << '\n';
+    Check(flowed && round_trips >= 50, "game traffic flows the whole time");
+    Check(renewals >= 2, "the lease was renewed meanwhile");
+    Check(worst < 200, "no round trip waited for the backend (each backend call took 400 ms)");
+    Check(PumpUntil(std::chrono::seconds(8), pump, [&]() { return rig.backend.last_admitted(bindings.session_id) == 1; }),
+        "the lease reports the admitted joiner");
+    Check(feed.count_events("PEER_ADMITTED account=join-account") == 1, "the admission is reported once");
+
+    (void)join_module.stop_session(join);
+    (void)host_module.stop_session(hunt);
+    const auto batches = rig.backend.guard_batches();
+    std::vector<std::string> hashes;
+    for (std::size_t index = 1; index <= batches.size(); ++index) {
+        std::string hash(64, 'b');
+        const std::string count = std::to_string(index);
+        hash.replace(hash.size() - count.size(), count.size(), count);
+        hashes.push_back(hash);
+    }
+    std::uint64_t events = 0;
+    const bool chain = ValidGuardChain(batches, hashes, events);
+    Check(chain && !batches.empty() && batches.front().events.size() >= 2 &&
+            batches.front().events[0].type == "SESSION_STARTED" && batches.front().events[1].type == "WORLD_READY",
+        "the hunt's evidence went in batches; its first two events in the first one");
+    Check(chain && !batches.empty() && batches.back().events.back().type == "HUNT_ABORTED",
+        "the stopped hunt's last event is HUNT_ABORTED, after its PLAYER_LOST");
+    std::cout << "  guard batches=" << batches.size() << " events=" << events << '\n';
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1901,7 +2327,12 @@ int main(int argc, char** argv) {
         section(relay_local ? "hub (relay)" : "hub (direct)");
         RunHub(relay_local);
     } else if (command == "localbridge") RunLocalBridge();
-    else if (command == "all") {
+    else if (command == "backend") {
+        section("backend");
+        RunBackend();
+        section("slow backend");
+        RunSlowBackend();
+    } else if (command == "all") {
         section("localbridge");
         RunLocalBridge();
         section("crypto");
@@ -1916,6 +2347,10 @@ int main(int argc, char** argv) {
         RunSession();
         section("session through the module");
         RunModuleSessions();
+        section("backend");
+        RunBackend();
+        section("slow backend");
+        RunSlowBackend();
         section("hub (direct)");
         RunHub(false);
         if (relay_local) {
@@ -1923,7 +2358,7 @@ int main(int argc, char** argv) {
             RunHub(true);
         }
     } else {
-        std::cout << "usage: ParadoxTransportTest crypto|parse|abi|session|localbridge|hub [--relay-local]|ice [--relay-local | --relay-file <path>]|all\n";
+        std::cout << "usage: ParadoxTransportTest crypto|parse|abi|session|backend|localbridge|hub [--relay-local]|ice [--relay-local | --relay-file <path>]|all\n";
         return 2;
     }
     std::cout << (gFailures == 0 ? "PASS" : "FAIL") << " (" << gFailures << " failed)\n";

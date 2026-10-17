@@ -49,6 +49,7 @@ Self-test commands (`ParadoxTransportTest.exe`):
 | `session` | Host and joiner sessions end to end with locally signed MPT2 tickets and a fake backend: admission, one consume per joiner, a foreign ticket refused (`wrong_account`), game traffic; then through the module: a hub and a hunt on one host, one joiner in both, the 8-session limit, the ABI 3 config rules, ABI 2 on the default handle |
 | `hub` | A hub host (`session_role=HUB`, `host_local_client=0`, `maximum_peers=6`) with six loopback joiners one after another, a remove, a rejoin of the same account, a restart without remove, a signal that arrives before `AddPeerH`, request ids unique across all links; plus the held-signal rules of `IceHostSession` |
 | `hub --relay-local` | The same, relay only, through a TURN server started in the test on 127.0.0.2 (the agents use 127.0.0.1, so only relay-to-relay pairs exist, as with a real relay) |
+| `backend` | [17 Oct] The host's backend calls off its packet thread: the lane (order, a full and a stopped lane), the Guard publisher (252 events in 4 batches with a 300 ms backend, one unbroken chain, the completion with the chain's head, a 429 / no answer / 503 batch sent again unchanged, a 409 that ends the evidence, a full queue reported as `EVIDENCE_LOSS`), and a hosted hunt whose every backend call takes 400 ms: game round trips stay under 200 ms (400 ms with a blocking lease) |
 | `ice` | Two links on this PC, direct, carrying UDP through the real bridges (1-2000 byte datagrams, a 300-datagram burst) |
 | `ice --relay-local` | The same, relay only, through a TURN server started in the test |
 | `ice --relay-file <f>` | The same through the relay named in `<f>`; both sides must select the relay |
@@ -71,6 +72,21 @@ fragmentation, lost every 1400- and 2000-byte datagram (1200 passed): hence the 
 (`IceLink::kFragmentPayload`).
 
 ## How a session works
+
+- **Backend calls never run on the packet thread (17 October 2026).** A host session's thread relays every packet of the
+  session, the host's own client included. It used to make its backend calls itself, each a blocking HTTPS request: the
+  lease every 2 s, an admission's ticket consume, a peer's disconnect notice, and one request per Hunt Guard event. Each call
+  stopped every player's packets for a round trip to the backend, a few hundred ms for players far from the
+  server: rubber-banding in every hosted hunt, and in fights the event queue grew until the hunt's request budget refused the
+  lease as well. Now (`backend_lane.hpp`, `guard_publisher.hpp`):
+  - the lease runs on a lane of its own, one renewal at a time; a renewal still unanswered at the next beat counts as the
+    backend being away (`LeaseTracker`, so a backend that never answers still ends the lease after 30 s);
+  - consumes and disconnect notices run on a second lane, in order; a link waits for its consume while the others play, and
+    a consume that comes back after its link closed is settled as admitted-then-left;
+  - Hunt Guard events go to the `GuardPublisher`: one batch per 2 s at most (up to 96 events, 56 KiB), sent at once for a
+    terminal event; a batch the backend did not take (no answer, 408, 429, 5xx) is sent again with the same id and events,
+    any other answer ends that hunt's evidence (no completion is requested then).
+  The host-ready and the host's own consume still run in place before the session relays any packet.
 
 - **Signalling.** The joiner speaks first: its link sends a `DESCRIPTION` (ICE credentials), then `CANDIDATE`s and
   `GATHERING_DONE`. The host creates its link for that joiner only when the description arrives (so the host is the
