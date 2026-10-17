@@ -14095,6 +14095,7 @@ static void StartClientHitchSampler() {
 struct MpFunctionNameCacheEntry {
     int32_t Index; int32_t NameIndex; uint32_t NameNumber; const void* Outer; std::string Name;
     uint64_t PeMask; bool PeMaskValid;
+    int8_t TravelSkip;   // [2026-10-16 0.2.142] TravelCause: -1 unknown, 1 = a per-frame function the history leaves out
 };
 static MpFunctionNameCacheEntry& CachedFunctionNameEntry(UFunction* Function) {
     static thread_local std::unordered_map<const void*, MpFunctionNameCacheEntry> s_names;
@@ -14112,6 +14113,7 @@ static MpFunctionNameCacheEntry& CachedFunctionNameEntry(UFunction* Function) {
     Slot.Name = Function->GetFullName();
     Slot.PeMask = 0;
     Slot.PeMaskValid = false;
+    Slot.TravelSkip = -1;
     return Slot;
 }
 
@@ -14214,6 +14216,148 @@ namespace GauntletCensus {
     }
 }
 
+// [2026-10-16 0.2.142] Client diagnostic, read-only: what sends the client back to the login screen. A player at the hidden
+// ExperienceTrack_PlayerLevel rank 20 returns to Map_LoginMenu ~1 s after reaching a realm's Ramsgate, with no error; the hub
+// never sends a return-to-menu (EnqueueDisconnectError never fires), so the client queues the travel itself.
+// Records:
+//  - a history of the client's game-thread ProcessEvent calls (function full name, nesting depth, time), per-frame functions left out;
+//  - after each call, whether FWorldContext.TravelURL (+0xB8 FString, +0xC0 its Num; +0xC8 TravelType - UEngine::TickWorldTravel
+//    reads exactly these before Browse, 0x14427D6E0) became set: "[TravelCause] QUEUED" names the call during which it happened,
+//    the active call chain and the URL;
+//  - on LoadMap of Map_LoginMenu from a play map, and on a queued travel whose URL looks like a return to the menu, the last
+//    kDumpLines history entries.
+// The world context is the one LoadMap is given (EngineLoadMapDetour). Client only; TRAVEL_CAUSE_OFF.flag disables it.
+static std::string MpFStringAt(const void* Base, uintptr_t Offset);   // defined with the LoadMap probe
+
+namespace TravelCause {
+    struct Entry { uint64_t Ms; const std::string* Name; uint8_t Depth; };
+    static constexpr int kRing = 2048;
+    static constexpr int kDumpLines = 160;
+    static Entry s_ring[kRing];
+    static int s_next = 0;
+    static int s_filled = 0;
+    static int s_enabled = -1;
+    static std::atomic<uintptr_t> s_worldContext{ 0 };
+    static std::atomic<int> s_queuedReports{ 0 };
+    static std::atomic<int> s_dumps{ 0 };
+    static bool s_reportedCurrent = false;
+    static thread_local std::vector<const std::string*> t_stack;
+
+    static bool Active() {
+        if (s_enabled < 0) {
+            s_enabled = (Globals::AmServer || MpExeRelativeFlagPresent(L"TRAVEL_CAUSE_OFF.flag")) ? 0 : 1;
+            if (!Globals::AmServer) {
+                MpLog(std::string("[TravelCause] ") + (s_enabled ? "ENABLED (history " + std::to_string(kRing) + ", dump "
+                    + std::to_string(kDumpLines) + ")" : "disabled (TRAVEL_CAUSE_OFF.flag)"));
+            }
+        }
+        return s_enabled == 1;
+    }
+
+    static bool OnGameThread() {
+        const DWORD Game = g_clientGameThreadId.load(std::memory_order_relaxed);
+        return Game != 0 && Game == GetCurrentThreadId();
+    }
+
+    static bool Skip(MpFunctionNameCacheEntry& Entry) {
+        if (Entry.TravelSkip < 0) {
+            const std::string& N = Entry.Name;
+            Entry.TravelSkip = (N.find("Tick") != std::string::npos || N.find("UpdateAnimation") != std::string::npos
+                || N.find("AnimGraph") != std::string::npos || N.find("BlueprintThreadSafe") != std::string::npos) ? 1 : 0;
+        }
+        return Entry.TravelSkip == 1;
+    }
+
+    static void SetWorldContext(void* Context) {
+        if (!Context || !IsReadablePointer(Context, 0xD0)) return;
+        s_worldContext.store(reinterpret_cast<uintptr_t>(Context), std::memory_order_relaxed);
+    }
+
+    static int32_t TravelUrlNum() {
+        const uintptr_t Context = s_worldContext.load(std::memory_order_relaxed);
+        return Context ? *reinterpret_cast<volatile const int32_t*>(Context + 0xC0) : 0;
+    }
+
+    // [2026-10-16 0.2.143] Option VALUES are never logged: a server travel URL carries the session's EncryptionToken (a bearer
+    // token, logged in clear by 0.2.142). Keeps the address/map before the first '?' and each option's name.
+    static std::string RedactUrl(const std::string& Url) {
+        const size_t Query = Url.find('?');
+        if (Query == std::string::npos) return Url;
+        std::string Out = Url.substr(0, Query);
+        size_t At = Query;
+        while (At != std::string::npos && At < Url.size()) {
+            const size_t Next = Url.find('?', At + 1);
+            const std::string Option = Url.substr(At + 1, Next == std::string::npos ? std::string::npos : Next - At - 1);
+            const size_t Equals = Option.find('=');
+            Out += "?" + (Equals == std::string::npos ? Option.substr(0, 32) : Option.substr(0, Equals < 32 ? Equals : 32) + "=<redacted>");
+            At = Next;
+        }
+        return Out;
+    }
+
+    static std::string TravelUrl() {
+        const uintptr_t Context = s_worldContext.load(std::memory_order_relaxed);
+        if (!Context) return "?";
+        std::string Url = RedactUrl(MpFStringAt(reinterpret_cast<const void*>(Context), 0xB8));
+        return Url + " type=" + std::to_string(*reinterpret_cast<volatile const uint8_t*>(Context + 0xC8));
+    }
+
+    static void Dump(const char* Reason) {
+        if (s_dumps.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+        const uint64_t Now = GetTickCount64();
+        const int Count = s_filled < kDumpLines ? s_filled : kDumpLines;
+        MpLog(std::string("[TravelCause] HISTORY reason=") + Reason + " last=" + std::to_string(Count) + " (oldest first)");
+        for (int i = Count; i >= 1; --i) {
+            const Entry& E = s_ring[(s_next - i + kRing) % kRing];
+            MpLog("[TravelCause]   -" + std::to_string(Now - E.Ms) + "ms d=" + std::to_string(E.Depth) + " "
+                + (E.Name ? *E.Name : std::string("null")));
+        }
+        MpLog("[TravelCause] HISTORY end");
+    }
+
+    // Before the original ProcessEvent: history + call chain. Returns TravelURL's Num before the call (-1 = not tracked).
+    static int32_t Before(MpFunctionNameCacheEntry* NameEntry) {
+        if (!NameEntry || !Active() || !OnGameThread()) return -1;
+        if (!Skip(*NameEntry)) {
+            s_ring[s_next] = { GetTickCount64(), &NameEntry->Name, static_cast<uint8_t>(t_stack.size() > 255 ? 255 : t_stack.size()) };
+            s_next = (s_next + 1) % kRing;
+            if (s_filled < kRing) ++s_filled;
+        }
+        t_stack.push_back(&NameEntry->Name);
+        return TravelUrlNum();
+    }
+
+    // After it: report the first call during which (or before which) a travel was queued.
+    static void After(MpFunctionNameCacheEntry* NameEntry, int32_t NumBefore) {
+        if (NumBefore < 0) return;
+        if (!t_stack.empty()) t_stack.pop_back();
+        const int32_t NumAfter = TravelUrlNum();
+        if (NumAfter <= 1) { s_reportedCurrent = false; return; }
+        if (s_reportedCurrent) return;
+        s_reportedCurrent = true;
+        if (s_queuedReports.fetch_add(1, std::memory_order_relaxed) >= 16) return;
+        std::string Chain;
+        for (const std::string* Outer : t_stack) Chain += (Chain.empty() ? "" : " <- ") + *Outer;
+        const std::string Url = TravelUrl();
+        MpLog(std::string("[TravelCause] QUEUED ") + (NumBefore <= 1 ? "during" : "before") + " fn=" + NameEntry->Name
+            + " url=" + Url + " depth=" + std::to_string(t_stack.size()) + " chain=[" + Chain + "]");
+        if (Url.find("LoginMenu") != std::string::npos || Url.rfind("?", 0) == 0 || Url.find("closed") != std::string::npos
+            || Url.find("failed") != std::string::npos) {
+            Dump("queued-menu-travel");
+        }
+    }
+
+    // From EngineLoadMapDetour (client): the destination and the world being left.
+    static void OnLoadMap(void* WorldContext, const std::string& Map, const std::string& OldWorldName) {
+        if (Globals::AmServer || !Active()) return;
+        SetWorldContext(WorldContext);
+        if (Map.find("Map_LoginMenu") != std::string::npos && OldWorldName.find("Map_LoginMenu") == std::string::npos
+            && OldWorldName.find("Untitled") == std::string::npos && OldWorldName != "none") {
+            Dump(("loadmap-login from " + OldWorldName).c_str());
+        }
+    }
+}
+
 void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     g_clientProcessEventCount.fetch_add(1, std::memory_order_relaxed);
     if (g_clientGameThreadId.load(std::memory_order_relaxed) == 0) {
@@ -14281,7 +14425,10 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
     }
     */
 
-    const std::string& FunctionName = CachedFunctionFullName(Function);
+    // [2026-10-16 0.2.142] The cache entry itself, for TravelCause (same lookup CachedFunctionFullName does).
+    static const std::string s_nullFunctionName = "null";
+    MpFunctionNameCacheEntry* FunctionNameEntry = Function ? &CachedFunctionNameEntry(Function) : nullptr;
+    const std::string& FunctionName = FunctionNameEntry ? FunctionNameEntry->Name : s_nullFunctionName;
 
     // Player-host joins can complete the UE handshake and PostLogin, then be rejected by
     // the client during its first travel/replication frame.  The normal UE diagnostics are
@@ -14679,7 +14826,9 @@ void ProcessEventClientHook(UObject* Object, UFunction* Function, void* Parms) {
 
 
     const int GauntletCensusSeq = GauntletCensus::Enter(Object, Function, FunctionName, Parms);
+    const int32_t TravelUrlNumBefore = TravelCause::Before(FunctionNameEntry);
     reinterpret_cast<void(*)(UObject*, UFunction*, void*)>(OrigProcessEventClient)(Object, Function, Parms);
+    TravelCause::After(FunctionNameEntry, TravelUrlNumBefore);
     GauntletCensus::Exit(GauntletCensusSeq, Function, Parms);
     TraceArtificerDroneEvent("Client", "EXIT", Object, FunctionName, Parms);
 
@@ -16851,6 +17000,9 @@ static uint64_t MpPeComputeCategoryMask(const std::string& N) {
     return Mask;
 }
 
+static std::string MpGrantTraceCallChain();        // defined with [GrantTrace]
+static std::string MpGrantTraceUFunctionChain();   // defined with [GrantTrace]
+
 void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     // [1.12.0 REENTRANCY GUARD 2026-07-10] Safety-net against runaway ProcessEvent
     // recursion. Root cause of the FTUE crash was
@@ -16912,6 +17064,20 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     const std::string& FunctionName = s_peNameCacheMode == 1
         ? (PeNameEntry ? PeNameEntry->Name : CachedFunctionFullName(nullptr))
         : (FunctionNameUncached = Function ? Function->GetFullName() : std::string("null"));
+
+    // [2026-10-16 0.2.143] Server diagnostic, read-only: who sends a player back to the menu. The client's TravelCause trace
+    // (0.2.142) showed the travel to the login screen is queued by this server's ClientReturnToMainMenuWithTextReason RPC, sent
+    // right after the Hunt Pass replication, for a player at the hidden ExperienceTrack_PlayerLevel rank 20. Log the native caller
+    // chain (RVAs with their function starts) and the reflected chain once per call, at most 32 per process.
+    if (FunctionName.find("ClientReturnToMainMenu") != std::string::npos || FunctionName.find("ClientWasKicked") != std::string::npos) {
+        static std::atomic<int> s_returnToMenuSeq{ 0 };
+        const int Seq = s_returnToMenuSeq.fetch_add(1, std::memory_order_relaxed);
+        if (Seq < 32) {
+            MpLog("[ReturnToMenuTrace #" + std::to_string(Seq) + "] fn=" + FunctionName
+                + " obj=" + (Object ? SafeObjectNameForDiagnostic(Object) : std::string("null"))
+                + " native=" + MpGrantTraceCallChain() + " reflected=" + MpGrantTraceUFunctionChain());
+        }
+    }
 
     // [2026-10-11 1.14.7 O3] Per-UFunction category mask (see MpPeCategory). ~0 = every test runs (the old behaviour).
     static int s_peCategoryMode = -1;
@@ -21708,8 +21874,13 @@ static bool ProgConfigLoadedHook(void* GameInstance) {
         g_archonGameInstanceForHuntPass = GameInstance;
     }
     // [1.14.7 hunt pass query] issue the genuine configuration query once, two readiness checks in.
+    // [2026-10-16] Always, with no flag. It was gated by CALL_HUNTPASS_QUERY.flag, which only a
+    // development install had: on every other PC a realm hub never queried the progression configuration, so a player's
+    // progression load waited for it ("ReadFromBackend will WAIT for the config event", then "still not loaded after 90 s"), the
+    // game's player-data timeout fired twice and the hub sent the player back to the menu 120 s after Ramsgate loaded (fresh
+    // installs). A hub with the flag issued the query at boot and loaded.
     static std::atomic<int> s_huntPassQueryState{ 0 };
-    if (MpExeRelativeFlagPresent(L"CALL_HUNTPASS_QUERY.flag")) {
+    {
         const int QState = s_huntPassQueryState.load();
         if (QState == 1) {
             s_huntPassQueryState.store(2);
@@ -23003,7 +23174,7 @@ static void MpCoinTossClientProbe(UObject* PC) {
 //       const TDelegate<void(bool bHasData, const FHuntPassSeasonDataTable& HuntPassData)>& Event);
 // and TDelegate<Ret(Args...)> is a 16-byte FScriptDelegate, so an unbound (zeroed) delegate is a valid
 // argument: the callback simply will not fire, while the QUERY itself - the part that was missing - is
-// issued. Called on the game thread from the readiness hook, flag gated by CALL_HUNTPASS_QUERY.flag.
+// issued. Called on the game thread from the readiness hook (always since 2026-10-16; CALL_HUNTPASS_QUERY.flag is no longer read).
 static void CallHuntPassSeasonQuery() {
     void* GameInstance = g_archonGameInstanceForHuntPass;
     if (!GameInstance) {
@@ -23719,8 +23890,10 @@ static bool __fastcall EngineLoadMapDetour(void* Engine, void* WorldContext, voi
     if (MpProcessDetaching()) return OrigEngineLoadMap(Engine, WorldContext, Url, Pending, Error);
     void* OldWorld = MpWorldContextWorld(WorldContext);
     const std::string Map = MpFStringAt(Url, 0x28);
+    const std::string OldWorldName = OldWorld ? SafeObjectNameForDiagnostic(OldWorld) : std::string("none");
     MpLog("[LoadMap] enter map=" + Map + " pending=" + MpPtr(Pending) + " context=" + MpPtr(WorldContext)
-        + " oldWorld=" + MpPtr(OldWorld) + "/" + (OldWorld ? SafeObjectNameForDiagnostic(OldWorld) : std::string("none")));
+        + " oldWorld=" + MpPtr(OldWorld) + "/" + OldWorldName);
+    TravelCause::OnLoadMap(WorldContext, Map, OldWorldName);   // [2026-10-16 0.2.142] client: the history before a return to the menu
     MpWorldCensus("loadmap-enter");
 
     // The census above has just released the stuck Async keep flag of every leftover world (MpReleaseZombieKeepFlags,
