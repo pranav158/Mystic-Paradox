@@ -32,8 +32,13 @@ use crate::install::paths;
 use crate::launch::logs::iso8601_now;
 use crate::servers::active_target;
 
-/// Free memory a host needs before a hub, a Training hub or a realm hunt starts (MiB).
+/// Free physical memory under which a hub, a Training hub or a realm hunt still starts, with a line in realm-host.log (MiB).
+/// [2026-10-16] Realm servers start like a dedicated server's: it refused until now. A server uses about 1.4 GB and Windows
+/// pages to make room; what can end a server is running out of commit, which HOST_COMMIT_FLOOR_MIB still refuses. A PC with
+/// little free memory and plenty of commit turned down every Training and hunt start. The backend's realm rule is the same.
 pub(crate) const HOST_MEMORY_FLOOR_MIB: u64 = 3072;
+/// Commit available (physical memory plus page file) a host needs before one more server starts (MiB): the backend's realm floor.
+pub(crate) const HOST_COMMIT_FLOOR_MIB: u64 = 4096;
 const MAX_PLAYERS_LIMIT: u32 = 64;
 const MAX_SERVERS_LIMIT: u32 = 8;
 /// 0 means "never" (the runtime floors any other value at 60 s).
@@ -256,17 +261,23 @@ pub(crate) fn default_max_servers(physical_gb: u64) -> u32 {
     (2 * (physical_gb - 4) / 3).clamp(1, MAX_SERVERS_CAP as u64) as u32
 }
 
-/// A hunt or hub offer (or a Training start) is accepted only with the memory floor free and a server slot left.
+/// A hunt or hub offer (or a Training start) is accepted only with the commit floor available and a server slot left.
+/// [2026-10-16] Free physical memory under HOST_MEMORY_FLOOR_MIB no longer refuses (the caller logs it, low_free_memory).
 pub(crate) fn capacity_decision(
-    free_mib: u64,
+    commit_mib: u64,
     active_servers: u32,
     max_servers: u32,
 ) -> CapacityDecision {
-    if free_mib < HOST_MEMORY_FLOOR_MIB || active_servers >= max_servers {
+    if commit_mib < HOST_COMMIT_FLOOR_MIB || active_servers >= max_servers {
         CapacityDecision::Refuse { reason: HOST_BUSY }
     } else {
         CapacityDecision::Accept
     }
+}
+
+/// Whether free physical memory is under the floor that only logs now (HOST_MEMORY_FLOOR_MIB).
+pub(crate) fn low_free_memory(free_mib: u64) -> bool {
+    free_mib < HOST_MEMORY_FLOOR_MIB
 }
 
 /// The wait before restart attempt number `attempts_in_window + 1`: 5 s, then 15 s, then 60 s for every later one.
@@ -1750,10 +1761,15 @@ fn start_realm(app: &AppHandle, options: RealmHostOptions) -> Result<(), String>
     if !target.uses_official_feed() {
         return Err("Select the official server or a Paradox realm to host a realm.".to_string());
     }
-    let (free_mib, _) = control::memory_status();
-    if free_mib < HOST_MEMORY_FLOOR_MIB {
+    let (free_mib, commit_mib) = control::memory_status();
+    if commit_mib < HOST_COMMIT_FLOOR_MIB {
         return Err(format!(
-            "Hosting needs {HOST_MEMORY_FLOOR_MIB} MiB of free memory; {free_mib} MiB is free."
+            "Hosting needs {HOST_COMMIT_FLOOR_MIB} MiB of memory available (including the page file); {commit_mib} MiB is available."
+        ));
+    }
+    if low_free_memory(free_mib) {
+        realm_log(&format!(
+            "host start with {free_mib} MiB free physical memory (under {HOST_MEMORY_FLOOR_MIB} MiB, logged only); {commit_mib} MiB commit available"
         ));
     }
     ensure_host_transport(app)?;
@@ -2235,8 +2251,9 @@ fn training_sweep(app: &AppHandle, idle: &mut HashMap<String, Instant>, now: Ins
 
 // ---- hunt offers (control.rs) --------------------------------------------------------------------------------------
 
-/// `Some(reason)` when this PC, hosting a realm, must refuse a hunt offer now (free memory under the floor, or no server
-/// slot left). `None` accepts the offer as before, which is also the answer while no realm is online.
+/// `Some(reason)` when this PC, hosting a realm, must refuse a hunt offer now (commit available under the floor, or no
+/// server slot left). `None` accepts the offer as before, which is also the answer while no realm is online. [2026-10-16]
+/// Low free physical memory only logs (realm-host.log).
 pub(super) fn offer_refusal() -> Option<&'static str> {
     let (state, max_servers) = {
         let host = lock(host_state());
@@ -2245,10 +2262,17 @@ pub(super) fn offer_refusal() -> Option<&'static str> {
     if state != HostState::Online {
         return None;
     }
-    let (free_mib, _) = control::memory_status();
+    let (free_mib, commit_mib) = control::memory_status();
     let active = hosted_sessions().len() as u32;
-    match capacity_decision(free_mib, active, max_servers) {
-        CapacityDecision::Accept => None,
+    match capacity_decision(commit_mib, active, max_servers) {
+        CapacityDecision::Accept => {
+            if low_free_memory(free_mib) {
+                realm_log(&format!(
+                    "hunt offer accepted with {free_mib} MiB free physical memory (under {HOST_MEMORY_FLOOR_MIB} MiB, logged only); {commit_mib} MiB commit available"
+                ));
+            }
+            None
+        }
         CapacityDecision::Refuse { reason } => Some(reason),
     }
 }
@@ -2320,28 +2344,38 @@ mod tests {
         assert_eq!(default_max_servers(128), 6);
     }
 
+    // [2026-10-16] The commit available decides (HOST_COMMIT_FLOOR_MIB); low free physical memory only logs (low_free_memory).
     #[test]
-    fn capacity_refuses_below_the_memory_floor_and_at_the_server_limit() {
-        assert_eq!(capacity_decision(3072, 0, 1), CapacityDecision::Accept);
+    fn capacity_refuses_below_the_commit_floor_and_at_the_server_limit() {
+        assert_eq!(capacity_decision(4096, 0, 1), CapacityDecision::Accept);
         assert_eq!(
-            capacity_decision(3071, 0, 1),
+            capacity_decision(4095, 0, 1),
             CapacityDecision::Refuse {
                 reason: "HOST_BUSY"
             }
         );
         assert_eq!(
-            capacity_decision(3072, 1, 1),
+            capacity_decision(4096, 1, 1),
             CapacityDecision::Refuse {
                 reason: "HOST_BUSY"
             }
         );
-        assert_eq!(capacity_decision(3072, 1, 2), CapacityDecision::Accept);
+        assert_eq!(capacity_decision(4096, 1, 2), CapacityDecision::Accept);
         assert_eq!(
             capacity_decision(0, 0, 6),
             CapacityDecision::Refuse {
                 reason: "HOST_BUSY"
             }
         );
+        // Plenty of commit available is a yes, whatever the free physical memory.
+        assert_eq!(capacity_decision(15460, 1, 6), CapacityDecision::Accept);
+    }
+
+    #[test]
+    fn low_free_physical_memory_is_only_reported() {
+        assert!(low_free_memory(2006));
+        assert!(low_free_memory(3071));
+        assert!(!low_free_memory(3072));
     }
 
     #[test]
