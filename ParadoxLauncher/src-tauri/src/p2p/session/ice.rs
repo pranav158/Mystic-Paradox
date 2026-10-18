@@ -65,6 +65,18 @@ impl TransportConfig {
             .filter(|relay| relay.allowed)
             .and_then(|relay| relay.expires_at.clone())
     }
+
+    /// [2026-10-17] The relay (TURN) username and credential in this answer, chosen as `ice_files` chooses them (the first server
+    /// that carries a pair); None without one or with an unsafe value. For the relay credential refresh; never logged.
+    pub(super) fn relay_turn_credential(&self) -> Option<(String, String)> {
+        let server = self
+            .ice_servers
+            .iter()
+            .find(|server| server.username.is_some() && server.credential.is_some())?;
+        let (user, secret) = (server.username.as_deref()?, server.credential.as_deref()?);
+        (safe_credential(user) && safe_credential(secret))
+            .then(|| (user.to_string(), secret.to_string()))
+    }
 }
 
 /// Who the files are for: a hunt's host lists every joiner, a joiner exactly the host, and a hub's host none (its
@@ -423,6 +435,8 @@ pub(super) fn start_join(
     let force_relay = bootstrap.common.force_relay;
     let runtime = verified_runtime(app, &bootstrap.common.artifacts)?;
     let transport_config = fetch_transport_config(app, session_id, generation)?;
+    // [2026-10-17] Known to the relay credential refresh (session.rs refresh_due_relay_credentials).
+    super::set_relay_expiry(session_id, transport_config.relay_expires_at());
     let files = ice_files(
         &transport_config,
         FilesFor::Joiner,

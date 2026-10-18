@@ -293,6 +293,14 @@ pub(crate) fn api_error_message(status: u16, code: Option<&str>, fallback: &str)
             "Your closed-test access request was not approved.".to_string()
         }
         Some("AUTH_ACCOUNT_DISABLED") => "This account has been disabled.".to_string(),
+        // [2026-10-17] The channel switch from an account that is not a test-channel account.
+        // [2026-10-18] A concurrent refresh renewed the session; the caller retries (never a sign-out: no "expired" in it).
+        Some("AUTH_REFRESH_SUPERSEDED") => {
+            "Your session was renewed a moment ago. Try again.".to_string()
+        }
+        Some("CHANNEL_SWITCH_UNAVAILABLE") => {
+            "This account plays the stable channel only.".to_string()
+        }
         Some("AUTH_ACCOUNT_BANNED") => "This account has been banned.".to_string(),
         Some("AUTH_EMAIL_TAKEN") => "That email is already registered.".to_string(),
         Some("AUTH_DISPLAY_NAME_TAKEN") => "That username is already taken.".to_string(),
@@ -621,6 +629,28 @@ pub(crate) fn current_access_token(app: &AppHandle) -> Result<String, String> {
     access_token_with(&AppHost(app), &AuthScope::Official)
 }
 
+/// The account id an access token names (its `userId` claim). Read without checking the signature: it only chooses
+/// this account's own files on this PC (the log upload), and the backend checks the token itself.
+fn access_token_account_id(access_token: &str) -> Option<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let payload = access_token.split('.').nth(1)?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+    let account_id = claims.get("userId")?.as_str()?;
+    let plausible = !account_id.is_empty()
+        && account_id.len() <= 64
+        && account_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    plausible.then(|| account_id.to_string())
+}
+
+/// [2026-10-17] The signed-in official account's id.
+pub(crate) fn current_account_id(app: &AppHandle) -> Result<String, String> {
+    let token = current_access_token(app)?;
+    access_token_account_id(&token).ok_or_else(|| "Sign in again, then try once more.".to_string())
+}
+
 /// Sends an authenticated request with `scope`'s current access token. On 401/403 the token is
 /// dropped and the session refreshed once: the refresh path owns sign-out for expired,
 /// unapproved, disabled and banned accounts, exactly as when every call refreshed.
@@ -688,33 +718,131 @@ pub(crate) fn refresh_native_session(app: &AppHandle) -> Result<NativeSession, S
     refresh_session_for(app, &AuthScope::Official)
 }
 
+/// [2026-10-18] The refresh lock across launcher processes: an exclusive lock on a per-scope file next to the logs, held for the
+/// whole load -> rotate -> save. The in-process lock above only serializes one process; two launcher processes on one PC (a
+/// duplicate start) refreshed with the same saved token at the same moment, the backend took the second as a replayed token and
+/// revoked the session, and the player was signed out mid-game. Waits at most CROSS_PROCESS_LOCK_WAIT; past that (a hung
+/// process) the refresh goes on without it, and the backend's short grace for a just-replaced token covers the race.
+const CROSS_PROCESS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+struct CrossProcessRefreshLock(Option<std::fs::File>);
+
+impl Drop for CrossProcessRefreshLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.take() {
+            let _ = file.unlock();
+        }
+    }
+}
+
+fn cross_process_refresh_lock(scope: &AuthScope) -> CrossProcessRefreshLock {
+    #[cfg(not(test))]
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .map(|dir| dir.join("MysticParadox"))
+        .unwrap_or_else(std::env::temp_dir);
+    #[cfg(test)]
+    let base = std::env::temp_dir().join("mp-refresh-locks");
+    let name: String = scope
+        .key()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = base.join(format!("refresh-{name}.lock"));
+    let _ = std::fs::create_dir_all(&base);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    else {
+        return CrossProcessRefreshLock(None);
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return CrossProcessRefreshLock(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock)
+                if started.elapsed() < CROSS_PROCESS_LOCK_WAIT =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return CrossProcessRefreshLock(None),
+        }
+    }
+}
+
+/// [2026-10-18] The backend's answer for a token another refresh replaced moments ago (a concurrent refresh, not a replay).
+const REFRESH_SUPERSEDED: &str = "AUTH_REFRESH_SUPERSEDED";
+
 /// Rotates the refresh token. The caller holds the scope's refresh lock.
 fn refresh_locked(host: &dyn SessionHost, scope: &AuthScope) -> Result<NativeSession, String> {
-    let (epoch, token) = {
+    let _cross_process = cross_process_refresh_lock(scope);
+    let (epoch, mut token) = {
         let epoch = session_epoch::lock(scope.key());
         let token = host
             .load_token(scope)?
             .ok_or_else(|| "Your session expired. Sign in again.".to_string())?;
         (*epoch, token)
     };
-    let response = http_client_for(scope)?
-        .post(format!("{}/launcher/v1/auth/refresh", scope.base_url()))
-        .json(&RefreshRequest {
-            refresh_token: &token,
-            device_id: "native-windows-launcher",
-            device_name: "Windows PC",
-        })
-        .send()
-        .map_err(|_| {
-            scope
-                .pick(
-                    "Couldn't reach the Mystic Paradox account server.",
-                    "Couldn't reach this server.",
-                )
-                .to_string()
-        })?;
-    let parsed =
-        parse_success::<NativeSession>(response, "Couldn't restore your launcher session.");
+    let mut retried = false;
+    let parsed = loop {
+        let response = http_client_for(scope)?
+            .post(format!("{}/launcher/v1/auth/refresh", scope.base_url()))
+            .json(&RefreshRequest {
+                refresh_token: &token,
+                device_id: "native-windows-launcher",
+                device_name: "Windows PC",
+            })
+            .send()
+            .map_err(|_| {
+                scope
+                    .pick(
+                        "Couldn't reach the Mystic Paradox account server.",
+                        "Couldn't reach this server.",
+                    )
+                    .to_string()
+            })?;
+        if response.status().as_u16() == 409 {
+            // Another refresh replaced this token moments ago and saved the newer one: use it once. Never a sign-out.
+            let status = response.status().as_u16();
+            let body = response
+                .bytes()
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default();
+            let code = error_code_of(&body);
+            if code.as_deref() == Some(REFRESH_SUPERSEDED) && !retried {
+                retried = true;
+                // The other refresh may still be saving its token: wait up to 2 s for it.
+                let mut newer = None;
+                for _ in 0..8 {
+                    match host.load_token(scope)? {
+                        Some(saved) if saved != token => {
+                            newer = Some(saved);
+                            break;
+                        }
+                        _ => std::thread::sleep(std::time::Duration::from_millis(250)),
+                    }
+                }
+                if let Some(saved) = newer {
+                    token = saved;
+                    continue;
+                }
+            }
+            break Err(api_error_message(
+                status,
+                code.as_deref(),
+                "Couldn't restore your launcher session.",
+            ));
+        }
+        break parse_success::<NativeSession>(response, "Couldn't restore your launcher session.");
+    };
     let mut current_epoch = session_epoch::lock(scope.key());
     session_epoch::check(epoch, *current_epoch)?;
     let session = match parsed {
@@ -1562,6 +1690,16 @@ pub struct NativePolicy {
     /// The server's half of the co-op switch (p2p/mod.rs); absent on a dedicated-only server.
     #[serde(default)]
     pub coop_hunts: bool,
+    /// [2026-10-17] Present only for a test-channel account: the channels its switch offers and the one in use (Library).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_switch: Option<NativeChannelSwitch>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeChannelSwitch {
+    pub channels: Vec<String>,
+    pub current: String,
 }
 
 // Shared by native_get_policy (badge/channel, exposed to JS) and secure_launch's flag
@@ -1729,6 +1867,28 @@ mod tests {
     use super::super::test_support::{access_token, error_json, mock_backend, session_json};
     use super::*;
 
+    #[test]
+    fn the_account_id_comes_from_the_access_tokens_user_id_claim() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let token = |claims: &str| format!("h.{}.s", URL_SAFE_NO_PAD.encode(claims));
+        assert_eq!(
+            access_token_account_id(&token(r#"{"userId":"4f6a2d1e00004000","sid":"x"}"#))
+                .as_deref(),
+            Some("4f6a2d1e00004000")
+        );
+        assert_eq!(
+            access_token_account_id(&access_token("a")),
+            None,
+            "no userId claim"
+        );
+        assert_eq!(
+            access_token_account_id(&token(r#"{"userId":"../x"}"#)),
+            None
+        );
+        assert_eq!(access_token_account_id(&token(r#"{"userId":""}"#)), None);
+        assert_eq!(access_token_account_id("not-a-token"), None);
+    }
+
     // ---- an in-memory host and a mock backend --------------------------------------------------------------
 
     #[derive(Default)]
@@ -1868,6 +2028,75 @@ mod tests {
         // A sign-out (epoch bump) of one scope drops only its own cache.
         *session_epoch::lock(b.key()) += 1;
         assert_eq!(cached_access(&b), None);
+    }
+
+    // [2026-10-18] Two launcher processes refreshing with the same saved token.
+    #[test]
+    fn a_superseded_refresh_retries_once_with_the_token_the_other_refresh_saved() {
+        let (base, requests) = mock_backend(vec![
+            (409, error_json("AUTH_REFRESH_SUPERSEDED")),
+            (200, session_json("local-race", "rotated-after-race")),
+        ]);
+        let scope = local("s-auth-superseded", &base);
+        let host = TestHost::with(&[(&scope, "old-refresh")]);
+        let session = std::thread::scope(|threads| {
+            // The other process saves its newer token a moment after this one's refresh is refused.
+            threads.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                host.save_token(&scope, "newer-refresh").unwrap();
+            });
+            refresh_session_with(&host, &scope)
+        })
+        .unwrap();
+        assert_eq!(session.account.user_id, "user-local-race");
+        assert!(requests.recv().unwrap().text.contains("old-refresh"));
+        assert!(
+            requests.recv().unwrap().text.contains("newer-refresh"),
+            "the retry uses the newer token"
+        );
+        assert_eq!(host.token(&scope).as_deref(), Some("rotated-after-race"));
+        assert!(host.ended().is_empty(), "no sign-out");
+    }
+
+    #[test]
+    fn a_superseded_refresh_without_a_newer_token_is_an_error_but_never_a_sign_out() {
+        let (base, _requests) = mock_backend(vec![(409, error_json("AUTH_REFRESH_SUPERSEDED"))]);
+        let scope = local("s-auth-superseded-alone", &base);
+        let host = TestHost::with(&[(&scope, "old-refresh")]);
+        let Err(error) = refresh_session_with(&host, &scope) else {
+            panic!("a superseded refresh with no newer token must fail");
+        };
+        assert!(error.contains("renewed a moment ago"), "{error}");
+        assert!(!error.contains("expired"));
+        assert_eq!(
+            host.token(&scope).as_deref(),
+            Some("old-refresh"),
+            "the saved session is kept"
+        );
+        assert!(host.ended().is_empty());
+    }
+
+    #[test]
+    fn the_cross_process_refresh_lock_makes_a_second_holder_wait() {
+        let scope = local("s-auth-cross-process-lock", "http://127.0.0.1:9");
+        let first = cross_process_refresh_lock(&scope);
+        assert!(first.0.is_some(), "the lock file opens");
+        let started = std::time::Instant::now();
+        let waited = std::thread::scope(|threads| {
+            let second = threads.spawn(|| {
+                let guard = cross_process_refresh_lock(&scope);
+                (guard.0.is_some(), started.elapsed())
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(first);
+            second.join().unwrap()
+        });
+        assert!(waited.0, "the second holder gets the lock");
+        assert!(
+            waited.1 >= std::time::Duration::from_millis(250),
+            "it waited for the first: {:?}",
+            waited.1
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@ use crate::p2p::transport;
 
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(20);
 const OBSERVATION_INTERVAL: Duration = Duration::from_secs(5);
+/// [2026-10-17] How often running sessions are checked for a relay credential about to expire (session.rs).
+const RELAY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_WAIT_MS: u64 = 5_000;
 const FALLBACK_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -761,6 +763,7 @@ fn run_control_loop(app: AppHandle) {
     let mut account_id = String::new();
     let mut next_presence = Instant::now();
     let mut next_observation = Instant::now();
+    let mut next_relay_refresh = Instant::now() + RELAY_REFRESH_INTERVAL;
     let mut known_sessions = HashMap::<String, u32>::new();
     // A failed cycle (session refresh, presence) is logged and retried. It never ends a game:
     // Guard enforcement is the backend's, which stops offering this PC as a host.
@@ -824,6 +827,11 @@ fn run_control_loop(app: AppHandle) {
                 ));
             }
             next_observation = Instant::now() + OBSERVATION_INTERVAL;
+        }
+        // [2026-10-17] Running sessions whose relay credential is about to expire get a fresh one (session.rs).
+        if Instant::now() >= next_relay_refresh {
+            p2p_session::refresh_due_relay_credentials(&app);
+            next_relay_refresh = Instant::now() + RELAY_REFRESH_INTERVAL;
         }
         let cursor = cursor_for(&load_settings(&app), &account_id);
         let client = match reqwest::blocking::Client::builder()

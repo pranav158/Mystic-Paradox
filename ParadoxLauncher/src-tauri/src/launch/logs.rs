@@ -8,6 +8,8 @@ use tauri::{AppHandle, Manager};
 
 use sha2::{Digest, Sha256};
 
+use super::log_upload;
+
 /// %LOCALAPPDATA%\MysticParadox\Logs\Sessions — a fixed, memorable path independent of the
 /// Tauri bundle identifier, so testers/support can find it without asking the launcher.
 pub fn sessions_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -94,10 +96,9 @@ pub fn append_launcher_log(dir: &Path, line: &str) {
 /// windowless launcher closed with no game running still leaves a record of how far its cleanup
 /// got and which stage it stopped in. Sits next to the Sessions tree under the same Logs folder.
 pub fn append_shutdown_log(line: &str) {
-    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+    let Some(dir) = logs_dir() else {
         return;
     };
-    let dir = PathBuf::from(local).join("MysticParadox").join("Logs");
     if fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -129,31 +130,59 @@ pub fn write_metadata(dir: &Path, metadata: &SessionMetadata) {
     }
 }
 
-/// Best-effort: copies any combined runtime DLL log (`mysticparadox_dll_port*.log`, written
-/// beside the game exe — see ParadoxRuntime/dllmain.cpp's MpLogDir()) modified since launch
-/// into the session folder. The DLL doesn't accept a log-path argument, so this is the
-/// non-invasive way to get its output into the per-session folder without changing the
-/// (signed, separately-published) runtime DLL itself.
-pub fn copy_runtime_logs_best_effort(game_dir: &Path, session_dir: &Path, since: SystemTime) {
-    let Ok(entries) = fs::read_dir(game_dir) else {
+/// `%LOCALAPPDATA%\MysticParadox\Logs`: the session folders, `realm-host.log`, `launcher-exit.log` and the hosted
+/// servers' log start records.
+pub fn logs_dir() -> Option<PathBuf> {
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|local| PathBuf::from(local).join("MysticParadox").join("Logs"))
+}
+
+/// [2026-10-17] At Play, before the game starts: where the client's runtime log (`mysticparadox_dll_port0.log` beside
+/// the game exe; the runtime appends every run to it and never rotates it) and the realm host log end now, so a log
+/// upload sends this session's lines only (launch/log_upload.rs).
+pub fn record_play_log_starts(game_dir: &Path, session_dir: &Path) {
+    let realm_host = logs_dir().map(|dir| dir.join(log_upload::REALM_HOST_LOG));
+    log_upload::record_session_starts(
+        session_dir,
+        &game_dir.join(log_upload::CLIENT_LOG_NAME),
+        realm_host.as_deref(),
+    );
+}
+
+/// [2026-10-17] Before a hosted server starts: where its runtime log (`mysticparadox_dll_port<port>.log`) ends now, and
+/// the hosting account, so a log upload sends this run and never another account's.
+#[cfg_attr(not(mystic_p2p), allow(dead_code))]
+pub fn record_hosted_server_log_start(game_dir: &Path, port: u16, account_id: Option<&str>) {
+    let Some(dir) = logs_dir() else {
         return;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.starts_with("mysticparadox_dll_port") || !name_str.ends_with(".log") {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else {
-            continue;
-        };
-        if modified < since {
-            continue;
-        }
-        let _ = fs::copy(
-            entry.path(),
-            session_dir.join(format!("runtime-{name_str}")),
+    log_upload::record_host_start(
+        &dir,
+        &game_dir.join(format!("mysticparadox_dll_port{port}.log")),
+        account_id,
+        log_upload::now_ms(),
+    );
+}
+
+/// When the game exits: where its runtime log ends, and this session's part of it (at most the newest 8 MB) copied
+/// into the session folder as `runtime-mysticparadox_dll_port0.log` for reading on this PC. The upload reads the log
+/// itself; hosted servers keep running after the client and are never copied here.
+pub fn finish_session_logs(session_dir: &Path) {
+    log_upload::record_session_end(session_dir);
+    let Some(client) = log_upload::read_session_offsets(session_dir).client_log else {
+        return;
+    };
+    if let Ok(window) = log_upload::read_window(
+        Path::new(&client.path),
+        Some(client.start),
+        client.end,
+        log_upload::RUNTIME_LOG_MAX,
+        true,
+    ) {
+        let _ = fs::write(
+            session_dir.join(format!("runtime-{}", log_upload::CLIENT_LOG_NAME)),
+            window.bytes,
         );
     }
 }

@@ -3,6 +3,7 @@ pub mod game_settings;
 pub mod guard;
 pub mod guard_checks;
 pub mod guard_loop;
+pub mod log_upload;
 pub mod logs;
 pub mod module_signer;
 pub mod process;

@@ -66,6 +66,13 @@
   gap: 20px;
 }
 
+/* [2026-10-17] Library: the test-channel accounts' channel switch, under the runtime row. */
+.channel-switch {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+}
+
 .section-head {
   display: flex;
   align-items: flex-start;
@@ -158,6 +165,34 @@
 
 .feedback.ok { color: #9eecc8; }
 .feedback.bad { color: #ffb0bd; }
+
+/* [2026-10-17] Settings -> Logs: what an upload sends, and the files it could not send. */
+.log-contents {
+  margin-top: 12px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.log-contents summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--ink-2);
+}
+
+.log-contents ul,
+.log-problems {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  list-style: disc;
+}
+
+.log-problems {
+  color: var(--ink-3);
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
 
 .grid-2 {
   display: grid;

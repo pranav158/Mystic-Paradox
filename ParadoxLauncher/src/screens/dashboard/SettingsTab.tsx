@@ -1,13 +1,27 @@
 import { useCallback, useEffect, useState, type ComponentType, type CSSProperties } from "react";
 import { usePolicy } from "../../policy/PolicyContext";
-import { getLogPaths, openLogFolder, uploadLastSession } from "../../api/tauri";
+import { getLogPaths, onLogUploadProgress, openLogFolder, uploadLogs } from "../../api/tauri";
 import { sanitizeError } from "../../lib/sanitize";
 import { setUiPrefs, useUiPrefs, type SidebarMode, type UiScale } from "../../lib/prefs";
-import type { LogPaths } from "../../api/types";
+import type { LogPaths, LogUploadProgress, LogUploadReport } from "../../api/types";
 import { CopyIcon, FolderIcon, SidebarIcon, SparkIcon, UploadIcon, ZoomIcon } from "../../components/icons";
 import { ArtBackdrop } from "../../components/ArtBackdrop";
 
-type UploadState = { status: "idle" } | { status: "uploading" } | { status: "done"; count: number } | { status: "error"; message: string };
+type UploadState =
+  | { status: "idle" }
+  | { status: "uploading"; progress: LogUploadProgress | null }
+  | { status: "done"; report: LogUploadReport }
+  | { status: "error"; message: string };
+
+/** What "Upload logs" sends (launch/log_upload.rs on the native side). */
+const UPLOAD_CONTENTS = [
+  "The launcher log and the session details of your newest Play session.",
+  "The game's own log for that session (the newest 8 MB at most).",
+  "The logs of the newest game servers you host (up to 4, the newest 8 MB of each). They name the players in your realm and what they did in the game.",
+  "Connection logs (transport, host and join) and the realm host log.",
+  "The game's settings files (Game.ini, Engine.ini, GameUserSettings.ini).",
+  "A list of what was sent and left out.",
+];
 type Feedback = { kind: "ok" | "bad"; message: string };
 
 const UI_SIZES: { id: UiScale; label: string }[] = [
@@ -73,13 +87,18 @@ export function SettingsTab() {
   }, []);
 
   const handleUpload = useCallback(async () => {
-    setUpload({ status: "uploading" });
+    setUpload({ status: "uploading", progress: null });
+    const stopListening = await onLogUploadProgress((progress) => {
+      setUpload((current) => (current.status === "uploading" ? { status: "uploading", progress } : current));
+    }).catch(() => null);
     try {
-      const count = await uploadLastSession();
-      setUpload({ status: "done", count });
+      const report = await uploadLogs();
+      setUpload({ status: "done", report });
       void refreshPaths();
     } catch (err) {
       setUpload({ status: "error", message: sanitizeError(err instanceof Error ? err.message : String(err)) });
+    } finally {
+      stopListening?.();
     }
   }, [refreshPaths]);
 
@@ -188,13 +207,13 @@ export function SettingsTab() {
             <div className="section-row">
               <div className="section-head">
                 <div className="section-icon"><UploadIcon /></div>
-                <div>
-                  <h2 className="section-title">Last session</h2>
+                <div className="min-w-0">
+                  <h2 className="section-title">Logs</h2>
                   <p className="section-desc">
-                    {paths?.latestSessionDir ? "A recorded Play attempt is ready to send to the team." : "No Play attempts recorded yet."}
+                    Sends your newest session and the logs written since it started, including the game servers you host, to the team.
+                    Password- and token-like values are removed first.
                   </p>
-                  {upload.status === "done" && <p className="feedback ok">Uploaded {upload.count} file{upload.count === 1 ? "" : "s"}.</p>}
-                  {upload.status === "error" && <p className="feedback bad" role="alert">{upload.message}</p>}
+                  <UploadResult upload={upload} />
                   {!isTester && <p className="note">Log upload is available to tester accounts.</p>}
                 </div>
               </div>
@@ -204,16 +223,70 @@ export function SettingsTab() {
                     type="button"
                     className="btn btn-primary"
                     onClick={() => void handleUpload()}
-                    disabled={upload.status === "uploading" || !paths?.latestSessionDir}
+                    disabled={upload.status === "uploading"}
                   >
-                    {upload.status === "uploading" ? <><span className="spinner" aria-hidden="true" />Uploading…</> : <><UploadIcon />Upload last session</>}
+                    {upload.status === "uploading" ? <><span className="spinner" aria-hidden="true" />Uploading…</> : <><UploadIcon />Upload logs</>}
                   </button>
                 </div>
               )}
             </div>
+            {isTester && (
+              <details className="log-contents">
+                <summary>What's included</summary>
+                <ul>
+                  {UPLOAD_CONTENTS.map((line) => <li key={line}>{line}</li>)}
+                </ul>
+                <p className="note">Nothing is sent until you press Upload logs.</p>
+              </details>
+            )}
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+/** The upload's progress and result: how many files went, which failed and why, and why it stopped. */
+function UploadResult({ upload }: { upload: UploadState }) {
+  if (upload.status === "uploading") {
+    return (
+      <p className="feedback" role="status">
+        {upload.progress ? `Uploading ${upload.progress.index} of ${upload.progress.total}…` : "Preparing the upload…"}
+      </p>
+    );
+  }
+  if (upload.status === "error") return <p className="feedback bad" role="alert">{upload.message}</p>;
+  if (upload.status !== "done") return null;
+  const { report } = upload;
+  const complete = report.failed.length === 0 && report.stopped === null;
+  return (
+    <div className="log-result">
+      <p className={`feedback ${complete ? "ok" : "bad"}`} role={complete ? "status" : "alert"}>
+        Uploaded {report.uploaded} of {report.total} file{report.total === 1 ? "" : "s"}
+        {report.uploadKind === "host" ? " (your hosted servers; no Play session on this PC)" : ""}.
+        {report.stopped ? ` Stopped: ${report.stopped}` : ""}
+      </p>
+      {report.failed.length > 0 && (
+        <ul className="log-problems">
+          {report.failed.map((problem) => (
+            <li key={problem.name}>
+              <span className="mono">{problem.name}</span>: {problem.reason}
+            </li>
+          ))}
+        </ul>
+      )}
+      {report.skipped.length > 0 && (
+        <details className="log-contents">
+          <summary>{report.skipped.length} left out</summary>
+          <ul className="log-problems">
+            {report.skipped.map((problem) => (
+              <li key={problem.name}>
+                <span className="mono">{problem.name}</span>: {problem.reason}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   );
 }

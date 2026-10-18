@@ -142,10 +142,36 @@ impl Drop for ActiveGuard {
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+/// [2026-10-17] The anti-rollback floor, one per channel. A single floor for every channel refused a `dev` manifest numbered
+/// below the stable one (co-op then stayed off), and with the channel switch an account moves between channels. A channel
+/// without an entry starts at 0. `maximum_manifest_sequence` is still written (the highest of all) for an older launcher.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct RollbackState {
     maximum_manifest_sequence: u64,
+    #[serde(default)]
+    channels: HashMap<String, u64>,
+}
+
+impl RollbackState {
+    fn floor(&self, channel: &str) -> u64 {
+        self.channels.get(channel).copied().unwrap_or(0)
+    }
+
+    /// The state after accepting `sequence` on `channel`; an error for a rollback, None when nothing changes.
+    fn accepting(&self, channel: &str, sequence: u64) -> Result<Option<RollbackState>, String> {
+        let current = self.floor(channel);
+        if sequence < current {
+            return Err("Guard manifest rollback was rejected.".to_string());
+        }
+        if sequence == current && self.channels.contains_key(channel) {
+            return Ok(None);
+        }
+        let mut next = self.clone();
+        next.channels.insert(channel.to_string(), sequence);
+        next.maximum_manifest_sequence = next.maximum_manifest_sequence.max(sequence);
+        Ok(Some(next))
+    }
 }
 
 fn active() -> &'static Mutex<HashMap<String, ActiveGuard>> {
@@ -162,31 +188,23 @@ fn state_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("guard-rollback.json"))
 }
 
-fn load_floor(app: &AppHandle) -> u64 {
+fn load_rollback_state(app: &AppHandle) -> RollbackState {
     state_path(app)
         .ok()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|json| serde_json::from_str::<RollbackState>(&json).ok())
-        .map(|state| state.maximum_manifest_sequence)
-        .unwrap_or(0)
+        .unwrap_or_default()
 }
 
-fn commit_floor(app: &AppHandle, sequence: u64) -> Result<(), String> {
+fn commit_floor(app: &AppHandle, channel: &str, sequence: u64) -> Result<(), String> {
     let path = state_path(app)?;
-    let current = load_floor(app);
-    if sequence < current {
-        return Err("Guard manifest rollback was rejected.".to_string());
-    }
-    if sequence == current {
+    let Some(next) = load_rollback_state(app).accepting(channel, sequence)? else {
         return Ok(());
-    }
+    };
     let temporary = path.with_extension("json.tmp");
     std::fs::write(
         &temporary,
-        serde_json::to_vec_pretty(&RollbackState {
-            maximum_manifest_sequence: sequence,
-        })
-        .map_err(|_| "Couldn't encode Guard state.".to_string())?,
+        serde_json::to_vec_pretty(&next).map_err(|_| "Couldn't encode Guard state.".to_string())?,
     )
     .map_err(|_| "Couldn't stage Guard state.".to_string())?;
     std::fs::rename(temporary, path).map_err(|_| "Couldn't commit Guard state.".to_string())
@@ -361,10 +379,7 @@ fn fetch_manifest(
             .map_err(|_| "The Guard manifest envelope was malformed.".to_string())?,
         channel,
     )?;
-    if payload.sequence < load_floor(app) {
-        return Err("Guard manifest rollback was rejected.".to_string());
-    }
-    commit_floor(app, payload.sequence)?;
+    commit_floor(app, channel, payload.sequence)?;
     Ok(payload)
 }
 
@@ -954,6 +969,33 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // [2026-10-17] One floor per channel: dev at 91 no longer refuses stable 90, and an old shared file starts each channel at 0.
+    #[test]
+    fn each_channel_keeps_its_own_rollback_floor() {
+        let legacy: RollbackState =
+            serde_json::from_str(r#"{"maximumManifestSequence":91}"#).unwrap();
+        assert_eq!(legacy.floor("stable"), 0);
+        let stable = legacy.accepting("stable", 90).unwrap().unwrap();
+        assert_eq!(stable.floor("stable"), 90);
+        assert_eq!(
+            stable.maximum_manifest_sequence, 91,
+            "the shared field keeps the highest"
+        );
+        let dev = stable.accepting("dev", 91).unwrap().unwrap();
+        assert_eq!((dev.floor("stable"), dev.floor("dev")), (90, 91));
+        assert!(
+            dev.accepting("stable", 90).unwrap().is_none(),
+            "the same stable manifest again"
+        );
+        assert!(dev.accepting("stable", 89).is_err(), "a stable rollback");
+        assert!(dev.accepting("dev", 90).is_err(), "a dev rollback");
+        assert_eq!(
+            dev.accepting("stable", 93).unwrap().unwrap().floor("dev"),
+            91
+        );
+    }
+
     #[test]
     fn rejects_unknown_manifest_key() {
         let result = verify_envelope(

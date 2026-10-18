@@ -56,17 +56,22 @@ use, which have their own policies.
   also appears in a few security logs, for example chat connections.
 - **Log files - testers only.** The launcher keeps logs of your recent sessions on your PC (section 10). We receive them only
   from tester accounts: our operators give tester access only to players who volunteer to help test. A tester who chooses
-  "Upload last session" sends us that Play session's launcher and game logs (the launcher log, the session details and the
-  game's log files). They include the tester's username, account ID, the folder path of the game install, and what the
-  launcher and the game did during that session. Nothing is uploaded unless the tester presses the button.
+  "Upload logs" sends us their newest Play session and the logs written since it started: the launcher log and the session
+  details, the game's log for that session, the logs of the game servers their PC runs for their realm, the connection logs
+  (transport, host and join), the realm host log, and the game's settings files with password- and token-like values
+  removed. They include the tester's username, account ID, the folder path of the game install, and what the launcher and
+  the game did. Nothing is uploaded unless the tester presses the button.
+- **If you play in a tester's realm:** the logs of the game servers their PC runs include your account ID or username and
+  what you did in the game on those servers (for example where you travelled, the hunts you joined and the rewards you
+  received). When that tester uploads logs, this part reaches us too. We use it only to find and fix problems.
 - **Every other account:** log upload is switched off. The launcher does not offer it, our servers refuse it, and we never
-  collect your launcher or game log files.
+  collect log files from your PC.
 
 **What we do not collect**
 - No real names, dates of birth, home addresses, phone numbers or payment details.
 - No precise location.
 - No advertising or analytics trackers.
-- No launcher or game log files from players without tester access.
+- No log files from the PCs of players without tester access.
 
 ## 2. Why we use it
 
@@ -86,7 +91,7 @@ We do not sell your data, and we do not use it for advertising.
 - **Cloudflare** relays co-op game traffic between players. It handles the IP addresses of the connected players and a
   pseudonymous identifier (not your account ID) we use to count relay usage.
 - **Our operators** (the people who run Mystic Paradox) can read the logs a tester uploads, to find and fix problems. Every
-  read and every deletion of an upload is recorded in our audit log. This applies to tester accounts only.
+  read and every deletion of an upload is recorded in our audit log. Only tester accounts can upload.
 - **Discord**, if you choose to sign in with Discord.
 - **Our hosting provider**, which runs our servers.
 - **Authorities**, if the law requires it.
@@ -145,7 +150,7 @@ security problem.
 
 The launcher stores your settings, your saved sign-in (as above), the servers you added, and logs of your recent sessions
 in `%LOCALAPPDATA%\MysticParadox\Logs`. These logs stay on your PC: they are sent to us only if your account has tester
-access and you press "Upload last session" (section 1). It uses no cookies or trackers. You can remove all of it by uninstalling the
+access and you press "Upload logs" (section 1). It uses no cookies or trackers. You can remove all of it by uninstalling the
 launcher and deleting those folders.
 
 ## 11. Changes

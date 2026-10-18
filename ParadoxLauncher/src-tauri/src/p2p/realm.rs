@@ -23,8 +23,8 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 
 use super::control;
 use super::session::{
-    hosted_sessions, is_session_running, refresh_relay_expiry, set_hub_afk_seconds,
-    start_host_bundle, stop_session_generation, HostedSession, HubKind, PeerLive, SessionKind,
+    hosted_sessions, is_session_running, set_hub_afk_seconds, start_host_bundle,
+    stop_session_generation, HostedSession, HubKind, PeerLive, SessionKind,
 };
 use super::{coop_artifacts, start_host_transport};
 use crate::commands::auth::{api_base_url, http_client, refresh_native_session, send_authorized};
@@ -51,13 +51,10 @@ const SUPERVISOR_TICK: Duration = Duration::from_secs(5);
 const RESTART_WINDOW: Duration = Duration::from_secs(10 * 60);
 const MAX_RESTARTS_IN_WINDOW: usize = 5;
 /// A hub up longer than this with nobody present is restarted silently.
+/// [2026-10-17] The only scheduled restart: the backend renews the hub's capability with its lease and the relay credential is
+/// refreshed in place (session.rs refresh_due_relay_credentials), so a hub with players in it is never restarted on a timer.
 const SCHEDULED_RESTART_WHEN_IDLE: Duration = Duration::from_secs(20 * 3600);
-/// A hub is restarted silently at this age regardless (its capability lasts 24 h).
-const SCHEDULED_RESTART_AT: Duration = Duration::from_secs(23 * 3600);
 const TRAINING_IDLE_LIMIT: Duration = Duration::from_secs(5 * 60);
-/// How often the supervisor reads the hub's relay credential expiry (the credential itself is not replaced: see the
-/// TODO in `check_relay`).
-const RELAY_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const SESSION_WAIT: Duration = Duration::from_secs(20);
 const BAN_REASON_LIMIT: usize = 200;
 const HOST_BUSY: &str = "HOST_BUSY";
@@ -320,10 +317,11 @@ pub(crate) fn training_should_stop(idle_since: Option<Instant>, now: Instant) ->
     idle_since.is_some_and(|since| now.saturating_duration_since(since) >= TRAINING_IDLE_LIMIT)
 }
 
-/// The silent restart rule for the Ramsgate hub: 20 h up with nobody present, or 23 h up regardless.
-/// How long before the running hub's relay credential expires the supervisor restarts the hub (which mints a fresh one):
-/// ABI 3 cannot hand a new credential to a running session, and a hub past that point loses its relay.
-const RELAY_RESTART_MARGIN: Duration = Duration::from_secs(15 * 60);
+/// The silent restart rule for the Ramsgate hub: 20 h up with nobody present.
+/// [2026-10-17] A fallback only: how long before the running hub's relay credential expires the supervisor restarts the hub (which
+/// mints a fresh one) when the refresh did not happen - a transport that cannot take a fresh credential, or refreshes that kept
+/// failing since RELAY_REFRESH_MARGIN_SECONDS (20 min) before the expiry.
+const RELAY_RESTART_MARGIN: Duration = Duration::from_secs(5 * 60);
 
 /// Seconds until an RFC 3339 expiry (negative once past); None for an unreadable value.
 pub(crate) fn seconds_until(expires_at: &str, now: time::OffsetDateTime) -> Option<i64> {
@@ -339,7 +337,7 @@ pub(crate) fn relay_restart_due(seconds_left: Option<i64>) -> bool {
 }
 
 pub(crate) fn scheduled_restart_due(uptime: Duration, present: bool) -> bool {
-    uptime >= SCHEDULED_RESTART_AT || (!present && uptime > SCHEDULED_RESTART_WHEN_IDLE)
+    !present && uptime > SCHEDULED_RESTART_WHEN_IDLE
 }
 
 pub(crate) fn validate_options(options: &RealmHostOptions) -> Result<(), String> {
@@ -2055,7 +2053,6 @@ fn mark_restarting(notice: Option<String>) {
 fn supervise(app: AppHandle, stop: Receiver<()>) {
     let mut attempts: Vec<Instant> = Vec::new();
     let mut due: Option<Instant> = None;
-    let mut relay_check_at = Instant::now() + RELAY_CHECK_INTERVAL;
     let mut idle: HashMap<String, Instant> = HashMap::new();
     loop {
         if !matches!(
@@ -2119,18 +2116,16 @@ fn supervise(app: AppHandle, stop: Receiver<()>) {
                     .and_then(|session| session.live.relay_expires_at.clone())
                     .and_then(|at| seconds_until(&at, time::OffsetDateTime::now_utc()));
                 if relay_restart_due(relay_left) {
+                    // [2026-10-17] A fallback: the refresh (session.rs) did not renew the credential in time.
                     realm_log(&format!(
-                        "hub restart before the relay credential expires secondsLeft={}",
-                        relay_left.unwrap_or_default()
+                        "hub restart before the relay credential expires secondsLeft={} refreshUnsupported={}",
+                        relay_left.unwrap_or_default(),
+                        super::session::relay_refresh_unsupported(&run.session_id)
                     ));
                     end_hub(&app, &run.session_id);
                     mark_restarting(None);
                     due = Some(now);
                     continue;
-                }
-                if now >= relay_check_at {
-                    relay_check_at = now + RELAY_CHECK_INTERVAL;
-                    check_relay(&app, &run.session_id);
                 }
                 training_sweep(&app, &mut idle, now);
             }
@@ -2188,28 +2183,6 @@ fn supervise(app: AppHandle, stop: Receiver<()>) {
             }
             _ => return,
         }
-    }
-}
-
-/// Reads the hub's relay credential expiry again, for the log. ABI 3 cannot take a new credential into a running session,
-/// so the supervisor restarts the hub `RELAY_RESTART_MARGIN` before the one it started with expires (the backend mints hub
-/// credentials for the hub's life, up to 24 h, so normally the scheduled restart comes first). Applying a fresh
-/// credential without a restart would need an ABI 4 call (`UpdateSecretsH`).
-fn check_relay(app: &AppHandle, session_id: &str) {
-    let Some((generation, running_expiry)) = hosted_sessions()
-        .into_iter()
-        .find(|session| session.session_id == session_id)
-        .map(|session| (session.generation, session.live.relay_expires_at))
-    else {
-        return;
-    };
-    let running = running_expiry.unwrap_or_else(|| "unknown".to_string());
-    match refresh_relay_expiry(app, session_id, generation) {
-        Ok(Some(fresh)) => realm_log(&format!(
-            "hub relay credential: running {running}, fresh {fresh} (the fresh one is not applied to the running hub)"
-        )),
-        Ok(None) => realm_log(&format!("hub relay credential: running {running}, fresh has no expiry")),
-        Err(error) => realm_log(&format!("hub relay credential check failed: {error}")),
     }
 }
 
@@ -2432,14 +2405,37 @@ mod tests {
         assert_eq!(seconds_until("2026-10-14T13:00:00Z", now), Some(3 * 3600));
         assert_eq!(seconds_until("2026-10-14T09:59:00Z", now), Some(-60));
         assert_eq!(seconds_until("not a date", now), None);
-        assert!(!relay_restart_due(Some(16 * 60)));
-        assert!(relay_restart_due(Some(15 * 60)));
+        assert!(!relay_restart_due(Some(6 * 60)));
+        assert!(relay_restart_due(Some(5 * 60)));
         assert!(relay_restart_due(Some(-60)));
         assert!(!relay_restart_due(None), "no known expiry: no restart");
+        // [2026-10-17] The refresh comes first, 20 minutes before the expiry; the restart is the fallback.
+        use crate::p2p::session::relay_refresh_due;
+        let just_now = Some(Duration::from_secs(60));
+        assert!(!relay_refresh_due(Some(21 * 60), just_now));
+        assert!(relay_refresh_due(Some(20 * 60), just_now));
+        assert!(!relay_refresh_due(None, None));
+        // The early refresh: 12 h or less left, at most every 30 minutes.
+        assert!(!relay_refresh_due(Some(12 * 3600 + 1), None));
+        assert!(relay_refresh_due(Some(12 * 3600), None));
+        assert!(relay_refresh_due(
+            Some(12 * 3600),
+            Some(Duration::from_secs(30 * 60))
+        ));
+        assert!(!relay_refresh_due(
+            Some(12 * 3600),
+            Some(Duration::from_secs(29 * 60))
+        ));
+        // A 3 h hunt credential refreshes every 30 minutes, not every minute; a 25-minute one still at 20 minutes left.
+        assert!(!relay_refresh_due(Some(3 * 3600), just_now));
+        assert!(relay_refresh_due(
+            Some(20 * 60),
+            Some(Duration::from_secs(5 * 60))
+        ));
     }
 
     #[test]
-    fn scheduled_restart_at_twenty_hours_idle_or_twenty_three_regardless() {
+    fn scheduled_restart_only_at_twenty_hours_idle() {
         assert!(!scheduled_restart_due(
             Duration::from_secs(20 * 3600),
             false
@@ -2449,7 +2445,8 @@ mod tests {
             false
         ));
         assert!(!scheduled_restart_due(Duration::from_secs(21 * 3600), true));
-        assert!(scheduled_restart_due(Duration::from_secs(23 * 3600), true));
+        // [2026-10-17] No restart at 23 hours any more while players are present (the capability and relay renew).
+        assert!(!scheduled_restart_due(Duration::from_secs(48 * 3600), true));
     }
 
     #[test]

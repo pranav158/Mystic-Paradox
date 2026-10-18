@@ -281,6 +281,12 @@ struct SupervisorRegistration {
     handle: Option<SessionHandle>,
     live: Option<SharedLive>,
     peer_sync: Option<mpsc::Sender<SyncCommand>>,
+    /// [2026-10-17] When the session's relay credential stops working (RFC 3339), for the relay credential refresh.
+    relay_expires_at: Option<String>,
+    /// When the session's current relay credential was set, or a refresh last tried (the early refresh waits between tries).
+    relay_refreshed_at: Option<Instant>,
+    /// [2026-10-17] The transport module cannot take a fresh relay credential into a running session (an older module).
+    relay_refresh_unsupported: bool,
 }
 
 /// How a session's transport module is reached: the Steam transport's one session, or an ICE session by handle.
@@ -1126,6 +1132,9 @@ fn reserve_supervisor(session_id: &str) -> Result<SupervisorReservation, String>
             handle: None,
             live: None,
             peer_sync: None,
+            relay_expires_at: None,
+            relay_refreshed_at: None,
+            relay_refresh_unsupported: false,
         },
     );
     Ok(SupervisorReservation {
@@ -1338,6 +1347,14 @@ fn set_handle(session_id: &str, handle: SessionHandle) {
     update_registration(session_id, |entry| entry.handle = Some(handle));
 }
 
+/// [2026-10-17] Records when the session's relay credential stops working (the host and join paths, after their transport-config).
+pub(super) fn set_relay_expiry(session_id: &str, expires_at: Option<String>) {
+    update_registration(session_id, |entry| {
+        entry.relay_expires_at = expires_at;
+        entry.relay_refreshed_at = Some(Instant::now());
+    });
+}
+
 /// [2026-10-14] Without a registration the session's peers never reach the realm status, so that is said in the session log
 /// (the realm panel then shows nobody for it).
 fn set_live(session_id: &str, live: SharedLive) {
@@ -1418,16 +1435,123 @@ pub fn stop_hunt_joins_for_hub_join() {
     }
 }
 
-/// The relay credential of a running session, fetched again from the backend (`transport-config`). Transport ABI 3 has
-/// no call that takes new secrets into a running session, so this only reports when the fresh credential expires; the
-/// running session keeps the credential it started with (TODO: an ABI 4 `UpdateSecretsH` would apply it).
-pub(crate) fn refresh_relay_expiry(
-    app: &AppHandle,
-    session_id: &str,
-    generation: u32,
-) -> Result<Option<String>, String> {
-    let config = ice::fetch_transport_config(app, session_id, generation)?;
-    Ok(config.relay_expires_at())
+/// [2026-10-17] How long before a running session's relay credential expires the launcher fetches a fresh one (`transport-config`)
+/// and hands it to the transport (`MysticTransport_UpdateRelayCredentialH`), for host and join sessions alike. A relay credential
+/// has a lifetime (a hunt's is its remaining time plus 10 minutes, a hub's up to 24 hours) and the relay ends a session whose
+/// credential expired; until now the hub was restarted instead (which dropped everyone in it), and a joiner was not covered.
+pub(crate) const RELAY_REFRESH_MARGIN_SECONDS: i64 = 20 * 60;
+
+/// [2026-10-17] The early refresh. A link keeps the relay credential it was opened with: a fresh credential handed to a running
+/// session reaches its open links, but the relay still ends each link a few minutes after the credential it opened with expired
+/// (measured). What a refresh really buys is the credential that the NEXT links open with. So a session's credential is
+/// renewed once it has 12 hours or less left: every link then opens with at least 12 hours, more than a hub visit or a hunt
+/// lasts. A shorter credential (a hunt's) would always be inside that window, so the early refresh waits 30 minutes between tries;
+/// the 20-minute margin above still applies at any time.
+pub(crate) const RELAY_EARLY_REFRESH_SECONDS: i64 = 12 * 3600;
+pub(crate) const RELAY_EARLY_REFRESH_SPACING: Duration = Duration::from_secs(30 * 60);
+
+/// Pure: whether a session's relay credential is due for the refresh. `since_last` is the time since the current credential was
+/// set or a refresh last tried (None: never recorded).
+pub(crate) fn relay_refresh_due(seconds_left: Option<i64>, since_last: Option<Duration>) -> bool {
+    let Some(left) = seconds_left else {
+        return false;
+    };
+    left <= RELAY_REFRESH_MARGIN_SECONDS
+        || (left <= RELAY_EARLY_REFRESH_SECONDS
+            && since_last.is_none_or(|elapsed| elapsed >= RELAY_EARLY_REFRESH_SPACING))
+}
+
+/// Whether the transport could not take a fresh relay credential into this session (an older module): the hub supervisor
+/// then restarts the hub before its credential expires, as before.
+pub(crate) fn relay_refresh_unsupported(session_id: &str) -> bool {
+    registry()
+        .lock()
+        .ok()
+        .and_then(|sessions| {
+            sessions
+                .get(session_id)
+                .map(|entry| entry.relay_refresh_unsupported)
+        })
+        .unwrap_or(false)
+}
+
+/// Refreshes every running ICE session whose relay credential is due (`relay_refresh_due`). Called from the control loop about
+/// once a minute. A credential is never logged.
+pub(crate) fn refresh_due_relay_credentials(app: &AppHandle) {
+    let now = time::OffsetDateTime::now_utc();
+    let tick = Instant::now();
+    let due: Vec<(String, u32, SessionHandle, Option<SharedLive>)> = registry()
+        .lock()
+        .map(|sessions| {
+            sessions
+                .iter()
+                .filter(|(_, entry)| !entry.relay_refresh_unsupported)
+                .filter(|(_, entry)| {
+                    relay_refresh_due(
+                        entry
+                            .relay_expires_at
+                            .as_deref()
+                            .and_then(|at| super::realm::seconds_until(at, now)),
+                        entry
+                            .relay_refreshed_at
+                            .map(|at| tick.saturating_duration_since(at)),
+                    )
+                })
+                .filter_map(|(session_id, entry)| {
+                    Some((
+                        session_id.clone(),
+                        entry.generation?,
+                        entry.handle?,
+                        entry.live.clone(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for (session_id, generation, handle, live) in due {
+        // A try counts for the early refresh's spacing whatever its outcome (a refused or failed fetch is not repeated each minute).
+        update_registration(&session_id, |entry| entry.relay_refreshed_at = Some(tick));
+        let config = match ice::fetch_transport_config(app, &session_id, generation) {
+            Ok(config) => config,
+            Err(error) => {
+                process::append_active_session_log(&format!(
+                    "relay credential refresh failed session={session_id}: {error}"
+                ));
+                continue;
+            }
+        };
+        let fresh = config.relay_expires_at();
+        let Some((username, credential)) = config.relay_turn_credential() else {
+            process::append_active_session_log(&format!(
+                "relay credential refresh: the backend issued no relay credential session={session_id}"
+            ));
+            continue;
+        };
+        match handle.update_relay_credential(&username, &credential) {
+            Some(true) => {
+                set_relay_expiry(&session_id, fresh.clone());
+                if let Some(live) = live {
+                    if let Ok(mut live) = live.lock() {
+                        live.relay_expires_at = fresh.clone();
+                    }
+                }
+                process::append_active_session_log(&format!(
+                    "relay credential refreshed session={session_id} until={}",
+                    fresh.as_deref().unwrap_or("unknown")
+                ));
+            }
+            Some(false) => process::append_active_session_log(&format!(
+                "relay credential refresh refused by the transport session={session_id}"
+            )),
+            None => {
+                update_registration(&session_id, |entry| entry.relay_refresh_unsupported = true);
+                process::append_active_session_log(&format!(
+                    "relay credential refresh: this transport cannot take one into a running session session={session_id}; \
+                     it keeps the credential it started with"
+                ));
+            }
+        }
+    }
 }
 
 /// A hosted session as the realm panel reads it.
@@ -1776,6 +1900,9 @@ mod tests {
                 handle: None,
                 live: None,
                 peer_sync: None,
+                relay_expires_at: None,
+                relay_refreshed_at: None,
+                relay_refresh_unsupported: false,
             }
         };
         let sessions: HashMap<String, SupervisorRegistration> = [

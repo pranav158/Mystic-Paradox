@@ -111,9 +111,37 @@ export interface LauncherPolicy {
   diagnosticsProfile: "PRODUCTION" | "DEVELOPMENT";
   /** The server's half of the co-op switch; absent on a dedicated-only server. */
   coopHunts: boolean;
+  /** [2026-10-17] Present only for a test-channel account: the channels the Library's switch offers and the one in use. */
+  channelSwitch?: { channels: string[]; current: string };
 }
 
 export interface LogPaths {
   sessionsRoot: string;
   latestSessionDir: string | null;
+}
+
+/** [2026-10-17] One file of a log upload that was not sent, and why. */
+export interface LogUploadProblem {
+  name: string;
+  reason: string;
+}
+
+/** [2026-10-17] The result of "Upload logs" (`native_upload_logs`). */
+export interface LogUploadReport {
+  uploadId: string;
+  /** `play`: the newest Play session and the logs since; `host`: no Play session of this account, its host logs. */
+  uploadKind: "play" | "host";
+  uploaded: number;
+  total: number;
+  failed: LogUploadProblem[];
+  skipped: LogUploadProblem[];
+  /** Why the upload stopped before its last file. */
+  stopped: string | null;
+}
+
+/** [2026-10-17] Sent before each file of an upload (index from 1). */
+export interface LogUploadProgress {
+  index: number;
+  total: number;
+  name: string;
 }

@@ -148,6 +148,8 @@ pub fn start_host_bundle(
         config.push_str(&files.config);
         host_account_id = Some(transport_config.local_account_id.clone());
         relay_expires_at = transport_config.relay_expires_at();
+        // [2026-10-17] Known to the relay credential refresh (session.rs refresh_due_relay_credentials).
+        super::set_relay_expiry(session_id, relay_expires_at.clone());
     }
 
     let game_dir = runtime
@@ -233,6 +235,13 @@ pub fn start_host_bundle(
             "MYSTICPARADOX_ALLOW_DAMAGE_DEBUG",
             "MYSTICPARADOX_DEBUG_DAMAGE_MULTIPLIER",
         ],
+    );
+    // [2026-10-17] Where this server's runtime log ends before it starts, and who hosts it: a tester's log upload sends
+    // this run of the port's log, never earlier runs or another account's (launch/log_upload.rs).
+    crate::launch::logs::record_hosted_server_log_start(
+        game_dir,
+        bootstrap.server_udp_port,
+        host_account_id.as_deref(),
     );
     // These positional arguments are the frozen DeployServer launch manifest. The launcher must not reinterpret
     // hunt IDs or content; it only transports the dedicated resolver's result into the local host process.

@@ -84,6 +84,8 @@ type SubmitSignalHFn = unsafe extern "C" fn(i32, *const i8, *const i8, *const i8
 type ReadLineHFn = unsafe extern "C" fn(i32, *mut u8, u32) -> i32;
 type AddPeerHFn = unsafe extern "C" fn(i32, *const i8, u64, *const i8) -> i32;
 type RemovePeerHFn = unsafe extern "C" fn(i32, *const i8, *const i8) -> i32;
+/// [2026-10-17] Additive to ABI 3, looked up by name: an older module lacks it.
+type UpdateRelayCredentialHFn = unsafe extern "C" fn(i32, *const i8, *const i8) -> i32;
 
 #[derive(Clone, Debug, Default)]
 pub struct TransportStatus {
@@ -176,6 +178,16 @@ pub(crate) trait SessionApi: Send + Sync {
     fn read_diagnostic(&self, handle: SessionHandle) -> Option<String>;
     fn add_peer(&self, handle: SessionHandle, account_id: &str, peer_id: u64, key: &str) -> bool;
     fn remove_peer(&self, handle: SessionHandle, account_id: &str, reason: &str) -> bool;
+    /// [2026-10-17] A fresh relay credential for a running session: Some(true) queued, Some(false) refused, None when the module
+    /// has no such call (the session then keeps the credential it started with).
+    fn update_relay_credential(
+        &self,
+        _handle: SessionHandle,
+        _username: &str,
+        _credential: &str,
+    ) -> Option<bool> {
+        None
+    }
 }
 
 /// How the launcher talks to a module of a given interface version.
@@ -252,6 +264,11 @@ unsafe fn load_symbol<T: Copy>(module: HMODULE, name: &'static [u8]) -> Result<T
     Ok(std::mem::transmute_copy(&address))
 }
 
+/// [2026-10-17] An export the launcher can do without (additive to the module's ABI): None when the module lacks it.
+unsafe fn load_optional_symbol<T: Copy>(module: HMODULE, name: &'static [u8]) -> Option<T> {
+    GetProcAddress(module, name.as_ptr()).map(|address| std::mem::transmute_copy(&address))
+}
+
 fn native_text(buffer: &[u8]) -> String {
     let end = buffer
         .iter()
@@ -299,6 +316,8 @@ struct NativeV3 {
     read_diagnostic: ReadLineHFn,
     add_peer: AddPeerHFn,
     remove_peer: RemovePeerHFn,
+    /// [2026-10-17] None for a module without the relay credential refresh.
+    update_relay_credential: Option<UpdateRelayCredentialHFn>,
 }
 
 impl NativeV3 {
@@ -316,6 +335,10 @@ impl NativeV3 {
             read_diagnostic: load_symbol(module, b"MysticTransport_ReadDiagnosticH\0")?,
             add_peer: load_symbol(module, b"MysticTransport_AddPeerH\0")?,
             remove_peer: load_symbol(module, b"MysticTransport_RemovePeerH\0")?,
+            update_relay_credential: load_optional_symbol(
+                module,
+                b"MysticTransport_UpdateRelayCredentialH\0",
+            ),
         })
     }
 
@@ -474,6 +497,19 @@ impl SessionApi for NativeV3 {
             return false;
         };
         unsafe { (self.remove_peer)(handle.0, account.as_ptr(), reason.as_ptr()) == 1 }
+    }
+
+    fn update_relay_credential(
+        &self,
+        handle: SessionHandle,
+        username: &str,
+        credential: &str,
+    ) -> Option<bool> {
+        let function = self.update_relay_credential?;
+        let (Ok(user), Ok(secret)) = (text_cstring(username), text_cstring(credential)) else {
+            return Some(false);
+        };
+        Some(unsafe { function(handle.0, user.as_ptr(), secret.as_ptr()) == 1 })
     }
 }
 
@@ -961,6 +997,14 @@ impl SessionHandle {
     /// Host sessions only: true when the module queued the removal.
     pub fn remove_peer(self, account_id: &str, reason: &str) -> bool {
         session_api().is_ok_and(|api| api.remove_peer(self, account_id, reason))
+    }
+
+    /// [2026-10-17] Hands the running session a fresh relay credential: Some(true) queued, Some(false) refused, None when the
+    /// module cannot take one into a running session (an older module).
+    pub fn update_relay_credential(self, username: &str, credential: &str) -> Option<bool> {
+        session_api()
+            .ok()
+            .and_then(|api| api.update_relay_credential(self, username, credential))
     }
 }
 

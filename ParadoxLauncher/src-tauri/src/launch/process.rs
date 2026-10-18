@@ -323,7 +323,6 @@ pub fn spawn_game(
 ) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
-    use std::time::SystemTime;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
@@ -344,7 +343,8 @@ pub fn spawn_game(
     let game_dir = exe_path
         .parent()
         .ok_or_else(|| "Invalid installation path.".to_string())?;
-    let launch_started_at = SystemTime::now();
+    // Where the client's runtime log ends before this run writes to it (the log upload sends from here).
+    logs::record_play_log_starts(game_dir, session_dir);
 
     // A P2P build starts its co-op transport here, before the game process exists. The default
     // dedicated-only build has none.
@@ -560,7 +560,7 @@ pub fn spawn_game(
             metadata.exit_code = Some(code);
             metadata.exited_at = Some(logs::iso8601_now());
             logs::write_metadata(session_dir, &metadata);
-            logs::copy_runtime_logs_best_effort(game_dir, session_dir, launch_started_at);
+            logs::finish_session_logs(session_dir);
             return Err(format!("Dauntless exited immediately (code: {code})."));
         }
 
@@ -577,7 +577,6 @@ pub fn spawn_game(
         let h_process = SendableHandle(pi.hProcess);
         let process_id = pi.dwProcessId;
         let session_dir_owned = session_dir.to_path_buf();
-        let game_dir_owned = game_dir.to_path_buf();
         let app = app.clone();
         std::thread::spawn(move || {
             // `let h_process = h_process;` forces the closure to capture the whole
@@ -599,11 +598,7 @@ pub fn spawn_game(
             metadata.exit_code = Some(code);
             metadata.exited_at = Some(logs::iso8601_now());
             logs::write_metadata(&session_dir_owned, &metadata);
-            logs::copy_runtime_logs_best_effort(
-                &game_dir_owned,
-                &session_dir_owned,
-                launch_started_at,
-            );
+            logs::finish_session_logs(&session_dir_owned);
             // Home flips back from "running" to Play without a manual status check.
             use tauri::Emitter;
             let _ = app.emit(GAME_EXITED_EVENT, code);

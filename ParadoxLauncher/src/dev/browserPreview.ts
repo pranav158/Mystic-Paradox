@@ -113,6 +113,8 @@ const previewHostKey = () => (params.has("realmchanged") ? "KEY-NEWHOST012345678
 const previewFingerprint = (key: string) => (key.length <= 16 ? key : `${key.slice(0, 8)}…${key.slice(-8)}`);
 // [2026-10-14] The Terms of Use and deletion state of the official account, kept in memory like the list.
 let consentAccepted = !params.has("gate");
+// [2026-10-17] The channel chosen with the Library's switch in this preview (?channelswitch).
+let previewChannel: string | undefined = params.has("channelswitch") ? "dev" : undefined;
 let deletionRequest: { requestedAt: string; scheduledFor: string } | null = params.has("deactivated")
   ? { requestedAt: iso(-10 * 24 * 60), scheduledFor: iso(20 * 24 * 60) }
   : null;
@@ -227,7 +229,7 @@ mockIPC((cmd, args) => {
     const answer = optionalMock(cmd, args);
     if (answer !== undefined) return answer;
   }
-  const payload = (args ?? {}) as { serverId?: string; remember?: boolean; ownFolder?: boolean; hostPublicKey?: string; confirmUsername?: string; code?: string; displayName?: string; name?: string; server?: { kind?: string; name?: string; backendUrl?: string; realmName?: string } };
+  const payload = (args ?? {}) as { serverId?: string; remember?: boolean; ownFolder?: boolean; hostPublicKey?: string; confirmUsername?: string; code?: string; displayName?: string; name?: string; channel?: string; server?: { kind?: string; name?: string; backendUrl?: string; realmName?: string } };
   switch (cmd) {
     case "native_restore_session": {
       if (screen === "checking") return new Promise(() => {});
@@ -329,7 +331,13 @@ mockIPC((cmd, args) => {
     case "native_refresh_account":
       return delay(accountFor(payload.serverId));
     case "native_get_policy":
-      return delay({ policyVersion: "preview", roles: ["tester"], channel, managedFeatureIds: [], logUpload: { auto: false }, guardEnforcement: "OBSERVE", diagnosticsProfile: "PRODUCTION", coopHunts: false }, 200);
+      return delay({ policyVersion: "preview", roles: ["tester"], channel: previewChannel ?? channel, managedFeatureIds: [], logUpload: { auto: false }, guardEnforcement: "OBSERVE", diagnosticsProfile: "PRODUCTION", coopHunts: false,
+        // [2026-10-17] ?channelswitch: a test-channel account (the Library's channel switch).
+        ...(params.has("channelswitch") ? { channelSwitch: { channels: ["stable", "dev"], current: previewChannel ?? "dev" } } : {}) }, 200);
+    case "native_set_runtime_channel":
+      if (params.get("channelswitch") === "playing") return Promise.reject("Close the game first: the channel decides which runtime the next Play installs.");
+      previewChannel = String(payload.channel);
+      return delay({ channel: previewChannel }, 400);
     case "native_get_server_status":
       return params.has("offline") ? Promise.reject("offline") : delay({ online: true, supportedBuildChangelist: 647472 }, 300);
     case "get_install_status":
@@ -373,6 +381,11 @@ mockIPC((cmd, args) => {
       return delay(sessions, 300);
     case "native_get_log_paths":
       return delay({ sessionsRoot: "C:\\Users\\Slayer\\AppData\\Local\\MysticParadox\\Logs\\Sessions", latestSessionDir: "C:\\Users\\Slayer\\AppData\\Local\\MysticParadox\\Logs\\Sessions\\s1" });
+    // [2026-10-17] Upload logs. ?uploadstopped: the hourly limit stops it after the first files.
+    case "native_upload_logs":
+      return delay(params.has("uploadstopped")
+        ? { uploadId: "7c1e4a90-2b3d-4f5e-8a6b-1c2d3e4f5a6b", uploadKind: "play", uploaded: 3, total: 12, failed: [{ name: "runtime-mysticparadox_dll_port0.log", reason: "Too many log files were uploaded in the last hour. Try again later." }], skipped: [], stopped: "Too many log files were uploaded in the last hour. Try again later." }
+        : { uploadId: "7c1e4a90-2b3d-4f5e-8a6b-1c2d3e4f5a6b", uploadKind: "play", uploaded: 11, total: 12, failed: [{ name: "p2p-hub-1-host-a1b2c3.log", reason: "The server refused this file." }], skipped: [{ name: "runtime-mysticparadox_dll_port8790.log", reason: "only the newest 4 server logs are sent" }], stopped: null }, 1600);
     case "native_get_p2p_host_settings":
       return { available: !params.has("nop2p"), memoryNotice: "Hosting a party hunt uses about 4 GB of extra memory.", transportReady: false, transportStatus: "UNAVAILABLE", transportStatusDetail: "The co-op connection starts automatically when you press Play.", transportCheckedAt: iso(0) };
     // [2026-10-16] Realm invites and join requests (the player's side).

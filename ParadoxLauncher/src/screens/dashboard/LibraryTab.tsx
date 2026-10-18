@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
-import { checkRuntimeUpdate, getInstallStatus, installRuntimeUpdate, pickInstallPath, type InstallStatus, type RuntimeUpdateStatus } from "../../api/tauri";
+import { checkRuntimeUpdate, getInstallStatus, installRuntimeUpdate, pickInstallPath, setRuntimeChannel as chooseRuntimeChannel, type InstallStatus, type RuntimeUpdateStatus } from "../../api/tauri";
 import { usePolicy } from "../../policy/PolicyContext";
 import { sanitizeError } from "../../lib/sanitize";
 import { buildName, shortHash } from "../../lib/sessions";
@@ -9,6 +9,11 @@ import { useServer } from "../../servers/ServerContext";
 import { statusNaming } from "../../servers/serverNames";
 
 type Feedback = { kind: "ok" | "bad"; message: string } | null;
+
+/** A channel's name on screen: "stable" -> "Stable". */
+function channelLabel(channel: string): string {
+  return channel.length > 0 ? channel[0].toUpperCase() + channel.slice(1) : channel;
+}
 
 function at(index: number, extra?: Record<string, string>): CSSProperties {
   return { "--i": index, ...extra } as CSSProperties;
@@ -22,7 +27,9 @@ export function LibraryTab() {
   const [runtime, setRuntime] = useState<RuntimeUpdateStatus | null>(null);
   const [runtimeChannel, setRuntimeChannel] = useState<string | null>(null);
   const [runtimeError, setRuntimeError] = useState(false);
-  const [busy, setBusy] = useState<"repair" | "locate" | null>(null);
+  // [2026-10-17] The channel switch: only a test-channel account's policy carries it (the backend refuses everyone else).
+  const [channelSwitch, setChannelSwitch] = useState<{ channels: string[]; current: string } | null>(null);
+  const [busy, setBusy] = useState<"repair" | "locate" | "channel" | null>(null);
   const [feedback, setFeedback] = useState<Feedback>(null);
   const mountedRef = useRef(true);
   // The runtime check must not re-run whenever the caller hands us a new refreshPolicy.
@@ -47,6 +54,7 @@ export function LibraryTab() {
     try {
       const policy = await refreshPolicyRef.current();
       if (!policy) return;
+      if (mountedRef.current) setChannelSwitch(policy.channelSwitch ?? null);
       const status = await checkRuntimeUpdate(policy.channel);
       if (mountedRef.current) {
         setRuntime(status);
@@ -96,6 +104,24 @@ export function LibraryTab() {
       if (mountedRef.current) setBusy(null);
     }
   }, [refreshPolicy, refreshRuntime]);
+
+  const handleChannel = useCallback(async (channel: string) => {
+    setBusy("channel");
+    setFeedback(null);
+    try {
+      const result = await chooseRuntimeChannel(channel);
+      if (mountedRef.current) {
+        setFeedback({ kind: "ok", message: `You are on the ${channelLabel(result.channel)} channel. The next Play installs its runtime.` });
+      }
+    } catch (err) {
+      if (mountedRef.current) {
+        setFeedback({ kind: "bad", message: sanitizeError(typeof err === "string" ? err : undefined) || "Couldn't switch the channel." });
+      }
+    } finally {
+      void refreshRuntime();
+      if (mountedRef.current) setBusy(null);
+    }
+  }, [refreshRuntime]);
 
   const handleLocate = useCallback(async () => {
     setBusy("locate");
@@ -217,6 +243,25 @@ export function LibraryTab() {
                       </>
                     )}
                   </dl>
+                )}
+                {runtimeManaged && channelSwitch && channelSwitch.channels.length > 1 && (
+                  <div className="section-row channel-switch">
+                    <div className="min-w-0">
+                      <h4 className="section-title" id="channel-switch-label">Channel</h4>
+                      <p className="section-desc">Test builds come on {channelSwitch.channels.filter((c) => c !== "stable").map(channelLabel).join(" / ")} first. Close the game and stop hosting before you switch.</p>
+                    </div>
+                    <div className="section-actions" role="group" aria-labelledby="channel-switch-label">
+                      {channelSwitch.channels.map((channel) => {
+                        const active = channel === channelSwitch.current;
+                        return (
+                          <button key={channel} type="button" aria-pressed={active} disabled={busy != null}
+                            onClick={() => { if (!active) void handleChannel(channel); }} className={`btn ${active ? "btn-primary" : "btn-secondary"}`}>
+                            {busy === "channel" && !active ? <><span className="spinner" aria-hidden="true" />Switching…</> : channelLabel(channel)}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
                 )}
                 {feedback && <p className={`feedback ${feedback.kind}`} role={feedback.kind === "bad" ? "alert" : "status"}>{feedback.message}</p>}
                 {runtimeManaged && <p className="note with-icon"><ShieldIcon />Every runtime file is signed. Play re-checks the game and runtime hashes with the server before it starts.</p>}

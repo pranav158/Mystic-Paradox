@@ -3,6 +3,8 @@ mod commands;
 mod install;
 mod launch;
 mod servers;
+#[cfg(windows)]
+mod single_instance;
 // rustfmt resolves `mod` files whatever their cfg, and the public tree has no P2P folder: format it with
 // `rustfmt --edition 2021 --check src/p2p/mod.rs` instead.
 #[cfg(mystic_p2p)]
@@ -45,6 +47,7 @@ macro_rules! launcher_commands {
             // [2026-10-14] Terms of Use and Privacy Policy consent, and account deletion (official accounts only).
             commands::account::native_consent_status,
             commands::account::native_accept_consent,
+            commands::account::native_set_runtime_channel,
             commands::account::native_deletion_status,
             commands::account::native_request_deletion,
             commands::account::native_cancel_deletion,
@@ -64,7 +67,8 @@ macro_rules! launcher_commands {
             commands::updates::install_runtime_update,
             commands::logs::native_get_log_paths,
             commands::logs::native_open_log_folder,
-            commands::logs::native_upload_last_session,
+            // [2026-10-17] Upload logs: the newest session and host logs, with per-file results.
+            commands::logs::native_upload_logs,
             commands::logs::native_recent_sessions,
             // [2026-10-13 realms S1] Multi-server list.
             commands::servers::list_servers,
@@ -87,10 +91,16 @@ macro_rules! launcher_commands {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // [2026-10-18] A second start never opens a second launcher: it is handed to the running one, or told it already runs.
+    #[cfg(windows)]
+    let _instance = single_instance::ensure_single_instance();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             match app.get_webview_window(launch::MAIN_WINDOW) {
                 Some(window) => {
+                    if window.is_minimized().unwrap_or(false) {
+                        let _ = window.unminimize();
+                    }
                     let _ = window.set_focus();
                 }
                 // Windowless while a game runs (the window was lost): starting the launcher again brings it back.

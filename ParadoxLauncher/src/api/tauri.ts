@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { LauncherNotices, LauncherPolicy, LogPaths, OfficialPlay, ServerStatusResponse, UsernameAvailabilityResponse } from "./types";
+import type { LauncherNotices, LauncherPolicy, LogPaths, LogUploadProgress, LogUploadReport, OfficialPlay, ServerStatusResponse, UsernameAvailabilityResponse } from "./types";
 import type { SessionSummary } from "../lib/sessions";
 
 /** [2026-10-13 realms S1] The three kinds of server the launcher can play on. */
@@ -268,8 +268,13 @@ export async function openLogFolder(): Promise<void> {
   return invoke<void>("native_open_log_folder");
 }
 
-export async function uploadLastSession(): Promise<number> {
-  return invoke<number>("native_upload_last_session");
+/** [2026-10-17] Uploads this account's newest session and the logs written since (tester accounts). */
+export async function uploadLogs(): Promise<LogUploadReport> {
+  return invoke<LogUploadReport>("native_upload_logs");
+}
+
+export function onLogUploadProgress(handler: (progress: LogUploadProgress) => void): Promise<UnlistenFn> {
+  return listen<LogUploadProgress>("log-upload-progress", (event) => handler(event.payload));
 }
 
 /** This account's newest Play sessions on this PC, newest first. */
@@ -332,6 +337,11 @@ export async function getConsentStatus(serverId?: string): Promise<ConsentStatus
 /** Records the player's acceptance of these versions. Rejects with a readable message (an outdated launcher, for one). */
 export async function acceptConsent(termsVersion: string, privacyVersion: string, serverId?: string): Promise<ConsentStatus> {
   return invoke<ConsentStatus>("native_accept_consent", { serverId, termsVersion, privacyVersion, ageConfirmed: true });
+}
+
+/** [2026-10-17] The Library's channel switch (test-channel accounts only); refused while a game runs or this PC hosts. */
+export async function setRuntimeChannel(channel: string, serverId?: string): Promise<{ channel: string }> {
+  return invoke<{ channel: string }>("native_set_runtime_channel", { serverId, channel });
 }
 
 export async function getDeletionStatus(serverId?: string): Promise<DeletionStatus> {

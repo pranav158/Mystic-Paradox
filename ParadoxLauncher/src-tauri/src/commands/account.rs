@@ -376,6 +376,77 @@ pub async fn native_accept_consent(
     .await
 }
 
+/// [2026-10-17] Why the channel cannot be switched right now, or None. The switch changes which runtime the next Play installs and
+/// which files a realm host must run, so it waits while this PC plays or hosts (the same rule as the launcher's own update).
+pub(crate) fn channel_switch_hold_reason(
+    game_running: bool,
+    hosting: bool,
+) -> Option<&'static str> {
+    if game_running {
+        Some("Close the game first: the channel decides which runtime the next Play installs.")
+    } else if hosting {
+        Some("Stop hosting first: your realm's servers run this channel's files.")
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeChannelChoice {
+    pub channel: String,
+}
+
+/// [2026-10-17] The Library's channel switch: POST /launcher/v1/account/runtime-channel (test-channel accounts only; the backend
+/// refuses everyone else). The next policy read names the new channel; the next Play installs its runtime.
+#[tauri::command]
+pub async fn native_set_runtime_channel(
+    app: AppHandle,
+    server_id: Option<String>,
+    channel: String,
+) -> Result<NativeChannelChoice, String> {
+    let game_running = crate::launch::process::is_game_running().unwrap_or(false);
+    #[cfg(mystic_p2p)]
+    let hosting = crate::p2p::hosting_active();
+    #[cfg(not(mystic_p2p))]
+    let hosting = false;
+    if let Some(reason) = channel_switch_hold_reason(game_running, hosting) {
+        return Err(reason.to_string());
+    }
+    if channel.is_empty() || channel.len() > 16 || !channel.chars().all(|c| c.is_ascii_lowercase())
+    {
+        return Err("Choose a channel from the list.".to_string());
+    }
+    run_auth_task(move || {
+        let scope = official_account_scope(&app, server_id.as_deref())?;
+        let response = send_authorized_with(&AppHost(&app), &scope, |token| {
+            http_client_for(&scope)?
+                .post(format!(
+                    "{}/launcher/v1/account/runtime-channel",
+                    scope.base_url()
+                ))
+                .bearer_auth(token)
+                .json(&NativeChannelChoice {
+                    channel: channel.clone(),
+                })
+                .send()
+                .map_err(|_| UNREACHABLE.to_string())
+        })?;
+        let status = response.status().as_u16();
+        let bytes = response_bytes(response);
+        if !(200..300).contains(&status) {
+            return Err(api_error_message(
+                status,
+                error_code_of(&bytes).as_deref(),
+                "Couldn't switch the channel.",
+            ));
+        }
+        serde_json::from_slice::<NativeChannelChoice>(&bytes)
+            .map_err(|_| "Couldn't switch the channel.".to_string())
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn native_deletion_status(
     app: AppHandle,
@@ -426,6 +497,23 @@ mod tests {
     use crate::auth::session_epoch;
     use crate::commands::auth::{cache_access, NativeAccount, NativeSession};
     use crate::commands::test_support::{access_token, error_json, mock_backend};
+
+    #[test]
+    fn the_channel_switch_waits_while_a_game_runs_or_this_pc_hosts() {
+        assert!(
+            channel_switch_hold_reason(true, false).is_some_and(|r| r.contains("Close the game"))
+        );
+        assert!(channel_switch_hold_reason(false, true).is_some_and(|r| r.contains("Stop hosting")));
+        assert!(channel_switch_hold_reason(false, false).is_none());
+    }
+
+    #[test]
+    fn a_refused_channel_switch_reads_as_a_sentence() {
+        assert_eq!(
+            api_error_message(403, Some("CHANNEL_SWITCH_UNAVAILABLE"), "fallback"),
+            "This account plays the stable channel only."
+        );
+    }
 
     const CONSENT_JSON: &str = r#"{"required":{"termsVersion":"2026-10-14","privacyVersion":"2026-10-14","minimumAge":16},"accepted":{"termsVersion":"2026-09-01","privacyVersion":"2026-09-01","ageConfirmed":true,"acceptedAt":"2026-09-01T10:00:00.000Z"},"upToDate":false}"#;
 
