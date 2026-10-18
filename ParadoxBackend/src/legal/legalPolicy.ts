@@ -12,7 +12,7 @@
 // reads the launcher file and fails when they drift apart.
 
 export const TERMS_VERSION = "2026-10-14";
-export const PRIVACY_VERSION = "2026-10-16";
+export const PRIVACY_VERSION = "2026-10-17";
 export const MINIMUM_AGE = 16;
 
 export interface LegalRequirements {
@@ -28,7 +28,11 @@ export interface LegalRequirements {
 // [2026-10-16] 2026-10-16 only states plainly that log files come from tester accounts alone (upload switched off for everyone
 // else, never collected). Launchers up to 0.1.73 carry 2026-10-15, so it stays accepted until the Guard minimum launcher shows
 // 2026-10-16.
-export const PRIVACY_VERSIONS_STILL_ACCEPTED: readonly string[] = ["2026-10-15", "2026-10-14.2"];
+// [2026-10-17] 2026-10-17 describes the wider tester log upload (the newest session and the logs since, the game servers a
+// tester's PC runs for their realm, which name the other players there, connection logs and the game's settings files).
+// Launchers before it carry 2026-10-16 or older, so every earlier version stays accepted until the Guard minimum launcher
+// shows 2026-10-17; dropping only the older ones now would ask some players to accept twice.
+export const PRIVACY_VERSIONS_STILL_ACCEPTED: readonly string[] = ["2026-10-16", "2026-10-15", "2026-10-14.2"];
 
 /** Whether a privacy version counts as accepted: the current one, or one still accepted during its transition. */
 export function IsAcceptedPrivacyVersion(version: unknown, required: LegalRequirements = CurrentLegalRequirements()): boolean {
