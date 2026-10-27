@@ -2,8 +2,7 @@
 
 Dauntless 1.14.7 (`rel-1.14.7-Archon`, changelist `647472`) is the final release of the game. This page
 tracks the port from the 1.12.0 target. Since 9 October 2026 every component on `main` targets 1.14.7, and
-the official server runs it as a **closed beta** (access on request in our
-[Discord server](https://discord.gg/e3HuAZGdU3)).
+the official server runs it (news and help in our [Discord server](https://discord.gg/e3HuAZGdU3)).
 A 1.12.0 setup (legacy, no longer updated) builds from the
 [`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag. These notes move into
 the main docs once the port is complete.
@@ -127,7 +126,7 @@ servers.
 ### Realms only on the official server (15 October 2026)
 
 - The official server runs no dedicated servers any more: every hub and hunt is a Paradox realm hosted on a
-  player's PC. New accounts there wait for approval (the closed beta).
+  player's PC.
 - **Hunt end:** calling the airship at the end of a hunt used to cut the hunt server out from under the
   player. The hunt now drains and closes once everyone has left it.
 - Email codes for sign-up, password reset and Discord linking; launcher notices.
