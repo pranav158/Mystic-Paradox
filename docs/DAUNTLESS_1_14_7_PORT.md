@@ -4,8 +4,9 @@ Dauntless 1.14.7 (`rel-1.14.7-Archon`, changelist `647472`) is the final release
 tracks the port from the 1.12.0 target. Since 9 October 2026 every component on `main` targets 1.14.7, and
 the official server runs it (news and help in our [Discord server](https://discord.gg/e3HuAZGdU3)).
 A 1.12.0 setup (legacy, no longer updated) builds from the
-[`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag. These notes move into
-the main docs once the port is complete.
+[`dauntless-1.12.0`](https://github.com/pranav158/Mystic-Paradox/tree/dauntless-1.12.0) tag. The port is complete:
+since late October 2026 the Gauntlet, the last mode left, runs on the official server too. These notes record how
+the port was done.
 
 ## Target
 
@@ -130,9 +131,9 @@ servers.
 - **Hunt end:** calling the airship at the end of a hunt used to cut the hunt server out from under the
   player. The hunt now drains and closes once everyone has left it.
 - Email codes for sign-up, password reset and Discord linking; launcher notices.
-- The launcher and the runtime's loader and transport are built by this repository's GitHub workflows, with
-  build provenance (`gh attestation verify <file> --repo pranav158/Mystic-Paradox`); the launcher is signed
-  there too. The runtime DLL itself is built by the maintainer, because it needs the game SDK.
+- Launcher releases are signed. To check a download, compare the installer with `SHA256SUMS` on its
+  [Releases](https://github.com/pranav158/Mystic-Paradox/releases) page, or open **About → Check this build** in the launcher: it checks the
+  installed launcher and its files against the official server's signed release.
 
 ### Realm access, the Ramsgate kick and faster Play (16 October 2026)
 
@@ -145,16 +146,29 @@ servers.
   diagnosis came from new runtime traces of what queues a travel on the client and what sends a player back
   to the menu on the server.
 - **Gauntlet:** its service calls now answer in the shapes the 1.14.7 client parses. The Gauntlet itself
-  stays off.
+  stayed off until late October (see below).
 - **Faster Play:** the game polled its matchmaking status every 10 seconds, so Play took 10–12 seconds; the
   backend now asks for one-second polls while matching.
-- **Airship back to Ramsgate** (launcher 0.1.73, the next release): leaving a realm hunt by airship could time
+- **Airship back to Ramsgate** (launcher 0.1.73): leaving a realm hunt by airship could time
   out to the login screen, because the launcher closed the hunt's connection as soon as the hub join began,
   while the game was still travelling over it. The connection now closes once the game has left the hunt.
 
+### The Gauntlet, guilds and more (17 October to early November 2026)
+
+On the official server; the code reaches this repository in stages.
+
+- **The Gauntlet** is open, with its season leaderboard, and **guilds** work.
+- **Leaderboards**, **Slayer's Path**, the **Hunt Pass**, **loadouts**, **pets** and the in-game store are saved on
+  the server.
+- **Parties across realms:** a party whose members are in different realms lands in the same hunt.
+- **Paradox Isle events**, with their own rewards.
+- **Chat** works in the 1.14.7 client.
+- **DLSS upscaling** (NVIDIA DLSS), turned on in the launcher's settings. The DLSS module is not part of this
+  repository.
+
 ### Still open
 
-- The Gauntlet (only its menus answer).
+Nothing that blocks play. Fixes and new work continue; news is on our [Discord server](https://discord.gg/e3HuAZGdU3).
 
 ## Lessons so far
 

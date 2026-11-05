@@ -9,11 +9,11 @@ and/or Forte Labs. I cannot upload, distribute or provide them. You must obtain 
 files lawfully and generate the SDK from your own compatible installation by following
 [Generating the SDK](GENERATING_SDK.md) and [Generating game data](GENERATING_GAME_DATA.md).
 
-## Why is development slow? Have you stopped working on the project?
+## Is the project still being worked on?
 
-No, I have not abandoned the project. Development is slow because my job and personal schedule leave
-me limited time to work on it. Current progress on the Dauntless 1.14.7 port is in
-[DAUNTLESS_1_14_7_PORT.md](DAUNTLESS_1_14_7_PORT.md).
+Yes. Mystic Paradox gets updates most weeks: fixes, new features and events. The launcher installs them by
+itself, and news and changelogs are posted on our [Discord server](https://discord.gg/e3HuAZGdU3). How the final release was
+ported is in [DAUNTLESS_1_14_7_PORT.md](DAUNTLESS_1_14_7_PORT.md).
 
 ## Is there a public server or launcher?
 

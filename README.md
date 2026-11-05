@@ -50,7 +50,8 @@
 
 1. **Install Dauntless 1.14.7** from Epic with your own account — [Installing Dauntless](docs/INSTALLING_DAUNTLESS.md).
 2. **Download the Mystic Paradox launcher** from the [Releases](https://github.com/pranav158/Mystic-Paradox/releases)
-   page and install it. It keeps itself and the game's runtime up to date.
+   page and install it. It keeps itself and the game's runtime up to date. Each release lists the installer's
+   SHA-256 in `SHA256SUMS` if you want to check your download.
 3. **Create your account** in the launcher, with an email and a password or through Discord.
 4. **Point the launcher at your Dauntless folder and press Play.**
 
@@ -58,12 +59,23 @@ Questions, news and help are on our [Discord server](https://discord.gg/e3HuAZGd
 
 ## ✨ What's in the game
 
-- **Ramsgate and the Training Grounds**, hunts across the Shattered Isles, **Escalations**, **Trials** and **the Gauntlet**.
-- **Parties, friends and chat.**
-- **Saved progress:** loot, XP, weapon levels, reforge, mastery and bounties.
+Everything here runs on the official server today.
+
+- **Hubs:** Ramsgate and the Training Grounds.
+- **Hunts:** the Shattered Isles and the Hunting Grounds, **Escalations**, **Trials**, **the Gauntlet** and
+  **Paradox Isle events**.
+- **Together:** parties, also across realms (invite a friend who is in another realm, start a hunt, and you land in
+  the same hunt), friends, chat, **guilds** and **leaderboards**.
+- **Your Slayer, saved on the server:** loot, XP, weapon levels, reforge, mastery, bounties, **Slayer's Path**, the
+  **Hunt Pass**, **loadouts**, **pets** and the in-game store.
 - **Paradox realms:** every hub and hunt on the official server is hosted on a player's PC and joined through
-  **Mystic Relay**, so the game does not depend on rented game servers. A self-hosted server can run realms too, or
-  classic dedicated hubs and hunts.
+  **Mystic Relay**, so the game does not depend on rented game servers. Host a realm of your own from the launcher
+  and choose who can join: Solo, Allowlisted or Public. A self-hosted server can run realms too, or classic
+  dedicated hubs and hunts.
+- **Graphics:** NVIDIA **DLSS** upscaling, turned on in the launcher's settings. The DLSS module is not part of this
+  repository.
+- **Launcher:** sign in with email or Discord; the launcher and the game's runtime update themselves; install checks;
+  and **About → Check this build** confirms that your launcher and its files match the official release.
 
 | Game version | State |
 |---|---|
@@ -132,6 +144,8 @@ provided on Reddit.
 - **Mystic Paradox** is a separate community project with substantial independent changes, maintained
   by **Mystic / Pranav Karande**.
 - Development assistance: [Claude](https://www.anthropic.com/claude) (Anthropic).
+- DLSS upscaling uses **NVIDIA DLSS**. NVIDIA and DLSS are trademarks and/or registered trademarks of NVIDIA
+  Corporation in the U.S. and other countries.
 
 Full provenance in [NOTICE.md](NOTICE.md).
 
